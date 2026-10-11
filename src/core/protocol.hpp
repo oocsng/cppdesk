@@ -16,8 +16,8 @@ namespace cppdesk {
 constexpr uint32_t PROTOCOL_MAGIC   = 0x43505044; // "CPPD" (CppDesk packet magic)
 constexpr uint32_t RELAY_MAGIC      = 0x4344534B; // "CDSK" (CppDesk relay magic)
 constexpr uint16_t PROTOCOL_VERSION = 3;
-constexpr const char* CPP_DESK_VERSION = "3.3.2";
-constexpr uint32_t CPP_DESK_VERSION_NUM = 0x030302;
+constexpr const char* CPP_DESK_VERSION = "3.4.0";
+constexpr uint32_t CPP_DESK_VERSION_NUM = 0x030400;
 
 struct SemanticVersion {
     int major = 0;
@@ -1440,7 +1440,7 @@ inline bool deserializeSyncActionResp(const uint8_t* data, size_t size, SyncActi
 
 struct VersionUpgradeNoticePayload {
     std::string senderVersion;      // Version of connecting peer (e.g. "3.4.0")
-    std::string minimumVersion;     // Recommended minimum version (e.g. "3.3.2")
+    std::string minimumVersion;     // Recommended minimum version (e.g. "3.4.0")
     std::string downloadUrl;        // Release or asset download URL
     std::string message;            // Human-readable upgrade notice
 };
