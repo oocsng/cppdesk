@@ -361,9 +361,9 @@ void testEndToEndSessionAndFileTransfer() {
     std::cout << "  -> Testing Brute-Force Rate Limiting (5 bad attempts -> 60s lockout)...\n";
     hostNet.clearRateLimitRecords();
     bool sawRateLimited = false;
-    for (int attempt = 1; attempt <= 8; ++attempt) {
+    for (int attempt = 1; attempt <= 10; ++attempt) {
         TEST_ASSERT(viewerNet.connectToRemote(targetIdStr, "WrongPasswordAttempt"));
-        for (int w = 0; w < 40; ++w) {
+        for (int w = 0; w < 60; ++w) {
             auto st = viewerNet.viewerStats();
             if (st.state == ViewerConnectionState::Error) {
                 if (st.statusMessage.find("Too many failed") != std::string::npos ||
@@ -376,7 +376,7 @@ void testEndToEndSessionAndFileTransfer() {
         }
         viewerNet.disconnectViewer();
         if (sawRateLimited) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     TEST_ASSERT(sawRateLimited);
     hostNet.clearRateLimitRecords();

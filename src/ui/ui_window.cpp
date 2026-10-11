@@ -872,6 +872,10 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (network_.isVoiceIntercomActive()) {
                     network_.stopVoiceIntercom();
                 }
+                rewindBuffer_.clear();
+                showRewindScrubber_ = false;
+                rewindFrozen_ = false;
+                rewindOffsetMs_ = 0;
                 if (notificationMgr_) {
                     std::string hName = prevViewerHostname_.empty() ? "Remote Desktop" : prevViewerHostname_;
                     notificationMgr_->notify(NotificationType::SessionDropped, "Session Disconnected",
@@ -2321,6 +2325,10 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                        if (network_.isVoiceIntercomActive()) {
                            network_.stopVoiceIntercom();
                        }
+                       rewindBuffer_.clear();
+                       showRewindScrubber_ = false;
+                       rewindFrozen_ = false;
+                       rewindOffsetMs_ = 0;
                        network_.disconnectViewer();
                        if (sessionTabs_.tabCount() > 0) {
                            closeSessionTab(sessionTabs_.activeTabId());
@@ -2389,20 +2397,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             }
         });
 
-        // 4. Privacy Mode Blank Screen
-        bool privacyOn = stats.privacyModeEngaged;
-        hudButtons.push_back({
-            "sess_privacy_btn", privacyOn ? "Blank: ON" : "Blank Screen", 94.0f,
-            privacyOn ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-            privacyOn ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-            privacyOn ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-            !privacyOn, COL_BORDER, privacyOn ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT,
-            [this]() {
-                network_.requestTogglePrivacyMode();
-            }
-        });
-
-        // 5. Audio / Volume
+        // 4. Audio / Volume
         bool isMuted = network_.isAudioMuted();
         int vol = network_.audioVolume();
         std::string audioLabel = isMuted ? "Audio: Mute" : ("Vol: " + std::to_string(vol) + "%");
@@ -3838,11 +3833,11 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
     else if (settingsSection_ == SettingsSection::CurtainPrivacy) {
         drawText("Curtain Screen & Privacy", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
         cy += 25.0f;
-        drawText("Customize privacy blanking, organization security branding, and hardware DPMS display standby.",
+        drawText("Customize privacy curtain display and organization security branding.",
                  { cx, cy, crx, cy + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
-        UiRect privBox = { cx, cy, crx, cy + 156.0f };
+        UiRect privBox = { cx, cy, crx, cy + 128.0f };
         fillRoundRect(privBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(privBox, 12.0f, COL_BORDER);
 
@@ -3880,15 +3875,6 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
             ns.privacyShowDeskId = !ns.privacyShowDeskId;
             identity_.updateSettings(ns);
             network_.configurePrivacyCurtain(ns.privacyCustomNotice, ns.privacyBrandName, ns.privacyShowDeskId);
-        });
-
-        float py4 = py3 + 28.0f;
-        UiRect dpmsToggle = { privBox.left + 16.0f, py4, privBox.right - 16.0f, py4 + 24.0f };
-        drawToggleSwitch("sett_priv_dpms_blank", dpmsToggle, s.hardwareDpmsBlanking,
-                         "Hardware DPMS Display Standby (Power Off Monitor)", [this]() {
-            AppSettings ns = identity_.settings();
-            ns.hardwareDpmsBlanking = !ns.hardwareDpmsBlanking;
-            identity_.updateSettings(ns);
         });
 
         cy = privBox.bottom + 12.0f;
@@ -5404,18 +5390,6 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                    showQualityMenu_ = false;
                }, fmtSmall_, islandAudioMuted, COL_BORDER);
     curX = islandAudioBtn.right + 6.0f;
-
-    // Privacy Mode Screen Blank Button
-    bool islandPrivacyOn = stats.privacyModeEngaged;
-    UiRect islandPrivacyBtn = { curX, pillTop + 6.0f, curX + 88.0f, pillBottom - 6.0f };
-    drawButton("island_privacy_btn", islandPrivacyBtn, islandPrivacyOn ? "Blank: ON" : "Blank Screen",
-               islandPrivacyOn ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-               islandPrivacyOn ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-               islandPrivacyOn ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-               8.0f, [this]() {
-                   network_.requestTogglePrivacyMode();
-               }, fmtSmall_, !islandPrivacyOn, COL_BORDER);
-    curX = islandPrivacyBtn.right + 6.0f;
 
     // Port Forwarding Tunnels Button
     UiRect islandTunnelBtn = { curX, pillTop + 6.0f, curX + 70.0f, pillBottom - 6.0f };
@@ -7617,6 +7591,27 @@ void CppDeskWindow::onMouseMove(float x, float y) {
         }
     }
 
+    if (draggingRewindScrubber_) {
+        if (!mouseLeftDown_ || !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+            draggingRewindScrubber_ = false;
+            ReleaseCapture();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        } else {
+            float trackW = rewindScrubberTrackRect_.width();
+            if (trackW > 1.0f) {
+                float frac = std::clamp((x - rewindScrubberTrackRect_.left) / trackW, 0.0f, 1.0f);
+                rewindOffsetMs_ = static_cast<int64_t>((1.0f - frac) * 60000.0f);
+                rewindFrozen_ = (rewindOffsetMs_ > 0);
+                if (rewindFrozen_) {
+                    uint64_t actualTs = 0;
+                    rewindBuffer_.getFrameAtOffset(rewindOffsetMs_, rewindCachedFrameBgra_, rewindCachedW_, rewindCachedH_, actualTs);
+                }
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            }
+        }
+    }
+
     std::string newHover;
     bool newIsText = false;
     for (auto it = clickRegions_.rbegin(); it != clickRegions_.rend(); ++it) {
@@ -7676,6 +7671,14 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
     if (btn == MouseButtonId::Left && !isDown && draggingPlayerScrubber_) {
         mouseLeftDown_ = false;
         draggingPlayerScrubber_ = false;
+        ReleaseCapture();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
+
+    if (btn == MouseButtonId::Left && !isDown && draggingRewindScrubber_) {
+        mouseLeftDown_ = false;
+        draggingRewindScrubber_ = false;
         ReleaseCapture();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
@@ -8372,6 +8375,10 @@ void CppDeskWindow::closeSessionTab(uint32_t tabId) {
         if (network_.isVoiceIntercomActive()) {
             network_.stopVoiceIntercom();
         }
+        rewindBuffer_.clear();
+        showRewindScrubber_ = false;
+        rewindFrozen_ = false;
+        rewindOffsetMs_ = 0;
         prevViewerState_ = ViewerConnectionState::Disconnected;
         network_.disconnectViewer();
     }
@@ -8698,7 +8705,10 @@ void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
     fillRoundRect(thumbHandle, 6.0f, rgba(255, 255, 255, 1.0f));
     strokeRoundRect(thumbHandle, 6.0f, COL_PRIMARY_ACCENT, 1.5f);
 
+    rewindScrubberTrackRect_ = { trackLeft, trackY - 12.0f, trackRight, trackY + 12.0f };
     clickRegions_.push_back({ { trackLeft - 6.0f, trackY - 12.0f, trackRight + 6.0f, trackY + 12.0f }, "rewind_scrubber_track", [this, trackLeft, trackRight]() {
+        draggingRewindScrubber_ = true;
+        SetCapture(hwnd_);
         float f = std::clamp((mouseX_ - trackLeft) / (trackRight - trackLeft), 0.0f, 1.0f);
         rewindOffsetMs_ = static_cast<int64_t>((1.0f - f) * 60000.0f);
         rewindFrozen_ = (rewindOffsetMs_ > 0);

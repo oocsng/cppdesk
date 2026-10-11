@@ -14,8 +14,11 @@ void SessionRewindBuffer::pushFrame(uint64_t timestampMs, const uint8_t* bgra, i
     if (!bgra || width <= 0 || height <= 0) return;
 
     // Throttle to approximately INTERVAL_MS intervals
-    if (count_ > 0 && timestampMs > lastPushedTs_ && (timestampMs - lastPushedTs_) < (INTERVAL_MS - 50)) {
-        return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (count_ > 0 && timestampMs > lastPushedTs_ && (timestampMs - lastPushedTs_) < (INTERVAL_MS - 50)) {
+            return;
+        }
     }
 
     std::vector<uint8_t> jpeg = TileCodec::encodeJpeg(bgra, width, height, 70);
@@ -57,7 +60,8 @@ bool SessionRewindBuffer::getFrameAtOffset(int64_t offsetMs, std::vector<uint8_t
 
     uint64_t oldestTs = buffer_[start_].timestampMs;
     uint64_t newestTs = buffer_[(start_ + count_ - 1) % MAX_SNAPSHOTS].timestampMs;
-    int64_t targetTs = static_cast<int64_t>(newestTs) + offsetMs;
+    int64_t delta = (offsetMs > 0) ? -offsetMs : offsetMs;
+    int64_t targetTs = static_cast<int64_t>(newestTs) + delta;
 
     if (targetTs <= static_cast<int64_t>(oldestTs)) {
         size_t slot = start_;

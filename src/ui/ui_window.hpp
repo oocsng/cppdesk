@@ -556,6 +556,8 @@ private:
     bool                    showRewindScrubber_ = false;
     int64_t                 rewindOffsetMs_ = 0;
     bool                    rewindFrozen_ = false;
+    bool                    draggingRewindScrubber_ = false;
+    UiRect                  rewindScrubberTrackRect_{};
     std::vector<uint8_t>    rewindCachedFrameBgra_;
     int                     rewindCachedW_ = 0;
     int                     rewindCachedH_ = 0;

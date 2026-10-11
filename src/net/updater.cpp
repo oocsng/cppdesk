@@ -589,8 +589,11 @@ int AutoUpdater::applySelfUpdateAndRestart(
     if (copied && launchAfter) {
         STARTUPINFOW si{};
         si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_SHOWNORMAL;
         PROCESS_INFORMATION pi{};
-        std::vector<wchar_t> cmdBuf(targetExePath.begin(), targetExePath.end());
+        std::wstring quotedCmd = L"\"" + targetExePath + L"\"";
+        std::vector<wchar_t> cmdBuf(quotedCmd.begin(), quotedCmd.end());
         cmdBuf.push_back(L'\0');
         if (CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
             CloseHandle(pi.hThread);
