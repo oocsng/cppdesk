@@ -63,6 +63,11 @@ struct AppSettings {
     bool          totpEnabled = false;
     std::string   totpSecret = "";        // Base32 encoded 160-bit secret
     std::string   totpAlgorithm = "SHA1"; // Default SHA1
+
+    // Privacy Cloak: Sensitive Window & PII Auto-Redaction Mask
+    bool          privacyCloakEnabled = true;
+    std::string   privacyCloakKeywords = "KeePass, Bitwarden, 1Password, Authenticator, Credential, Wallet, .env, Banking";
+    uint8_t       privacyCloakStyle = 0; // 0 = Solid Charcoal, 1 = Mosaic
 };
 
 class CryptoUtils {

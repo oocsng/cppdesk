@@ -9,6 +9,8 @@
 #include "../media/voice_intercom.hpp"
 #include "../capture/display_manager.hpp"
 #include "../control/file_sync_manager.hpp"
+#include "../control/scratchpad_manager.hpp"
+#include "../control/command_palette.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -290,6 +292,18 @@ public:
     const ClipboardManager& clipboardManager() const { return clipboardManager_; }
     FileSyncManager& fileSyncManager() { return fileSyncMgr_; }
     const FileSyncManager& fileSyncManager() const { return fileSyncMgr_; }
+
+    // Real-Time Collaborative Dual-Peer Scratchpad
+    ScratchpadManager& scratchpadManager() { return scratchpadMgr_; }
+    const ScratchpadManager& scratchpadManager() const { return scratchpadMgr_; }
+    void setOnScratchpadUpdateCallback(std::function<void(const ScratchpadUpdatePayload&)> cb);
+    bool sendScratchpadText(const std::string& text, uint32_t cursorPos = 0);
+
+    // Spotlight Omnibar Command Palette
+    CommandPaletteManager& commandPaletteManager() { return commandPaletteMgr_; }
+    const CommandPaletteManager& commandPaletteManager() const { return commandPaletteMgr_; }
+    void setOnCommandPaletteOutputCallback(std::function<void(const CommandPaletteOutputPayload&)> cb);
+    bool sendCommandPaletteExec(const std::string& commandLine, uint32_t execId = 0);
 
     bool requestRemoteScan(const std::string& remotePath);
     bool requestRemoteBlockHashes(const std::string& relativePath);
@@ -630,6 +644,17 @@ private:
     std::atomic<bool>                          remoteIsOutdated_{false};
     std::function<void(const VersionUpgradeNoticePayload&)> onVersionUpgradeNotice_;
     std::function<void(const std::string& hostVer, const std::string& viewerVer)> onVersionMismatch_;
+
+    // Real-Time Collaborative Dual-Peer Scratchpad
+    ScratchpadManager                                       scratchpadMgr_;
+    mutable std::mutex                                      scratchpadCbMutex_;
+    std::function<void(const ScratchpadUpdatePayload&)>     onScratchpadUpdate_;
+
+    // Spotlight Omnibar Command Palette
+    CommandPaletteManager                                   commandPaletteMgr_;
+    mutable std::mutex                                      commandPaletteCbMutex_;
+    std::function<void(const CommandPaletteOutputPayload&)> onCommandPaletteOutput_;
+    std::atomic<uint32_t>                                   nextExecId_{1};
 };
 
 } // namespace cppdesk

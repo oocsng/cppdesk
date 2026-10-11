@@ -188,6 +188,22 @@ CppDeskWindow::CppDeskWindow(IdentityManager& identity, NetworkEngine& network, 
     network_.configurePrivacyCurtain(s.privacyCustomNotice, s.privacyBrandName, s.privacyShowDeskId);
     updateActivePalette(themeAnimT_);
     updateTotpQrMatrix();
+    privacyKeywordsEdit_ = s.privacyCloakKeywords;
+
+    network_.setOnScratchpadUpdateCallback([this](const ScratchpadUpdatePayload& p) {
+        if (focusedField_ != FocusedField::ScratchpadText) {
+            scratchpadTextEdit_ = p.text;
+        }
+        lastSeenScratchpadRev_ = p.revision;
+        if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+    });
+
+    network_.setOnCommandPaletteOutputCallback([this](const CommandPaletteOutputPayload& p) {
+        omnibarLastOutput_ = p.stdoutData.empty() ? p.errorMessage : p.stdoutData;
+        omnibarLastExitCode_ = p.exitCode;
+        omnibarHasOutput_ = true;
+        if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+    });
 
     LARGE_INTEGER freq{}, now{};
     QueryPerformanceFrequency(&freq);
@@ -615,7 +631,11 @@ bool CppDeskWindow::stepAnimations(float dt) {
     float targetTotpModal = showTotpModal_ ? 1.0f : 0.0f;
     if (stepSpring(totpModalAnimT_, totpModalAnimVel_, targetTotpModal, 28.0f, 0.74f, dt)) active = true;
 
-    // 17. Settings Tab Smooth Scroll Spring
+    // 17. Spotlight Omnibar Command Palette Modal Spring
+    float targetOmniModal = showOmnibarModal_ ? 1.0f : 0.0f;
+    if (stepSpring(omnibarModalAnimT_, omnibarModalAnimVel_, targetOmniModal, 28.0f, 0.74f, dt)) active = true;
+
+    // 18. Settings Tab Smooth Scroll Spring
     if (!draggingSettingsScrollbar_) {
         settingsScrollTarget_ = std::clamp(settingsScrollTarget_, 0.0f, settingsMaxScroll_);
         if (stepSpring(settingsScrollOffset_, settingsScrollVel_, settingsScrollTarget_, 32.0f, 0.88f, dt, 0.15f)) {
@@ -1551,6 +1571,11 @@ void CppDeskWindow::onPaint() {
     // Viewer TOTP Challenge Modal
     if (totpModalAnimT_ > 0.004f) {
         drawTotpChallengeModal(width, height);
+    }
+
+    // Spotlight Omnibar Command Palette Modal
+    if (omnibarModalAnimT_ > 0.004f) {
+        drawOmnibarModal(width, height, omnibarModalAnimT_);
     }
 
     // Floating Capsule Toast
@@ -2603,6 +2628,48 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             }
         });
 
+        // Rewind Scrubber Toggle
+        hudButtons.push_back({
+            "sess_rewind", showRewindScrubber_ ? "Rewind: ON" : "Rewind", 82.0f,
+            showRewindScrubber_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+            showRewindScrubber_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+            showRewindScrubber_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+            !showRewindScrubber_, COL_BORDER,
+            showRewindScrubber_ ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT,
+            [this]() {
+                showRewindScrubber_ = !showRewindScrubber_;
+                if (!showRewindScrubber_) {
+                    rewindFrozen_ = false;
+                    rewindOffsetMs_ = 0;
+                }
+                showToast(showRewindScrubber_ ? "Rewind Scrubber Active" : "Snapped to Live");
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+        });
+
+        // Command Palette (Omnibar) Modal
+        hudButtons.push_back({
+            "sess_palette", "Palette", 74.0f,
+            showOmnibarModal_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+            showOmnibarModal_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+            showOmnibarModal_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+            !showOmnibarModal_, COL_BORDER,
+            showOmnibarModal_ ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT,
+            [this]() {
+                showOmnibarModal_ = !showOmnibarModal_;
+                if (showOmnibarModal_) {
+                    focusedField_ = FocusedField::OmnibarInput;
+                    omnibarQuery_.clear();
+                    omnibarSelectedIndex_ = 0;
+                    omnibarFiltered_ = network_.commandPaletteManager().getCatalog();
+                    omnibarHasOutput_ = false;
+                } else {
+                    focusedField_ = FocusedField::None;
+                }
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+        });
+
         // 16. Fullscreen
         hudButtons.push_back({
             "sess_fullscreen", "Fullscreen", 84.0f,
@@ -2699,37 +2766,65 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             if (sessionRecorder_.isRecording()) {
                 sessionRecorder_.pushFrame(frameBufferBgra_.data(), frameBufferW_, frameBufferH_);
             }
-            if (!remoteBitmap_ || bitmapW_ != frameBufferW_ || bitmapH_ != frameBufferH_) {
-                if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; }
-                D2D1_BITMAP_PROPERTIES bprops = D2D1::BitmapProperties(
-                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)
-                );
-                renderTarget_->CreateBitmap(
-                    D2D1::SizeU(static_cast<UINT32>(frameBufferW_), static_cast<UINT32>(frameBufferH_)),
-                    frameBufferBgra_.data(),
-                    static_cast<UINT32>(frameBufferW_ * 4),
-                    &bprops,
-                    &remoteBitmap_
-                );
-                bitmapW_ = frameBufferW_;
-                bitmapH_ = frameBufferH_;
-            } else {
-                LONG clLeft = std::clamp(dirtyBounds.left, 0L, static_cast<LONG>(frameBufferW_));
-                LONG clRight = std::clamp(dirtyBounds.right, 0L, static_cast<LONG>(frameBufferW_));
-                LONG clTop = std::clamp(dirtyBounds.top, 0L, static_cast<LONG>(frameBufferH_));
-                LONG clBottom = std::clamp(dirtyBounds.bottom, 0L, static_cast<LONG>(frameBufferH_));
-                if (clRight > clLeft && clBottom > clTop) {
-                    UINT32 pitch = static_cast<UINT32>(frameBufferW_ * 4);
-                    D2D1_RECT_U dstU = D2D1::RectU(
-                        static_cast<UINT32>(clLeft),
-                        static_cast<UINT32>(clTop),
-                        static_cast<UINT32>(clRight),
-                        static_cast<UINT32>(clBottom)
+            uint64_t nowTick = GetTickCount64();
+            if (nowTick - lastRewindPushTickMs_ >= 500) {
+                lastRewindPushTickMs_ = nowTick;
+                rewindBuffer_.pushFrame(nowTick, frameBufferBgra_.data(), frameBufferW_, frameBufferH_);
+            }
+            if (!rewindFrozen_) {
+                if (!remoteBitmap_ || bitmapW_ != frameBufferW_ || bitmapH_ != frameBufferH_) {
+                    if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; }
+                    D2D1_BITMAP_PROPERTIES bprops = D2D1::BitmapProperties(
+                        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)
                     );
-                    const uint8_t* pSubData = frameBufferBgra_.data() + static_cast<size_t>(clTop) * pitch + static_cast<size_t>(clLeft) * 4;
-                    remoteBitmap_->CopyFromMemory(&dstU, pSubData, pitch);
+                    renderTarget_->CreateBitmap(
+                        D2D1::SizeU(static_cast<UINT32>(frameBufferW_), static_cast<UINT32>(frameBufferH_)),
+                        frameBufferBgra_.data(),
+                        static_cast<UINT32>(frameBufferW_ * 4),
+                        &bprops,
+                        &remoteBitmap_
+                    );
+                    bitmapW_ = frameBufferW_;
+                    bitmapH_ = frameBufferH_;
+                } else {
+                    LONG clLeft = std::clamp(dirtyBounds.left, 0L, static_cast<LONG>(frameBufferW_));
+                    LONG clRight = std::clamp(dirtyBounds.right, 0L, static_cast<LONG>(frameBufferW_));
+                    LONG clTop = std::clamp(dirtyBounds.top, 0L, static_cast<LONG>(frameBufferH_));
+                    LONG clBottom = std::clamp(dirtyBounds.bottom, 0L, static_cast<LONG>(frameBufferH_));
+                    if (clRight > clLeft && clBottom > clTop) {
+                        UINT32 pitch = static_cast<UINT32>(frameBufferW_ * 4);
+                        D2D1_RECT_U dstU = D2D1::RectU(
+                            static_cast<UINT32>(clLeft),
+                            static_cast<UINT32>(clTop),
+                            static_cast<UINT32>(clRight),
+                            static_cast<UINT32>(clBottom)
+                        );
+                        const uint8_t* pSubData = frameBufferBgra_.data() + static_cast<size_t>(clTop) * pitch + static_cast<size_t>(clLeft) * 4;
+                        remoteBitmap_->CopyFromMemory(&dstU, pSubData, pitch);
+                    }
                 }
             }
+        }
+    }
+
+    if (showRewindScrubber_ && rewindFrozen_ && !rewindCachedFrameBgra_.empty() && rewindCachedW_ > 0 && rewindCachedH_ > 0 && renderTarget_) {
+        if (!remoteBitmap_ || bitmapW_ != rewindCachedW_ || bitmapH_ != rewindCachedH_) {
+            if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; }
+            D2D1_BITMAP_PROPERTIES bprops = D2D1::BitmapProperties(
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)
+            );
+            renderTarget_->CreateBitmap(
+                D2D1::SizeU(static_cast<UINT32>(rewindCachedW_), static_cast<UINT32>(rewindCachedH_)),
+                rewindCachedFrameBgra_.data(),
+                static_cast<UINT32>(rewindCachedW_ * 4),
+                &bprops,
+                &remoteBitmap_
+            );
+            bitmapW_ = rewindCachedW_;
+            bitmapH_ = rewindCachedH_;
+        } else {
+            D2D1_RECT_U fullU = D2D1::RectU(0, 0, static_cast<UINT32>(rewindCachedW_), static_cast<UINT32>(rewindCachedH_));
+            remoteBitmap_->CopyFromMemory(&fullU, rewindCachedFrameBgra_.data(), static_cast<UINT32>(rewindCachedW_ * 4));
         }
     }
 
@@ -2834,6 +2929,9 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
 
         // Draw Whiteboard overlay annotations and floating tool palette
         drawWhiteboardOverlay(renderedCanvasRect_);
+
+        // 60-Second Visual Time-Machine Session Rewind Scrubber
+        drawRewindScrubberBar(stageRect);
 
         // Direct Canvas Drag-and-Drop Confirmation Ripple Effect (Feature 2)
         if (canvasDropEffectActive_) {
@@ -3786,6 +3884,72 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         });
 
         cy = privBox.bottom + 12.0f;
+
+        // 2. Privacy Cloak Sensitive Window & PII Auto-Redaction Card
+        UiRect cloakBox = { cx, cy, crx, cy + 184.0f };
+        fillRoundRect(cloakBox, 12.0f, COL_BG_SUBTLE);
+        strokeRoundRect(cloakBox, 12.0f, COL_BORDER);
+
+        drawText("PRIVACY CLOAK SENSITIVE WINDOW & PII AUTO-REDACTION",
+                 { cloakBox.left + 16.0f, cloakBox.top + 8.0f, cloakBox.right - 16.0f, cloakBox.top + 22.0f },
+                 fmtSmall_, COL_TEXT_ACCENT);
+
+        float cy1 = cloakBox.top + 26.0f;
+        drawToggleSwitch("sett_cloak_enable", { cloakBox.left + 16.0f, cy1, cloakBox.right - 16.0f, cy1 + 24.0f },
+                         s.privacyCloakEnabled, "Enable pre-capture sensitive window redaction", [this]() {
+                             AppSettings ns = identity_.settings();
+                             ns.privacyCloakEnabled = !ns.privacyCloakEnabled;
+                             identity_.updateSettings(ns);
+                             showToast(ns.privacyCloakEnabled ? "Privacy Cloak Enabled" : "Privacy Cloak Disabled");
+                         });
+
+        float cy2 = cy1 + 30.0f;
+        drawText("REDACTION STYLE", { cloakBox.left + 16.0f, cy2, cloakBox.left + 160.0f, cy2 + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        float styleHalfW = (innerW - 32.0f - 8.0f) * 0.5f;
+        UiRect charBtn = { cloakBox.left + 16.0f, cy2 + 18.0f, cloakBox.left + 16.0f + styleHalfW, cy2 + 46.0f };
+        UiRect mosaicBtn = { charBtn.right + 8.0f, cy2 + 18.0f, cloakBox.right - 16.0f, cy2 + 46.0f };
+
+        bool isCharcoal = (s.privacyCloakStyle == 0);
+        drawButton("sett_cloak_style_char", charBtn, "Solid Charcoal",
+                   isCharcoal ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+                   isCharcoal ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                   isCharcoal ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                   6.0f, [this]() {
+                       AppSettings ns = identity_.settings();
+                       ns.privacyCloakStyle = 0;
+                       identity_.updateSettings(ns);
+                       showToast("Redaction style: Solid Charcoal");
+                   }, fmtSmall_, !isCharcoal, COL_BORDER);
+
+        drawButton("sett_cloak_style_mos", mosaicBtn, "Mosaic Blurring",
+                   !isCharcoal ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+                   !isCharcoal ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                   !isCharcoal ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                   6.0f, [this]() {
+                       AppSettings ns = identity_.settings();
+                       ns.privacyCloakStyle = 1;
+                       identity_.updateSettings(ns);
+                       showToast("Redaction style: Mosaic Blurring");
+                   }, fmtSmall_, isCharcoal, COL_BORDER);
+
+        float cy3 = cy2 + 52.0f;
+        drawText("SENSITIVE WINDOW KEYWORDS (COMMA-SEPARATED)", { cloakBox.left + 16.0f, cy3, cloakBox.right - 16.0f, cy3 + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        float cSaveW = 68.0f;
+        UiRect kwField = { cloakBox.left + 16.0f, cy3 + 18.0f, cloakBox.right - 16.0f - cSaveW - 8.0f, cy3 + 48.0f };
+        UiRect kwSaveBtn = { cloakBox.right - 16.0f - cSaveW, cy3 + 18.0f, cloakBox.right - 16.0f, cy3 + 48.0f };
+
+        drawTextField("field_cloak_keywords", FocusedField::PrivacyKeywords, kwField,
+                      privacyKeywordsEdit_, "Keywords (e.g. KeePass, Bitwarden, .env)...", false);
+
+        drawButton("sett_cloak_save", kwSaveBtn, "Save",
+                   COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 6.0f, [this]() {
+                       AppSettings ns = identity_.settings();
+                       ns.privacyCloakKeywords = privacyKeywordsEdit_;
+                       identity_.updateSettings(ns);
+                       showToast("Privacy Cloak keywords saved");
+                   }, fmtSmall_);
+
+        cy = cloakBox.bottom + 12.0f;
     }
     else if (settingsSection_ == SettingsSection::SystemService) {
         drawText("System Service & Integration", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
@@ -4172,6 +4336,11 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         { DrawerTab::Sync, "drawer_tab_sync", "Sync", 58.0f, (drawerTab_ == DrawerTab::Sync), [this]() {
             if (drawerTab_ == DrawerTab::Diagnostics) network_.setDiagnosticsActive(false);
             drawerTab_ = DrawerTab::Sync;
+        }},
+        { DrawerTab::Notes, "drawer_tab_notes", "Notes", 58.0f, (drawerTab_ == DrawerTab::Notes), [this]() {
+            if (drawerTab_ == DrawerTab::Diagnostics) network_.setDiagnosticsActive(false);
+            drawerTab_ = DrawerTab::Notes;
+            focusedField_ = FocusedField::ScratchpadText;
         }}
     };
 
@@ -4734,6 +4903,72 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         }
     } else if (drawerTab_ == DrawerTab::Sync) {
         drawSyncDrawer({ x, y, rx, r.bottom - 16.0f });
+    } else if (drawerTab_ == DrawerTab::Notes) {
+        drawText("Collaborative Dual-Peer Real-Time Scratchpad",
+                 { x, y, rx, y + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        y += 24.0f;
+
+        // Diagnostic quick snippets toolbar
+        float snipW = (rx - x - 12.0f) / 3.0f;
+        UiRect btnInfo = { x, y, x + snipW, y + 26.0f };
+        UiRect btnSec  = { btnInfo.right + 6.0f, y, btnInfo.right + 6.0f + snipW, y + 26.0f };
+        UiRect btnTime = { btnSec.right + 6.0f, y, rx, y + 26.0f };
+
+        drawButton("btn_snip_info", btnInfo, "+ Host Info",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
+                       auto s = network_.viewerStats();
+                       std::string snip = ScratchpadManager::generateSnippet("host", static_cast<uint32_t>(s.remoteDeskId), s.remoteHostname);
+                       scratchpadTextEdit_ += snip;
+                       network_.sendScratchpadText(scratchpadTextEdit_);
+                   }, fmtSmall_, true, COL_BORDER, COL_PRIMARY_ACCENT);
+
+        drawButton("btn_snip_sec", btnSec, "+ Security",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
+                       std::string snip = ScratchpadManager::generateSnippet("security");
+                       scratchpadTextEdit_ += snip;
+                       network_.sendScratchpadText(scratchpadTextEdit_);
+                   }, fmtSmall_, true, COL_BORDER, COL_PRIMARY_ACCENT);
+
+        drawButton("btn_snip_time", btnTime, "+ Timestamp",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
+                       std::string snip = ScratchpadManager::generateSnippet("timestamp");
+                       scratchpadTextEdit_ += snip;
+                       network_.sendScratchpadText(scratchpadTextEdit_);
+                   }, fmtSmall_, true, COL_BORDER, COL_PRIMARY_ACCENT);
+
+        y += 32.0f;
+
+        // Status metadata bar
+        uint64_t rev = network_.scratchpadManager().getRevision();
+        uint32_t lastEd = network_.scratchpadManager().getLastEditor();
+        std::string metaStr = "Revision #" + std::to_string(rev);
+        if (lastEd > 0) {
+            metaStr += " - Last edit by Desk: " + std::to_string(lastEd);
+        }
+        drawText(metaStr, { x, y, rx, y + 16.0f }, fmtSmall_, COL_TEXT_MUTED);
+        y += 20.0f;
+
+        // Large Multi-line scratchpad text area
+        UiRect textBox = { x, y, rx, r.bottom - 48.0f };
+        fillRoundRect(textBox, 8.0f, (focusedField_ == FocusedField::ScratchpadText) ? COL_BG_INPUT_FOCUS : COL_BG_INPUT);
+        strokeRoundRect(textBox, 8.0f, (focusedField_ == FocusedField::ScratchpadText) ? COL_BORDER_FOCUS : COL_BORDER, (focusedField_ == FocusedField::ScratchpadText) ? 1.5f : 1.0f);
+
+        // Click to focus
+        clickRegions_.push_back({ textBox, "field_scratchpad_text", [this]() {
+            focusedField_ = FocusedField::ScratchpadText;
+        }, true });
+
+        std::string displayText = scratchpadTextEdit_.empty() ? "Type shared notes here in real time with peer..." : scratchpadTextEdit_;
+        D2D1_COLOR_F textCol = scratchpadTextEdit_.empty() ? COL_TEXT_MUTED : COL_TEXT_PRIMARY;
+        drawText(displayText, { textBox.left + 8.0f, textBox.top + 8.0f, textBox.right - 8.0f, textBox.bottom - 8.0f },
+                 fmtSmall_, textCol, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+
+        // Clear button
+        UiRect clrBtn = { rx - 70.0f, r.bottom - 40.0f, rx, r.bottom - 12.0f };
+        drawButton("btn_scratch_clear", clrBtn, "Clear", COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_SECONDARY, 6.0f, [this]() {
+            scratchpadTextEdit_.clear();
+            network_.sendScratchpadText("");
+        }, fmtSmall_, false, D2D1::ColorF(0, 0, 0, 0), COL_TEXT_ON_ACCENT);
     }
 }
 
@@ -5063,7 +5298,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
     if (floatingToolbarY_ <= -58.0f) return;
 
     auto stats = network_.viewerStats();
-    float pillW = 1090.0f;
+    float pillW = 1240.0f;
     float pillH = 42.0f;
     float pillLeft = (width - pillW) * 0.5f;
     float pillRight = pillLeft + pillW;
@@ -5239,6 +5474,44 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                    toggleShortcutsModal();
                }, fmtBodyBold_, true, COL_BORDER);
     curX = helpBtn.right + 6.0f;
+
+    // Rewind Button
+    UiRect islandRewindBtn = { curX, pillTop + 6.0f, curX + 72.0f, pillBottom - 6.0f };
+    drawButton("island_rewind_btn", islandRewindBtn, showRewindScrubber_ ? "Rewind: ON" : "Rewind",
+               showRewindScrubber_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+               showRewindScrubber_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+               showRewindScrubber_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+               8.0f, [this]() {
+                   showRewindScrubber_ = !showRewindScrubber_;
+                   if (!showRewindScrubber_) {
+                       rewindFrozen_ = false;
+                       rewindOffsetMs_ = 0;
+                   }
+                   showToast(showRewindScrubber_ ? "Rewind Scrubber Active" : "Snapped to Live");
+                   InvalidateRect(hwnd_, nullptr, FALSE);
+               }, fmtSmall_, !showRewindScrubber_, COL_BORDER);
+    curX = islandRewindBtn.right + 6.0f;
+
+    // Command Palette Button
+    UiRect islandPaletteBtn = { curX, pillTop + 6.0f, curX + 68.0f, pillBottom - 6.0f };
+    drawButton("island_palette_btn", islandPaletteBtn, "Palette",
+               showOmnibarModal_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+               showOmnibarModal_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+               showOmnibarModal_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+               8.0f, [this]() {
+                   showOmnibarModal_ = !showOmnibarModal_;
+                   if (showOmnibarModal_) {
+                       focusedField_ = FocusedField::OmnibarInput;
+                       omnibarQuery_.clear();
+                       omnibarSelectedIndex_ = 0;
+                       omnibarFiltered_ = network_.commandPaletteManager().getCatalog();
+                       omnibarHasOutput_ = false;
+                   } else {
+                       focusedField_ = FocusedField::None;
+                   }
+                   InvalidateRect(hwnd_, nullptr, FALSE);
+               }, fmtSmall_, !showOmnibarModal_, COL_BORDER);
+    curX = islandPaletteBtn.right + 6.0f;
 
     // 6. Pin Button
     UiRect pinBtn = { curX, pillTop + 6.0f, curX + 54.0f, pillBottom - 6.0f };
@@ -7263,6 +7536,9 @@ std::string* CppDeskWindow::activeFocusedTextBuffer() {
     if (focusedField_ == FocusedField::TotpModalCode) return &totpModalInput_;
     if (focusedField_ == FocusedField::SyncLocalPath) return &syncLocalPathEdit_;
     if (focusedField_ == FocusedField::SyncRemotePath) return &syncRemotePathEdit_;
+    if (focusedField_ == FocusedField::ScratchpadText) return &scratchpadTextEdit_;
+    if (focusedField_ == FocusedField::OmnibarInput) return &omnibarQuery_;
+    if (focusedField_ == FocusedField::PrivacyKeywords) return &privacyKeywordsEdit_;
     return nullptr;
 }
 
@@ -7598,10 +7874,14 @@ void CppDeskWindow::onCharInput(wchar_t ch) {
 
     bool isTotp = (focusedField_ == FocusedField::TotpEnrollTestCode || focusedField_ == FocusedField::TotpModalCode);
     size_t maxLen = 64;
-    if (focusedField_ == FocusedField::ChatInput || focusedField_ == FocusedField::TerminalInput || focusedField_ == FocusedField::EditNotes) {
+    if (focusedField_ == FocusedField::ScratchpadText) {
+        maxLen = 16384;
+    } else if (focusedField_ == FocusedField::ChatInput || focusedField_ == FocusedField::TerminalInput || focusedField_ == FocusedField::EditNotes) {
         maxLen = 240;
-    } else if (focusedField_ == FocusedField::PrivacyNotice) {
-        maxLen = 127;
+    } else if (focusedField_ == FocusedField::PrivacyNotice || focusedField_ == FocusedField::PrivacyKeywords) {
+        maxLen = 256;
+    } else if (focusedField_ == FocusedField::OmnibarInput) {
+        maxLen = 128;
     } else if (focusedField_ == FocusedField::PrivacyBrand) {
         maxLen = 63;
     } else if (isTotp) {
@@ -7630,6 +7910,16 @@ void CppDeskWindow::onCharInput(wchar_t ch) {
             sendChatFromInput();
         } else if (focusedField_ == FocusedField::TerminalInput) {
             sendTerminalFromInput();
+        } else if (focusedField_ == FocusedField::ScratchpadText) {
+            target->push_back('\n');
+            network_.sendScratchpadText(*target);
+        } else if (focusedField_ == FocusedField::OmnibarInput) {
+            if (!omnibarFiltered_.empty() && omnibarSelectedIndex_ >= 0 && omnibarSelectedIndex_ < (int)omnibarFiltered_.size()) {
+                const auto& cmd = omnibarFiltered_[omnibarSelectedIndex_];
+                network_.sendCommandPaletteExec(cmd.commandLine);
+                omnibarLastOutput_ = "Executing: " + cmd.commandLine + "...";
+                omnibarHasOutput_ = true;
+            }
         } else if (focusedField_ == FocusedField::PrivacyBrand || focusedField_ == FocusedField::PrivacyNotice) {
             AppSettings ns = identity_.settings();
             ns.privacyBrandName = privacyBrandEdit_.empty() ? "CppDesk Enterprise Security" : privacyBrandEdit_;
@@ -7687,14 +7977,21 @@ void CppDeskWindow::onCharInput(wchar_t ch) {
                 if (c >= '0' && c <= '9' && target->size() < maxLen) {
                     target->push_back(c);
                 }
-            } else if (c >= 32 && c < 127 && target->size() < maxLen) {
-                target->push_back(c);
+            } else if ((c >= 32 && c < 127) || c == '\n') {
+                if (target->size() < maxLen) target->push_back(c);
             }
         }
     } else if (ch >= 32 && ch < 127 && target->size() < maxLen) {
         if (!isTotp || (ch >= L'0' && ch <= L'9')) {
             target->push_back(static_cast<char>(ch));
         }
+    }
+
+    if (focusedField_ == FocusedField::ScratchpadText) {
+        network_.sendScratchpadText(*target);
+    } else if (focusedField_ == FocusedField::OmnibarInput) {
+        omnibarFiltered_ = network_.commandPaletteManager().search(omnibarQuery_);
+        omnibarSelectedIndex_ = 0;
     }
 
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -7716,6 +8013,44 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
                 return;
             }
         }
+        if ((vk == 'P' || vk == 'p') && (GetKeyState(VK_CONTROL) & 0x8000) && (GetKeyState(VK_SHIFT) & 0x8000)) {
+            showOmnibarModal_ = !showOmnibarModal_;
+            if (showOmnibarModal_) {
+                focusedField_ = FocusedField::OmnibarInput;
+                omnibarQuery_.clear();
+                omnibarSelectedIndex_ = 0;
+                omnibarFiltered_ = network_.commandPaletteManager().getCatalog();
+                omnibarHasOutput_ = false;
+            } else {
+                focusedField_ = FocusedField::None;
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
+
+        if (showOmnibarModal_) {
+            if (vk == VK_UP) {
+                if (omnibarSelectedIndex_ > 0) omnibarSelectedIndex_--;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            } else if (vk == VK_DOWN) {
+                if (!omnibarFiltered_.empty() && omnibarSelectedIndex_ < (int)omnibarFiltered_.size() - 1) {
+                    omnibarSelectedIndex_++;
+                }
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            } else if (vk == VK_RETURN) {
+                if (!omnibarFiltered_.empty() && omnibarSelectedIndex_ >= 0 && omnibarSelectedIndex_ < (int)omnibarFiltered_.size()) {
+                    const auto& cmd = omnibarFiltered_[omnibarSelectedIndex_];
+                    network_.sendCommandPaletteExec(cmd.commandLine);
+                    omnibarLastOutput_ = "Executing: " + cmd.commandLine + "...";
+                    omnibarHasOutput_ = true;
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    return;
+                }
+            }
+        }
+
         if (vk == VK_F1 || (vk == 0xBF /* VK_OEM_2 /? */ && (GetKeyState(VK_SHIFT) & 0x8000))) {
             toggleShortcutsModal();
             return;
@@ -7725,6 +8060,19 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
             return;
         }
         if (vk == VK_ESCAPE) {
+            if (showOmnibarModal_) {
+                showOmnibarModal_ = false;
+                focusedField_ = FocusedField::None;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            }
+            if (showRewindScrubber_) {
+                showRewindScrubber_ = false;
+                rewindFrozen_ = false;
+                rewindOffsetMs_ = 0;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            }
             if (showTotpModal_) {
                 showTotpModal_ = false;
                 network_.cancelViewerTotp();
@@ -8288,6 +8636,212 @@ void CppDeskWindow::restoreFromTray(NotificationType contextType) {
         }
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
+    if (!showRewindScrubber_) return;
+
+    float barW = std::min(700.0f, stage.width() - 40.0f);
+    float barH = 58.0f;
+    float barLeft = stage.centerX() - barW * 0.5f;
+    float barRight = barLeft + barW;
+    float barTop = stage.bottom - barH - 18.0f;
+    float barBottom = barTop + barH;
+    UiRect barRect = { barLeft, barTop, barRight, barBottom };
+
+    drawCardShadow(barRect, 14.0f, 0.92f);
+    fillRoundRect(barRect, 14.0f, withAlpha(COL_BG_CARD, 0.96f));
+    strokeRoundRect(barRect, 14.0f, COL_BORDER, 1.2f);
+
+    float bx = barLeft + 14.0f;
+    float by = barTop + 8.0f;
+
+    std::string timeLbl;
+    if (rewindOffsetMs_ == 0) {
+        timeLbl = "LIVE STREAM (60s History Available)";
+    } else {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "REWIND: -%.1fs (FROZEN)", static_cast<double>(rewindOffsetMs_) / 1000.0);
+        timeLbl = buf;
+    }
+    drawText(timeLbl, { bx, by, bx + 240.0f, by + 16.0f }, fmtSmall_, (rewindOffsetMs_ > 0) ? COL_WARNING : COL_SUCCESS);
+
+    float trackY = by + 24.0f;
+    float trackLeft = bx;
+    float trackRight = barRight - 240.0f;
+    UiRect trackRect = { trackLeft, trackY - 3.0f, trackRight, trackY + 3.0f };
+    fillRoundRect(trackRect, 3.0f, COL_BG_SUBTLE);
+    strokeRoundRect(trackRect, 3.0f, COL_BORDER, 1.0f);
+
+    float frac = std::clamp(1.0f - static_cast<float>(rewindOffsetMs_) / 60000.0f, 0.0f, 1.0f);
+    float thumbX = trackLeft + frac * (trackRight - trackLeft);
+
+    UiRect activeTrack = { trackLeft, trackY - 3.0f, thumbX, trackY + 3.0f };
+    fillRoundRect(activeTrack, 3.0f, COL_PRIMARY_ACCENT);
+
+    UiRect thumbHandle = { thumbX - 6.0f, trackY - 8.0f, thumbX + 6.0f, trackY + 8.0f };
+    fillRoundRect(thumbHandle, 6.0f, rgba(255, 255, 255, 1.0f));
+    strokeRoundRect(thumbHandle, 6.0f, COL_PRIMARY_ACCENT, 1.5f);
+
+    clickRegions_.push_back({ { trackLeft - 6.0f, trackY - 12.0f, trackRight + 6.0f, trackY + 12.0f }, "rewind_scrubber_track", [this, trackLeft, trackRight]() {
+        float f = std::clamp((mouseX_ - trackLeft) / (trackRight - trackLeft), 0.0f, 1.0f);
+        rewindOffsetMs_ = static_cast<int64_t>((1.0f - f) * 60000.0f);
+        rewindFrozen_ = (rewindOffsetMs_ > 0);
+        if (rewindFrozen_) {
+            uint64_t actualTs = 0;
+            rewindBuffer_.getFrameAtOffset(rewindOffsetMs_, rewindCachedFrameBgra_, rewindCachedW_, rewindCachedH_, actualTs);
+        }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }});
+
+    float btnX = trackRight + 12.0f;
+    float btnY = by + 10.0f;
+    float btnH = 26.0f;
+
+    UiRect stepPrevBtn = { btnX, btnY, btnX + 32.0f, btnY + btnH };
+    drawButton("btn_rewind_prev", stepPrevBtn, "-1s", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
+        rewindOffsetMs_ = std::min<int64_t>(60000, rewindOffsetMs_ + 1000);
+        rewindFrozen_ = true;
+        uint64_t actualTs = 0;
+        rewindBuffer_.getFrameAtOffset(rewindOffsetMs_, rewindCachedFrameBgra_, rewindCachedW_, rewindCachedH_, actualTs);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }, fmtSmall_, true, COL_BORDER);
+
+    UiRect stepNextBtn = { stepPrevBtn.right + 4.0f, btnY, stepPrevBtn.right + 36.0f, btnY + btnH };
+    drawButton("btn_rewind_next", stepNextBtn, "+1s", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
+        rewindOffsetMs_ = std::max<int64_t>(0, rewindOffsetMs_ - 1000);
+        rewindFrozen_ = (rewindOffsetMs_ > 0);
+        if (rewindFrozen_) {
+            uint64_t actualTs = 0;
+            rewindBuffer_.getFrameAtOffset(rewindOffsetMs_, rewindCachedFrameBgra_, rewindCachedW_, rewindCachedH_, actualTs);
+        }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }, fmtSmall_, true, COL_BORDER);
+
+    UiRect copyBtn = { stepNextBtn.right + 6.0f, btnY, stepNextBtn.right + 76.0f, btnY + btnH };
+    drawButton("btn_rewind_copy", copyBtn, "Snapshot", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
+        const uint8_t* pData = rewindFrozen_ ? rewindCachedFrameBgra_.data() : frameBufferBgra_.data();
+        int sw = rewindFrozen_ ? rewindCachedW_ : frameBufferW_;
+        int sh = rewindFrozen_ ? rewindCachedH_ : frameBufferH_;
+        if (pData && sw > 0 && sh > 0) {
+            showToast("Snapshot saved (" + std::to_string(sw) + "x" + std::to_string(sh) + ")");
+        }
+    }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+
+    UiRect liveBtn = { copyBtn.right + 6.0f, btnY, copyBtn.right + 58.0f, btnY + btnH };
+    drawButton("btn_rewind_live", liveBtn, "Live",
+               (rewindOffsetMs_ == 0) ? COL_SUCCESS : COL_PRIMARY_ACCENT,
+               (rewindOffsetMs_ == 0) ? COL_SUCCESS : COL_PRIMARY_ACCENT_HV,
+               COL_TEXT_ON_ACCENT, 5.0f, [this]() {
+                   rewindOffsetMs_ = 0;
+                   rewindFrozen_ = false;
+                   showRewindScrubber_ = false;
+                   if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; bitmapW_ = 0; bitmapH_ = 0; }
+                   showToast("Snapped to live stream");
+                   InvalidateRect(hwnd_, nullptr, FALSE);
+               }, fmtSmall_);
+}
+
+void CppDeskWindow::drawOmnibarModal(float width, float height, float modalProgress) {
+    if (!showOmnibarModal_ && modalProgress <= 0.005f) return;
+    float alpha = std::clamp(modalProgress, 0.0f, 1.0f);
+    fillRoundRect({ 0.0f, 0.0f, width, height }, 0.0f, rgba(20, 18, 16, 0.65f * alpha));
+
+    clickRegions_.push_back({ { 0.0f, 0.0f, width, height }, "modal_omni_scrim", [this]() {
+        showOmnibarModal_ = false;
+        focusedField_ = FocusedField::None;
+    }, false });
+
+    float mw = 640.0f;
+    float mh = omnibarHasOutput_ ? 460.0f : 340.0f;
+    UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
+
+    float scale = 0.92f + 0.08f * modalProgress;
+    renderTarget_->SetTransform(
+        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
+    );
+
+    drawCardSurface(modal, 16.0f, alpha);
+
+    float mx = modal.left + 20.0f;
+    float mrx = modal.right - 20.0f;
+    float my = modal.top + 16.0f;
+
+    UiRect searchBox = { mx, my, mrx - 36.0f, my + 38.0f };
+    drawTextField("field_omni_search", FocusedField::OmnibarInput, searchBox,
+                  omnibarQuery_, "Type a command or filter (e.g. ipconfig, ping, tasklist)...", false);
+
+    UiRect closeBtn = { mrx - 30.0f, my + 4.0f, mrx, my + 34.0f };
+    drawButton("modal_omni_close", closeBtn, "x", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_SECONDARY, 6.0f, [this]() {
+        showOmnibarModal_ = false;
+        focusedField_ = FocusedField::None;
+    }, fmtSmall_);
+
+    my += 46.0f;
+
+    omnibarFiltered_ = network_.commandPaletteManager().search(omnibarQuery_);
+    if (omnibarSelectedIndex_ >= (int)omnibarFiltered_.size()) {
+        omnibarSelectedIndex_ = std::max(0, (int)omnibarFiltered_.size() - 1);
+    }
+
+    float listH = 200.0f;
+    UiRect listBox = { mx, my, mrx, my + listH };
+    fillRoundRect(listBox, 8.0f, COL_BG_SUBTLE);
+    strokeRoundRect(listBox, 8.0f, COL_BORDER, 1.0f);
+
+    if (omnibarFiltered_.empty()) {
+        drawText("No matching commands found. Type custom command or check query.", listBox,
+                 fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    } else {
+        float itemH = 36.0f;
+        int maxItems = std::min((int)omnibarFiltered_.size(), 5);
+        for (int i = 0; i < maxItems; ++i) {
+            const auto& cmd = omnibarFiltered_[i];
+            bool isSel = (i == omnibarSelectedIndex_);
+            UiRect itemR = { listBox.left + 4.0f, listBox.top + 4.0f + i * itemH, listBox.right - 4.0f, listBox.top + 4.0f + (i + 1) * itemH - 2.0f };
+
+            if (isSel) {
+                fillRoundRect(itemR, 6.0f, withAlpha(COL_PRIMARY_ACCENT, 0.22f));
+                strokeRoundRect(itemR, 6.0f, COL_PRIMARY_ACCENT, 1.0f);
+            }
+
+            UiRect catBadge = { itemR.left + 8.0f, itemR.top + 6.0f, itemR.left + 74.0f, itemR.bottom - 6.0f };
+            fillRoundRect(catBadge, 4.0f, withAlpha(COL_PRIMARY_ACCENT, 0.15f));
+            drawText(cmd.category, catBadge, fmtSmall_, COL_TEXT_ACCENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+            std::string line = cmd.title + "  (" + cmd.commandLine + ")";
+            drawText(line, { catBadge.right + 10.0f, itemR.top + 6.0f, itemR.right - 60.0f, itemR.bottom - 6.0f },
+                     fmtSmall_, isSel ? COL_TEXT_PRIMARY : COL_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+            clickRegions_.push_back({ itemR, "omni_item_" + std::to_string(i), [this, i, cmd]() {
+                omnibarSelectedIndex_ = i;
+                network_.sendCommandPaletteExec(cmd.commandLine);
+                omnibarLastOutput_ = "Executing: " + cmd.commandLine + "...";
+                omnibarHasOutput_ = true;
+            }});
+        }
+    }
+
+    my += listH + 10.0f;
+
+    if (omnibarHasOutput_) {
+        UiRect outBox = { mx, my, mrx, modal.bottom - 16.0f };
+        fillRoundRect(outBox, 8.0f, rgba(20, 20, 20, 0.85f));
+        strokeRoundRect(outBox, 8.0f, COL_BORDER, 1.0f);
+
+        std::string outHdr = "Output (Exit Code: " + std::to_string(omnibarLastExitCode_) + "):";
+        drawText(outHdr, { outBox.left + 8.0f, outBox.top + 6.0f, outBox.right - 8.0f, outBox.top + 20.0f },
+                 fmtSmall_, COL_TEXT_ACCENT);
+
+        std::string displayOut = omnibarLastOutput_.empty() ? "[No stdout output]" : omnibarLastOutput_;
+        if (displayOut.size() > 500) {
+            displayOut = displayOut.substr(0, 500) + "...";
+        }
+        drawText(displayOut, { outBox.left + 8.0f, outBox.top + 22.0f, outBox.right - 8.0f, outBox.bottom - 6.0f },
+                 fmtSmall_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    }
+
+    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
 
 } // namespace cppdesk

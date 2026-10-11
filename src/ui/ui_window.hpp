@@ -8,6 +8,8 @@
 #include "../control/session_tab_manager.hpp"
 #include "../control/shortcut_manager.hpp"
 #include "../core/qr_matrix.hpp"
+#include "../capture/session_rewind_buffer.hpp"
+#include "../capture/privacy_cloak_manager.hpp"
 #include "notification_manager.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -71,7 +73,10 @@ enum class FocusedField : uint8_t {
     TotpEnrollTestCode = 20,
     TotpModalCode      = 21,
     SyncLocalPath      = 22,
-    SyncRemotePath     = 23
+    SyncRemotePath     = 23,
+    ScratchpadText     = 24,
+    OmnibarInput       = 25,
+    PrivacyKeywords    = 26
 };
 
 enum class DrawerTab : uint8_t {
@@ -80,7 +85,8 @@ enum class DrawerTab : uint8_t {
     RemoteTerminal   = 2,
     Diagnostics      = 3,
     ClipboardHistory = 4,
-    Sync             = 5
+    Sync             = 5,
+    Notes            = 6
 };
 
 struct UiRect {
@@ -174,6 +180,8 @@ private:
     void drawAudioVolumePopup(float anchorX, float anchorY);
     void drawRecordingPlayerModal(float width, float height, float modalProgress);
     void drawToastBanner(float width, float height, float toastProgress);
+    void drawRewindScrubberBar(const UiRect& stage);
+    void drawOmnibarModal(float width, float height, float modalProgress);
     void triggerUpdateCheck(bool manual);
 
     // Primitive drawing & vector icon helpers
@@ -542,6 +550,35 @@ private:
     SyncMode                syncSelectedMode_ = SyncMode::PushMirror;
     float                   syncDiffScrollOffset_ = 0.0f;
     bool                    syncMirrorPurgeChoice_ = false;
+
+    // 60-Second In-Memory Session Rewind Scrubber
+    SessionRewindBuffer     rewindBuffer_;
+    bool                    showRewindScrubber_ = false;
+    int64_t                 rewindOffsetMs_ = 0;
+    bool                    rewindFrozen_ = false;
+    std::vector<uint8_t>    rewindCachedFrameBgra_;
+    int                     rewindCachedW_ = 0;
+    int                     rewindCachedH_ = 0;
+    uint64_t                lastRewindPushTickMs_ = 0;
+
+    // Dual-Peer Collaborative Scratchpad UI
+    std::string             scratchpadTextEdit_;
+    uint64_t                lastSeenScratchpadRev_ = 0;
+    float                   scratchpadScrollOffset_ = 0.0f;
+
+    // Spotlight Omnibar Command Palette UI
+    bool                    showOmnibarModal_ = false;
+    float                   omnibarModalAnimT_ = 0.0f;
+    float                   omnibarModalAnimVel_ = 0.0f;
+    std::string             omnibarQuery_;
+    int                     omnibarSelectedIndex_ = 0;
+    std::vector<OmnibarCommand> omnibarFiltered_;
+    std::string             omnibarLastOutput_;
+    int32_t                 omnibarLastExitCode_ = 0;
+    bool                    omnibarHasOutput_ = false;
+
+    // Privacy Cloak Settings UI
+    std::string             privacyKeywordsEdit_;
 };
 
 } // namespace cppdesk
