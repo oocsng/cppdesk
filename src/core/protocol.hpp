@@ -16,8 +16,8 @@ namespace cppdesk {
 constexpr uint32_t PROTOCOL_MAGIC   = 0x43505044; // "CPPD" (CppDesk packet magic)
 constexpr uint32_t RELAY_MAGIC      = 0x4344534B; // "CDSK" (CppDesk relay magic)
 constexpr uint16_t PROTOCOL_VERSION = 3;
-constexpr const char* CPP_DESK_VERSION = "3.3.1";
-constexpr uint32_t CPP_DESK_VERSION_NUM = 0x030301;
+constexpr const char* CPP_DESK_VERSION = "3.3.2";
+constexpr uint32_t CPP_DESK_VERSION_NUM = 0x030302;
 
 struct SemanticVersion {
     int major = 0;
@@ -145,6 +145,11 @@ enum class PacketType : uint8_t {
 
     // Peer Version Handshake & Upgrade Notice
     VERSION_UPGRADE_NOTICE  = 0x48, // Bidirectional: Notify peer that an upgrade is recommended
+
+    // Breakthrough Power Features
+    SCRATCHPAD_UPDATE       = 0x49, // Bidirectional: Live collaborative notepad synchronization
+    COMMAND_PALETTE_EXEC    = 0x4A, // Viewer -> Host: Execute remote administrative omnibar action
+    COMMAND_PALETTE_OUTPUT  = 0x4B, // Host -> Viewer: Piped output stream from omnibar action
 
     // Relay & Rendezvous Protocol
     RELAY_REGISTER      = 0x50,
@@ -1435,7 +1440,7 @@ inline bool deserializeSyncActionResp(const uint8_t* data, size_t size, SyncActi
 
 struct VersionUpgradeNoticePayload {
     std::string senderVersion;      // Version of connecting peer (e.g. "3.4.0")
-    std::string minimumVersion;     // Recommended minimum version (e.g. "3.3.1")
+    std::string minimumVersion;     // Recommended minimum version (e.g. "3.3.2")
     std::string downloadUrl;        // Release or asset download URL
     std::string message;            // Human-readable upgrade notice
 };
@@ -1457,6 +1462,104 @@ inline bool deserializeVersionUpgradeNotice(const uint8_t* data, size_t size, Ve
         out.minimumVersion = r.readString();
         out.downloadUrl = r.readString();
         out.message = r.readString();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// ---------------- Breakthrough Power Features Payloads ----------------
+
+struct ScratchpadUpdatePayload {
+    uint32_t revision = 0;        // Monotonically increasing revision counter
+    uint64_t authorDeskId = 0;    // Desk ID of peer modifying text
+    uint32_t cursorPosition = 0;  // Cursor offset
+    uint8_t flags = 0;            // 0x01 = FullText, 0x02 = Snippet, 0x04 = Clear
+    std::string text;             // Content string
+};
+
+inline void serializeScratchpadUpdate(const ScratchpadUpdatePayload& p, std::vector<uint8_t>& out) {
+    ByteWriter w;
+    w.writeU32(p.revision);
+    w.writeU64(p.authorDeskId);
+    w.writeU32(p.cursorPosition);
+    w.writeU8(p.flags);
+    w.writeString(p.text);
+    out = w.takeBuffer();
+}
+
+inline bool deserializeScratchpadUpdate(const uint8_t* data, size_t size, ScratchpadUpdatePayload& out) {
+    if (!data || size < 19) return false;
+    try {
+        ByteReader r(data, size);
+        out.revision = r.readU32();
+        out.authorDeskId = r.readU64();
+        out.cursorPosition = r.readU32();
+        out.flags = r.readU8();
+        out.text = r.readString();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+struct CommandPaletteExecPayload {
+    uint32_t commandId = 0;       // Unique command execution identifier
+    std::string commandKey;       // Catalog identifier (e.g. "net_flush_dns")
+    std::string customCommand;    // Optional custom argument or command override
+    uint8_t flags = 0;            // 0x01 = RequireElevated
+};
+
+inline void serializeCommandPaletteExec(const CommandPaletteExecPayload& p, std::vector<uint8_t>& out) {
+    ByteWriter w;
+    w.writeU32(p.commandId);
+    w.writeString(p.commandKey);
+    w.writeString(p.customCommand);
+    w.writeU8(p.flags);
+    out = w.takeBuffer();
+}
+
+inline bool deserializeCommandPaletteExec(const uint8_t* data, size_t size, CommandPaletteExecPayload& out) {
+    if (!data || size < 9) return false;
+    try {
+        ByteReader r(data, size);
+        out.commandId = r.readU32();
+        out.commandKey = r.readString();
+        out.customCommand = r.readString();
+        out.flags = r.readU8();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+struct CommandPaletteOutputPayload {
+    uint32_t commandId = 0;
+    uint32_t exitCode = 0;
+    bool isCompleted = false;
+    std::string stdoutData;
+    std::string errorMessage;
+};
+
+inline void serializeCommandPaletteOutput(const CommandPaletteOutputPayload& p, std::vector<uint8_t>& out) {
+    ByteWriter w;
+    w.writeU32(p.commandId);
+    w.writeU32(p.exitCode);
+    w.writeU8(p.isCompleted ? 1 : 0);
+    w.writeString(p.stdoutData);
+    w.writeString(p.errorMessage);
+    out = w.takeBuffer();
+}
+
+inline bool deserializeCommandPaletteOutput(const uint8_t* data, size_t size, CommandPaletteOutputPayload& out) {
+    if (!data || size < 13) return false;
+    try {
+        ByteReader r(data, size);
+        out.commandId = r.readU32();
+        out.exitCode = r.readU32();
+        out.isCompleted = (r.readU8() != 0);
+        out.stdoutData = r.readString();
+        out.errorMessage = r.readString();
         return true;
     } catch (...) {
         return false;

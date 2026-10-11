@@ -1106,6 +1106,24 @@ bool ScreenCapturer::captureDirtyTiles(
     auto tCapEnd = std::chrono::steady_clock::now();
     lastCaptureLatencyMs_ = std::chrono::duration<float, std::milli>(tCapEnd - tCapStart).count();
 
+    if (privacyCloak_.isEnabled() && !currentFrame_.empty() && frameW_ > 0 && frameH_ > 0) {
+        auto rects = privacyCloak_.findSensitiveWindowRects();
+        if (!rects.empty()) {
+            privacyCloak_.redactCaptureBuffer(
+                currentFrame_.data(), frameW_, frameH_,
+                activeMonitor_.x, activeMonitor_.y, rects
+            );
+            for (const auto& r : rects) {
+                RECT winR;
+                winR.left = r.left - activeMonitor_.x;
+                winR.top = r.top - activeMonitor_.y;
+                winR.right = r.right - activeMonitor_.x;
+                winR.bottom = r.bottom - activeMonitor_.y;
+                dxgiDirtyRects.push_back(winR);
+            }
+        }
+    }
+
     outCursor = captureCursorState();
     auto tEncStart = std::chrono::steady_clock::now();
 

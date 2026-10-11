@@ -126,7 +126,7 @@ If you run into any bugs, unexpected behavior, connection issues, or have featur
 
 When opening an issue, include:
 - Windows version (e.g. Windows 11 23H2 x64)
-- CppDesk version (e.g. v3.3.1)
+- CppDesk version (e.g. v3.3.2)
 - Connection topology (Direct LAN, STUN NAT traversal, or Relay)
 - Steps to reproduce the issue along with any displayed status text or error messages
 

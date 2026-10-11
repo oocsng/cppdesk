@@ -489,6 +489,12 @@ bool IdentityManager::loadOrCreate() {
                 settings_.totpSecret = val;
             } else if (key == "totp_algorithm") {
                 settings_.totpAlgorithm = val;
+            } else if (key == "privacy_cloak_enabled") {
+                settings_.privacyCloakEnabled = (val == "1" || val == "true");
+            } else if (key == "privacy_cloak_keywords") {
+                settings_.privacyCloakKeywords = val;
+            } else if (key == "privacy_cloak_style") {
+                settings_.privacyCloakStyle = static_cast<uint8_t>(std::atoi(val.c_str()));
             } else if (key == "recent") {
                 // Backward-compatible pipe format:
                 // 3 fields: deskId|hostname|address
@@ -612,6 +618,9 @@ bool IdentityManager::save() const {
     out << "totp_enabled=" << (settings_.totpEnabled ? "1" : "0") << "\n";
     out << "totp_secret=" << settings_.totpSecret << "\n";
     out << "totp_algorithm=" << settings_.totpAlgorithm << "\n";
+    out << "privacy_cloak_enabled=" << (settings_.privacyCloakEnabled ? "1" : "0") << "\n";
+    out << "privacy_cloak_keywords=" << sanitizeIniValue(settings_.privacyCloakKeywords) << "\n";
+    out << "privacy_cloak_style=" << static_cast<int>(settings_.privacyCloakStyle) << "\n";
 
     for (const auto& r : recentSessions_) {
         out << "recent=" << r.deskId << "|" << sanitizeIniValue(r.hostname) << "|" << sanitizeIniValue(r.address) << "|" << (r.isFavorite ? "1" : "0")

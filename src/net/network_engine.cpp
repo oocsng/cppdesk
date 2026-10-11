@@ -2461,6 +2461,40 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             }
                             break;
                         }
+                        case PacketType::SCRATCHPAD_UPDATE: {
+                            ScratchpadUpdatePayload pad{};
+                            if (deserializeScratchpadUpdate(payload.data(), payload.size(), pad)) {
+                                if (scratchpadMgr_.handleRemoteUpdate(pad)) {
+                                    std::function<void(const ScratchpadUpdatePayload&)> cb;
+                                    {
+                                        std::lock_guard<std::mutex> lk(scratchpadCbMutex_);
+                                        cb = onScratchpadUpdate_;
+                                    }
+                                    if (cb) cb(pad);
+                                }
+                            }
+                            break;
+                        }
+                        case PacketType::COMMAND_PALETTE_EXEC: {
+                            if (perms & PERM_INPUT) {
+                                CommandPaletteExecPayload execReq{};
+                                if (deserializeCommandPaletteExec(payload.data(), payload.size(), execReq)) {
+                                    uint32_t cmdId = execReq.commandId;
+                                    std::string runCmd = execReq.customCommand.empty() ? execReq.commandKey : execReq.customCommand;
+                                    commandPaletteMgr_.executeAsync(runCmd, [this, cmdId](int32_t exitCode, const std::string& output) {
+                                        CommandPaletteOutputPayload outPayload{};
+                                        outPayload.commandId = cmdId;
+                                        outPayload.exitCode = exitCode;
+                                        outPayload.isCompleted = true;
+                                        outPayload.stdoutData = output;
+                                        std::vector<uint8_t> outBuf;
+                                        serializeCommandPaletteOutput(outPayload, outBuf);
+                                        sendHostEncryptedPacket(PacketType::COMMAND_PALETTE_OUTPUT, FLAG_ENCRYPTED, outBuf.data(), outBuf.size());
+                                    });
+                                }
+                            }
+                            break;
+                        }
                         case PacketType::DISCONNECT:
                             sessionAlive.store(false);
                             break;
@@ -3879,6 +3913,32 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                 if (cb) {
                                     cb(notice);
                                 }
+                            }
+                            break;
+                        }
+                        case PacketType::SCRATCHPAD_UPDATE: {
+                            ScratchpadUpdatePayload pad{};
+                            if (deserializeScratchpadUpdate(payload.data(), payload.size(), pad)) {
+                                if (scratchpadMgr_.handleRemoteUpdate(pad)) {
+                                    std::function<void(const ScratchpadUpdatePayload&)> cb;
+                                    {
+                                        std::lock_guard<std::mutex> lk(scratchpadCbMutex_);
+                                        cb = onScratchpadUpdate_;
+                                    }
+                                    if (cb) cb(pad);
+                                }
+                            }
+                            break;
+                        }
+                        case PacketType::COMMAND_PALETTE_OUTPUT: {
+                            CommandPaletteOutputPayload outPayload{};
+                            if (deserializeCommandPaletteOutput(payload.data(), payload.size(), outPayload)) {
+                                std::function<void(const CommandPaletteOutputPayload&)> cb;
+                                {
+                                    std::lock_guard<std::mutex> lk(commandPaletteCbMutex_);
+                                    cb = onCommandPaletteOutput_;
+                                }
+                                if (cb) cb(outPayload);
                             }
                             break;
                         }
@@ -5935,6 +5995,45 @@ void NetworkEngine::setOnVersionUpgradeNoticeCallback(std::function<void(const V
 void NetworkEngine::setOnVersionMismatchCallback(std::function<void(const std::string& hostVer, const std::string& viewerVer)> cb) {
     std::lock_guard<std::mutex> lk(peerVersionMutex_);
     onVersionMismatch_ = std::move(cb);
+}
+
+void NetworkEngine::setOnScratchpadUpdateCallback(std::function<void(const ScratchpadUpdatePayload&)> cb) {
+    std::lock_guard<std::mutex> lk(scratchpadCbMutex_);
+    onScratchpadUpdate_ = std::move(cb);
+}
+
+bool NetworkEngine::sendScratchpadText(const std::string& text, uint32_t cursorPos) {
+    uint32_t myId = static_cast<uint32_t>(identity_.deskId());
+    ScratchpadUpdatePayload payload = scratchpadMgr_.updateLocalText(text, myId, cursorPos);
+    std::vector<uint8_t> buf;
+    serializeScratchpadUpdate(payload, buf);
+    if (viewerActive_.load()) {
+        return sendViewerEncryptedPacket(PacketType::SCRATCHPAD_UPDATE, FLAG_ENCRYPTED, buf.data(), buf.size());
+    } else if (activeHostClientSock_.load() != ~uintptr_t(0)) {
+        return sendHostEncryptedPacket(PacketType::SCRATCHPAD_UPDATE, FLAG_ENCRYPTED, buf.data(), buf.size());
+    }
+    return false;
+}
+
+void NetworkEngine::setOnCommandPaletteOutputCallback(std::function<void(const CommandPaletteOutputPayload&)> cb) {
+    std::lock_guard<std::mutex> lk(commandPaletteCbMutex_);
+    onCommandPaletteOutput_ = std::move(cb);
+}
+
+bool NetworkEngine::sendCommandPaletteExec(const std::string& commandLine, uint32_t execId) {
+    if (execId == 0) {
+        execId = nextExecId_.fetch_add(1);
+    }
+    CommandPaletteExecPayload payload;
+    payload.commandId = execId;
+    payload.commandKey = commandLine;
+    payload.customCommand = commandLine;
+    std::vector<uint8_t> buf;
+    serializeCommandPaletteExec(payload, buf);
+    if (viewerActive_.load()) {
+        return sendViewerEncryptedPacket(PacketType::COMMAND_PALETTE_EXEC, FLAG_ENCRYPTED, buf.data(), buf.size());
+    }
+    return false;
 }
 
 } // namespace cppdesk

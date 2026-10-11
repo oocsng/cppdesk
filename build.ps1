@@ -34,7 +34,11 @@ $CoreSources = @(
     "src/control/windows_service_manager.cpp",
     "src/control/shortcut_manager.cpp",
     "src/core/totp_manager.cpp",
-    "src/core/qr_matrix.cpp"
+    "src/core/qr_matrix.cpp",
+    "src/capture/session_rewind_buffer.cpp",
+    "src/capture/privacy_cloak_manager.cpp",
+    "src/control/scratchpad_manager.cpp",
+    "src/control/command_palette.cpp"
 )
 
 $AppSources = $CoreSources + @(

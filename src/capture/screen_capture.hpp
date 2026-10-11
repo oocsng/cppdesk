@@ -7,6 +7,7 @@
 
 #include "../core/protocol.hpp"
 #include "virtual_display_manager.hpp"
+#include "privacy_cloak_manager.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -162,6 +163,10 @@ public:
     void setAutoHeadless(bool enable) { autoHeadless_ = enable; }
     bool autoHeadless() const { return autoHeadless_; }
 
+    // Privacy Cloak manager
+    PrivacyCloakManager& privacyCloak() { return privacyCloak_; }
+    const PrivacyCloakManager& privacyCloak() const { return privacyCloak_; }
+
 private:
     bool initDxgiForMonitor(int monitorIndex);
     void releaseDxgi();
@@ -200,6 +205,7 @@ private:
     std::vector<uint8_t>                  reusableCandidateTiles_;
     std::vector<TileThreadPool::RectTask> reusableTasks_;
     bool                                  autoHeadless_ = true;
+    PrivacyCloakManager                   privacyCloak_;
 };
 
 } // namespace cppdesk

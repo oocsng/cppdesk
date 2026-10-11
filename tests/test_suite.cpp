@@ -19,6 +19,10 @@
 #include "../src/core/totp_manager.hpp"
 #include "../src/core/qr_matrix.hpp"
 #include "../src/control/file_sync_manager.hpp"
+#include "../src/capture/session_rewind_buffer.hpp"
+#include "../src/capture/privacy_cloak_manager.hpp"
+#include "../src/control/scratchpad_manager.hpp"
+#include "../src/control/command_palette.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -1143,8 +1147,8 @@ void testAutoUpdaterAndProtocolV3() {
     TEST_ASSERT(PROTOCOL_MAGIC == 0x43505044); // "CPPD"
     TEST_ASSERT(RELAY_MAGIC == 0x4344534B);    // "CDSK"
     TEST_ASSERT(PROTOCOL_VERSION == 3);
-    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.3.1");
-    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030301);
+    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.3.2");
+    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030302);
 
     // 2. Semantic Version Triad Parsing
     int maj = 0, min = 0, pat = 0;
@@ -5452,6 +5456,310 @@ void testPeerVersionHandshakeAndSelfUpdater() {
     }
 }
 
+void testNovelBreakthroughPowerFeatures() {
+    std::cout << "[TEST 49] Breakthrough Power Features (Rewind Buffer, Privacy Cloak, Scratchpad, Omnibar)...\n";
+
+    // Part 1: 60-Second Visual Time-Machine & Session Rewind Scrubber
+    {
+        SessionRewindBuffer rewindBuf;
+        TEST_ASSERT(rewindBuf.empty());
+        TEST_ASSERT(rewindBuf.size() == 0);
+        TEST_ASSERT(rewindBuf.totalMemoryBytes() == 0);
+
+        // Push 130 frames at 500ms intervals (frame size: 64x64 BGRA)
+        std::vector<uint8_t> bgra(64 * 64 * 4, 128);
+        for (size_t i = 0; i < 130; ++i) {
+            uint64_t ts = 1000 + i * 500;
+            // Introduce subtle color variation to ensure valid unique JPEG encoding
+            bgra[0] = static_cast<uint8_t>(i % 250);
+            bgra[1] = static_cast<uint8_t>((i * 3) % 250);
+            bgra[2] = static_cast<uint8_t>((i * 7) % 250);
+            rewindBuf.pushFrame(ts, bgra.data(), 64, 64);
+        }
+
+        // Buffer must be capped at MAX_SNAPSHOTS (120 keyframes)
+        TEST_ASSERT(rewindBuf.size() == 120);
+        TEST_ASSERT(!rewindBuf.empty());
+
+        // Memory must remain bounded < 25 MB
+        TEST_ASSERT(rewindBuf.totalMemoryBytes() > 0);
+        TEST_ASSERT(rewindBuf.totalMemoryBytes() < 25 * 1024 * 1024);
+
+        // First 10 frames evicted; oldest is frame 10 (ts = 1000 + 10*500 = 6000), newest is frame 129 (ts = 1000 + 129*500 = 65500)
+        uint64_t expectedOldest = 1000 + 10 * 500;
+        uint64_t expectedNewest = 1000 + 129 * 500;
+        TEST_ASSERT(rewindBuf.oldestTimestampMs() == expectedOldest);
+        TEST_ASSERT(rewindBuf.newestTimestampMs() == expectedNewest);
+
+        // Offset queries
+        std::vector<uint8_t> outBgra;
+        int outW = 0, outH = 0;
+        uint64_t outTs = 0;
+
+        // Offset 0ms (live snapshot)
+        TEST_ASSERT(rewindBuf.getFrameAtOffset(0, outBgra, outW, outH, outTs));
+        TEST_ASSERT(outW == 64 && outH == 64);
+        TEST_ASSERT(outTs == expectedNewest);
+        TEST_ASSERT(outBgra.size() == 64 * 64 * 4);
+
+        // Offset -30000ms (30s ago)
+        TEST_ASSERT(rewindBuf.getFrameAtOffset(-30000, outBgra, outW, outH, outTs));
+        uint64_t expected30s = expectedNewest - 30000;
+        uint64_t diff30s = (outTs >= expected30s) ? (outTs - expected30s) : (expected30s - outTs);
+        TEST_ASSERT(diff30s <= 500);
+
+        // Offset -75000ms (exceeds window, clamps to oldest)
+        TEST_ASSERT(rewindBuf.getFrameAtOffset(-75000, outBgra, outW, outH, outTs));
+        TEST_ASSERT(outTs == expectedOldest);
+
+        // Index queries
+        TEST_ASSERT(rewindBuf.getFrameAtIndex(0, outBgra, outW, outH, outTs));
+        TEST_ASSERT(outTs == expectedOldest);
+
+        TEST_ASSERT(rewindBuf.getFrameAtIndex(119, outBgra, outW, outH, outTs));
+        TEST_ASSERT(outTs == expectedNewest);
+
+        // Out of bounds index
+        TEST_ASSERT(!rewindBuf.getFrameAtIndex(120, outBgra, outW, outH, outTs));
+
+        // Clear
+        rewindBuf.clear();
+        TEST_ASSERT(rewindBuf.empty());
+        TEST_ASSERT(rewindBuf.size() == 0);
+        TEST_ASSERT(rewindBuf.totalMemoryBytes() == 0);
+        TEST_ASSERT(!rewindBuf.getFrameAtOffset(0, outBgra, outW, outH, outTs));
+    }
+
+    // Part 2: Privacy Cloak Sensitive Window & PII Auto-Redaction
+    {
+        PrivacyCloakManager cloakMgr;
+        TEST_ASSERT(cloakMgr.isEnabled());
+
+        // Default sensitive keywords matching
+        TEST_ASSERT(cloakMgr.matchesSensitiveTitle(L"1Password - Master Vault"));
+        TEST_ASSERT(cloakMgr.matchesSensitiveTitle(L"Personal Vault - KeePassXC"));
+        TEST_ASSERT(cloakMgr.matchesSensitiveTitle(L"Google Chrome - Bitwarden Extension"));
+        TEST_ASSERT(cloakMgr.matchesSensitiveTitle(L"Online Banking - Chase Login"));
+        TEST_ASSERT(cloakMgr.matchesSensitiveTitle(L"Wells Fargo Accounts - Edge"));
+        TEST_ASSERT(cloakMgr.matchesSensitiveTitle(L"Wallet - Coinbase Pro"));
+        TEST_ASSERT(cloakMgr.matchesSensitiveTitle(L"MetaMask Notification"));
+        TEST_ASSERT(cloakMgr.matchesSensitiveTitle(L"ledger live manager"));
+        TEST_ASSERT(cloakMgr.matchesSensitiveTitle(L"Private - Incognito Window"));
+        TEST_ASSERT(cloakMgr.matchesSensitiveTitle(L"WireGuard VPN Client"));
+
+        // Non-sensitive titles
+        TEST_ASSERT(!cloakMgr.matchesSensitiveTitle(L"Visual Studio Code"));
+        TEST_ASSERT(!cloakMgr.matchesSensitiveTitle(L"Calculator"));
+        TEST_ASSERT(!cloakMgr.matchesSensitiveTitle(L"Command Prompt"));
+
+        // Custom keywords
+        cloakMgr.setCustomKeywords("confidential,secret_project,topsecret");
+        TEST_ASSERT(cloakMgr.matchesSensitiveTitle(L"Confidential Document.docx"));
+        TEST_ASSERT(cloakMgr.matchesSensitiveTitle(L"secret_project roadmap"));
+        TEST_ASSERT(cloakMgr.matchesSensitiveTitle(L"TOPSECRET file"));
+        std::string kwStr = cloakMgr.customKeywords();
+        TEST_ASSERT(kwStr.find("confidential") != std::string::npos);
+
+        // Solid Charcoal Redaction (style 0) on 64x64 frame
+        cloakMgr.setRedactionStyle(0);
+        std::vector<uint8_t> frameBgra(64 * 64 * 4, 255); // White frame
+        RECT sensitiveRect = { 10, 10, 30, 30 };
+        cloakMgr.redactCaptureBuffer(frameBgra.data(), 64, 64, 0, 0, { sensitiveRect });
+
+        // Verify inside redaction rect (Charcoal: RGB 0x1E, 0x1E, 0x1E, A 0xFF)
+        size_t inIdx = (15 * 64 + 15) * 4;
+        TEST_ASSERT(frameBgra[inIdx + 0] == 0x1E); // B
+        TEST_ASSERT(frameBgra[inIdx + 1] == 0x1E); // G
+        TEST_ASSERT(frameBgra[inIdx + 2] == 0x1E); // R
+        TEST_ASSERT(frameBgra[inIdx + 3] == 0xFF); // A
+
+        // Verify outside redaction rect remains unmodified (white)
+        size_t outIdx = (5 * 64 + 5) * 4;
+        TEST_ASSERT(frameBgra[outIdx + 0] == 255);
+        TEST_ASSERT(frameBgra[outIdx + 1] == 255);
+        TEST_ASSERT(frameBgra[outIdx + 2] == 255);
+
+        // Mosaic Block Averaging Redaction (style 1)
+        cloakMgr.setRedactionStyle(1);
+        std::vector<uint8_t> mosaicFrame(64 * 64 * 4);
+        for (int y = 0; y < 64; ++y) {
+            for (int x = 0; x < 64; ++x) {
+                size_t p = (y * 64 + x) * 4;
+                mosaicFrame[p + 0] = static_cast<uint8_t>(x * 3);
+                mosaicFrame[p + 1] = static_cast<uint8_t>(y * 3);
+                mosaicFrame[p + 2] = static_cast<uint8_t>((x + y) * 2);
+                mosaicFrame[p + 3] = 255;
+            }
+        }
+        cloakMgr.redactCaptureBuffer(mosaicFrame.data(), 64, 64, 0, 0, { sensitiveRect });
+
+        // Adjacent pixels in same mosaic cell must have identical block-averaged values
+        size_t p1 = (12 * 64 + 12) * 4;
+        size_t p2 = (13 * 64 + 13) * 4;
+        TEST_ASSERT(mosaicFrame[p1 + 0] == mosaicFrame[p2 + 0]);
+        TEST_ASSERT(mosaicFrame[p1 + 1] == mosaicFrame[p2 + 1]);
+        TEST_ASSERT(mosaicFrame[p1 + 2] == mosaicFrame[p2 + 2]);
+
+        // AppSettings persistence roundtrip via IdentityManager
+        {
+            IdentityManager idSave(99);
+            idSave.loadOrCreate();
+            AppSettings s = idSave.settings();
+            s.privacyCloakEnabled = true;
+            s.privacyCloakKeywords = "payroll,tax_return,private_key";
+            s.privacyCloakStyle = 1;
+            idSave.updateSettings(s);
+        }
+        {
+            IdentityManager idLoad(99);
+            idLoad.loadOrCreate();
+            AppSettings loaded = idLoad.settings();
+            TEST_ASSERT(loaded.privacyCloakEnabled == true);
+            TEST_ASSERT(loaded.privacyCloakKeywords == "payroll,tax_return,private_key");
+            TEST_ASSERT(loaded.privacyCloakStyle == 1);
+        }
+        std::error_code ec;
+        std::filesystem::remove("cppdesk_99.ini", ec);
+    }
+
+    // Part 3: Collaborative Dual-Peer Real-Time Scratchpad
+    {
+        // Wire serialization roundtrip
+        ScratchpadUpdatePayload spIn;
+        spIn.revision = 42;
+        spIn.authorDeskId = 123456789ULL;
+        spIn.cursorPosition = 15;
+        spIn.flags = 0x01;
+        spIn.text = "System maintenance scheduled for 22:00 UTC";
+
+        std::vector<uint8_t> spBytes;
+        serializeScratchpadUpdate(spIn, spBytes);
+
+        ScratchpadUpdatePayload spOut;
+        TEST_ASSERT(deserializeScratchpadUpdate(spBytes.data(), spBytes.size(), spOut));
+        TEST_ASSERT(spOut.revision == 42);
+        TEST_ASSERT(spOut.authorDeskId == 123456789ULL);
+        TEST_ASSERT(spOut.cursorPosition == 15);
+        TEST_ASSERT(spOut.flags == 0x01);
+        TEST_ASSERT(spOut.text == "System maintenance scheduled for 22:00 UTC");
+
+        // ScratchpadManager local and remote monotonic updates
+        ScratchpadManager scratchpad;
+        TEST_ASSERT(scratchpad.getText().empty());
+        TEST_ASSERT(scratchpad.getRevision() == 0);
+
+        auto localUpdate = scratchpad.updateLocalText("Initial notes", 111222333, 13);
+        TEST_ASSERT(localUpdate.revision == 1);
+        TEST_ASSERT(localUpdate.text == "Initial notes");
+        TEST_ASSERT(scratchpad.getText() == "Initial notes");
+        TEST_ASSERT(scratchpad.getRevision() == 1);
+        TEST_ASSERT(scratchpad.getLastEditor() == 111222333);
+        TEST_ASSERT(scratchpad.getCursorPos() == 13);
+
+        // Stale remote update must be rejected
+        ScratchpadUpdatePayload stalePayload;
+        stalePayload.revision = 0;
+        stalePayload.authorDeskId = 999888777;
+        stalePayload.text = "Stale overwrite";
+        bool acceptedStale = scratchpad.handleRemoteUpdate(stalePayload);
+        TEST_ASSERT(!acceptedStale);
+        TEST_ASSERT(scratchpad.getText() == "Initial notes");
+
+        // Newer remote update must be accepted
+        ScratchpadUpdatePayload newerPayload;
+        newerPayload.revision = 10;
+        newerPayload.authorDeskId = 999888777;
+        newerPayload.text = "Updated from remote peer";
+        newerPayload.cursorPosition = 24;
+        bool acceptedNewer = scratchpad.handleRemoteUpdate(newerPayload);
+        TEST_ASSERT(acceptedNewer);
+        TEST_ASSERT(scratchpad.getText() == "Updated from remote peer");
+        TEST_ASSERT(scratchpad.getRevision() == 10);
+        TEST_ASSERT(scratchpad.getLastEditor() == 999888777);
+        TEST_ASSERT(scratchpad.getCursorPos() == 24);
+
+        // Diagnostic snippet generators
+        std::string snipHost = ScratchpadManager::generateSnippet("host", 555666777, "SRV-TEST01");
+        TEST_ASSERT(snipHost.find("Host:") != std::string::npos || snipHost.find("SRV-TEST01") != std::string::npos);
+        std::string snipSec = ScratchpadManager::generateSnippet("security");
+        TEST_ASSERT(snipSec.find("Security") != std::string::npos || snipSec.find("AES-256-GCM") != std::string::npos);
+        std::string snipTime = ScratchpadManager::generateSnippet("timestamp");
+        TEST_ASSERT(snipTime.find("UTC") != std::string::npos || snipTime.find("Timestamp") != std::string::npos);
+
+        // Clear
+        scratchpad.clear();
+        TEST_ASSERT(scratchpad.getText().empty());
+    }
+
+    // Part 4: Spotlight Omnibar Command Palette
+    {
+        // Serialization roundtrips
+        CommandPaletteExecPayload execIn;
+        execIn.commandId = 202;
+        execIn.commandKey = "net_flush_dns";
+        execIn.customCommand = "ipconfig /flushdns";
+        execIn.flags = 0x01;
+
+        std::vector<uint8_t> execBytes;
+        serializeCommandPaletteExec(execIn, execBytes);
+
+        CommandPaletteExecPayload execOut;
+        TEST_ASSERT(deserializeCommandPaletteExec(execBytes.data(), execBytes.size(), execOut));
+        TEST_ASSERT(execOut.commandId == 202);
+        TEST_ASSERT(execOut.commandKey == "net_flush_dns");
+        TEST_ASSERT(execOut.customCommand == "ipconfig /flushdns");
+        TEST_ASSERT(execOut.flags == 0x01);
+
+        CommandPaletteOutputPayload outIn;
+        outIn.commandId = 202;
+        outIn.exitCode = 0;
+        outIn.isCompleted = true;
+        outIn.stdoutData = "Successfully flushed the DNS Resolver Cache.\r\n";
+        outIn.errorMessage = "";
+
+        std::vector<uint8_t> outBytes;
+        serializeCommandPaletteOutput(outIn, outBytes);
+
+        CommandPaletteOutputPayload outOut;
+        TEST_ASSERT(deserializeCommandPaletteOutput(outBytes.data(), outBytes.size(), outOut));
+        TEST_ASSERT(outOut.commandId == 202);
+        TEST_ASSERT(outOut.exitCode == 0);
+        TEST_ASSERT(outOut.isCompleted == true);
+        TEST_ASSERT(outOut.stdoutData == "Successfully flushed the DNS Resolver Cache.\r\n");
+        TEST_ASSERT(outOut.errorMessage.empty());
+
+        // Command catalog & search
+        CommandPaletteManager palMgr;
+        const auto& catalog = palMgr.getCatalog();
+        TEST_ASSERT(!catalog.empty());
+        TEST_ASSERT(catalog.size() >= 10);
+
+        auto searchResults = palMgr.search("flush");
+        TEST_ASSERT(!searchResults.empty());
+
+        // Custom command registration
+        OmnibarCommand customCmd;
+        customCmd.id = "custom_ping_gateway";
+        customCmd.title = "Ping Default Gateway";
+        customCmd.category = "Network Diagnostics";
+        customCmd.commandLine = "cmd.exe /c ping 127.0.0.1 -n 1";
+        customCmd.requiresAdmin = false;
+        palMgr.registerCommand(customCmd);
+
+        auto customResults = palMgr.search("Gateway");
+        TEST_ASSERT(!customResults.empty());
+        TEST_ASSERT(customResults[0].id == "custom_ping_gateway");
+
+        // Synchronous non-blocking piped execution verification
+        int32_t exitCode = -1;
+        std::string syncOutput;
+        bool execOk = CommandPaletteManager::executeSync("cmd.exe /c echo CPPDESK_OMNIBAR_VERIFIED", exitCode, syncOutput, 5000);
+        TEST_ASSERT(execOk);
+        TEST_ASSERT(exitCode == 0);
+        TEST_ASSERT(syncOutput.find("CPPDESK_OMNIBAR_VERIFIED") != std::string::npos);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -5510,6 +5818,7 @@ int main() {
         testTwoFactorAuthTotpAndQrMatrix(); std::cout << "Test 46 done\n" << std::flush;
         testRemoteFileSyncAndFolderMirroring(); std::cout << "Test 47 done\n" << std::flush;
         testPeerVersionHandshakeAndSelfUpdater(); std::cout << "Test 48 done\n" << std::flush;
+        testNovelBreakthroughPowerFeatures(); std::cout << "Test 49 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
