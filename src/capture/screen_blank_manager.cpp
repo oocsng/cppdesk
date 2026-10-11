@@ -214,32 +214,11 @@ ScreenBlankManager& ScreenBlankManager::instance() {
 }
 
 void ScreenBlankManager::powerDownDisplays() {
-    DWORD_PTR result = 0;
-    SendMessageTimeoutW(
-        HWND_BROADCAST,
-        WM_SYSCOMMAND,
-        SC_MONITORPOWER,
-        static_cast<LPARAM>(2), // 2 = power off
-        SMTO_ABORTIFHUNG | SMTO_NORMAL,
-        1000,
-        &result
-    );
+    // Hardware DPMS power off eliminated to prevent DWM composition disruption and cursor freezes
 }
 
 void ScreenBlankManager::wakeDisplays() {
-    DWORD_PTR result = 0;
-    SendMessageTimeoutW(
-        HWND_BROADCAST,
-        WM_SYSCOMMAND,
-        SC_MONITORPOWER,
-        static_cast<LPARAM>(-1), // -1 = power on
-        SMTO_ABORTIFHUNG | SMTO_NORMAL,
-        1000,
-        &result
-    );
-    // Relative cursor oscillation to awaken WDDM GPU backlight and DWM compositor
-    mouse_event(MOUSEEVENTF_MOVE, 0, 1, 0, 0);
-    mouse_event(MOUSEEVENTF_MOVE, 0, static_cast<DWORD>(-1), 0, 0);
+    // DPMS wake safe no-op
 }
 
 bool ScreenBlankManager::isPhysicalEvent(DWORD flags, bool isMouse) {

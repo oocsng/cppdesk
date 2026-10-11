@@ -489,7 +489,7 @@ private:
     float                   updateModalAnimT_ = 0.0f;
     float                   updateModalAnimVel_ = 0.0f;
     bool                    isCheckingUpdates_ = false;
-    std::string             updateStatusText_ = "Version v3.3.2 (Up to date)";
+    std::string             updateStatusText_ = "Version v3.4.1 (Up to date)";
     UpdateInfo              latestUpdateInfo_{};
     float                   startupUpdateCheckTimer_ = 2.0f;
     bool                    startupCheckTriggered_ = false;
@@ -556,6 +556,8 @@ private:
     bool                    showRewindScrubber_ = false;
     int64_t                 rewindOffsetMs_ = 0;
     bool                    rewindFrozen_ = false;
+    bool                    draggingRewindScrubber_ = false;
+    UiRect                  rewindScrubberTrackRect_{};
     std::vector<uint8_t>    rewindCachedFrameBgra_;
     int                     rewindCachedW_ = 0;
     int                     rewindCachedH_ = 0;

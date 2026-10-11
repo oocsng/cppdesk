@@ -227,6 +227,9 @@ UpdateInfo AutoUpdater::queryLatestReleaseSync(
     WinHttpCloseHandle(hSession);
 
     info.latestVersion = extractJsonString(responseBody, "tag_name");
+    if (!info.latestVersion.empty() && (info.latestVersion[0] == 'v' || info.latestVersion[0] == 'V')) {
+        info.latestVersion = info.latestVersion.substr(1);
+    }
     std::string releaseUrl = extractJsonString(responseBody, "html_url");
     if (!releaseUrl.empty()) {
         info.downloadUrl = releaseUrl;
@@ -559,13 +562,62 @@ bool AutoUpdater::validatePeBinary(const std::wstring& filePath) {
     return (ntSig == IMAGE_NT_SIGNATURE);
 }
 
+int AutoUpdater::applySelfUpdateAndRestart(
+    const std::wstring& sourceExePath,
+    const std::wstring& targetExePath,
+    uint32_t waitPid,
+    bool launchAfter)
+{
+    if (waitPid != 0) {
+        HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, waitPid);
+        if (hProcess) {
+            WaitForSingleObject(hProcess, 15000);
+            CloseHandle(hProcess);
+        }
+    }
+    Sleep(200);
+
+    bool copied = false;
+    for (int attempt = 0; attempt < 30; ++attempt) {
+        if (CopyFileW(sourceExePath.c_str(), targetExePath.c_str(), FALSE)) {
+            copied = true;
+            break;
+        }
+        Sleep(250);
+    }
+
+    if (copied && launchAfter) {
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_SHOWNORMAL;
+        PROCESS_INFORMATION pi{};
+        std::wstring quotedCmd = L"\"" + targetExePath + L"\"";
+        std::vector<wchar_t> cmdBuf(quotedCmd.begin(), quotedCmd.end());
+        cmdBuf.push_back(L'\0');
+        if (CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+    }
+    return copied ? 0 : 1;
+}
+
+int AutoUpdater::applySelfUpdateAndRestart(const std::wstring& targetExePath, uint32_t waitPid) {
+    wchar_t myPath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, myPath, MAX_PATH);
+    return applySelfUpdateAndRestart(myPath, targetExePath, waitPid, true);
+}
+
 std::wstring AutoUpdater::buildSelfUpdateCommand(const std::wstring& newExePath, const std::wstring& currentExePath) {
     std::wstring cmd = L"cmd.exe /c \"timeout /t 1 /nobreak >nul & move /y \"" + newExePath + L"\" \"" + currentExePath + L"\" & start \"\" \"" + currentExePath + L"\"\"";
     return cmd;
 }
 
 bool AutoUpdater::launchSelfUpdate(const std::wstring& newExePath, const std::wstring& currentExePath) {
-    std::wstring cmd = buildSelfUpdateCommand(newExePath, currentExePath);
+    DWORD currentPid = GetCurrentProcessId();
+    std::wstring cmd = L"\"" + newExePath + L"\" --update-target \"" + currentExePath + L"\" --wait-pid " + std::to_wstring(currentPid);
+
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -575,19 +627,42 @@ bool AutoUpdater::launchSelfUpdate(const std::wstring& newExePath, const std::ws
     std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
     cmdBuf.push_back(L'\0');
 
+    // Launch target new executable directly as GUI process (zero console window popup)
     BOOL res = CreateProcessW(
         nullptr,
         cmdBuf.data(),
         nullptr,
         nullptr,
         FALSE,
-        CREATE_NO_WINDOW | DETACHED_PROCESS,
+        0,
         nullptr,
         nullptr,
         &si,
         &pi
     );
 
+    if (res) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return true;
+    }
+
+    // Fallback: spawn command line helper if direct launch fails
+    std::wstring fbCmd = buildSelfUpdateCommand(newExePath, currentExePath);
+    std::vector<wchar_t> fbBuf(fbCmd.begin(), fbCmd.end());
+    fbBuf.push_back(L'\0');
+    res = CreateProcessW(
+        nullptr,
+        fbBuf.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &si,
+        &pi
+    );
     if (res) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
