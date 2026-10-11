@@ -28,7 +28,7 @@
   <br>
   <sub>
     <a href="assets/CppDeskShowcase.mp4">
-      <b>Watch Full Product Showcase Video (1080p 60 FPS • Audio & Voiceover)</b>
+      <b>Watch Full Video (1080p 60 FPS • Audio & Voiceover)</b>
     </a>
   </sub>
 </p>
