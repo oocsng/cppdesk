@@ -73,6 +73,16 @@ public:
     // Builds helper command for detached replacement
     static std::wstring buildSelfUpdateCommand(const std::wstring& newExePath, const std::wstring& currentExePath);
 
+    // Applies self-update: waits for previous instance PID, replaces target binary, and optionally launches updated app
+    static int applySelfUpdateAndRestart(
+        const std::wstring& sourceExePath,
+        const std::wstring& targetExePath,
+        uint32_t waitPid,
+        bool launchAfter = true);
+
+    // Convenience overload using current module executable as source
+    static int applySelfUpdateAndRestart(const std::wstring& targetExePath, uint32_t waitPid);
+
     // Spawns detached helper and triggers process replacement
     static bool launchSelfUpdate(const std::wstring& newExePath, const std::wstring& currentExePath);
 };

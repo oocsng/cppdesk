@@ -5,6 +5,7 @@
 
 #include "control/windows_service_manager.hpp"
 #include "control/shortcut_manager.hpp"
+#include "net/updater.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -64,6 +65,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
                 LocalFree(argv);
                 OleUninitialize();
                 return res;
+            } else if (arg == L"--update-target" && i + 1 < argc) {
+                std::wstring targetExe = argv[++i];
+                DWORD waitPid = 0;
+                for (int j = 1; j < argc; ++j) {
+                    if (std::wstring(argv[j]) == L"--wait-pid" && j + 1 < argc) {
+                        try {
+                            waitPid = static_cast<DWORD>(std::stoul(argv[j + 1]));
+                        } catch (...) {}
+                        break;
+                    }
+                }
+                LocalFree(argv);
+                OleUninitialize();
+                return cppdesk::AutoUpdater::applySelfUpdateAndRestart(targetExe, waitPid);
             } else if (arg == L"--instance" && i + 1 < argc) {
                 try {
                     instanceId = std::stoi(argv[++i]);
@@ -93,6 +108,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         return 0;
+    }
+
+    // Clean up temporary update binary if left behind from previous self-update
+    wchar_t tempDir[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, tempDir) > 0) {
+        std::wstring updateTemp = std::wstring(tempDir) + L"CppDesk_update.exe";
+        DeleteFileW(updateTemp.c_str());
     }
 
     // Enforce single-instance per instanceId to prevent zombie instances and duplicate tray icons

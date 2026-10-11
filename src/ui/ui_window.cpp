@@ -332,7 +332,11 @@ bool CppDeskWindow::create(HINSTANCE hInstance, int nCmdShow) {
         peerMismatchViewerVer_ = viewerVer;
         showPeerMismatchModal_ = true;
         showUpdateRequiredModal_ = true;
-        latestUpdateInfo_.latestVersion = hostVer;
+        std::string cleanVer = hostVer;
+        if (!cleanVer.empty() && (cleanVer[0] == 'v' || cleanVer[0] == 'V')) {
+            cleanVer = cleanVer.substr(1);
+        }
+        latestUpdateInfo_.latestVersion = cleanVer;
         triggerUpdateCheck(false);
         if (hwnd_) {
             InvalidateRect(hwnd_, nullptr, FALSE);
@@ -1071,9 +1075,13 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     updateStatusText_ = "Check failed (Offline or rate-limited)";
                     if (manual) showToast("Could not check for updates", true);
                 } else if (info->updateRequired) {
-                    updateStatusText_ = "Mandatory Update: v" + info->latestVersion;
+                    std::string cleanVer = info->latestVersion;
+                    if (!cleanVer.empty() && (cleanVer[0] == 'v' || cleanVer[0] == 'V')) {
+                        cleanVer = cleanVer.substr(1);
+                    }
+                    updateStatusText_ = "Mandatory Update: v" + cleanVer;
                     showUpdateRequiredModal_ = true;
-                    if (manual) showToast("Mandatory update v" + info->latestVersion + " available!", true);
+                    if (manual) showToast("Mandatory update v" + cleanVer + " available!", true);
                 } else {
                     updateStatusText_ = "CppDesk is up to date (v" + std::string(CPP_DESK_VERSION) + ")";
                     if (manual) showToast("You have the latest version (v" + std::string(CPP_DESK_VERSION) + ")");
@@ -6232,7 +6240,11 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
         drawText("Update Required to Continue", { mx, my, mrx, my + 30.0f }, fmtHeading_, COL_TEXT_PRIMARY);
         my += 34.0f;
 
-        std::string verText = "CppDesk v" + latestUpdateInfo_.latestVersion + " is now available (Current: v" + CPP_DESK_VERSION + ").";
+        std::string latestVerClean = latestUpdateInfo_.latestVersion;
+        if (!latestVerClean.empty() && (latestVerClean[0] == 'v' || latestVerClean[0] == 'V')) {
+            latestVerClean = latestVerClean.substr(1);
+        }
+        std::string verText = "CppDesk v" + latestVerClean + " is now available (Current: v" + CPP_DESK_VERSION + ").";
         drawText(verText, { mx, my, mrx, my + 20.0f }, fmtBodyBold_, COL_PRIMARY_ACCENT);
         my += 28.0f;
     }
@@ -6365,8 +6377,11 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
                            }
 
                            updateStatusMsg_ = "Restarting CppDesk...";
+                           if (h) InvalidateRect(h, nullptr, FALSE);
                            if (AutoUpdater::launchSelfUpdate(targetPath, currExePath)) {
-                               PostQuitMessage(0);
+                               if (h) PostMessageW(h, WM_CLOSE, 0, 0);
+                               std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                               ExitProcess(0);
                            } else {
                                isDownloadingUpdate_ = false;
                                updateStatusMsg_ = "Failed to launch updater helper";

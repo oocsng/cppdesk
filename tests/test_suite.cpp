@@ -1147,8 +1147,8 @@ void testAutoUpdaterAndProtocolV3() {
     TEST_ASSERT(PROTOCOL_MAGIC == 0x43505044); // "CPPD"
     TEST_ASSERT(RELAY_MAGIC == 0x4344534B);    // "CDSK"
     TEST_ASSERT(PROTOCOL_VERSION == 3);
-    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.4.0");
-    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030400);
+    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.4.1");
+    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030401);
 
     // 2. Semantic Version Triad Parsing
     int maj = 0, min = 0, pat = 0;
@@ -5407,6 +5407,28 @@ void testPeerVersionHandshakeAndSelfUpdater() {
         TEST_ASSERT(cmd.find(L"start \"\"") != std::wstring::npos);
         TEST_ASSERT(cmd.find(newExe) != std::wstring::npos);
         TEST_ASSERT(cmd.find(curExe) != std::wstring::npos);
+
+        // 5d. Test silent applySelfUpdateAndRestart file replacement
+        std::wstring testSrc = std::wstring(tempPath) + L"test_update_src.bin";
+        std::wstring testDest = std::wstring(tempPath) + L"test_update_dest.bin";
+        {
+            std::ofstream srcOut(testSrc.c_str(), std::ios::binary);
+            srcOut << "CPPDESK_UPDATE_V340_PAYLOAD";
+        }
+        {
+            std::ofstream destOut(testDest.c_str(), std::ios::binary);
+            destOut << "OLD_V332_CONTENT";
+        }
+        int updateRes = AutoUpdater::applySelfUpdateAndRestart(testSrc, testDest, 0, false);
+        TEST_ASSERT(updateRes == 0);
+        {
+            std::ifstream destIn(testDest.c_str(), std::ios::binary);
+            std::string content;
+            destIn >> content;
+            TEST_ASSERT(content == "CPPDESK_UPDATE_V340_PAYLOAD");
+        }
+        DeleteFileW(testSrc.c_str());
+        DeleteFileW(testDest.c_str());
     }
 
     // Part 6: Smooth Horizontal Scroll Spring Simulation
