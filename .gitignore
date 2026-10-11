@@ -3,6 +3,7 @@
 .claude/
 .gemini/
 graphify-out/
+AGENTS.md
 
 # Compiler / IDE / .NET / Python temporaries
 *.o
