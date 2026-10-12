@@ -1,5 +1,6 @@
 #pragma once
 
+#include "socket_compat.hpp"
 #include "../core/protocol.hpp"
 #include "../core/crypto_identity.hpp"
 #include "../capture/screen_capture.hpp"
@@ -12,10 +13,12 @@
 #include "../control/scratchpad_manager.hpp"
 #include "../control/command_palette.hpp"
 
+#if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <mmsystem.h>
+#endif
 
 #include <cstdint>
 #include <string>
@@ -386,9 +389,9 @@ public:
     void setOnVersionMismatchCallback(std::function<void(const std::string& hostVer, const std::string& viewerVer)> cb);
 
     // Socket options and scatter-gather transmission helpers
-    static void setTcpNoDelay(SOCKET s);
+    static void setTcpNoDelay(socket_t s);
     static bool sendScatterGather(
-        SOCKET s,
+        socket_t s,
         const void* hdrBuf,
         size_t hdrLen,
         const void* payloadBuf = nullptr,
@@ -575,7 +578,7 @@ private:
     struct ActiveTunnel {
         uint32_t tunnelId = 0;
         uint32_t ruleId = 0;
-        SOCKET   sock = INVALID_SOCKET;
+        socket_t sock = INVALID_SOCKET_VAL;
         uint16_t targetPort = 0;
     };
 
@@ -583,7 +586,7 @@ private:
         uint32_t ruleId = 0;
         uint16_t localPort = 0;
         uint16_t targetPort = 0;
-        SOCKET   listenSock = INVALID_SOCKET;
+        socket_t listenSock = INVALID_SOCKET_VAL;
     };
 
     void viewerTunnelMultiplexerLoop();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ui_platform.hpp"
 #include "../core/protocol.hpp"
 #include "../core/crypto_identity.hpp"
 #include "../net/network_engine.hpp"
@@ -11,7 +12,16 @@
 #include "../capture/session_rewind_buffer.hpp"
 #include "../capture/privacy_cloak_manager.hpp"
 #include "notification_manager.hpp"
+#include "../net/updater.hpp"
 
+#include <string>
+#include <vector>
+#include <array>
+#include <unordered_map>
+#include <functional>
+#include <memory>
+
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -19,18 +29,14 @@
 #include <shellapi.h>
 #include <d2d1.h>
 #include <dwrite.h>
-
-#include <string>
-#include <vector>
-#include <array>
-#include <unordered_map>
-#include <functional>
-#include "../net/updater.hpp"
+#endif
 
 namespace cppdesk {
 
+#if defined(_WIN32)
 static constexpr UINT WM_DESK_UPDATE_CHECK_DONE = WM_USER + 102;
 static constexpr UINT WM_APP_FRAME_READY        = WM_APP + 101;
+#endif
 
 enum class ActiveTab : uint8_t {
     Dashboard     = 0,
@@ -89,29 +95,7 @@ enum class DrawerTab : uint8_t {
     Notes            = 6
 };
 
-struct UiRect {
-    float left = 0.0f;
-    float top = 0.0f;
-    float right = 0.0f;
-    float bottom = 0.0f;
-
-    float width() const { return right - left; }
-    float height() const { return bottom - top; }
-    float centerX() const { return (left + right) * 0.5f; }
-    float centerY() const { return (top + bottom) * 0.5f; }
-
-    bool contains(float x, float y) const {
-        return x >= left && x <= right && y >= top && y <= bottom;
-    }
-
-    UiRect offset(float dx, float dy) const {
-        return { left + dx, top + dy, right + dx, bottom + dy };
-    }
-
-    UiRect inflate(float dx, float dy) const {
-        return { left - dx, top - dy, right + dx, bottom + dy };
-    }
-};
+// UiRect is provided by ui_platform.hpp (using UiRect = UiPlatformRect;)
 
 struct ClickRegion {
     UiRect                rect;
@@ -135,12 +119,14 @@ struct WidgetAnimState {
     bool  toggleInitialized = false;
 };
 
+#if defined(_WIN32)
+
 class CppDeskWindow {
 public:
     CppDeskWindow(IdentityManager& identity, NetworkEngine& network, const std::string& autoConnectTarget = "");
     ~CppDeskWindow();
 
-    bool create(HINSTANCE hInstance, int nCmdShow);
+    bool create(HINSTANCE hInstance = nullptr, int nCmdShow = 1);
     int messageLoop();
 
 private:
@@ -489,7 +475,7 @@ private:
     float                   updateModalAnimT_ = 0.0f;
     float                   updateModalAnimVel_ = 0.0f;
     bool                    isCheckingUpdates_ = false;
-    std::string             updateStatusText_ = "Version v3.4.2 (Up to date)";
+    std::string             updateStatusText_ = "Version v3.5.0 (Up to date)";
     UpdateInfo              latestUpdateInfo_{};
     float                   startupUpdateCheckTimer_ = 2.0f;
     bool                    startupCheckTriggered_ = false;
@@ -582,5 +568,27 @@ private:
     // Privacy Cloak Settings UI
     std::string             privacyKeywordsEdit_;
 };
+
+#elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
+
+struct CppDeskWindowMacImpl;
+
+class CppDeskWindow {
+public:
+    CppDeskWindow(IdentityManager& identity, NetworkEngine& network, const std::string& autoConnectTarget = "");
+    ~CppDeskWindow();
+
+    bool create(void* displayContext = nullptr, int showCommand = 1);
+    int messageLoop();
+    void close();
+
+private:
+    IdentityManager& identity_;
+    NetworkEngine& network_;
+    std::string autoConnectTarget_;
+    std::unique_ptr<CppDeskWindowMacImpl> pImpl_;
+};
+
+#endif
 
 } // namespace cppdesk

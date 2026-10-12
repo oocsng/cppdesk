@@ -38,7 +38,9 @@ $CoreSources = @(
     "src/capture/session_rewind_buffer.cpp",
     "src/capture/privacy_cloak_manager.cpp",
     "src/control/scratchpad_manager.cpp",
-    "src/control/command_palette.cpp"
+    "src/control/command_palette.cpp",
+    "src/simd/simd_fallback.cpp",
+    "src/ui/ui_platform.cpp"
 )
 
 $AppSources = $CoreSources + @(

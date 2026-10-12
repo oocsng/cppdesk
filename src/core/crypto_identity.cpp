@@ -2,12 +2,16 @@
 #include "../simd/simd_kernels.hpp"
 #include "protocol.hpp"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <bcrypt.h>
 #include <shlobj.h>
+#elif defined(__APPLE__)
+#include <unistd.h>
+#endif
 
 #include <cstdio>
 #include <cstring>
@@ -45,6 +49,7 @@ bool constantTimeEquals32(const std::array<uint8_t, 32>& a, const std::array<uin
 
 bool CryptoUtils::randomBytes(void* buffer, size_t len) {
     if (len == 0) return true;
+#if defined(_WIN32)
     NTSTATUS status = BCryptGenRandom(
         nullptr,
         static_cast<PUCHAR>(buffer),
@@ -52,6 +57,15 @@ bool CryptoUtils::randomBytes(void* buffer, size_t len) {
         BCRYPT_USE_SYSTEM_PREFERRED_RNG
     );
     return status >= 0;
+#elif defined(__APPLE__)
+    return SecRandomCopyBytes(kSecRandomDefault, len, buffer) == errSecSuccess;
+#else
+    FILE* f = std::fopen("/dev/urandom", "rb");
+    if (!f) return false;
+    size_t rd = std::fread(buffer, 1, len, f);
+    std::fclose(f);
+    return rd == len;
+#endif
 }
 
 uint64_t CryptoUtils::generateNineDigitId() {
@@ -62,6 +76,7 @@ uint64_t CryptoUtils::generateNineDigitId() {
 
 std::array<uint8_t, 32> CryptoUtils::sha256(const void* data, size_t len) {
     std::array<uint8_t, 32> digest{};
+#if defined(_WIN32)
     BCRYPT_ALG_HANDLE hAlg = nullptr;
     BCRYPT_HASH_HANDLE hHash = nullptr;
 
@@ -80,6 +95,9 @@ std::array<uint8_t, 32> CryptoUtils::sha256(const void* data, size_t len) {
         }
         BCryptCloseAlgorithmProvider(hAlg, 0);
     }
+#elif defined(__APPLE__)
+    CC_SHA256(data, static_cast<CC_LONG>(len), digest.data());
+#endif
     return digest;
 }
 
@@ -149,59 +167,45 @@ std::array<uint8_t, 32> CryptoUtils::computeChallengeResponse(
 }
 
 void CryptoUtils::secureZero(void* ptr, size_t len) {
-    if (ptr && len > 0) {
-        SecureZeroMemory(ptr, len);
-    }
+    crypto_secure_zero(ptr, len);
 }
 
 bool CryptoUtils::pinMemory(void* ptr, size_t len) {
-    if (ptr && len > 0) {
-        return VirtualLock(ptr, len) != FALSE;
-    }
-    return false;
+    return crypto_pin_memory(ptr, len);
 }
 
 void CryptoUtils::unpinMemory(void* ptr, size_t len) {
-    if (ptr && len > 0) {
-        VirtualUnlock(ptr, len);
-    }
+    crypto_unpin_memory(ptr, len);
 }
 
 std::array<uint8_t, 32> CryptoUtils::hmacSha256(const void* key, size_t keyLen, const void* msg, size_t msgLen) {
-    uint8_t kBlock[64] = {};
-    if (keyLen > 64) {
-        auto h = sha256(key, keyLen);
-        std::memcpy(kBlock, h.data(), 32);
-    } else if (key && keyLen > 0) {
-        std::memcpy(kBlock, key, keyLen);
+    std::array<uint8_t, 32> digest{};
+#if defined(_WIN32)
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    if (status >= 0) {
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        status = BCryptCreateHash(hAlg, &hHash, nullptr, 0,
+                                  const_cast<PUCHAR>(static_cast<const uint8_t*>(key)),
+                                  static_cast<ULONG>(keyLen), 0);
+        if (status >= 0) {
+            if (msg && msgLen > 0) {
+                BCryptHashData(hHash,
+                               const_cast<PUCHAR>(static_cast<const uint8_t*>(msg)),
+                               static_cast<ULONG>(msgLen), 0);
+            }
+            BCryptFinishHash(hHash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+            BCryptDestroyHash(hHash);
+        }
+        BCryptCloseAlgorithmProvider(hAlg, 0);
     }
-
-    uint8_t ipad[64];
-    uint8_t opad[64];
-    for (int i = 0; i < 64; ++i) {
-        ipad[i] = kBlock[i] ^ 0x36;
-        opad[i] = kBlock[i] ^ 0x5C;
-    }
-
-    std::vector<uint8_t> inner;
-    inner.reserve(64 + msgLen);
-    inner.insert(inner.end(), ipad, ipad + 64);
-    if (msg && msgLen > 0) {
-        const uint8_t* m = static_cast<const uint8_t*>(msg);
-        inner.insert(inner.end(), m, m + msgLen);
-    }
-    auto innerHash = sha256(inner.data(), inner.size());
-
-    std::vector<uint8_t> outer;
-    outer.reserve(64 + 32);
-    outer.insert(outer.end(), opad, opad + 64);
-    outer.insert(outer.end(), innerHash.begin(), innerHash.end());
-    auto result = sha256(outer.data(), outer.size());
-
-    secureZero(kBlock, sizeof(kBlock));
-    secureZero(ipad, sizeof(ipad));
-    secureZero(opad, sizeof(opad));
-    return result;
+    return digest;
+#elif defined(__APPLE__)
+    CCHmac(kCCHmacAlgSHA256, key, keyLen, msg, msgLen, digest.data());
+    return digest;
+#else
+    return digest;
+#endif
 }
 
 std::array<uint8_t, 32> CryptoUtils::hkdfSha256(
@@ -351,6 +355,7 @@ IdentityManager::IdentityManager(int instanceId)
     listenPort_ = static_cast<uint16_t>(DEFAULT_HOST_PORT + (instanceId_ - 1));
     sessionCode_ = generateRandomSixCharCode();
 
+#if defined(_WIN32)
     char compName[MAX_COMPUTERNAME_LENGTH + 1] = {};
     DWORD sz = MAX_COMPUTERNAME_LENGTH + 1;
     if (GetComputerNameA(compName, &sz)) {
@@ -358,10 +363,26 @@ IdentityManager::IdentityManager(int instanceId)
     } else {
         hostname_ = "Windows-PC";
     }
+#elif defined(__APPLE__)
+    char compName[256] = {};
+    if (gethostname(compName, sizeof(compName)) == 0) {
+        hostname_ = compName;
+    } else {
+        hostname_ = "Mac-Desktop";
+    }
+#else
+    char compName[256] = {};
+    if (gethostname(compName, sizeof(compName)) == 0) {
+        hostname_ = compName;
+    } else {
+        hostname_ = "CppDesk-Host";
+    }
+#endif
     if (instanceId_ > 1) {
         hostname_ += " #" + std::to_string(instanceId_);
     }
 
+#if defined(_WIN32)
     char appData[MAX_PATH] = {};
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, appData))) {
         std::filesystem::path dir = std::filesystem::path(appData) / "CppDesk";
@@ -388,6 +409,13 @@ IdentityManager::IdentityManager(int instanceId)
         }
         configPath_ = newLocal.string();
     }
+#else
+    const char* home = std::getenv("HOME");
+    std::filesystem::path dir = home ? (std::filesystem::path(home) / ".cppdesk") : std::filesystem::path(".cppdesk");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    configPath_ = (dir / ("config_" + std::to_string(instanceId_) + ".ini")).string();
+#endif
 }
 
 bool IdentityManager::loadOrCreate() {
@@ -853,6 +881,7 @@ EcdhKeyExchange::~EcdhKeyExchange() {
     reset();
 }
 
+#if defined(_WIN32)
 bool EcdhKeyExchange::initialize() {
     reset();
 
@@ -1148,6 +1177,258 @@ bool AesGcmSessionCipher::decrypt(
     if (outSeq) *outSeq = seq;
     return true;
 }
+
+#elif defined(__APPLE__)
+
+// ---------------- EcdhKeyExchange (macOS Security Framework) ----------------
+
+bool EcdhKeyExchange::initialize() {
+    reset();
+
+    CFMutableDictionaryRef parameters = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFDictionarySetValue(parameters, kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom);
+    int keySize = 256;
+    CFNumberRef numSize = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &keySize);
+    CFDictionarySetValue(parameters, kSecAttrKeySizeInBits, numSize);
+    CFRelease(numSize);
+
+    CFErrorRef error = nullptr;
+    SecKeyRef privateKey = SecKeyCreateRandomKey(parameters, &error);
+    CFRelease(parameters);
+
+    if (!privateKey) {
+        if (error) CFRelease(error);
+        return false;
+    }
+    hKey_ = reinterpret_cast<uintptr_t>(privateKey);
+
+    SecKeyRef publicKey = SecKeyCopyPublicKey(privateKey);
+    if (!publicKey) {
+        reset();
+        return false;
+    }
+
+    CFDataRef pubData = SecKeyCopyExternalRepresentation(publicKey, &error);
+    CFRelease(publicKey);
+    if (!pubData) {
+        if (error) CFRelease(error);
+        reset();
+        return false;
+    }
+
+    const uint8_t* bytes = CFDataGetBytePtr(pubData);
+    CFIndex len = CFDataGetLength(pubData);
+    // Apple uncompressed EC point is 65 bytes: 0x04 || X (32 bytes) || Y (32 bytes)
+    if (len == 65 && bytes[0] == 0x04) {
+        // Wrap with standard 8-byte CNG header: dwMagic (0x314B4345) || cbKey (32)
+        localPubBlob_.resize(72);
+        uint32_t magic = 0x314B4345;
+        uint32_t cbKey = 32;
+        std::memcpy(localPubBlob_.data(), &magic, 4);
+        std::memcpy(localPubBlob_.data() + 4, &cbKey, 4);
+        std::memcpy(localPubBlob_.data() + 8, bytes + 1, 64);
+        initialized_ = true;
+    }
+    CFRelease(pubData);
+    return initialized_;
+}
+
+bool EcdhKeyExchange::computeSharedSessionKey(
+    const uint8_t* peerPubBlob,
+    size_t peerPubLen,
+    uint64_t hostId,
+    uint64_t viewerId,
+    const std::array<uint8_t, 32>& nonce,
+    std::array<uint8_t, 32>& outSessionKey)
+{
+    if (!initialized_ || !peerPubBlob || peerPubLen < 72 || !hKey_) return false;
+
+    // Verify 8-byte CNG header
+    uint32_t magic = 0, cbKey = 0;
+    std::memcpy(&magic, peerPubBlob, 4);
+    std::memcpy(&cbKey, peerPubBlob + 4, 4);
+    if (magic != 0x314B4345 || cbKey != 32) return false;
+
+    // Format ANSI X9.63 uncompressed point: 0x04 || X (32) || Y (32)
+    std::vector<uint8_t> x963(65);
+    x963[0] = 0x04;
+    std::memcpy(x963.data() + 1, peerPubBlob + 8, 64);
+
+    CFDataRef peerData = CFDataCreate(kCFAllocatorDefault, x963.data(), x963.size());
+    CryptoUtils::secureZero(x963.data(), x963.size());
+    if (!peerData) return false;
+
+    CFMutableDictionaryRef keyAttrs = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFDictionarySetValue(keyAttrs, kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom);
+    CFDictionarySetValue(keyAttrs, kSecAttrKeyClass, kSecAttrKeyClassPublic);
+
+    CFErrorRef error = nullptr;
+    SecKeyRef peerKey = SecKeyCreateWithData(peerData, keyAttrs, &error);
+    CFRelease(keyAttrs);
+    CFRelease(peerData);
+
+    if (!peerKey) {
+        if (error) CFRelease(error);
+        return false;
+    }
+
+    SecKeyRef privateKey = reinterpret_cast<SecKeyRef>(hKey_);
+    CFMutableDictionaryRef exchangeParams = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+    CFDataRef sharedSecret = SecKeyCopyKeyExchangeResult(
+        privateKey, kSecKeyAlgorithmECDHKeyExchangeStandard, peerKey, exchangeParams, &error);
+    CFRelease(exchangeParams);
+    CFRelease(peerKey);
+
+    if (!sharedSecret) {
+        if (error) CFRelease(error);
+        return false;
+    }
+
+    const uint8_t* secretPtr = CFDataGetBytePtr(sharedSecret);
+    CFIndex secretLen = CFDataGetLength(sharedSecret);
+
+    outSessionKey = CryptoUtils::deriveSessionKey(hostId, viewerId, nonce, secretPtr, static_cast<size_t>(secretLen));
+    CFRelease(sharedSecret);
+    return true;
+}
+
+void EcdhKeyExchange::reset() {
+    if (hKey_) {
+        CFRelease(reinterpret_cast<SecKeyRef>(hKey_));
+        hKey_ = 0;
+    }
+    hAlg_ = 0;
+    CryptoUtils::secureZero(localPubBlob_.data(), localPubBlob_.size());
+    localPubBlob_.clear();
+    initialized_ = false;
+}
+
+// ---------------- AesGcmSessionCipher (macOS CommonCrypto CCCryptorGCM) ----------------
+
+bool AesGcmSessionCipher::initialize(const std::array<uint8_t, 32>& sessionKey, bool isHost) {
+    reset();
+    isHost_ = isHost;
+    sessionKey_ = sessionKey;
+    CryptoUtils::pinMemory(sessionKey_.data(), sessionKey_.size());
+    replayWindow_.reset();
+    initialized_ = true;
+    return true;
+}
+
+void AesGcmSessionCipher::reset() {
+    CryptoUtils::unpinMemory(sessionKey_.data(), sessionKey_.size());
+    CryptoUtils::secureZero(sessionKey_.data(), sessionKey_.size());
+    replayWindow_.reset();
+    initialized_ = false;
+}
+
+bool AesGcmSessionCipher::encrypt(
+    const void* plaintext,
+    size_t plainLen,
+    uint64_t seq,
+    const void* aad,
+    size_t aadLen,
+    std::vector<uint8_t>& outEncryptedPayload)
+{
+    if (!initialized_) return false;
+
+    uint8_t nonce[12] = {};
+    if (isHost_) {
+        nonce[0] = 'H'; nonce[1] = 'S'; nonce[2] = 'T'; nonce[3] = '1';
+    } else {
+        nonce[0] = 'V'; nonce[1] = 'I'; nonce[2] = 'W'; nonce[3] = '1';
+    }
+    std::memcpy(nonce + 4, &seq, 8);
+
+    uint8_t tag[16] = {};
+    size_t tagLen = sizeof(tag);
+
+    outEncryptedPayload.resize(12 + plainLen + 16);
+    std::memcpy(outEncryptedPayload.data(), nonce, 12);
+
+    CCCryptorStatus status = CCCryptorGCM(
+        kCCEncrypt,
+        kCCAlgorithmAES,
+        sessionKey_.data(),
+        sessionKey_.size(),
+        nonce,
+        sizeof(nonce),
+        aad,
+        aadLen,
+        plaintext,
+        plainLen,
+        plainLen > 0 ? outEncryptedPayload.data() + 12 : nullptr,
+        tag,
+        &tagLen
+    );
+
+    if (status != kCCSuccess) {
+        outEncryptedPayload.clear();
+        return false;
+    }
+
+    std::memcpy(outEncryptedPayload.data() + 12 + plainLen, tag, 16);
+    return true;
+}
+
+bool AesGcmSessionCipher::decrypt(
+    const uint8_t* encryptedPayload,
+    size_t payloadLen,
+    const void* aad,
+    size_t aadLen,
+    std::vector<uint8_t>& outPlaintext,
+    uint64_t* outSeq)
+{
+    if (!initialized_ || payloadLen < 28) return false;
+
+    const uint8_t* nonce = encryptedPayload;
+    size_t cipherLen = payloadLen - 28;
+    const uint8_t* ciphertext = encryptedPayload + 12;
+    const uint8_t* tag = encryptedPayload + 12 + cipherLen;
+
+    uint64_t seq = 0;
+    std::memcpy(&seq, nonce + 4, 8);
+
+    if (!replayWindow_.check(seq)) {
+        return false;
+    }
+
+    outPlaintext.resize(cipherLen);
+    uint8_t tagCopy[16];
+    std::memcpy(tagCopy, tag, 16);
+    size_t tagLen = 16;
+
+    CCCryptorStatus status = CCCryptorGCM(
+        kCCDecrypt,
+        kCCAlgorithmAES,
+        sessionKey_.data(),
+        sessionKey_.size(),
+        nonce,
+        12,
+        aad,
+        aadLen,
+        ciphertext,
+        cipherLen,
+        cipherLen > 0 ? outPlaintext.data() : nullptr,
+        tagCopy,
+        &tagLen
+    );
+
+    if (status != kCCSuccess) {
+        outPlaintext.clear();
+        return false;
+    }
+
+    replayWindow_.mark(seq);
+    if (outSeq) *outSeq = seq;
+    return true;
+}
+
+#endif
 
 bool AesGcmSessionCipher::ratchetKey() {
     if (!initialized_) return false;

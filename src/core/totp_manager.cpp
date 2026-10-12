@@ -1,11 +1,14 @@
 #include "totp_manager.hpp"
 #include "crypto_identity.hpp"
+#include "crypto_compat.hpp"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <bcrypt.h>
+#endif
 
 #include <ctime>
 #include <cstdio>
@@ -235,6 +238,7 @@ bool TotpManager::computeHmac(
     size_t dataLen,
     std::vector<uint8_t>& digestOut)
 {
+#if defined(_WIN32)
 #ifndef BCRYPT_ALG_HANDLE_HMAC_FLAG
 #define BCRYPT_ALG_HANDLE_HMAC_FLAG 0x00000008
 #endif
@@ -267,6 +271,15 @@ bool TotpManager::computeHmac(
     BCryptCloseAlgorithmProvider(hAlg, 0);
 
     return status >= 0;
+#elif defined(__APPLE__)
+    CCHmacAlgorithm ccAlg = (alg == TotpAlgorithm::Sha256) ? kCCHmacAlgSHA256 : kCCHmacAlgSHA1;
+    size_t digestLen = (alg == TotpAlgorithm::Sha256) ? CC_SHA256_DIGEST_LENGTH : CC_SHA1_DIGEST_LENGTH;
+    digestOut.resize(digestLen);
+    CCHmac(ccAlg, key, keyLen, data, dataLen, digestOut.data());
+    return true;
+#else
+    return false;
+#endif
 }
 
 uint32_t TotpManager::computeHotpCode(

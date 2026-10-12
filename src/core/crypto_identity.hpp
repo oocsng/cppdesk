@@ -2,6 +2,7 @@
 
 #include "protocol.hpp"
 #include "totp_manager.hpp"
+#include "crypto_compat.hpp"
 
 #include <cstdint>
 #include <string>

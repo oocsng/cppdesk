@@ -23,6 +23,7 @@
 #include "../src/capture/privacy_cloak_manager.hpp"
 #include "../src/control/scratchpad_manager.hpp"
 #include "../src/control/command_palette.hpp"
+#include "../src/ui/ui_platform.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -1147,8 +1148,8 @@ void testAutoUpdaterAndProtocolV3() {
     TEST_ASSERT(PROTOCOL_MAGIC == 0x43505044); // "CPPD"
     TEST_ASSERT(RELAY_MAGIC == 0x4344534B);    // "CDSK"
     TEST_ASSERT(PROTOCOL_VERSION == 3);
-    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.4.2");
-    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030402);
+    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.5.0");
+    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030500);
 
     // 2. Semantic Version Triad Parsing
     int maj = 0, min = 0, pat = 0;
@@ -5782,11 +5783,715 @@ void testNovelBreakthroughPowerFeatures() {
     }
 }
 
+void testCrossPlatformMacOsAndWindowsFoundation() {
+    std::cout << "[TEST 50] Cross-Platform macOS & Windows Abstraction Foundation...\n" << std::flush;
+
+    // Sub-test 1: Sockets Abstraction Layer
+    {
+        socket_init_network();
+        socket_t sInv = INVALID_SOCKET_VAL;
+        TEST_ASSERT(sInv == INVALID_SOCKET_VAL);
+
+        socket_t listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        TEST_ASSERT(listener != INVALID_SOCKET_VAL);
+
+        int opt = 1;
+        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+
+        int bRes = bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        TEST_ASSERT(bRes == 0);
+
+        int lRes = listen(listener, 1);
+        TEST_ASSERT(lRes == 0);
+
+        sockaddr_in boundAddr{};
+        socklen_t boundLen = sizeof(boundAddr);
+        getsockname(listener, reinterpret_cast<sockaddr*>(&boundAddr), &boundLen);
+        uint16_t port = ntohs(boundAddr.sin_port);
+        TEST_ASSERT(port > 0);
+
+        socket_t client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        TEST_ASSERT(client != INVALID_SOCKET_VAL);
+
+        sockaddr_in serverTarget{};
+        serverTarget.sin_family = AF_INET;
+        serverTarget.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        serverTarget.sin_port = htons(port);
+
+        int cRes = connect(client, reinterpret_cast<sockaddr*>(&serverTarget), sizeof(serverTarget));
+        TEST_ASSERT(cRes == 0);
+
+        sockaddr_in clientAddr{};
+        socklen_t clientLen = sizeof(clientAddr);
+        socket_t accepted = accept(listener, reinterpret_cast<sockaddr*>(&clientAddr), &clientLen);
+        TEST_ASSERT(accepted != INVALID_SOCKET_VAL);
+
+        // Non-blocking mode verification
+        bool nbOk1 = socket_set_nonblocking(client, true);
+        TEST_ASSERT(nbOk1);
+        bool nbOk2 = socket_set_nonblocking(accepted, true);
+        TEST_ASSERT(nbOk2);
+
+        // Wouldblock status checking on empty read
+        char dummyBuf[16];
+        int rBytes = recv(client, dummyBuf, sizeof(dummyBuf), 0);
+        int err = socket_errno();
+        TEST_ASSERT(rBytes == SOCKET_ERROR_VAL || rBytes == -1);
+        TEST_ASSERT(socket_is_wouldblock(err));
+
+        // Scatter-gather frame transmission via NetworkEngine
+        char hdrData[] = "HDR:";
+        char bodyData[] = "CROSS_PLATFORM_VERIFICATION";
+        size_t totalExpected = std::strlen(hdrData) + std::strlen(bodyData);
+
+        bool sgOk = NetworkEngine::sendScatterGather(accepted, hdrData, std::strlen(hdrData), bodyData, std::strlen(bodyData));
+        TEST_ASSERT(sgOk);
+
+        // Read back on client side
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        char recvBuf[64] = {0};
+        int totalReceived = 0;
+        for (int retry = 0; retry < 10 && totalReceived < static_cast<int>(totalExpected); ++retry) {
+            int n = recv(client, recvBuf + totalReceived, static_cast<int>(sizeof(recvBuf) - 1 - totalReceived), 0);
+            if (n > 0) {
+                totalReceived += n;
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        TEST_ASSERT(totalReceived == static_cast<int>(totalExpected));
+        std::string receivedStr(recvBuf, totalReceived);
+        TEST_ASSERT(receivedStr == "HDR:CROSS_PLATFORM_VERIFICATION");
+
+        // Validate socket handle conversion helpers in socket_compat.hpp
+        uintptr_t handleVal = fromSocket(client);
+        socket_t recoveredSock = toSocket(handleVal);
+        TEST_ASSERT(recoveredSock == client);
+
+        socket_close(client);
+        socket_close(accepted);
+        socket_close(listener);
+    }
+
+    // Sub-test 2: Dual-Backend Cryptography & AEAD Wire Verification
+    {
+        // 2a. Random byte distribution
+        std::array<uint8_t, 256> randBuf{};
+        CryptoUtils::randomBytes(randBuf.data(), randBuf.size());
+        size_t nonZeroCount = 0;
+        for (uint8_t b : randBuf) {
+            if (b != 0) ++nonZeroCount;
+        }
+        TEST_ASSERT(nonZeroCount > 240);
+
+        // 2b. Memory security primitives
+        std::vector<uint8_t> memSec(64, 0xAA);
+        TEST_ASSERT(CryptoUtils::pinMemory(memSec.data(), memSec.size()));
+        CryptoUtils::unpinMemory(memSec.data(), memSec.size());
+        CryptoUtils::secureZero(memSec.data(), memSec.size());
+        for (uint8_t b : memSec) {
+            TEST_ASSERT(b == 0);
+        }
+
+        // 2c. SHA-256 test vector ("abc")
+        auto shaVector = CryptoUtils::sha256("abc");
+        const uint8_t expectedSha[32] = {
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+            0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+            0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+            0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+        };
+        TEST_ASSERT(std::memcmp(shaVector.data(), expectedSha, 32) == 0);
+
+        // 2d. HMAC-SHA256 test vector (RFC 4231 Test Case 2)
+        const std::string rfcKey = "Jefe";
+        const std::string rfcData = "what do ya want for nothing?";
+        auto hmacVector = CryptoUtils::hmacSha256(rfcKey.data(), rfcKey.size(), rfcData.data(), rfcData.size());
+        const uint8_t expectedHmac[32] = {
+            0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e,
+            0x6a, 0x04, 0x24, 0x26, 0x08, 0x95, 0x75, 0xc7,
+            0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83,
+            0x9d, 0xec, 0x58, 0xb9, 0x64, 0xec, 0x38, 0x43
+        };
+        TEST_ASSERT(std::memcmp(hmacVector.data(), expectedHmac, 32) == 0);
+
+        // 2e. TOTP HMAC test vectors (RFC 6238)
+        std::vector<uint8_t> totpDigest1;
+        uint8_t counterBe[8] = { 0, 0, 0, 0, 0, 0, 0, 1 };
+        const char* rawKeySha1 = "12345678901234567890";
+        bool hmac1Ok = TotpManager::computeHmac(TotpAlgorithm::Sha1,
+                                                reinterpret_cast<const uint8_t*>(rawKeySha1), 20,
+                                                counterBe, 8, totpDigest1);
+        TEST_ASSERT(hmac1Ok);
+        TEST_ASSERT(totpDigest1.size() == 20);
+
+        std::vector<uint8_t> totpDigest256;
+        const char* rawKeySha256 = "12345678901234567890123456789012";
+        bool hmac256Ok = TotpManager::computeHmac(TotpAlgorithm::Sha256,
+                                                  reinterpret_cast<const uint8_t*>(rawKeySha256), 32,
+                                                  counterBe, 8, totpDigest256);
+        TEST_ASSERT(hmac256Ok);
+        TEST_ASSERT(totpDigest256.size() == 32);
+
+        // 2f. AES-256-GCM AEAD encryption, decryption, tamper resistance, and anti-replay
+        AesGcmSessionCipher cipherEnc;
+        AesGcmSessionCipher cipherDec;
+        std::array<uint8_t, 32> sessionKey{};
+        CryptoUtils::randomBytes(sessionKey.data(), sessionKey.size());
+        TEST_ASSERT(cipherEnc.initialize(sessionKey, true));
+        TEST_ASSERT(cipherDec.initialize(sessionKey, false));
+
+        // 0-byte, 64-byte, 1024-byte payloads
+        uint64_t testSeq = 1;
+        for (size_t payloadSize : {0ULL, 64ULL, 1024ULL}) {
+            std::vector<uint8_t> plain(payloadSize);
+            for (size_t i = 0; i < payloadSize; ++i) {
+                plain[i] = static_cast<uint8_t>((i * 7 + 13) & 0xFF);
+            }
+            std::vector<uint8_t> aad = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A};
+            std::vector<uint8_t> encrypted;
+            bool encOk = cipherEnc.encrypt(plain.data(), plain.size(), testSeq, aad.data(), aad.size(), encrypted);
+            TEST_ASSERT(encOk);
+            TEST_ASSERT(encrypted.size() == 12 + plain.size() + 16);
+
+            std::vector<uint8_t> decrypted;
+            uint64_t outSeq = 0;
+            bool decOk = cipherDec.decrypt(encrypted.data(), encrypted.size(), aad.data(), aad.size(), decrypted, &outSeq);
+            TEST_ASSERT(decOk);
+            TEST_ASSERT(outSeq == testSeq);
+            TEST_ASSERT(decrypted == plain);
+            ++testSeq;
+        }
+
+        // Tamper resistance: 1 bit flip in ciphertext body
+        {
+            std::vector<uint8_t> plain = {0x10, 0x20, 0x30, 0x40};
+            std::vector<uint8_t> aad = {0xAA, 0xBB};
+            std::vector<uint8_t> encrypted;
+            TEST_ASSERT(cipherEnc.encrypt(plain.data(), plain.size(), testSeq, aad.data(), aad.size(), encrypted));
+
+            std::vector<uint8_t> tamperedEncrypted = encrypted;
+            tamperedEncrypted[12] ^= 0x01; // Tamper first ciphertext byte
+            std::vector<uint8_t> tamperedDec;
+            bool tamperedOk = cipherDec.decrypt(tamperedEncrypted.data(), tamperedEncrypted.size(),
+                                                aad.data(), aad.size(), tamperedDec);
+            TEST_ASSERT(!tamperedOk);
+
+            // Tamper resistance: 1 bit flip in AAD
+            std::vector<uint8_t> tamperedAad = aad;
+            tamperedAad[0] ^= 0x01;
+            bool badAadOk = cipherDec.decrypt(encrypted.data(), encrypted.size(),
+                                              tamperedAad.data(), tamperedAad.size(), tamperedDec);
+            TEST_ASSERT(!badAadOk);
+
+            // Successful valid decryption
+            std::vector<uint8_t> validDec;
+            TEST_ASSERT(cipherDec.decrypt(encrypted.data(), encrypted.size(), aad.data(), aad.size(), validDec));
+            TEST_ASSERT(validDec == plain);
+
+            // Anti-replay: replaying the same sequence number must fail
+            bool replayOk = cipherDec.decrypt(encrypted.data(), encrypted.size(), aad.data(), aad.size(), validDec);
+            TEST_ASSERT(!replayOk);
+            ++testSeq;
+        }
+
+        // 2g. Ephemeral ECDH key agreement
+        EcdhKeyExchange alice;
+        EcdhKeyExchange bob;
+        TEST_ASSERT(alice.initialize());
+        TEST_ASSERT(bob.initialize());
+        TEST_ASSERT(!alice.localPublicKey().empty());
+        TEST_ASSERT(!bob.localPublicKey().empty());
+
+        std::array<uint8_t, 32> nonce{};
+        CryptoUtils::randomBytes(nonce.data(), nonce.size());
+        std::array<uint8_t, 32> keyAlice{};
+        std::array<uint8_t, 32> keyBob{};
+        bool aOk = alice.computeSharedSessionKey(bob.localPublicKey().data(), bob.localPublicKey().size(),
+                                                101, 202, nonce, keyAlice);
+        bool bOk = bob.computeSharedSessionKey(alice.localPublicKey().data(), alice.localPublicKey().size(),
+                                              101, 202, nonce, keyBob);
+        TEST_ASSERT(aOk);
+        TEST_ASSERT(bOk);
+        TEST_ASSERT(keyAlice == keyBob);
+    }
+
+    // Sub-test 3: Display Normalization & BGRA Format Mapping
+    {
+        // 3a. Monitor coordinate normalization and negative coordinate desktop layout
+        MonitorDesc primaryMon{};
+        primaryMon.index = 0;
+        primaryMon.x = 0;
+        primaryMon.y = 0;
+        primaryMon.width = 1920;
+        primaryMon.height = 1080;
+        primaryMon.isPrimary = true;
+
+        MonitorDesc leftMon{};
+        leftMon.index = 1;
+        leftMon.x = -1920;
+        leftMon.y = 0;
+        leftMon.width = 1920;
+        leftMon.height = 1080;
+        leftMon.isPrimary = false;
+
+        // Desktop bounding union
+        int minX = std::min(primaryMon.x, leftMon.x);
+        int minY = std::min(primaryMon.y, leftMon.y);
+        int maxX = std::max(primaryMon.x + primaryMon.width, leftMon.x + leftMon.width);
+        int maxY = std::max(primaryMon.y + primaryMon.height, leftMon.y + leftMon.height);
+        int totalWidth = maxX - minX;
+        int totalHeight = maxY - minY;
+        TEST_ASSERT(minX == -1920);
+        TEST_ASSERT(totalWidth == 3840);
+        TEST_ASSERT(totalHeight == 1080);
+
+        // Normalized mapping across virtual grid
+        int testGlobalX = -960; // Center of left monitor
+        float normX = static_cast<float>(testGlobalX - minX) / static_cast<float>(totalWidth);
+        TEST_ASSERT(std::abs(normX - 0.25f) < 0.001f);
+
+        // 3b. Simulate 64x64 RGBA pixel buffer and channel conversion to BGRA
+        const int tileSize = 64;
+        std::vector<uint8_t> rgbaBuffer(tileSize * tileSize * 4);
+        for (int y = 0; y < tileSize; ++y) {
+            for (int x = 0; x < tileSize; ++x) {
+                size_t idx = static_cast<size_t>(y * tileSize + x) * 4;
+                rgbaBuffer[idx + 0] = static_cast<uint8_t>((x * 3) & 0xFF); // R
+                rgbaBuffer[idx + 1] = static_cast<uint8_t>((y * 3) & 0xFF); // G
+                rgbaBuffer[idx + 2] = static_cast<uint8_t>((x + y) & 0xFF); // B
+                rgbaBuffer[idx + 3] = 0x80;                                 // Semi-transparent A
+            }
+        }
+
+        std::vector<uint8_t> bgraBuffer(tileSize * tileSize * 4);
+        for (size_t i = 0; i < rgbaBuffer.size(); i += 4) {
+            bgraBuffer[i + 0] = rgbaBuffer[i + 2]; // B <- B
+            bgraBuffer[i + 1] = rgbaBuffer[i + 1]; // G <- G
+            bgraBuffer[i + 2] = rgbaBuffer[i + 0]; // R <- R
+            bgraBuffer[i + 3] = 0xFF;              // Enforce opaque alpha
+        }
+
+        // Verify channel reordering and alpha enforcement
+        for (size_t i = 0; i < bgraBuffer.size(); i += 4) {
+            TEST_ASSERT(bgraBuffer[i + 0] == rgbaBuffer[i + 2]);
+            TEST_ASSERT(bgraBuffer[i + 1] == rgbaBuffer[i + 1]);
+            TEST_ASSERT(bgraBuffer[i + 2] == rgbaBuffer[i + 0]);
+            TEST_ASSERT(bgraBuffer[i + 3] == 0xFF);
+        }
+
+        // 3c. Tile hashing and TileCodec encoding verification
+        uint64_t hash1 = cppdesk_avx2_hash_tile(bgraBuffer.data(), tileSize * 4, tileSize * 4, tileSize);
+        TEST_ASSERT(hash1 != 0);
+
+        // Mutating a single pixel must change hash
+        std::vector<uint8_t> modifiedBgra = bgraBuffer;
+        modifiedBgra[0] ^= 0x55;
+        uint64_t hash2 = cppdesk_avx2_hash_tile(modifiedBgra.data(), tileSize * 4, tileSize * 4, tileSize);
+        TEST_ASSERT(hash2 != hash1);
+
+        // TileCodec encode
+        EncodedTile encTile = TileCodec::encodeRect(0, 0, tileSize, tileSize, bgraBuffer.data(), QualityPreset::Balanced);
+        TEST_ASSERT(encTile.width == tileSize);
+        TEST_ASSERT(encTile.height == tileSize);
+        TEST_ASSERT(!encTile.data.empty());
+    }
+
+    // Sub-test 4: macOS Keycode Mapping & Input Geometry Clamping
+    {
+        // 4a. Keycode translation validation
+        // Navigation and control
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x0D) == 0x24); // Return
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x09) == 0x30); // Tab
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x20) == 0x31); // Space
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x08) == 0x33); // Backspace / Delete
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x2E) == 0x75); // Forward Delete
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x1B) == 0x35); // Escape
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x25) == 0x7B); // Left Arrow
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x27) == 0x7C); // Right Arrow
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x26) == 0x7E); // Up Arrow
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x28) == 0x7D); // Down Arrow
+
+        // Modifiers
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x10) == 0x38); // Shift
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x11) == 0x3B); // Control
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x12) == 0x3A); // Alt / Option
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x5B) == 0x37); // Command / Win
+
+        // Alphanumeric keys
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x41) == 0x00); // 'A'
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x53) == 0x01); // 'S'
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x44) == 0x02); // 'D'
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x46) == 0x03); // 'F'
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x30) == 0x1D); // '0'
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x31) == 0x12); // '1'
+
+        // Function keys
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x70) == 0x7A); // F1
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0x7B) == 0x6F); // F12
+
+        // Unmapped VK
+        TEST_ASSERT(InputInjector::mapVkToMacKeyCode(0xEFFF) == 0xFFFF);
+
+        // 4b. Normalized input coordinate clamping
+        auto clampCoord = [](float v) -> float {
+            return std::clamp(v, 0.0f, 1.0f);
+        };
+        TEST_ASSERT(clampCoord(-0.5f) == 0.0f);
+        TEST_ASSERT(clampCoord(1.5f) == 1.0f);
+        TEST_ASSERT(clampCoord(0.42f) == 0.42f);
+    }
+
+    // Sub-test 5: Digital Signal Processing for Audio Intercom
+    {
+        // 5a. RMS calculation
+        std::vector<int16_t> silence(1000, 0);
+        float rmsZero = VoiceIntercom::calculateRmsLevel(silence.data(), silence.size());
+        TEST_ASSERT(std::abs(rmsZero - 0.0f) < 0.0001f);
+
+        // Full scale alternating square wave: +32767, -32768
+        std::vector<int16_t> squareWave(1000);
+        for (size_t i = 0; i < squareWave.size(); ++i) {
+            squareWave[i] = (i % 2 == 0) ? 32767 : -32768;
+        }
+        float rmsSquare = VoiceIntercom::calculateRmsLevel(squareWave.data(), squareWave.size());
+        TEST_ASSERT(rmsSquare >= 0.99f && rmsSquare <= 1.0f);
+
+        // Null / empty buffer edge case
+        TEST_ASSERT(VoiceIntercom::calculateRmsLevel(nullptr, 100) == 0.0f);
+        TEST_ASSERT(VoiceIntercom::calculateRmsLevel(silence.data(), 0) == 0.0f);
+
+        // 5b. Gain scaling and saturation clamping
+        std::vector<int16_t> gainSamples = { 100, -200, 300, 0 };
+        VoiceIntercom::applyGain(gainSamples.data(), gainSamples.size(), 2.0f);
+        TEST_ASSERT(gainSamples[0] == 200);
+        TEST_ASSERT(gainSamples[1] == -400);
+        TEST_ASSERT(gainSamples[2] == 600);
+        TEST_ASSERT(gainSamples[3] == 0);
+
+        // Overdrive clipping
+        std::vector<int16_t> clipSamples = { 20000, -25000 };
+        VoiceIntercom::applyGain(clipSamples.data(), clipSamples.size(), 2.5f);
+        TEST_ASSERT(clipSamples[0] == 32767);
+        TEST_ASSERT(clipSamples[1] == -32768);
+
+        // Edge case null buffer
+        VoiceIntercom::applyGain(nullptr, 10, 1.5f);
+    }
+}
+
+void testCrossPlatformUiWindowingAndMacOsViewer() {
+    std::cout << "[TEST 51] Cross-Platform UI Windowing & macOS Viewer Architecture...\n" << std::flush;
+
+    // Sub-test 1: Viewport Geometry & Letterboxing Math
+    {
+        // 1.1: 16:9 remote desktop (1920x1080) in 16:9 viewport (1920x1080)
+        auto geo1 = UiPlatform::calculateViewportGeometry(1920.0f, 1080.0f, 1920, 1080, ScaleMode::FitAspect);
+        TEST_ASSERT(std::abs(geo1.scaleX - 1.0f) < 0.001f);
+        TEST_ASSERT(std::abs(geo1.scaleY - 1.0f) < 0.001f);
+        TEST_ASSERT(std::abs(geo1.offsetX) < 0.001f);
+        TEST_ASSERT(std::abs(geo1.offsetY) < 0.001f);
+        TEST_ASSERT(std::abs(geo1.contentRect.left) < 0.001f);
+        TEST_ASSERT(std::abs(geo1.contentRect.top) < 0.001f);
+        TEST_ASSERT(std::abs(geo1.contentRect.right - 1920.0f) < 0.001f);
+        TEST_ASSERT(std::abs(geo1.contentRect.bottom - 1080.0f) < 0.001f);
+        TEST_ASSERT(!geo1.hasLetterbox);
+        TEST_ASSERT(!geo1.hasPillarbox);
+
+        // 1.2: 16:9 remote desktop (1920x1080) in 16:10 viewport (1920x1200) -> letterbox (top/bottom)
+        auto geo2 = UiPlatform::calculateViewportGeometry(1920.0f, 1200.0f, 1920, 1080, ScaleMode::FitAspect);
+        TEST_ASSERT(std::abs(geo2.scaleX - 1.0f) < 0.001f);
+        TEST_ASSERT(std::abs(geo2.offsetX) < 0.001f);
+        TEST_ASSERT(std::abs(geo2.offsetY - 60.0f) < 0.001f);
+        TEST_ASSERT(std::abs(geo2.contentRect.top - 60.0f) < 0.001f);
+        TEST_ASSERT(std::abs(geo2.contentRect.bottom - 1140.0f) < 0.001f);
+        TEST_ASSERT(geo2.hasLetterbox);
+        TEST_ASSERT(!geo2.hasPillarbox);
+
+        // 1.3: 4:3 remote desktop (1024x768) in 16:9 viewport (1920x1080) -> pillarbox (left/right)
+        auto geo3 = UiPlatform::calculateViewportGeometry(1920.0f, 1080.0f, 1024, 768, ScaleMode::FitAspect);
+        TEST_ASSERT(std::abs(geo3.scaleX - 1.40625f) < 0.001f);
+        TEST_ASSERT(geo3.offsetX > 0.001f);
+        TEST_ASSERT(std::abs(geo3.offsetY) < 0.001f);
+        TEST_ASSERT(!geo3.hasLetterbox);
+        TEST_ASSERT(geo3.hasPillarbox);
+
+        // 1.4: 16:9 remote desktop (1920x1080) in 4:3 viewport (1024x768) -> letterbox (top/bottom)
+        auto geo4 = UiPlatform::calculateViewportGeometry(1024.0f, 768.0f, 1920, 1080, ScaleMode::FitAspect);
+        TEST_ASSERT(std::abs(geo4.scaleX - (1024.0f / 1920.0f)) < 0.001f);
+        TEST_ASSERT(std::abs(geo4.offsetX) < 0.001f);
+        TEST_ASSERT(geo4.offsetY > 0.001f);
+        TEST_ASSERT(geo4.hasLetterbox);
+        TEST_ASSERT(!geo4.hasPillarbox);
+
+        // 1.5: 16:9 remote desktop (1920x1080) in 21:9 viewport (2560x1080) -> pillarbox (left/right)
+        auto geo5 = UiPlatform::calculateViewportGeometry(2560.0f, 1080.0f, 1920, 1080, ScaleMode::FitAspect);
+        TEST_ASSERT(std::abs(geo5.scaleX - 1.0f) < 0.001f);
+        TEST_ASSERT(std::abs(geo5.offsetX - 320.0f) < 0.001f);
+        TEST_ASSERT(std::abs(geo5.contentRect.left - 320.0f) < 0.001f);
+        TEST_ASSERT(std::abs(geo5.contentRect.right - 2240.0f) < 0.001f);
+        TEST_ASSERT(!geo5.hasLetterbox);
+        TEST_ASSERT(geo5.hasPillarbox);
+
+        // 1.6: Scaling Modes: Stretch, FillAspect, Original
+        auto geoStretch = UiPlatform::calculateViewportGeometry(1920.0f, 1200.0f, 1920, 1080, ScaleMode::Stretch);
+        TEST_ASSERT(std::abs(geoStretch.contentRect.width() - 1920.0f) < 0.001f);
+        TEST_ASSERT(std::abs(geoStretch.contentRect.height() - 1200.0f) < 0.001f);
+        TEST_ASSERT(!geoStretch.hasLetterbox && !geoStretch.hasPillarbox);
+
+        auto geoFill = UiPlatform::calculateViewportGeometry(1920.0f, 1200.0f, 1920, 1080, ScaleMode::FillAspect);
+        TEST_ASSERT(geoFill.scaleX > 1.0f);
+        TEST_ASSERT(geoFill.contentRect.width() > 1920.0f);
+        TEST_ASSERT(std::abs(geoFill.contentRect.height() - 1200.0f) < 0.001f);
+
+        auto geoOrig = UiPlatform::calculateViewportGeometry(2560.0f, 1440.0f, 1920, 1080, ScaleMode::Original);
+        TEST_ASSERT(std::abs(geoOrig.scaleX - 1.0f) < 0.001f);
+        TEST_ASSERT(std::abs(geoOrig.contentRect.width() - 1920.0f) < 0.001f);
+        TEST_ASSERT(std::abs(geoOrig.contentRect.height() - 1080.0f) < 0.001f);
+        TEST_ASSERT(geoOrig.hasLetterbox && geoOrig.hasPillarbox);
+
+        // 1.7: Coordinate Normalization & Mapping Roundtrip
+        float normX = -1.0f, normY = -1.0f;
+        // Point at top-left of contentRect -> (0.0, 0.0)
+        bool okTL = UiPlatform::mapPointToNormalized(geo2.contentRect.left, geo2.contentRect.top, geo2, normX, normY);
+        TEST_ASSERT(okTL);
+        TEST_ASSERT(std::abs(normX) < 0.001f);
+        TEST_ASSERT(std::abs(normY) < 0.001f);
+
+        // Point at center -> (0.5, 0.5)
+        bool okC = UiPlatform::mapPointToNormalized(geo2.contentRect.centerX(), geo2.contentRect.centerY(), geo2, normX, normY);
+        TEST_ASSERT(okC);
+        TEST_ASSERT(std::abs(normX - 0.5f) < 0.001f);
+        TEST_ASSERT(std::abs(normY - 0.5f) < 0.001f);
+
+        // Point at bottom-right -> (1.0, 1.0)
+        bool okBR = UiPlatform::mapPointToNormalized(geo2.contentRect.right, geo2.contentRect.bottom, geo2, normX, normY);
+        TEST_ASSERT(okBR);
+        TEST_ASSERT(std::abs(normX - 1.0f) < 0.001f);
+        TEST_ASSERT(std::abs(normY - 1.0f) < 0.001f);
+
+        // Point outside contentRect (in top letterbox bar) -> returns false
+        bool okOut = UiPlatform::mapPointToNormalized(100.0f, 20.0f, geo2, normX, normY);
+        TEST_ASSERT(!okOut);
+
+        // mapNormalizedToPoint round-trip
+        float roundViewX = 0.0f, roundViewY = 0.0f;
+        UiPlatform::mapNormalizedToPoint(0.5f, 0.5f, geo2, roundViewX, roundViewY);
+        TEST_ASSERT(std::abs(roundViewX - geo2.contentRect.centerX()) < 0.001f);
+        TEST_ASSERT(std::abs(roundViewY - geo2.contentRect.centerY()) < 0.001f);
+
+        UiPlatform::mapNormalizedToPoint(0.0f, 0.0f, geo2, roundViewX, roundViewY);
+        TEST_ASSERT(std::abs(roundViewX - geo2.contentRect.left) < 0.001f);
+        TEST_ASSERT(std::abs(roundViewY - geo2.contentRect.top) < 0.001f);
+
+        UiPlatform::mapNormalizedToPoint(1.0f, 1.0f, geo2, roundViewX, roundViewY);
+        TEST_ASSERT(std::abs(roundViewX - geo2.contentRect.right) < 0.001f);
+        TEST_ASSERT(std::abs(roundViewY - geo2.contentRect.bottom) < 0.001f);
+    }
+
+    // Sub-test 2: Keycode Translation & Modifier Bitmask Transitions
+    {
+        // 2.1: macOS to Windows VK translation for navigation & control
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x24) == 0x0D); // Return -> VK_RETURN
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x30) == 0x09); // Tab -> VK_TAB
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x31) == 0x20); // Space -> VK_SPACE
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x33) == 0x08); // Backspace -> VK_BACK
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x35) == 0x1B); // Escape -> VK_ESCAPE
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x75) == 0x2E); // Forward Delete -> VK_DELETE
+
+        // Arrows
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7B) == 0x25); // Left -> VK_LEFT
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7C) == 0x27); // Right -> VK_RIGHT
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7E) == 0x26); // Up -> VK_UP
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7D) == 0x28); // Down -> VK_DOWN
+
+        // Paging & Home/End
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x73) == 0x24); // Home -> VK_HOME
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x77) == 0x23); // End -> VK_END
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x74) == 0x21); // Page Up -> VK_PRIOR
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x79) == 0x22); // Page Down -> VK_NEXT
+
+        // Alphanumerics A-Z
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x00) == 0x41); // 'A'
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x06) == 0x5A); // 'Z'
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x0B) == 0x42); // 'B'
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x0C) == 0x51); // 'Q'
+
+        // Digits 0-9
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x1D) == 0x30); // '0'
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x12) == 0x31); // '1'
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x19) == 0x39); // '9'
+
+        // Function keys F1-F12
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7A) == 0x70); // F1
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x6F) == 0x7B); // F12
+
+        // Modifiers
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x38) == 0x10); // Shift
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x3B) == 0x11); // Control
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x3A) == 0x12); // Option
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x37) == 0x5B); // Command (Win)
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x39) == 0x14); // CapsLock
+
+        // 2.2: Bidirectional inverse mapping roundtrip: windowsVkToMacKeyCode(macKeyCodeToWindowsVk(k)) == k
+        std::vector<uint16_t> sampleKeys = {
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x19, 0x1A, 0x1C, 0x1D, 0x1F,
+            0x20, 0x22, 0x23, 0x24, 0x25, 0x26, 0x28, 0x2D, 0x2E,
+            0x30, 0x31, 0x33, 0x35, 0x37, 0x38, 0x39, 0x3A, 0x3B,
+            0x73, 0x74, 0x75, 0x77, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x6F
+        };
+        for (uint16_t mk : sampleKeys) {
+            uint32_t vk = UiPlatform::macKeyCodeToWindowsVk(mk);
+            TEST_ASSERT(vk != 0);
+            uint16_t roundTrip = UiPlatform::windowsVkToMacKeyCode(vk);
+            TEST_ASSERT(roundTrip == mk);
+        }
+
+        // Unmapped key checks
+        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0xFFFF) == 0);
+        TEST_ASSERT(UiPlatform::windowsVkToMacKeyCode(0xFFFF) == 0xFFFF);
+
+        // 2.3: Modifier Bitmask Transition Decoding
+        // Shift key pressed: 0 -> (1 << 17)
+        uint64_t mask0 = 0;
+        uint64_t maskShift = (1ULL << 17);
+        auto trans1 = UiPlatform::decodeModifierTransitions(mask0, maskShift);
+        TEST_ASSERT(trans1.size() == 1);
+        TEST_ASSERT(trans1[0].vkCode == 0x10); // VK_SHIFT
+        TEST_ASSERT(trans1[0].isDown == true);
+
+        // Shift released: (1 << 17) -> 0
+        auto trans2 = UiPlatform::decodeModifierTransitions(maskShift, mask0);
+        TEST_ASSERT(trans2.size() == 1);
+        TEST_ASSERT(trans2[0].vkCode == 0x10);
+        TEST_ASSERT(trans2[0].isDown == false);
+
+        // Command released: (1 << 20) -> 0
+        uint64_t maskCmd = (1ULL << 20);
+        auto trans3 = UiPlatform::decodeModifierTransitions(maskCmd, mask0);
+        TEST_ASSERT(trans3.size() == 1);
+        TEST_ASSERT(trans3[0].vkCode == 0x5B); // VK_LWIN
+        TEST_ASSERT(trans3[0].isDown == false);
+
+        // Multi-modifier combo: Shift pressed, Control and Option simultaneously engaged
+        uint64_t maskComboOld = (1ULL << 17); // Shift down
+        uint64_t maskComboNew = (1ULL << 18) | (1ULL << 19); // Shift up, Ctrl down, Opt down
+        auto trans4 = UiPlatform::decodeModifierTransitions(maskComboOld, maskComboNew);
+        TEST_ASSERT(trans4.size() == 3);
+        bool shiftUpSeen = false;
+        bool ctrlDownSeen = false;
+        bool optDownSeen = false;
+        for (const auto& t : trans4) {
+            if (t.vkCode == 0x10 && !t.isDown) shiftUpSeen = true;
+            if (t.vkCode == 0x11 && t.isDown) ctrlDownSeen = true;
+            if (t.vkCode == 0x12 && t.isDown) optDownSeen = true;
+        }
+        TEST_ASSERT(shiftUpSeen);
+        TEST_ASSERT(ctrlDownSeen);
+        TEST_ASSERT(optDownSeen);
+
+        // Test 32-bit overload
+        uint32_t mask32Old = 0;
+        uint32_t mask32New = static_cast<uint32_t>(1U << 17);
+        auto trans32 = UiPlatform::decodeModifierTransitions(mask32Old, mask32New);
+        TEST_ASSERT(trans32.size() == 1);
+        TEST_ASSERT(trans32[0].vkCode == 0x10);
+        TEST_ASSERT(trans32[0].isDown == true);
+    }
+
+    // Sub-test 3: Canvas Tile Blitting & Pitch Math
+    {
+        const int canvasW = 128;
+        const int canvasH = 128;
+        const int canvasPitch = canvasW * 4;
+        std::vector<uint8_t> canvas(canvasH * canvasPitch, 0x10); // Background color 0x10
+
+        const int tileW = 32;
+        const int tileH = 32;
+        const int tilePitch = tileW * 4;
+        std::vector<uint8_t> tile(tileH * tilePitch, 0xFF); // White tile 0xFF
+
+        // 3.1: Blit 32x32 colored tile into offset (16, 16)
+        bool blitOk = UiPlatform::blitTileToCanvas(
+            canvas.data(), canvasW, canvasH, canvasPitch,
+            tile.data(), 16, 16, tileW, tileH, tilePitch);
+        TEST_ASSERT(blitOk);
+
+        // Verify interior pixels match expected color (0xFF)
+        for (int y = 16; y < 16 + tileH; ++y) {
+            for (int x = 16; x < 16 + tileW; ++x) {
+                for (int c = 0; c < 4; ++c) {
+                    TEST_ASSERT(canvas[y * canvasPitch + x * 4 + c] == 0xFF);
+                }
+            }
+        }
+
+        // Verify exterior pixels remain untouched (0x10)
+        TEST_ASSERT(canvas[15 * canvasPitch + 15 * 4] == 0x10);
+        TEST_ASSERT(canvas[49 * canvasPitch + 49 * 4] == 0x10);
+        TEST_ASSERT(canvas[0] == 0x10);
+        TEST_ASSERT(canvas[100 * canvasPitch + 100 * 4] == 0x10);
+
+        // 3.2: Boundary clipping: tile partially outside right/bottom canvas boundaries
+        // Canvas is 128x128, tile placed at (110, 110) with size 32x32 -> [110, 128) x [110, 128)
+        std::vector<uint8_t> tileClip(tileH * tilePitch, 0xAA);
+        bool clipOk = UiPlatform::blitTileToCanvas(
+            canvas.data(), canvasW, canvasH, canvasPitch,
+            tileClip.data(), 110, 110, tileW, tileH, tilePitch);
+        TEST_ASSERT(clipOk);
+
+        for (int y = 110; y < 128; ++y) {
+            for (int x = 110; x < 128; ++x) {
+                TEST_ASSERT(canvas[y * canvasPitch + x * 4] == 0xAA);
+            }
+        }
+
+        // 3.3: Boundary clipping: tile partially outside left/top boundaries (negative coords)
+        std::vector<uint8_t> tileNeg(tileH * tilePitch, 0xBB);
+        bool negOk = UiPlatform::blitTileToCanvas(
+            canvas.data(), canvasW, canvasH, canvasPitch,
+            tileNeg.data(), -10, -10, tileW, tileH, tilePitch);
+        TEST_ASSERT(negOk);
+        TEST_ASSERT(canvas[0 * canvasPitch + 0 * 4] == 0xBB);
+        TEST_ASSERT(canvas[21 * canvasPitch + 21 * 4] == 0xBB);
+
+        // 3.4: Complete out-of-bounds rejection
+        bool oobRight = UiPlatform::blitTileToCanvas(
+            canvas.data(), canvasW, canvasH, canvasPitch,
+            tile.data(), 200, 200, tileW, tileH, tilePitch);
+        TEST_ASSERT(!oobRight);
+
+        bool oobLeft = UiPlatform::blitTileToCanvas(
+            canvas.data(), canvasW, canvasH, canvasPitch,
+            tile.data(), -100, -100, tileW, tileH, tilePitch);
+        TEST_ASSERT(!oobLeft);
+
+        // 3.5: Null buffer validation
+        bool nullDst = UiPlatform::blitTileToCanvas(
+            nullptr, canvasW, canvasH, canvasPitch,
+            tile.data(), 0, 0, tileW, tileH, tilePitch);
+        TEST_ASSERT(!nullDst);
+
+        bool nullSrc = UiPlatform::blitTileToCanvas(
+            canvas.data(), canvasW, canvasH, canvasPitch,
+            nullptr, 0, 0, tileW, tileH, tilePitch);
+        TEST_ASSERT(!nullSrc);
+    }
+}
+
 } // namespace
 
 int main() {
     try {
+#if defined(_WIN32)
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+#endif
 
         std::cout << "=========================================================\n" << std::flush;
         std::cout << "   CppDesk Automated Verification & Integration Suite    \n" << std::flush;
@@ -5841,12 +6546,16 @@ int main() {
         testRemoteFileSyncAndFolderMirroring(); std::cout << "Test 47 done\n" << std::flush;
         testPeerVersionHandshakeAndSelfUpdater(); std::cout << "Test 48 done\n" << std::flush;
         testNovelBreakthroughPowerFeatures(); std::cout << "Test 49 done\n" << std::flush;
+        testCrossPlatformMacOsAndWindowsFoundation(); std::cout << "Test 50 done\n" << std::flush;
+        testCrossPlatformUiWindowingAndMacOsViewer(); std::cout << "Test 51 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
         std::cout << "=========================================================\n";
 
+#if defined(_WIN32)
         CoUninitialize();
+#endif
         return (g_failed == 0) ? 0 : 1;
     } catch (const std::exception& ex) {
         std::cerr << "CAUGHT EXCEPTION IN MAIN: " << ex.what() << std::endl;

@@ -1,12 +1,17 @@
 #include "screen_capture.hpp"
 #include "../simd/simd_kernels.hpp"
 
+#if defined(_WIN32)
 #include <windows.h>
 #include <shlwapi.h>
 #include <objidl.h>
 #include <gdiplus.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#elif defined(__APPLE__)
+#include <CoreGraphics/CoreGraphics.h>
+#include <ApplicationServices/ApplicationServices.h>
+#endif
 #include <zstd.h>
 
 #include <cstring>
@@ -598,6 +603,7 @@ ScreenCapturer::~ScreenCapturer() {
 std::vector<MonitorDesc> ScreenCapturer::enumerateMonitors() {
     monitors_.clear();
 
+#if defined(_WIN32)
     struct EnumCtx {
         std::vector<MonitorDesc>* list;
     } ctx{ &monitors_ };
@@ -627,6 +633,28 @@ std::vector<MonitorDesc> ScreenCapturer::enumerateMonitors() {
         },
         reinterpret_cast<LPARAM>(&ctx)
     );
+#elif defined(__APPLE__)
+    uint32_t maxDisplays = 32;
+    CGDirectDisplayID displayIds[32];
+    uint32_t numDisplays = 0;
+    if (CGGetActiveDisplayList(maxDisplays, displayIds, &numDisplays) == kCGErrorSuccess) {
+        for (uint32_t i = 0; i < numDisplays; ++i) {
+            CGRect bounds = CGDisplayBounds(displayIds[i]);
+            MonitorDesc d;
+            d.index = static_cast<int32_t>(i);
+            d.x = static_cast<int32_t>(bounds.origin.x);
+            d.y = static_cast<int32_t>(bounds.origin.y);
+            d.width = static_cast<int32_t>(bounds.size.width);
+            d.height = static_cast<int32_t>(bounds.size.height);
+            d.isPrimary = CGDisplayIsMain(displayIds[i]);
+            d.name = "Display " + std::to_string(d.index + 1) +
+                     " (" + std::to_string(d.width) + "x" + std::to_string(d.height) + ")";
+            d.isVirtual = false;
+            d.virtualId = 0;
+            monitors_.push_back(d);
+        }
+    }
+#endif
 
     // If host has 0 physical monitors and auto-headless is active, provision fallback virtual display
     if (monitors_.empty() && autoHeadless_) {
@@ -1031,8 +1059,73 @@ bool ScreenCapturer::captureViaGdi() {
     return hasValidFrame_;
 }
 
+bool ScreenCapturer::captureViaCoreGraphics() {
+#if defined(__APPLE__)
+    CGDirectDisplayID displayId = kCGDirectMainDisplay;
+    if (activeMonitorIdx_ >= 0 && activeMonitorIdx_ < static_cast<int>(monitors_.size())) {
+        uint32_t maxDisplays = 32;
+        CGDirectDisplayID displayIds[32];
+        uint32_t numDisplays = 0;
+        if (CGGetActiveDisplayList(maxDisplays, displayIds, &numDisplays) == kCGErrorSuccess &&
+            static_cast<uint32_t>(activeMonitorIdx_) < numDisplays) {
+            displayId = displayIds[activeMonitorIdx_];
+        }
+    }
+
+    CGImageRef image = CGDisplayCreateImage(displayId);
+    if (!image) return false;
+
+    size_t w = CGImageGetWidth(image);
+    size_t h = CGImageGetHeight(image);
+    if (w == 0 || h == 0) {
+        CFRelease(image);
+        return false;
+    }
+
+    frameW_ = static_cast<int>(w);
+    frameH_ = static_cast<int>(h);
+    currentFrame_.resize(w * h * 4);
+
+    CGDataProviderRef provider = CGImageGetDataProvider(image);
+    CFDataRef rawData = provider ? CGDataProviderCopyData(provider) : nullptr;
+    if (!rawData) {
+        CFRelease(image);
+        return false;
+    }
+
+    const uint8_t* srcPixels = CFDataGetBytePtr(rawData);
+    size_t bytesPerRow = CGImageGetBytesPerRow(image);
+    size_t bpp = CGImageGetBitsPerPixel(image);
+    CGBitmapInfo info = CGImageGetBitmapInfo(image);
+
+    bool isBgra = (bpp == 32) && ((info & kCGBitmapByteOrderMask) == kCGBitmapByteOrder32Little);
+    for (size_t row = 0; row < h; ++row) {
+        const uint8_t* rowSrc = srcPixels + row * bytesPerRow;
+        uint8_t* rowDst = currentFrame_.data() + row * w * 4;
+        if (isBgra) {
+            std::memcpy(rowDst, rowSrc, w * 4);
+        } else {
+            for (size_t col = 0; col < w; ++col) {
+                rowDst[col * 4 + 0] = rowSrc[col * 4 + 2]; // B
+                rowDst[col * 4 + 1] = rowSrc[col * 4 + 1]; // G
+                rowDst[col * 4 + 2] = rowSrc[col * 4 + 0]; // R
+                rowDst[col * 4 + 3] = 0xFF;                // A
+            }
+        }
+    }
+
+    CFRelease(rawData);
+    CFRelease(image);
+    hasValidFrame_ = true;
+    return true;
+#else
+    return false;
+#endif
+}
+
 CursorState ScreenCapturer::captureCursorState() const {
     CursorState cs;
+#if defined(_WIN32)
     CURSORINFO ci{};
     ci.cbSize = sizeof(ci);
     if (GetCursorInfo(&ci)) {
@@ -1057,6 +1150,18 @@ CursorState ScreenCapturer::captureCursorState() const {
         cs.normX = std::clamp(static_cast<float>(relX) / std::max(1, frameW_), 0.0f, 1.0f);
         cs.normY = std::clamp(static_cast<float>(relY) / std::max(1, frameH_), 0.0f, 1.0f);
     }
+#elif defined(__APPLE__)
+    CGEventRef ev = CGEventCreate(NULL);
+    if (ev) {
+        CGPoint pt = CGEventGetLocation(ev);
+        CFRelease(ev);
+        int relX = static_cast<int>(pt.x) - activeMonitor_.x;
+        int relY = static_cast<int>(pt.y) - activeMonitor_.y;
+        cs.visible = true;
+        cs.normX = std::clamp(static_cast<float>(relX) / std::max(1, frameW_), 0.0f, 1.0f);
+        cs.normY = std::clamp(static_cast<float>(relY) / std::max(1, frameH_), 0.0f, 1.0f);
+    }
+#endif
     return cs;
 }
 
@@ -1075,7 +1180,12 @@ bool ScreenCapturer::captureDirtyTiles(
 
     // Check if background recovery from FallbackGdi should be attempted (500ms cooldown)
     if (dxgiRecoveryState_ == DxgiRecoveryState::FallbackGdi && activeMonitorIdx_ >= 0 && !activeMonitor_.isVirtual) {
+#if defined(_WIN32)
         uint64_t now = GetTickCount64();
+#else
+        auto steadyNow = std::chrono::steady_clock::now();
+        uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(steadyNow.time_since_epoch()).count());
+#endif
         if (now - lastDxgiAttemptTick_ >= 500) {
             lastDxgiAttemptTick_ = now;
             if (initDxgiForMonitor(activeMonitorIdx_)) {
@@ -1094,6 +1204,7 @@ bool ScreenCapturer::captureDirtyTiles(
             return false;
         }
     } else {
+#if defined(_WIN32)
         if (dxgiInitialized_ && dxgiRecoveryState_ == DxgiRecoveryState::Active) {
             captured = captureViaDxgi(dxgiUpdated, dxgiDirtyRects, hasExplicitDirtyRects);
         }
@@ -1102,6 +1213,11 @@ bool ScreenCapturer::captureDirtyTiles(
                 return false;
             }
         }
+#elif defined(__APPLE__)
+        if (!captureViaCoreGraphics()) {
+            return false;
+        }
+#endif
     }
     auto tCapEnd = std::chrono::steady_clock::now();
     lastCaptureLatencyMs_ = std::chrono::duration<float, std::milli>(tCapEnd - tCapStart).count();

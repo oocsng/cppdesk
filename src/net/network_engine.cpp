@@ -47,43 +47,37 @@ static const GUID KSDATAFORMAT_SUBTYPE_IEEE_FLOAT_val = { 0x00000003, 0x0000, 0x
 std::once_flag g_wsaInitFlag;
 
 void ensureWinsockInitialized() {
-    std::call_once(g_wsaInitFlag, []() {
-        WSADATA wsa{};
-        WSAStartup(MAKEWORD(2, 2), &wsa);
-    });
+    socket_init_network();
 }
 
 uint64_t nowTickMs() {
+#if defined(_WIN32)
     return static_cast<uint64_t>(GetTickCount64());
+#else
+    auto now = std::chrono::steady_clock::now();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+#endif
 }
 
-SOCKET toWinSock(uintptr_t s) {
-    return (s == ~uintptr_t(0)) ? INVALID_SOCKET : static_cast<SOCKET>(s);
-}
-
-uintptr_t fromWinSock(SOCKET s) {
-    return (s == INVALID_SOCKET) ? ~uintptr_t(0) : static_cast<uintptr_t>(s);
-}
-
-void closeWinSock(uintptr_t& s) {
-    SOCKET ws = toWinSock(s);
-    if (ws != INVALID_SOCKET) {
-        shutdown(ws, SD_BOTH);
-        closesocket(ws);
-        s = ~uintptr_t(0);
-    }
-}
-
-void setTcpNoDelay(SOCKET s) {
+void setTcpNoDelay(socket_t s) {
     NetworkEngine::setTcpNoDelay(s);
 }
 
-void setSocketTimeoutMs(SOCKET s, DWORD timeoutMs) {
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+void setSocketTimeoutMs(socket_t s, int timeoutMs) {
+#if defined(_WIN32)
+    DWORD dwTimeout = static_cast<DWORD>(timeoutMs);
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&dwTimeout), sizeof(dwTimeout));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&dwTimeout), sizeof(dwTimeout));
+#else
+    struct timeval tv;
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
 }
 
-bool sendAllBytes(SOCKET s, const void* buf, size_t len) {
+bool sendAllBytes(socket_t s, const void* buf, size_t len) {
     const char* p = static_cast<const char*>(buf);
     size_t sentTotal = 0;
     while (sentTotal < len) {
@@ -264,7 +258,7 @@ static LRESULT CALLBACK PrivacyCurtainWndProc(HWND hwnd, UINT msg, WPARAM wParam
     }
 }
 
-bool recvAllBytes(SOCKET s, void* buf, size_t len) {
+bool recvAllBytes(socket_t s, void* buf, size_t len) {
     char* p = static_cast<char*>(buf);
     size_t gotTotal = 0;
     while (gotTotal < len) {
@@ -276,7 +270,7 @@ bool recvAllBytes(SOCKET s, void* buf, size_t len) {
     return true;
 }
 
-SOCKET connectTcpWithTimeout(const std::string& host, uint16_t port, int timeoutMs) {
+socket_t connectTcpWithTimeout(const std::string& host, uint16_t port, int timeoutMs) {
     ensureWinsockInitialized();
 
     addrinfo hints{};
@@ -287,26 +281,26 @@ SOCKET connectTcpWithTimeout(const std::string& host, uint16_t port, int timeout
     addrinfo* res = nullptr;
     std::string portStr = std::to_string(port);
     if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0 || !res) {
-        return INVALID_SOCKET;
+        return INVALID_SOCKET_VAL;
     }
 
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) {
+    socket_t s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET_VAL) {
         freeaddrinfo(res);
-        return INVALID_SOCKET;
+        return INVALID_SOCKET_VAL;
     }
 
-    u_long nonBlock = 1;
-    ioctlsocket(s, FIONBIO, &nonBlock);
+    socket_set_nonblocking(s, true);
+    socket_set_nosigpipe(s);
 
     int rc = connect(s, res->ai_addr, static_cast<int>(res->ai_addrlen));
     freeaddrinfo(res);
 
-    if (rc == SOCKET_ERROR) {
-        int err = WSAGetLastError();
-        if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
-            closesocket(s);
-            return INVALID_SOCKET;
+    if (rc == SOCKET_ERROR_VAL) {
+        int err = socket_errno();
+        if (!socket_is_wouldblock(err)) {
+            socket_close(s);
+            return INVALID_SOCKET_VAL;
         }
 
         fd_set wfds{}, efds{};
@@ -319,23 +313,30 @@ SOCKET connectTcpWithTimeout(const std::string& host, uint16_t port, int timeout
         tv.tv_sec = timeoutMs / 1000;
         tv.tv_usec = (timeoutMs % 1000) * 1000;
 
+#if defined(_WIN32)
         int sel = select(0, nullptr, &wfds, &efds, &tv);
+#else
+        int sel = select(s + 1, nullptr, &wfds, &efds, &tv);
+#endif
         if (sel <= 0 || FD_ISSET(s, &efds) || !FD_ISSET(s, &wfds)) {
-            closesocket(s);
-            return INVALID_SOCKET;
+            socket_close(s);
+            return INVALID_SOCKET_VAL;
         }
 
         int soErr = 0;
+#if defined(_WIN32)
         int soLen = sizeof(soErr);
+#else
+        socklen_t soLen = sizeof(soErr);
+#endif
         getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &soLen);
         if (soErr != 0) {
-            closesocket(s);
-            return INVALID_SOCKET;
+            socket_close(s);
+            return INVALID_SOCKET_VAL;
         }
     }
 
-    nonBlock = 0;
-    ioctlsocket(s, FIONBIO, &nonBlock);
+    socket_set_nonblocking(s, false);
     setTcpNoDelay(s);
     return s;
 }
@@ -362,37 +363,41 @@ bool parseHostPort(const std::string& input, std::string& outHost, uint16_t& out
 
 std::string detectPrimaryLocalIpv4() {
     ensureWinsockInitialized();
-    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s != INVALID_SOCKET) {
+    socket_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s != INVALID_SOCKET_VAL) {
         sockaddr_in remote{};
         remote.sin_family = AF_INET;
         remote.sin_port = htons(53);
         inet_pton(AF_INET, "8.8.8.8", &remote.sin_addr);
         if (connect(s, reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) == 0) {
             sockaddr_in local{};
+#if defined(_WIN32)
             int len = sizeof(local);
+#else
+            socklen_t len = sizeof(local);
+#endif
             if (getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
                 char ipStr[INET_ADDRSTRLEN] = {};
                 if (inet_ntop(AF_INET, &local.sin_addr, ipStr, sizeof(ipStr))) {
-                    closesocket(s);
+                    socket_close(s);
                     return std::string(ipStr);
                 }
             }
         }
-        closesocket(s);
+        socket_close(s);
     }
     return "127.0.0.1";
 }
 
-void spliceSockets(SOCKET a, SOCKET b) {
+void spliceSockets(socket_t a, socket_t b) {
     char buf[32768];
     while (true) {
         int n = recv(a, buf, sizeof(buf), 0);
         if (n <= 0) break;
         if (!sendAllBytes(b, buf, static_cast<size_t>(n))) break;
     }
-    shutdown(a, SD_BOTH);
-    shutdown(b, SD_BOTH);
+    socket_close(a);
+    socket_close(b);
 }
 
 void executeRemoteSystemAction(SystemActionType action) {
@@ -403,9 +408,9 @@ void executeRemoteSystemAction(SystemActionType action) {
 
 // ---------------- Frame IO ----------------
 
-void NetworkEngine::setTcpNoDelay(SOCKET s) {
-    if (s == INVALID_SOCKET) return;
-    BOOL flag = TRUE;
+void NetworkEngine::setTcpNoDelay(socket_t s) {
+    if (s == INVALID_SOCKET_VAL) return;
+    int flag = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&flag), sizeof(flag));
 
     // Scale TCP socket send and receive buffers to 2 MB (2,097,152 bytes)
@@ -413,17 +418,19 @@ void NetworkEngine::setTcpNoDelay(SOCKET s) {
     int bufSize = 2 * 1024 * 1024;
     setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bufSize), sizeof(bufSize));
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bufSize), sizeof(bufSize));
+    socket_set_nosigpipe(s);
 }
 
 bool NetworkEngine::sendScatterGather(
-    SOCKET s,
+    socket_t s,
     const void* hdrBuf,
     size_t hdrLen,
     const void* payloadBuf,
     size_t payloadLen)
 {
-    if (s == INVALID_SOCKET || (!hdrBuf && hdrLen > 0)) return false;
+    if (s == INVALID_SOCKET_VAL || (!hdrBuf && hdrLen > 0)) return false;
 
+#if defined(_WIN32)
     WSABUF bufs[2];
     bufs[0].buf = const_cast<char*>(static_cast<const char*>(hdrBuf));
     bufs[0].len = static_cast<ULONG>(hdrLen);
@@ -464,6 +471,48 @@ bool NetworkEngine::sendScatterGather(
         }
     }
     return true;
+#else
+    struct iovec bufs[2];
+    bufs[0].iov_base = const_cast<void*>(hdrBuf);
+    bufs[0].iov_len = hdrLen;
+
+    int numBufs = 1;
+    if (payloadBuf && payloadLen > 0) {
+        bufs[1].iov_base = const_cast<void*>(payloadBuf);
+        bufs[1].iov_len = payloadLen;
+        numBufs = 2;
+    }
+
+    size_t totalBytes = hdrLen + ((payloadBuf && payloadLen > 0) ? payloadLen : 0);
+    if (totalBytes == 0) return true;
+    size_t totalSent = 0;
+    int curBufIdx = 0;
+
+    while (totalSent < totalBytes) {
+        ssize_t bytesSent = writev(s, &bufs[curBufIdx], numBufs - curBufIdx);
+        if (bytesSent <= 0) {
+            if (bytesSent < 0 && (errno == EINTR)) continue;
+            return false;
+        }
+
+        totalSent += static_cast<size_t>(bytesSent);
+        if (totalSent >= totalBytes) break;
+
+        size_t remainingSent = static_cast<size_t>(bytesSent);
+        while (curBufIdx < numBufs && remainingSent > 0) {
+            if (remainingSent >= bufs[curBufIdx].iov_len) {
+                remainingSent -= bufs[curBufIdx].iov_len;
+                bufs[curBufIdx].iov_len = 0;
+                curBufIdx++;
+            } else {
+                bufs[curBufIdx].iov_base = static_cast<char*>(bufs[curBufIdx].iov_base) + remainingSent;
+                bufs[curBufIdx].iov_len -= remainingSent;
+                remainingSent = 0;
+            }
+        }
+    }
+    return true;
+#endif
 }
 
 bool NetworkEngine::sendFrame(

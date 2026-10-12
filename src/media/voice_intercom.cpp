@@ -33,6 +33,8 @@ void VoiceIntercom::applyGain(int16_t* samples, size_t count, float gain) {
     }
 }
 
+#if defined(_WIN32)
+
 bool VoiceIntercom::startCapture(AudioChunkCallback onChunk, uint32_t sampleRate, uint8_t channels) {
     stopCapture();
     sampleRate_ = sampleRate;
@@ -233,5 +235,207 @@ void VoiceIntercom::stopPlayback() {
     hWaveOut_ = nullptr;
     playing_.store(false);
 }
+
+#elif defined(__APPLE__)
+
+void VoiceIntercom::MacAudioInputCallback(
+    void* custom_data,
+    AudioQueueRef queue,
+    AudioQueueBufferRef buffer,
+    const AudioTimeStamp* start_time,
+    UInt32 num_packets,
+    const AudioStreamPacketDescription* packet_desc) {
+    (void)start_time;
+    (void)num_packets;
+    (void)packet_desc;
+    auto* self = static_cast<VoiceIntercom*>(custom_data);
+    if (!self || !buffer || buffer->mAudioDataByteSize == 0) {
+        if (queue && buffer) {
+            AudioQueueEnqueueBuffer(queue, buffer, 0, nullptr);
+        }
+        return;
+    }
+
+    const int16_t* pcmSamples = reinterpret_cast<const int16_t*>(buffer->mAudioData);
+    size_t sampleCount = buffer->mAudioDataByteSize / sizeof(int16_t);
+    float level = calculateRmsLevel(pcmSamples, sampleCount);
+    self->inputLevel_.store(level);
+
+    if (!self->micMuted_.load() && self->onChunkCallback_) {
+        self->onChunkCallback_(reinterpret_cast<const uint8_t*>(buffer->mAudioData),
+                               buffer->mAudioDataByteSize,
+                               self->sampleRate_,
+                               self->channels_);
+    }
+
+    if (self->capturing_.load()) {
+        AudioQueueEnqueueBuffer(queue, buffer, 0, nullptr);
+    }
+}
+
+bool VoiceIntercom::startCapture(AudioChunkCallback onChunk, uint32_t sampleRate, uint8_t channels) {
+    stopCapture();
+    sampleRate_ = sampleRate;
+    channels_ = channels;
+    onChunkCallback_ = std::move(onChunk);
+
+    AudioStreamBasicDescription format{};
+    format.mSampleRate = static_cast<Float64>(sampleRate_);
+    format.mFormatID = kAudioFormatLinearPCM;
+    format.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
+    format.mBitsPerChannel = 16;
+    format.mChannelsPerFrame = channels_;
+    format.mBytesPerFrame = (format.mBitsPerChannel / 8) * format.mChannelsPerFrame;
+    format.mFramesPerPacket = 1;
+    format.mBytesPerPacket = format.mBytesPerFrame * format.mFramesPerPacket;
+
+    OSStatus status = AudioQueueNewInput(&format, MacAudioInputCallback, this, nullptr, nullptr, 0, &inQueue_);
+    if (status != noErr || !inQueue_) {
+        inQueue_ = nullptr;
+        return false;
+    }
+
+    UInt32 bufferByteSize = (sampleRate_ / 50) * format.mBytesPerFrame;
+    if (bufferByteSize == 0) bufferByteSize = 1920;
+
+    for (size_t i = 0; i < NUM_CAPTURE_BUFFERS; ++i) {
+        status = AudioQueueAllocateBuffer(inQueue_, bufferByteSize, &inBuffers_[i]);
+        if (status == noErr && inBuffers_[i]) {
+            AudioQueueEnqueueBuffer(inQueue_, inBuffers_[i], 0, nullptr);
+        }
+    }
+
+    capturing_.store(true);
+    captureStopping_.store(false);
+    AudioQueueStart(inQueue_, nullptr);
+    return true;
+}
+
+void VoiceIntercom::captureWorker() {
+    // AudioQueue manages its own audio servicing thread on macOS
+}
+
+void VoiceIntercom::stopCapture() {
+    if (!capturing_.load() && !inQueue_) return;
+    captureStopping_.store(true);
+    capturing_.store(false);
+
+    if (inQueue_) {
+        AudioQueueStop(inQueue_, true);
+        AudioQueueDispose(inQueue_, true);
+        inQueue_ = nullptr;
+    }
+    for (size_t i = 0; i < NUM_CAPTURE_BUFFERS; ++i) {
+        inBuffers_[i] = nullptr;
+    }
+    inputLevel_.store(0.0f);
+}
+
+bool VoiceIntercom::startPlayback(uint32_t sampleRate, uint8_t channels) {
+    std::lock_guard<std::mutex> lk(playbackMutex_);
+    if (outQueue_) return true;
+
+    AudioStreamBasicDescription format{};
+    format.mSampleRate = static_cast<Float64>(sampleRate);
+    format.mFormatID = kAudioFormatLinearPCM;
+    format.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
+    format.mBitsPerChannel = 16;
+    format.mChannelsPerFrame = channels;
+    format.mBytesPerFrame = (format.mBitsPerChannel / 8) * format.mChannelsPerFrame;
+    format.mFramesPerPacket = 1;
+    format.mBytesPerPacket = format.mBytesPerFrame * format.mFramesPerPacket;
+
+    OSStatus status = AudioQueueNewOutput(&format, nullptr, nullptr, nullptr, nullptr, 0, &outQueue_);
+    if (status != noErr || !outQueue_) {
+        outQueue_ = nullptr;
+        playing_.store(false);
+        return false;
+    }
+
+    UInt32 bufferByteSize = (sampleRate / 50) * format.mBytesPerFrame * 4;
+    if (bufferByteSize == 0) bufferByteSize = 1920 * 4;
+
+    for (size_t i = 0; i < NUM_PLAYBACK_BUFFERS; ++i) {
+        AudioQueueAllocateBuffer(outQueue_, bufferByteSize, &outBuffers_[i]);
+    }
+    currentPlayIdx_ = 0;
+    playing_.store(true);
+    AudioQueueStart(outQueue_, nullptr);
+    return true;
+}
+
+void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes) {
+    bytes = (bytes / sizeof(int16_t)) * sizeof(int16_t);
+    if (!pcm || bytes < sizeof(int16_t) || bytes > 192000) return;
+    std::lock_guard<std::mutex> lk(playbackMutex_);
+    if (!outQueue_) return;
+
+    int vol = outputVolume_.load();
+    float gain = static_cast<float>(vol) / 100.0f;
+
+    AudioQueueBufferRef buf = outBuffers_[currentPlayIdx_];
+    if (!buf) return;
+
+    if (buf->mAudioDataBytesCapacity < bytes) {
+        bytes = buf->mAudioDataBytesCapacity;
+    }
+
+    std::memcpy(buf->mAudioData, pcm, bytes);
+    buf->mAudioDataByteSize = static_cast<UInt32>(bytes);
+
+    if (vol != 100) {
+        applyGain(reinterpret_cast<int16_t*>(buf->mAudioData),
+                  bytes / sizeof(int16_t), gain);
+    }
+
+    AudioQueueEnqueueBuffer(outQueue_, buf, 0, nullptr);
+    currentPlayIdx_ = (currentPlayIdx_ + 1) % NUM_PLAYBACK_BUFFERS;
+}
+
+void VoiceIntercom::stopPlayback() {
+    std::lock_guard<std::mutex> lk(playbackMutex_);
+    if (!outQueue_) return;
+
+    AudioQueueStop(outQueue_, true);
+    AudioQueueDispose(outQueue_, true);
+    outQueue_ = nullptr;
+    for (size_t i = 0; i < NUM_PLAYBACK_BUFFERS; ++i) {
+        outBuffers_[i] = nullptr;
+    }
+    playing_.store(false);
+}
+
+#else
+
+bool VoiceIntercom::startCapture(AudioChunkCallback onChunk, uint32_t sampleRate, uint8_t channels) {
+    (void)onChunk;
+    (void)sampleRate;
+    (void)channels;
+    return false;
+}
+
+void VoiceIntercom::captureWorker() {}
+
+void VoiceIntercom::stopCapture() {
+    capturing_.store(false);
+    inputLevel_.store(0.0f);
+}
+
+bool VoiceIntercom::startPlayback(uint32_t sampleRate, uint8_t channels) {
+    (void)sampleRate;
+    (void)channels;
+    return false;
+}
+
+void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes) {
+    (void)pcm;
+    (void)bytes;
+}
+
+void VoiceIntercom::stopPlayback() {
+    playing_.store(false);
+}
+
+#endif
 
 } // namespace cppdesk

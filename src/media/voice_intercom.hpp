@@ -10,11 +10,15 @@
 #include <algorithm>
 #include <cmath>
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <mmsystem.h>
+#elif defined(__APPLE__)
+#include <AudioToolbox/AudioToolbox.h>
+#endif
 
 namespace cppdesk {
 
@@ -65,6 +69,7 @@ private:
     AudioChunkCallback          onChunkCallback_;
     std::thread                 captureThread_;
 
+#if defined(_WIN32)
     // Win32 waveIn handles & buffers
     HWAVEIN                     hWaveIn_{nullptr};
     HANDLE                      hCaptureEvent_{nullptr};
@@ -79,6 +84,26 @@ private:
     WAVEHDR                     playbackHeaders_[NUM_PLAYBACK_BUFFERS]{};
     std::vector<uint8_t>        playbackBuffers_[NUM_PLAYBACK_BUFFERS];
     size_t                      currentPlayIdx_{0};
+#elif defined(__APPLE__)
+    static void MacAudioInputCallback(
+        void* custom_data,
+        AudioQueueRef queue,
+        AudioQueueBufferRef buffer,
+        const AudioTimeStamp* start_time,
+        UInt32 num_packets,
+        const AudioStreamPacketDescription* packet_desc);
+
+    AudioQueueRef               inQueue_{nullptr};
+    AudioQueueRef               outQueue_{nullptr};
+    static constexpr size_t     NUM_CAPTURE_BUFFERS = 3;
+    AudioQueueBufferRef         inBuffers_[NUM_CAPTURE_BUFFERS]{};
+    static constexpr size_t     NUM_PLAYBACK_BUFFERS = 3;
+    AudioQueueBufferRef         outBuffers_[NUM_PLAYBACK_BUFFERS]{};
+    size_t                      currentPlayIdx_{0};
+    mutable std::mutex          playbackMutex_;
+#else
+    mutable std::mutex          playbackMutex_;
+#endif
 };
 
 } // namespace cppdesk

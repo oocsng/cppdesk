@@ -2,11 +2,11 @@
 #include "core/crypto_identity.hpp"
 #include "net/network_engine.hpp"
 #include "ui/ui_window.hpp"
-
-#include "control/windows_service_manager.hpp"
 #include "control/shortcut_manager.hpp"
 #include "net/updater.hpp"
 
+#if defined(_WIN32)
+#include "control/windows_service_manager.hpp"
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -14,12 +14,22 @@
 #include <shellapi.h>
 #include <objbase.h>
 #include <timeapi.h>
+#else
+#include <csignal>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#include <iostream>
+#endif
 
 #include <string>
 #include <vector>
 #include <cstdio>
 #include <chrono>
 #include <thread>
+#include <atomic>
+
+#if defined(_WIN32)
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpCmdLine*/, int nCmdShow) {
     // Request 1ms scheduler timer resolution for precise 60 FPS frame pacing and jitter-free sleep
@@ -131,7 +141,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
             SetForegroundWindow(existingHwnd);
         }
         CloseHandle(hMutex);
-        CoUninitialize();
+        OleUninitialize();
         return 0;
     }
 
@@ -155,7 +165,100 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
     if (hMutex) CloseHandle(hMutex);
     OleUninitialize();
 
-    // Absolute zero background residue: terminate all process threads immediately
+    // Terminate all process threads cleanly
     ExitProcess(static_cast<UINT>(exitCode));
     return exitCode;
 }
+
+#elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
+
+static std::atomic<bool> g_shutdownRequested{false};
+
+static void handlePosixSignal(int sig) {
+    (void)sig;
+    g_shutdownRequested.store(true);
+}
+
+int main(int argc, char* argv[]) {
+    // Ignore SIGPIPE to avoid unhandled socket closures killing process
+    std::signal(SIGPIPE, SIG_IGN);
+    std::signal(SIGINT, handlePosixSignal);
+    std::signal(SIGTERM, handlePosixSignal);
+
+    int instanceId = 1;
+    bool headlessRelayOnly = false;
+    uint16_t relayPort = cppdesk::DEFAULT_RELAY_PORT;
+    std::string connectTarget;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--instance" && i + 1 < argc) {
+            try {
+                instanceId = std::stoi(argv[++i]);
+            } catch (...) {}
+        } else if (arg == "--connect" && i + 1 < argc) {
+            connectTarget = argv[++i];
+        } else if (arg == "--relay-server") {
+            headlessRelayOnly = true;
+            if (i + 1 < argc) {
+                try {
+                    int p = std::stoi(argv[i + 1]);
+                    if (p > 0 && p <= 65535) {
+                        relayPort = static_cast<uint16_t>(p);
+                        ++i;
+                    }
+                } catch (...) {}
+            }
+        }
+    }
+
+    if (headlessRelayOnly) {
+        cppdesk::RelayServer server;
+        if (!server.start(relayPort)) {
+            std::cerr << "Failed to start relay server on port " << relayPort << "\n";
+            return 1;
+        }
+        std::cout << "CppDesk Relay Server running on port " << relayPort << "...\n";
+        while (server.isRunning() && !g_shutdownRequested.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        server.stop();
+        return 0;
+    }
+
+    // Single-instance protection via POSIX advisory file locking
+    std::string lockPath = "/tmp/cppdesk_single_instance_" + std::to_string(instanceId) + ".lock";
+    int lockFd = open(lockPath.c_str(), O_CREAT | O_RDWR, 0666);
+    if (lockFd < 0 || flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+        std::cout << "Another instance of CppDesk (instance " << instanceId << ") is already running.\n";
+        if (lockFd >= 0) close(lockFd);
+        return 0;
+    }
+
+    cppdesk::IdentityManager identity(instanceId);
+    identity.loadOrCreate();
+
+    cppdesk::NetworkEngine network(identity);
+    network.start();
+
+    cppdesk::CppDeskWindow window(identity, network, connectTarget);
+    if (!window.create()) {
+        std::cerr << "Failed to create CppDesk window.\n";
+        network.stop();
+        flock(lockFd, LOCK_UN);
+        close(lockFd);
+        unlink(lockPath.c_str());
+        return 1;
+    }
+
+    int exitCode = window.messageLoop();
+    network.stop();
+
+    flock(lockFd, LOCK_UN);
+    close(lockFd);
+    unlink(lockPath.c_str());
+
+    return exitCode;
+}
+
+#endif

@@ -1,9 +1,14 @@
 #pragma once
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <CoreGraphics/CoreGraphics.h>
+#include <ApplicationServices/ApplicationServices.h>
+#endif
 
 #include "../core/protocol.hpp"
 #include "virtual_display_manager.hpp"
@@ -173,6 +178,7 @@ private:
     void releaseGdiResources();
     bool captureViaDxgi(bool& outFrameUpdated, std::vector<RECT>& outDirtyRects, bool& outHasExplicitDirtyRects);
     bool captureViaGdi();
+    bool captureViaCoreGraphics();
     CursorState captureCursorState() const;
 
     struct DxgiImpl;
@@ -183,8 +189,13 @@ private:
     bool                      hasValidFrame_ = false;
 
     // GDI handle recycling cache
+#if defined(_WIN32)
     HDC                       gdiMemDC_ = nullptr;
     HBITMAP                   gdiSection_ = nullptr;
+#else
+    void*                     gdiMemDC_ = nullptr;
+    void*                     gdiSection_ = nullptr;
+#endif
     void*                     gdiBits_ = nullptr;
     int                       gdiWidth_ = 0;
     int                       gdiHeight_ = 0;
