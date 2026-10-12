@@ -4,6 +4,8 @@
 
 namespace cppdesk {
 
+#if defined(_WIN32)
+
 namespace {
 
 std::wstring utf8ToWide(const std::string& str) {
@@ -30,7 +32,7 @@ bool NotificationManager::init(HWND hwnd, HINSTANCE hInstance, const std::string
 
     hTrayIcon_ = LoadIconW(hInstance_, MAKEINTRESOURCEW(101));
     if (!hTrayIcon_) {
-        hTrayIcon_ = LoadIconW(nullptr, IDI_APPLICATION);
+        hTrayIcon_ = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
     }
 
     NOTIFYICONDATAW nid{};
@@ -150,5 +152,32 @@ void NotificationManager::showContextMenu(int x, int y, const std::string& statu
     PostMessageW(hwnd_, WM_NULL, 0, 0);
     DestroyMenu(hMenu);
 }
+
+#else
+
+NotificationManager::NotificationManager() = default;
+NotificationManager::~NotificationManager() = default;
+
+bool NotificationManager::init(void* /*hwnd*/, void* /*hInstance*/, const std::string& appTitle) {
+    appTitle_ = appTitle.empty() ? "CppDesk" : appTitle;
+    return true;
+}
+
+void NotificationManager::shutdown() {}
+
+void NotificationManager::notify(
+    NotificationType type,
+    const std::string& /*title*/,
+    const std::string& /*message*/,
+    const AppSettings& /*settings*/)
+{
+    lastType_.store(type);
+}
+
+void NotificationManager::flashTaskbar(bool /*flash*/) {}
+void NotificationManager::stopFlash() {}
+void NotificationManager::showContextMenu(int /*x*/, int /*y*/, const std::string& /*statusText*/) {}
+
+#endif
 
 } // namespace cppdesk

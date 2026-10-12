@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>CppDesk</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.oocsng.cppdesk</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>CppDesk</string>
+    <key>CFBundleDisplayName</key>
+    <string>CppDesk</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>3.5.1</string>
+    <key>CFBundleVersion</key>
+    <string>3.5.1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>CppDesk requires screen recording permission to stream your desktop during remote desktop sessions.</string>
+    <key>NSAccessibilityUsageDescription</key>
+    <string>CppDesk requires accessibility permission to inject remote keyboard and mouse input.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>CppDesk requires microphone access for voice intercom during remote desktop sessions.</string>
+</dict>
+</plist>

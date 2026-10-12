@@ -8,9 +8,40 @@
 #include <gdiplus.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
-#elif defined(__APPLE__)
+#endif
+#if defined(__APPLE__)
+#if __has_include(<CoreGraphics/CoreGraphics.h>)
 #include <CoreGraphics/CoreGraphics.h>
 #include <ApplicationServices/ApplicationServices.h>
+#else
+typedef uint32_t CGDirectDisplayID;
+typedef struct CGImage* CGImageRef;
+typedef struct CGDataProvider* CGDataProviderRef;
+typedef const struct __CFData* CFDataRef;
+typedef uint32_t CGBitmapInfo;
+typedef int32_t CGError;
+enum { kCGErrorSuccess = 0 };
+static const CGDirectDisplayID kCGDirectMainDisplay = 0;
+enum {
+    kCGBitmapByteOrderMask = 0x7000,
+    kCGBitmapByteOrder32Little = 0x2000
+};
+extern "C" {
+    CGError CGGetActiveDisplayList(uint32_t, CGDirectDisplayID*, uint32_t*);
+    CGImageRef CGDisplayCreateImage(CGDirectDisplayID);
+    size_t CGImageGetWidth(CGImageRef);
+    size_t CGImageGetHeight(CGImageRef);
+    CGDataProviderRef CGImageGetDataProvider(CGImageRef);
+    CFDataRef CGDataProviderCopyData(CGDataProviderRef);
+    const uint8_t* CFDataGetBytePtr(CFDataRef);
+    size_t CGImageGetBytesPerRow(CGImageRef);
+    size_t CGImageGetBitsPerPixel(CGImageRef);
+    CGBitmapInfo CGImageGetBitmapInfo(CGImageRef);
+    void CFRelease(const void*);
+    bool CGPreflightScreenCaptureAccess(void);
+    bool CGRequestScreenCaptureAccess(void);
+}
+#endif
 #endif
 #include <zstd.h>
 
@@ -1061,6 +1092,14 @@ bool ScreenCapturer::captureViaGdi() {
 
 bool ScreenCapturer::captureViaCoreGraphics() {
 #if defined(__APPLE__)
+    static bool checkedPermissions = false;
+    if (!checkedPermissions) {
+        checkedPermissions = true;
+        if (!CGPreflightScreenCaptureAccess()) {
+            CGRequestScreenCaptureAccess();
+        }
+    }
+
     CGDirectDisplayID displayId = kCGDirectMainDisplay;
     if (activeMonitorIdx_ >= 0 && activeMonitorIdx_ < static_cast<int>(monitors_.size())) {
         uint32_t maxDisplays = 32;
@@ -1104,6 +1143,9 @@ bool ScreenCapturer::captureViaCoreGraphics() {
         uint8_t* rowDst = currentFrame_.data() + row * w * 4;
         if (isBgra) {
             std::memcpy(rowDst, rowSrc, w * 4);
+            for (size_t col = 0; col < w; ++col) {
+                rowDst[col * 4 + 3] = 0xFF;
+            }
         } else {
             for (size_t col = 0; col < w; ++col) {
                 rowDst[col * 4 + 0] = rowSrc[col * 4 + 2]; // B

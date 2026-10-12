@@ -1,5 +1,6 @@
 #pragma once
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -8,6 +9,7 @@
 #include <shlobj.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#endif
 
 #include "../core/protocol.hpp"
 
@@ -21,6 +23,8 @@ namespace cppdesk {
 
 // Callback for reading on-demand chunk data: returns true on success
 using VirtualChunkReadFn = std::function<bool(uint32_t fileIndex, uint64_t offset, uint32_t length, std::vector<uint8_t>& outData)>;
+
+#if defined(_WIN32)
 
 class ShellClipboard {
 public:
@@ -128,5 +132,26 @@ private:
     std::vector<VirtualFileEntry> files_;
     VirtualChunkReadFn            chunkReader_;
 };
+
+#else
+
+class ShellClipboard {
+public:
+    static bool initializeOle() { return true; }
+    static void uninitializeOle() {}
+
+    static uint32_t getFileGroupDescriptorWFormat() { return 0; }
+    static uint32_t getFileContentsFormat() { return 0; }
+    static uint32_t getPreferredDropEffectFormat() { return 0; }
+
+    static bool getLocalClipboardFiles(std::vector<VirtualFileEntry>&, std::vector<std::wstring>&) { return false; }
+    static bool setVirtualClipboardFiles(const std::vector<VirtualFileEntry>&, VirtualChunkReadFn) { return false; }
+    static void clearClipboard() {}
+
+    static std::wstring resolveConflictFilenameW(const std::wstring& directory, const std::wstring& filename);
+    static std::string resolveConflictFilename(const std::string& directory, const std::string& filename);
+};
+
+#endif
 
 } // namespace cppdesk

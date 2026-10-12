@@ -7,6 +7,8 @@
 
 namespace cppdesk {
 
+#if defined(_WIN32)
+
 bool ShellClipboard::initializeOle() {
     HRESULT hr = OleInitialize(nullptr);
     return SUCCEEDED(hr);
@@ -17,17 +19,17 @@ void ShellClipboard::uninitializeOle() {
 }
 
 UINT ShellClipboard::getFileGroupDescriptorWFormat() {
-    static UINT cf = RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
+    static UINT cf = RegisterClipboardFormatW(L"FileGroupDescriptorW");
     return cf;
 }
 
 UINT ShellClipboard::getFileContentsFormat() {
-    static UINT cf = RegisterClipboardFormatW(CFSTR_FILECONTENTS);
+    static UINT cf = RegisterClipboardFormatW(L"FileContents");
     return cf;
 }
 
 UINT ShellClipboard::getPreferredDropEffectFormat() {
-    static UINT cf = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+    static UINT cf = RegisterClipboardFormatW(L"Preferred DropEffect");
     return cf;
 }
 
@@ -84,6 +86,8 @@ void ShellClipboard::clearClipboard() {
     OleSetClipboard(nullptr);
 }
 
+#endif
+
 namespace {
 
 template <typename StringType>
@@ -119,6 +123,7 @@ std::string ShellClipboard::resolveConflictFilename(const std::string& directory
     return resolveConflictFilenameImpl(directory, filename);
 }
 
+#if defined(_WIN32)
 
 // ---------------- VirtualFileStream ----------------
 
@@ -458,5 +463,7 @@ HRESULT STDMETHODCALLTYPE ShellDataObject::DUnadvise(DWORD /*dwConnection*/) {
 HRESULT STDMETHODCALLTYPE ShellDataObject::EnumDAdvise(IEnumSTATDATA** /*ppenumAdvise*/) {
     return OLE_E_ADVISENOTSUPPORTED;
 }
+
+#endif
 
 } // namespace cppdesk

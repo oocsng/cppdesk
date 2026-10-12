@@ -2,6 +2,7 @@
 #include "../core/crypto_identity.hpp"
 #include "../capture/screen_capture.hpp"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -9,6 +10,14 @@
 #include <bcrypt.h>
 #include <shlobj.h>
 #include <shellapi.h>
+#elif defined(__APPLE__)
+#include <CommonCrypto/CommonDigest.h>
+#include <unistd.h>
+#include <cstdlib>
+#else
+#include <unistd.h>
+#include <cstdlib>
+#endif
 
 #include <filesystem>
 #include <algorithm>
@@ -86,6 +95,7 @@ std::string FileTransferItem::formatEta(double etaSec) {
     return "ETA " + std::to_string(m) + "m " + std::to_string(remS) + "s";
 }
 
+#if defined(_WIN32)
 struct FileTransferManager::IncrementalSha256 {
     BCRYPT_ALG_HANDLE  hAlg = nullptr;
     BCRYPT_HASH_HANDLE hHash = nullptr;
@@ -121,6 +131,54 @@ struct FileTransferManager::IncrementalSha256 {
         return CryptoUtils::toHex(digest.data(), digest.size());
     }
 };
+#elif defined(__APPLE__)
+struct FileTransferManager::IncrementalSha256 {
+    CC_SHA256_CTX ctx;
+    bool valid = false;
+
+    IncrementalSha256() {
+        CC_SHA256_Init(&ctx);
+        valid = true;
+    }
+
+    ~IncrementalSha256() = default;
+
+    void update(const void* data, size_t len) {
+        if (valid && data && len > 0) {
+            CC_SHA256_Update(&ctx, data, static_cast<CC_LONG>(len));
+        }
+    }
+
+    std::string finishHex() {
+        std::array<uint8_t, 32> digest{};
+        if (valid) {
+            CC_SHA256_Final(digest.data(), &ctx);
+            valid = false;
+        }
+        return CryptoUtils::toHex(digest.data(), digest.size());
+    }
+};
+#else
+struct FileTransferManager::IncrementalSha256 {
+    std::vector<uint8_t> buffer_;
+
+    IncrementalSha256() = default;
+    ~IncrementalSha256() = default;
+
+    void update(const void* data, size_t len) {
+        if (data && len > 0) {
+            const auto* p = static_cast<const uint8_t*>(data);
+            buffer_.insert(buffer_.end(), p, p + len);
+        }
+    }
+
+    std::string finishHex() {
+        auto digest = CryptoUtils::sha256(buffer_.data(), buffer_.size());
+        buffer_.clear();
+        return CryptoUtils::toHex(digest.data(), digest.size());
+    }
+};
+#endif
 
 // ---------------- ClipboardHistoryManager & Classify ----------------
 
@@ -166,7 +224,7 @@ void ClipboardHistoryManager::addItem(const std::string& text, bool isFromRemote
     item.id = nextId_++;
     item.text = text;
     item.typeBadge = classifyClipboardText(text);
-    item.timestampMs = GetTickCount64();
+    item.timestampMs = currentTimeMs();
     item.isFromRemote = isFromRemote;
     item.charCount = text.size();
 
@@ -248,6 +306,8 @@ size_t ClipboardHistoryManager::count() const {
 }
 
 // ---------------- ClipboardManager ----------------
+
+#if defined(_WIN32)
 
 ClipboardManager::ClipboardManager() {
     lastSeqNumber_ = GetClipboardSequenceNumber();
@@ -433,20 +493,78 @@ void ClipboardManager::applyRemoteClipboard(const std::string& utf8Text) {
     lastSeqNumber_ = GetClipboardSequenceNumber();
 }
 
+#else
+
+ClipboardManager::ClipboardManager() {
+    lastSeqNumber_ = 1;
+}
+
+static std::string g_posixClipboardText;
+static std::mutex g_posixClipboardMutex;
+
+std::string ClipboardManager::getClipboardUtf8() {
+    std::lock_guard<std::mutex> lock(g_posixClipboardMutex);
+    return g_posixClipboardText;
+}
+
+bool ClipboardManager::setClipboardUtf8(const std::string& utf8Text) {
+    std::lock_guard<std::mutex> lock(g_posixClipboardMutex);
+    g_posixClipboardText = utf8Text;
+    return true;
+}
+
+bool ClipboardManager::getClipboardImageJpeg(std::vector<uint8_t>& /*outJpeg*/, uint32_t& /*outW*/, uint32_t& /*outH*/, int /*maxDim*/) {
+    return false;
+}
+
+bool ClipboardManager::pollLocalChange(std::string& outNewText) {
+    std::string txt = getClipboardUtf8();
+    if (txt.empty() || txt.size() > 256 * 1024) {
+        return false;
+    }
+    std::string h = CryptoUtils::sha256Hex(txt);
+    if (h == lastAppliedHash_) {
+        return false;
+    }
+    lastAppliedHash_ = h;
+    history_.addItem(txt, false);
+    outNewText = std::move(txt);
+    return true;
+}
+
+void ClipboardManager::applyRemoteClipboard(const std::string& utf8Text) {
+    if (utf8Text.empty()) return;
+    lastAppliedHash_ = CryptoUtils::sha256Hex(utf8Text);
+    setClipboardUtf8(utf8Text);
+    history_.addItem(utf8Text, true);
+    lastSeqNumber_++;
+}
+
+#endif
+
 // ---------------- FileTransferManager ----------------
 
+static constexpr const char* kDefaultReceivedFolder = "CppDesk_Received";
+
 FileTransferManager::FileTransferManager() {
+    std::filesystem::path dl;
+#if defined(_WIN32)
     char profileDir[MAX_PATH] = {};
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_PROFILE, nullptr, 0, profileDir))) {
-        std::filesystem::path dl = std::filesystem::path(profileDir) / "Downloads" / "CppDesk_Received";
-        std::error_code ec;
-        std::filesystem::create_directories(dl, ec);
-        receiveDir_ = dl.string();
-    } else {
-        receiveDir_ = "CppDesk_Received";
-        std::error_code ec;
-        std::filesystem::create_directories(receiveDir_, ec);
+        dl = std::filesystem::path(profileDir) / "Downloads" / kDefaultReceivedFolder;
     }
+#else
+    const char* home = std::getenv("HOME");
+    if (home) {
+        dl = std::filesystem::path(home) / "Downloads" / kDefaultReceivedFolder;
+    }
+#endif
+    if (dl.empty()) {
+        dl = kDefaultReceivedFolder;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dl, ec);
+    receiveDir_ = dl.string();
 }
 
 FileTransferManager::~FileTransferManager() {
@@ -469,7 +587,15 @@ void FileTransferManager::openReceiveDirectoryInExplorer() const {
     std::string dir = receiveDirectory();
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
+#if defined(_WIN32)
     ShellExecuteA(nullptr, "open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#elif defined(__APPLE__)
+    std::string cmd = "open \"" + dir + "\"";
+    std::system(cmd.c_str());
+#else
+    std::string cmd = "xdg-open \"" + dir + "\"";
+    std::system(cmd.c_str());
+#endif
 }
 
 uint32_t FileTransferManager::startOutgoingFile(const std::string& filePath, const SendPacketFn& sendPacket,
@@ -759,12 +885,22 @@ void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalByt
 
     std::string baseDir = receiveDir_;
     if (targetHint == FileOfferTarget::Desktop) {
+#if defined(_WIN32)
         PWSTR pDesk = nullptr;
         if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &pDesk)) && pDesk) {
             std::filesystem::path deskPath(pDesk);
             CoTaskMemFree(pDesk);
             baseDir = deskPath.string();
         }
+#else
+        const char* home = std::getenv("HOME");
+        if (home) {
+            std::filesystem::path deskPath = std::filesystem::path(home) / "Desktop";
+            if (std::filesystem::exists(deskPath, ec)) {
+                baseDir = deskPath.string();
+            }
+        }
+#endif
     }
     std::filesystem::create_directories(baseDir, ec);
 
@@ -774,11 +910,9 @@ void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalByt
     // Verify file size limit and available disk space
     bool spaceOk = (totalBytes <= MAX_TRANSFER_FILE_BYTES);
     if (spaceOk) {
-        ULARGE_INTEGER freeBytesAvailable{};
-        if (GetDiskFreeSpaceExA(baseDir.c_str(), &freeBytesAvailable, nullptr, nullptr)) {
-            if (freeBytesAvailable.QuadPart > 0 && totalBytes + (16ULL * 1024 * 1024) > freeBytesAvailable.QuadPart) {
-                spaceOk = false;
-            }
+        auto spaceInfo = std::filesystem::space(baseDir, ec);
+        if (!ec && spaceInfo.available > 0 && totalBytes + (16ULL * 1024 * 1024) > spaceInfo.available) {
+            spaceOk = false;
         }
     }
 
@@ -1031,12 +1165,20 @@ double FileTransferManager::aggregateActiveBandwidthBps() const {
 // ---------------- ClipboardFileTransferManager ----------------
 
 ClipboardFileTransferManager::ClipboardFileTransferManager() {
+#if defined(_WIN32)
     wchar_t tempPath[MAX_PATH] = {};
     GetTempPathW(MAX_PATH, tempPath);
     stagingDir_ = std::wstring(tempPath) + L"CppDesk_Clipboard\\";
+    lastSequenceNumber_ = GetClipboardSequenceNumber();
+#else
+    const char* tmp = std::getenv("TMPDIR");
+    if (!tmp) tmp = "/tmp";
+    std::string s = std::string(tmp) + "/CppDesk_Clipboard/";
+    stagingDir_ = std::wstring(s.begin(), s.end());
+    lastSequenceNumber_ = 1;
+#endif
     std::error_code ec;
     std::filesystem::create_directories(stagingDir_, ec);
-    lastSequenceNumber_ = GetClipboardSequenceNumber();
 }
 
 ClipboardFileTransferManager::~ClipboardFileTransferManager() {
@@ -1169,7 +1311,7 @@ bool ClipboardFileTransferManager::fetchChunk(uint32_t fileIndex, uint64_t offse
         incoming_.currentFileName = std::string(f.fileName.begin(), f.fileName.end());
     }
     if (incoming_.startTimeMs == 0) {
-        incoming_.startTimeMs = GetTickCount64();
+        incoming_.startTimeMs = currentTimeMs();
     }
 
     pendingReq_.transferId = incoming_.transferId;
@@ -1209,7 +1351,7 @@ bool ClipboardFileTransferManager::fetchChunk(uint32_t fileIndex, uint64_t offse
     outData = std::move(pendingReq_.data);
     incoming_.transferredBytes += outData.size();
 
-    uint64_t nowMs = GetTickCount64();
+    uint64_t nowMs = currentTimeMs();
     uint64_t elapsedMs = nowMs - incoming_.startTimeMs;
     if (elapsedMs > 200) {
         double sec = static_cast<double>(elapsedMs) / 1000.0;

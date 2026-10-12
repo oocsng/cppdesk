@@ -49,6 +49,11 @@ if [ "$BUILD_TESTS" = true ]; then
     cmake --build . --config Release --target CppDeskTests -- -j"${NPROC}"
 else
     cmake --build . --config Release -- -j"${NPROC}"
+    if [ -d "./CppDesk.app" ]; then
+        echo "Successfully built macOS Application Bundle: ${BUILD_DIR}/CppDesk.app"
+        tar -czf "${SCRIPT_DIR}/CppDesk-macos.tar.gz" -C "${BUILD_DIR}" CppDesk.app
+        echo "Created archive: ${SCRIPT_DIR}/CppDesk-macos.tar.gz"
+    fi
 fi
 
 if [ "$DO_TEST" = true ]; then

@@ -475,7 +475,7 @@ private:
     float                   updateModalAnimT_ = 0.0f;
     float                   updateModalAnimVel_ = 0.0f;
     bool                    isCheckingUpdates_ = false;
-    std::string             updateStatusText_ = "Version v3.5.0 (Up to date)";
+    std::string             updateStatusText_ = "Version v3.5.1 (Up to date)";
     UpdateInfo              latestUpdateInfo_{};
     float                   startupUpdateCheckTimer_ = 2.0f;
     bool                    startupCheckTriggered_ = false;

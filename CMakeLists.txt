@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(CppDesk VERSION 3.5.0 LANGUAGES C CXX ASM)
+project(CppDesk VERSION 3.5.1 LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -129,10 +129,17 @@ if(WIN32)
     )
     target_link_libraries(CppDesk PRIVATE ${PLATFORM_LIBS})
 elseif(APPLE)
-    add_executable(CppDesk
+    add_executable(CppDesk MACOSX_BUNDLE
         ${CORE_SOURCES}
         src/ui/ui_window_mac.mm
         src/main.cpp
+    )
+    set_target_properties(CppDesk PROPERTIES
+        MACOSX_BUNDLE_BUNDLE_NAME "CppDesk"
+        MACOSX_BUNDLE_BUNDLE_IDENTIFIER "com.oocsng.cppdesk"
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/Info.plist"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "3.5.1"
+        MACOSX_BUNDLE_LONG_VERSION_STRING "3.5.1"
     )
     target_link_libraries(CppDesk PRIVATE
         ${PLATFORM_LIBS}

@@ -61,7 +61,10 @@ std::string FileSyncManager::normalizePath(const std::string& p) {
     }
 
     std::string result = s.substr(start, end - start);
-    if (result.find("..") != std::string::npos) {
+    if (result.empty() || result.find(':') != std::string::npos || result.find("..") != std::string::npos) {
+        return "";
+    }
+    if (std::filesystem::path(result).is_absolute()) {
         return "";
     }
     return result;
@@ -887,7 +890,6 @@ bool FileSyncManager::handleDeltaBlock(const SyncDeltaBlockPayload& block) {
     }
 
     auto& in = incomingFiles_[block.fileId];
-    std::string root = resolveTargetRoot();
 
     if (!in.initialized) {
         in.syncId = block.syncId;
@@ -927,11 +929,23 @@ bool FileSyncManager::handleDeltaBlock(const SyncDeltaBlockPayload& block) {
             }
         }
 
+        in.relativePath = normalizePath(in.relativePath);
         if (in.relativePath.empty()) {
             in.relativePath = "sync_file_" + std::to_string(block.fileId) + ".dat";
         }
 
-        std::filesystem::path targetP = std::filesystem::path(root) / in.relativePath;
+        std::string root = resolveTargetRoot();
+        std::filesystem::path rootP = std::filesystem::path(root).lexically_normal();
+        std::filesystem::path targetP = (rootP / in.relativePath).lexically_normal();
+
+        // Security check: ensure target path is strictly contained within root
+        std::string normalTarget = targetP.generic_string();
+        std::string normalRoot = rootP.generic_string();
+        if (normalTarget.rfind(normalRoot, 0) != 0) {
+            errorMessage_ = "Path traversal rejected: " + in.relativePath;
+            return false;
+        }
+
         std::error_code ec;
         std::filesystem::create_directories(targetP.parent_path(), ec);
 
@@ -950,17 +964,28 @@ bool FileSyncManager::handleDeltaBlock(const SyncDeltaBlockPayload& block) {
 
     // 2. Seek and write delta block payload into staging .part file
     {
+#if defined(_WIN32)
         std::wstring partW = utf8ToWide(in.partFullPath);
         FILE* fp = _wfopen(partW.c_str(), L"r+b");
         if (!fp) {
             fp = _wfopen(partW.c_str(), L"w+b");
         }
+#else
+        FILE* fp = fopen(in.partFullPath.c_str(), "r+b");
+        if (!fp) {
+            fp = fopen(in.partFullPath.c_str(), "w+b");
+        }
+#endif
         if (!fp) {
             errorMessage_ = "Failed to open staging file: " + in.partFullPath;
             return false;
         }
 
+#if defined(_WIN32)
         if (_fseeki64(fp, static_cast<long long>(block.blockOffset), SEEK_SET) != 0) {
+#else
+        if (fseeko(fp, static_cast<off_t>(block.blockOffset), SEEK_SET) != 0) {
+#endif
             fclose(fp);
             errorMessage_ = "Failed to seek staging file: " + in.partFullPath;
             return false;
