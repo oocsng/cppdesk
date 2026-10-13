@@ -2123,7 +2123,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             uint8_t q = r.readU8();
                             uint8_t fps = r.readU8();
                             uint8_t adap = r.readU8();
-                            requestedQuality.store(q);
+                            requestedQuality.store(q > 3 ? 0 : q);
                             if (fps > 0) requestedTargetFps.store(clampTargetFps(fps));
                             adaptiveFpsEnabled.store(adap != 0);
                             forceKeyframeFlag.store(true);
@@ -2133,7 +2133,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             uint8_t q = r.readU8();
                             int32_t monIdx = r.readI32();
                             uint8_t reqKf = r.readU8();
-                            requestedQuality.store(q);
+                            requestedQuality.store(q > 3 ? 0 : q);
                             if (monIdx >= -1) requestedMonitor.store(monIdx);
                             if (reqKf != 0) forceKeyframeFlag.store(true);
                             if (r.hasRemaining(1)) {
@@ -2712,6 +2712,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
 
             uint64_t elapsed = nowTickMs() - frameStart;
             uint64_t targetInterval = (effectiveFps >= 60) ? 16 :
+                                      (effectiveFps >= 45) ? 22 :
                                       (effectiveFps >= 30) ? 33 : 66;
             if (elapsed < targetInterval) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(targetInterval - elapsed));
@@ -3133,9 +3134,16 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
             // 3. Compute & send AUTH_RESPONSE
             {
                 ByteWriter w;
-                if (autoReconnectingWithToken_.load() && !rebootResumeToken_.empty()) {
+                std::string tokenCopy;
+                {
+                    std::lock_guard<std::mutex> lock(rebootTokenMutex_);
+                    if (autoReconnectingWithToken_.load()) {
+                        tokenCopy = rebootResumeToken_;
+                    }
+                }
+                if (!tokenCopy.empty()) {
                     w.writeU8(2);
-                    auto tokenBytes = CryptoUtils::fromHex(rebootResumeToken_);
+                    auto tokenBytes = CryptoUtils::fromHex(tokenCopy);
                     if (tokenBytes.size() == 32) {
                         w.writeBytes(tokenBytes.data(), 32);
                     } else {
@@ -3464,6 +3472,9 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             int32_t monIdx = r.readI32();
                             int32_t fw = r.readI32();
                             int32_t fh = r.readI32();
+                            if (fw < 32 || fw > 8192 || fh < 32 || fh > 8192) {
+                                break;
+                            }
                             uint16_t mcount = r.readU16();
                             std::vector<MonitorDesc> mons;
                             for (uint16_t i = 0; i < mcount; ++i) {

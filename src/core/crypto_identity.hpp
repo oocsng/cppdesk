@@ -23,10 +23,10 @@ struct RecentSessionEntry {
 
 struct AppSettings {
     bool          darkTheme = false;                     // false = Light (White & Blue), true = Dark (Black & Blue)
-    uint8_t       targetFps = 30;                        // 15, 30, or 60 FPS
+    uint8_t       targetFps = 30;                        // 15, 30, 45, or 60 FPS
     bool          adaptiveFps = true;                    // Auto-drop FPS when network connection is poor
     QualityPreset defaultQuality = QualityPreset::Balanced;
-    ConnectionProfile connectionProfile = ConnectionProfile::Balanced; // One-Click Connection Quality Profile
+    ConnectionProfile connectionProfile = ConnectionProfile::BalancedBandwidth; // One-Click Connection Quality Profile
     uint8_t       defaultScaleMode = 0;                  // 0 = FitAspect, 1 = Stretch, 2 = Original 1:1
     bool          showRemoteCursor = true;               // Render remote cursor ring on viewer canvas
     bool          showSessionHud = true;                 // Show live FPS / RTT / Bitrate telemetry in session bar

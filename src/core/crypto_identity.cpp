@@ -465,7 +465,7 @@ bool IdentityManager::loadOrCreate() {
                 } catch (...) {}
             } else if (key == "connection_profile") {
                 try {
-                    int cp = std::clamp(std::stoi(val), 0, 3);
+                    int cp = std::clamp(std::stoi(val), 0, 4);
                     settings_.connectionProfile = static_cast<ConnectionProfile>(cp);
                 } catch (...) {}
             } else if (key == "default_scale") {

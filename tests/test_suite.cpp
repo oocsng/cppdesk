@@ -469,10 +469,15 @@ void testAppSettingsAndAdaptiveFps() {
     // 1. Verify clampTargetFps
     TEST_ASSERT(clampTargetFps(10) == 15);
     TEST_ASSERT(clampTargetFps(15) == 15);
+    TEST_ASSERT(clampTargetFps(20) == 15);
     TEST_ASSERT(clampTargetFps(28) == 30);
     TEST_ASSERT(clampTargetFps(30) == 30);
-    TEST_ASSERT(clampTargetFps(45) == 30);
-    TEST_ASSERT(clampTargetFps(50) == 60);
+    TEST_ASSERT(clampTargetFps(37) == 30);
+    TEST_ASSERT(clampTargetFps(40) == 45);
+    TEST_ASSERT(clampTargetFps(45) == 45);
+    TEST_ASSERT(clampTargetFps(50) == 45);
+    TEST_ASSERT(clampTargetFps(52) == 45);
+    TEST_ASSERT(clampTargetFps(55) == 60);
     TEST_ASSERT(clampTargetFps(60) == 60);
     TEST_ASSERT(clampTargetFps(120) == 60);
 
@@ -2814,7 +2819,7 @@ void testSystemHealthDiagnosticsAndHardwareSpecs() {
 }
 
 void testConnectionQualityProfiles() {
-    std::cout << "[TEST 30] One-Click Connection Quality Profiles (Low Bandwidth, Balanced, Ultra LAN)...\n" << std::flush;
+    std::cout << "[TEST 30] One-Click Connection Quality Profiles (Low Bandwidth, Balanced, High, Very High)...\n" << std::flush;
 
     // 1. Profile Mapping & Parameter Verification
     QualityPreset qp{};
@@ -2828,34 +2833,56 @@ void testConnectionQualityProfiles() {
     TEST_ASSERT(adaptive == true);
     TEST_ASSERT(std::string(connectionProfileName(ConnectionProfile::LowBandwidth)) == "Low Bandwidth");
 
-    // Balanced
+    // BalancedBandwidth
+    getProfileSettings(ConnectionProfile::BalancedBandwidth, qp, fps, adaptive);
+    TEST_ASSERT(qp == QualityPreset::Balanced);
+    TEST_ASSERT(fps == 30);
+    TEST_ASSERT(adaptive == true);
+    TEST_ASSERT(std::string(connectionProfileName(ConnectionProfile::BalancedBandwidth)) == "Balanced Bandwidth");
+
+    // Balanced alias
     getProfileSettings(ConnectionProfile::Balanced, qp, fps, adaptive);
     TEST_ASSERT(qp == QualityPreset::Balanced);
     TEST_ASSERT(fps == 30);
     TEST_ASSERT(adaptive == true);
-    TEST_ASSERT(std::string(connectionProfileName(ConnectionProfile::Balanced)) == "Balanced");
+    TEST_ASSERT(std::string(connectionProfileName(ConnectionProfile::Balanced)) == "Balanced Bandwidth");
 
-    // UltraLAN
+    // HighBandwidth
+    getProfileSettings(ConnectionProfile::HighBandwidth, qp, fps, adaptive);
+    TEST_ASSERT(qp == QualityPreset::Balanced);
+    TEST_ASSERT(fps == 45);
+    TEST_ASSERT(adaptive == true);
+    TEST_ASSERT(std::string(connectionProfileName(ConnectionProfile::HighBandwidth)) == "High Bandwidth");
+
+    // VeryHighBandwidth
+    getProfileSettings(ConnectionProfile::VeryHighBandwidth, qp, fps, adaptive);
+    TEST_ASSERT(qp == QualityPreset::Ultra);
+    TEST_ASSERT(fps == 60);
+    TEST_ASSERT(adaptive == false);
+    TEST_ASSERT(std::string(connectionProfileName(ConnectionProfile::VeryHighBandwidth)) == "Very High Bandwidth");
+
+    // UltraLAN alias
     getProfileSettings(ConnectionProfile::UltraLAN, qp, fps, adaptive);
     TEST_ASSERT(qp == QualityPreset::Ultra);
     TEST_ASSERT(fps == 60);
     TEST_ASSERT(adaptive == false);
-    TEST_ASSERT(std::string(connectionProfileName(ConnectionProfile::UltraLAN)) == "Ultra LAN");
+    TEST_ASSERT(std::string(connectionProfileName(ConnectionProfile::UltraLAN)) == "Very High Bandwidth");
 
     // Custom
     TEST_ASSERT(std::string(connectionProfileName(ConnectionProfile::Custom)) == "Custom");
 
     // 2. Profile Inference Tests
     TEST_ASSERT(inferConnectionProfile(QualityPreset::LowBandwidth, 15, true) == ConnectionProfile::LowBandwidth);
-    TEST_ASSERT(inferConnectionProfile(QualityPreset::Balanced, 30, true) == ConnectionProfile::Balanced);
-    TEST_ASSERT(inferConnectionProfile(QualityPreset::Ultra, 60, false) == ConnectionProfile::UltraLAN);
+    TEST_ASSERT(inferConnectionProfile(QualityPreset::Balanced, 30, true) == ConnectionProfile::BalancedBandwidth);
+    TEST_ASSERT(inferConnectionProfile(QualityPreset::Balanced, 45, true) == ConnectionProfile::HighBandwidth);
+    TEST_ASSERT(inferConnectionProfile(QualityPreset::Ultra, 60, false) == ConnectionProfile::VeryHighBandwidth);
     TEST_ASSERT(inferConnectionProfile(QualityPreset::Ultra, 30, true) == ConnectionProfile::Custom);
     TEST_ASSERT(inferConnectionProfile(QualityPreset::LowBandwidth, 60, false) == ConnectionProfile::Custom);
     TEST_ASSERT(inferConnectionProfile(QualityPreset::Balanced, 60, false) == ConnectionProfile::Custom);
 
     // 3. Settings Persistence Verification
     AppSettings s{};
-    s.connectionProfile = ConnectionProfile::UltraLAN;
+    s.connectionProfile = ConnectionProfile::VeryHighBandwidth;
     s.defaultQuality = QualityPreset::Ultra;
     s.targetFps = 60;
     s.adaptiveFps = false;
@@ -2863,10 +2890,17 @@ void testConnectionQualityProfiles() {
     IdentityManager idMgr(98);
     idMgr.updateSettings(s);
     AppSettings loaded = idMgr.settings();
-    TEST_ASSERT(loaded.connectionProfile == ConnectionProfile::UltraLAN);
+    TEST_ASSERT(loaded.connectionProfile == ConnectionProfile::VeryHighBandwidth);
     TEST_ASSERT(loaded.defaultQuality == QualityPreset::Ultra);
     TEST_ASSERT(loaded.targetFps == 60);
     TEST_ASSERT(loaded.adaptiveFps == false);
+
+    s.connectionProfile = ConnectionProfile::HighBandwidth;
+    s.targetFps = 45;
+    idMgr.updateSettings(s);
+    loaded = idMgr.settings();
+    TEST_ASSERT(loaded.connectionProfile == ConnectionProfile::HighBandwidth);
+    TEST_ASSERT(loaded.targetFps == 45);
 
     // 4. Network Engine Profile Application
     NetworkEngine net(idMgr);
@@ -2877,12 +2911,31 @@ void testConnectionQualityProfiles() {
     TEST_ASSERT(st.targetFps == 15);
     TEST_ASSERT(st.adaptiveFps == true);
 
-    net.applyConnectionProfile(ConnectionProfile::UltraLAN);
+    net.applyConnectionProfile(ConnectionProfile::BalancedBandwidth);
     st = net.viewerStats();
-    TEST_ASSERT(st.connectionProfile == ConnectionProfile::UltraLAN);
+    TEST_ASSERT(st.connectionProfile == ConnectionProfile::BalancedBandwidth);
+    TEST_ASSERT(st.qualityPreset == QualityPreset::Balanced);
+    TEST_ASSERT(st.targetFps == 30);
+    TEST_ASSERT(st.adaptiveFps == true);
+
+    net.applyConnectionProfile(ConnectionProfile::HighBandwidth);
+    st = net.viewerStats();
+    TEST_ASSERT(st.connectionProfile == ConnectionProfile::HighBandwidth);
+    TEST_ASSERT(st.qualityPreset == QualityPreset::Balanced);
+    TEST_ASSERT(st.targetFps == 45);
+    TEST_ASSERT(st.adaptiveFps == true);
+
+    net.applyConnectionProfile(ConnectionProfile::VeryHighBandwidth);
+    st = net.viewerStats();
+    TEST_ASSERT(st.connectionProfile == ConnectionProfile::VeryHighBandwidth);
     TEST_ASSERT(st.qualityPreset == QualityPreset::Ultra);
     TEST_ASSERT(st.targetFps == 60);
     TEST_ASSERT(st.adaptiveFps == false);
+
+    // Verify alias
+    net.applyConnectionProfile(ConnectionProfile::UltraLAN);
+    st = net.viewerStats();
+    TEST_ASSERT(st.connectionProfile == ConnectionProfile::VeryHighBandwidth);
 }
 
 void testDxgiDirtyRectsAndGdiRecycling() {
@@ -6482,6 +6535,61 @@ void testCrossPlatformUiWindowingAndMacOsViewer() {
             canvas.data(), canvasW, canvasH, canvasPitch,
             nullptr, 0, 0, tileW, tileH, tilePitch);
         TEST_ASSERT(!nullSrc);
+    }
+
+    // Sub-test 4: MacBook-Style Fluid Spring Physics & Tactile Transform Math
+    {
+        // 4.1: Spring physics integration (UiPlatform::stepSpring)
+        float pos = 0.0f;
+        float vel = 0.0f;
+        float target = 1.0f;
+        const float omega = 32.0f;
+        const float zeta = 0.72f;
+        const float dt = 0.016f;
+
+        bool inMotion = false;
+        float maxOvershoot = 0.0f;
+        for (int frame = 0; frame < 60; ++frame) {
+            bool moving = UiPlatform::stepSpring(pos, vel, target, omega, zeta, dt);
+            if (moving) inMotion = true;
+            if (pos > target) {
+                maxOvershoot = std::max(maxOvershoot, pos - target);
+            }
+        }
+
+        TEST_ASSERT(inMotion);
+        TEST_ASSERT(std::abs(pos - target) < 0.002f);
+        TEST_ASSERT(std::abs(vel) < 0.01f);
+        TEST_ASSERT(maxOvershoot > 0.005f);
+
+        // 4.2: Tactile transformed rect geometry (UiPlatform::computeSpringRect)
+        UiPlatformRect baseBtn = { 100.0f, 200.0f, 200.0f, 240.0f };
+
+        // Resting state: hoverT = 0, pressT = 0
+        UiPlatformRect restRect = UiPlatform::computeSpringRect(baseBtn, 0.0f, 0.0f);
+        TEST_ASSERT(std::abs(restRect.left - baseBtn.left) < 0.001f);
+        TEST_ASSERT(std::abs(restRect.top - baseBtn.top) < 0.001f);
+        TEST_ASSERT(std::abs(restRect.width() - baseBtn.width()) < 0.001f);
+        TEST_ASSERT(std::abs(restRect.height() - baseBtn.height()) < 0.001f);
+
+        // Hover state (hoverT = 1.0, pressT = 0): expands bounds, lifts upward
+        UiPlatformRect hoverRect = UiPlatform::computeSpringRect(baseBtn, 1.0f, 0.0f);
+        TEST_ASSERT(hoverRect.width() > baseBtn.width());
+        TEST_ASSERT(hoverRect.height() > baseBtn.height());
+        TEST_ASSERT(hoverRect.top < baseBtn.top);
+        TEST_ASSERT(std::abs(hoverRect.centerY() - (baseBtn.centerY() - 1.8f)) < 0.05f);
+
+        // Pressed state (hoverT = 1.0, pressT = 1.0): squishes down, depresses downward
+        UiPlatformRect pressRect = UiPlatform::computeSpringRect(baseBtn, 1.0f, 1.0f);
+        TEST_ASSERT(pressRect.width() < hoverRect.width());
+        TEST_ASSERT(pressRect.height() < hoverRect.height());
+        TEST_ASSERT(pressRect.top > hoverRect.top);
+
+        // Standalone press from rest (hoverT = 0, pressT = 1.0)
+        UiPlatformRect pressFromRest = UiPlatform::computeSpringRect(baseBtn, 0.0f, 1.0f);
+        TEST_ASSERT(pressFromRest.width() < baseBtn.width());
+        TEST_ASSERT(pressFromRest.height() < baseBtn.height());
+        TEST_ASSERT(pressFromRest.top > baseBtn.top);
     }
 }
 

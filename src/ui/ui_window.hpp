@@ -188,10 +188,12 @@ private:
                     float radius, std::function<void()> onClick, IDWriteTextFormat* fmt = nullptr,
                     bool hasBorder = false, D2D1_COLOR_F borderColor = D2D1::ColorF(0, 0, 0, 0),
                     D2D1_COLOR_F hoverTextColor = D2D1::ColorF(0, 0, 0, -1.0f));
+    UiRect getWidgetAnimRect(const std::string& id, const UiRect& r) const;
     void drawTextField(const std::string& id, FocusedField fieldType, const UiRect& r,
                        const std::string& value, const std::string& placeholder, bool maskPassword);
     void drawToggleSwitch(const std::string& id, const UiRect& r, bool checked,
-                          const std::string& label, std::function<void()> onToggle);
+                          const std::string& label, std::function<void()> onToggle,
+                          const std::string& tooltip = "");
     void ensureAppIconBitmap();
 
     // Two-Factor Authentication (TOTP) rendering
@@ -225,7 +227,7 @@ private:
     void closeRecordingPlayer();
     void switchToSessionTab(uint32_t tabId, bool force = false);
     void closeSessionTab(uint32_t tabId);
-    void showToast(const std::string& message, bool isError = false);
+    void showToast(const std::string& message, bool isError = false, uint32_t durationMs = 3000);
     void restoreFromTray(NotificationType contextType = NotificationType::GeneralInfo);
     bool mapCanvasPointToNormalized(float x, float y, float& outNormX, float& outNormY) const;
     std::string* activeFocusedTextBuffer();
@@ -253,6 +255,7 @@ private:
     IDWriteTextFormat*      fmtBodyBold_ = nullptr;
     IDWriteTextFormat*      fmtSmall_ = nullptr;
     IDWriteTextFormat*      fmtMono_ = nullptr;
+    IDWriteTextFormat*      fmtTooltip_ = nullptr;
 
     // Interactive UI state
     ActiveTab               activeTab_ = ActiveTab::Dashboard;
@@ -331,9 +334,6 @@ private:
 
     float                   viewportPos_ = 0.0f;
     float                   viewportVel_ = 0.0f;
-    float                   dashViewAnimT_ = 1.0f;
-    float                   sessViewAnimT_ = 0.0f;
-    float                   settingsViewAnimT_ = 0.0f;
     float                   tabEnterStaggerT_ = 1.0f;
     float                   tabEnterStaggerVel_ = 0.0f;
 
@@ -350,10 +350,14 @@ private:
     float                   themeAnimVel_ = 0.0f;
     float                   drawerAnimT_ = 0.0f;
     float                   drawerAnimVel_ = 0.0f;
+    float                   drawerWidth_ = 395.0f;
+    float                   drawerWidthVel_ = 0.0f;
     float                   modalAnimT_ = 0.0f;
     float                   modalAnimVel_ = 0.0f;
     float                   toastAnimT_ = 0.0f;
     float                   toastAnimVel_ = 0.0f;
+    float                   toastWidth_ = 280.0f;
+    float                   toastWidthVel_ = 0.0f;
     float                   transferProgSmooth_[16]{};
 
     // Toast notification
@@ -368,6 +372,14 @@ private:
     bool                    showDisplayMenu_ = false;
     bool                    showAdminMenu_ = false;
     bool                    showQualityMenu_ = false;
+    float                   displayMenuAnimT_ = 0.0f;
+    float                   displayMenuAnimVel_ = 0.0f;
+    float                   adminMenuAnimT_ = 0.0f;
+    float                   adminMenuAnimVel_ = 0.0f;
+    float                   qualityMenuAnimT_ = 0.0f;
+    float                   qualityMenuAnimVel_ = 0.0f;
+    float                   audioPopAnimT_ = 0.0f;
+    float                   audioPopAnimVel_ = 0.0f;
     bool                    lastClipTransferActive_ = false;
     uint64_t                lastClipTransferBytes_ = 0;
 
@@ -540,6 +552,8 @@ private:
     // 60-Second In-Memory Session Rewind Scrubber
     SessionRewindBuffer     rewindBuffer_;
     bool                    showRewindScrubber_ = false;
+    float                   rewindScrubberAnimT_ = 0.0f;
+    float                   rewindScrubberAnimVel_ = 0.0f;
     int64_t                 rewindOffsetMs_ = 0;
     bool                    rewindFrozen_ = false;
     bool                    draggingRewindScrubber_ = false;
@@ -567,6 +581,14 @@ private:
 
     // Privacy Cloak Settings UI
     std::string             privacyKeywordsEdit_;
+
+    // Settings Hover Tooltips
+    struct TooltipHitRegion { UiRect rect; std::string text; };
+    std::vector<TooltipHitRegion> activeTooltips_;
+    std::string             activeTooltipText_;
+    UiRect                  activeTooltipTargetRect_{};
+    float                   tooltipAnimT_ = 0.0f;
+    float                   tooltipAnimVel_ = 0.0f;
 };
 
 #elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
