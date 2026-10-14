@@ -92,14 +92,21 @@ bool SessionRecordingPlayer::open(const std::string& filePath) {
     }
 
     fileStream_.seekg(0, std::ios::end);
-    uint64_t fileLen = fileStream_.tellg();
+    auto endPos = fileStream_.tellg();
+    if (endPos < 0) {
+        fileStream_.close();
+        return false;
+    }
+    uint64_t fileLen = static_cast<uint64_t>(endPos);
     fileStream_.seekg(12);
 
     std::vector<AviIndexEntry> rawIndexEntries;
 
     // 2. Traverse top-level RIFF chunks
-    while (fileStream_.tellg() < static_cast<std::streamoff>(fileLen) && fileStream_.good()) {
-        uint64_t chunkPos = fileStream_.tellg();
+    while (fileStream_.good()) {
+        auto curTell = fileStream_.tellg();
+        if (curTell < 0 || curTell >= static_cast<std::streamoff>(fileLen)) break;
+        uint64_t chunkPos = static_cast<uint64_t>(curTell);
         uint32_t ckid = 0;
         uint32_t ckSize = 0;
         fileStream_.read(reinterpret_cast<char*>(&ckid), 4);
@@ -218,7 +225,8 @@ bool SessionRecordingPlayer::open(const std::string& filePath) {
                 uint64_t candC = moviListHeaderOffset_ + entry.offset;
 
                 auto testCandidate = [this, &entry](uint64_t pos) -> bool {
-                    if (pos + 4 > static_cast<uint64_t>(fileStream_.tellg())) {
+                    auto curG = fileStream_.tellg();
+                    if (curG < 0 || pos + 4 > static_cast<uint64_t>(curG)) {
                         fileStream_.clear();
                     }
                     fileStream_.seekg(pos);
@@ -519,12 +527,18 @@ void SessionRecordingPlayer::play() {
     if (currentFrameIndex_.load() >= totalFrames_ - 1) {
         seekToFrame(0);
     }
-    isPlaying_.store(true);
+    {
+        std::lock_guard<std::mutex> lock(playbackMutex_);
+        isPlaying_.store(true);
+    }
     playbackCv_.notify_all();
 }
 
 void SessionRecordingPlayer::pause() {
-    isPlaying_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(playbackMutex_);
+        isPlaying_.store(false);
+    }
     playbackCv_.notify_all();
 }
 
@@ -538,7 +552,10 @@ void SessionRecordingPlayer::togglePlayPause() {
 
 void SessionRecordingPlayer::setSpeed(float speed) {
     if (speed <= 0.05f) speed = 1.0f;
-    speedMultiplier_.store(speed);
+    {
+        std::lock_guard<std::mutex> lock(playbackMutex_);
+        speedMultiplier_.store(speed);
+    }
     playbackCv_.notify_all();
 }
 
@@ -575,13 +592,19 @@ void SessionRecordingPlayer::playbackWorkerLoop() {
 
 void SessionRecordingPlayer::startPlaybackThread() {
     stopPlaybackThread();
-    workerStopping_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(playbackMutex_);
+        workerStopping_.store(false);
+    }
     playbackThread_ = std::thread(&SessionRecordingPlayer::playbackWorkerLoop, this);
 }
 
 void SessionRecordingPlayer::stopPlaybackThread() {
-    workerStopping_.store(true);
-    isPlaying_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(playbackMutex_);
+        workerStopping_.store(true);
+        isPlaying_.store(false);
+    }
     playbackCv_.notify_all();
     if (playbackThread_.joinable()) {
         playbackThread_.join();

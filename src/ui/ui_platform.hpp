@@ -69,6 +69,12 @@ public:
 
     static bool blitTileToCanvas(uint8_t* dstCanvas, int canvasWidth, int canvasHeight, int canvasPitch,
                                 const uint8_t* srcTile, int tileX, int tileY, int tileWidth, int tileHeight, int tilePitch);
+
+    // Second-order damped harmonic oscillator (macOS CoreAnimation CASpringAnimation physics)
+    static bool stepSpring(float& pos, float& vel, float target, float omega, float zeta, float dt, float eps = 0.0012f);
+
+    // Compute MacBook-style tactile spring transformed rect (hover expands 2.8%, lifts -1.8px; press squishes 4.8%, depresses +1.6px)
+    static UiPlatformRect computeSpringRect(const UiPlatformRect& base, float hoverT, float pressT);
 };
 
 inline ViewportGeometry calculateViewportGeometry(float viewWidth, float viewHeight, uint32_t frameWidth, uint32_t frameHeight, ScaleMode scaleMode) {

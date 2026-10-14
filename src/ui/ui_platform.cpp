@@ -283,4 +283,44 @@ bool UiPlatform::blitTileToCanvas(uint8_t* dstCanvas, int canvasWidth, int canva
     return true;
 }
 
+bool UiPlatform::stepSpring(float& pos, float& vel, float target, float omega, float zeta, float dt, float eps) {
+    float diff = pos - target;
+    if (std::fabs(diff) <= eps && std::fabs(vel) <= eps * 8.0f) {
+        if (pos != target || vel != 0.0f) {
+            pos = target;
+            vel = 0.0f;
+            return true;
+        }
+        return false;
+    }
+
+    int steps = (dt > 0.008f) ? static_cast<int>(std::ceil(dt / 0.008f)) : 1;
+    steps = std::clamp(steps, 1, 6);
+    float subDt = dt / static_cast<float>(steps);
+
+    for (int i = 0; i < steps; ++i) {
+        float disp = pos - target;
+        float accel = (-omega * omega * disp) - (2.0f * zeta * omega * vel);
+        vel += accel * subDt;
+        pos += vel * subDt;
+    }
+
+    if (std::fabs(pos - target) <= eps && std::fabs(vel) <= eps * 8.0f) {
+        pos = target;
+        vel = 0.0f;
+    }
+    return true;
+}
+
+UiPlatformRect UiPlatform::computeSpringRect(const UiPlatformRect& base, float hoverT, float pressT) {
+    float hT = std::clamp(hoverT, 0.0f, 1.25f);
+    float pT = std::clamp(pressT, -0.25f, 1.25f);
+    float scaleDelta = (0.028f * hT) - (0.048f * pT);
+    float dx = std::max(base.width() * scaleDelta * 0.5f, 1.2f * hT - 1.8f * pT);
+    float dy = std::max(base.height() * scaleDelta * 0.5f, 0.9f * hT - 1.5f * pT);
+    float liftY = (-1.8f * hT) + (1.6f * pT);
+    return base.inflate(dx, dy).offset(0.0f, liftY);
+}
+
 } // namespace cppdesk
+

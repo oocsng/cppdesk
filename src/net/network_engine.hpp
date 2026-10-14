@@ -97,7 +97,7 @@ struct ViewerSessionStats {
     uint64_t              connectedSinceTickMs = 0;
     uint8_t               grantedPermissions = PERM_ALL;
     QualityPreset         qualityPreset = QualityPreset::Balanced;
-    ConnectionProfile     connectionProfile = ConnectionProfile::Balanced;
+    ConnectionProfile     connectionProfile = ConnectionProfile::BalancedBandwidth;
     uint8_t               targetFps = 30;
     uint8_t               effectiveFpsCap = 30;
     bool                  adaptiveFps = true;

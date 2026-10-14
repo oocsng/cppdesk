@@ -198,25 +198,30 @@ enum class QualityPreset : uint8_t {
 
 inline uint8_t clampTargetFps(uint8_t fps) {
     if (fps <= 20) return 15;
-    if (fps <= 45) return 30;
+    if (fps <= 37) return 30;
+    if (fps <= 52) return 45;
     return 60;
 }
 
 // One-Click Connection Quality Profiles
 enum class ConnectionProfile : uint8_t {
-    LowBandwidth = 0, // 15 FPS, LowBandwidth preset (JPEG Q50), Adaptive FPS ON
-    Balanced     = 1, // 30 FPS, Balanced preset (JPEG Q75/Zstd), Adaptive FPS ON
-    UltraLAN     = 2, // 60 FPS, Ultra preset (JPEG Q90/lossless UI), Adaptive FPS OFF
-    Custom       = 3  // User-defined combination of FPS and Quality
+    LowBandwidth      = 0, // 15 FPS, LowBandwidth preset (JPEG Q50), Adaptive FPS ON
+    BalancedBandwidth = 1, // 30 FPS, Balanced preset (JPEG Q75/Zstd), Adaptive FPS ON
+    HighBandwidth     = 2, // 45 FPS, Balanced preset (JPEG Q75/Zstd), Adaptive FPS ON
+    VeryHighBandwidth = 3, // 60 FPS, Ultra preset (JPEG Q90/lossless UI), Adaptive FPS OFF
+    Custom            = 4, // User-defined combination of FPS and Quality
+    Balanced          = BalancedBandwidth,
+    UltraLAN          = VeryHighBandwidth
 };
 
 inline const char* connectionProfileName(ConnectionProfile profile) {
     switch (profile) {
-        case ConnectionProfile::LowBandwidth: return "Low Bandwidth";
-        case ConnectionProfile::Balanced:     return "Balanced";
-        case ConnectionProfile::UltraLAN:     return "Ultra LAN";
-        case ConnectionProfile::Custom:       return "Custom";
-        default:                              return "Balanced";
+        case ConnectionProfile::LowBandwidth:      return "Low Bandwidth";
+        case ConnectionProfile::BalancedBandwidth: return "Balanced Bandwidth";
+        case ConnectionProfile::HighBandwidth:     return "High Bandwidth";
+        case ConnectionProfile::VeryHighBandwidth: return "Very High Bandwidth";
+        case ConnectionProfile::Custom:            return "Custom";
+        default:                                   return "Balanced Bandwidth";
     }
 }
 
@@ -227,12 +232,17 @@ inline void getProfileSettings(ConnectionProfile profile, QualityPreset& outQp, 
             outFps = 15;
             outAdaptive = true;
             break;
-        case ConnectionProfile::UltraLAN:
+        case ConnectionProfile::HighBandwidth:
+            outQp = QualityPreset::Balanced;
+            outFps = 45;
+            outAdaptive = true;
+            break;
+        case ConnectionProfile::VeryHighBandwidth:
             outQp = QualityPreset::Ultra;
             outFps = 60;
             outAdaptive = false;
             break;
-        case ConnectionProfile::Balanced:
+        case ConnectionProfile::BalancedBandwidth:
         default:
             outQp = QualityPreset::Balanced;
             outFps = 30;
@@ -245,11 +255,14 @@ inline ConnectionProfile inferConnectionProfile(QualityPreset qp, uint8_t fps, b
     if (qp == QualityPreset::LowBandwidth && fps <= 20 && adaptive) {
         return ConnectionProfile::LowBandwidth;
     }
-    if (qp == QualityPreset::Balanced && fps > 20 && fps <= 45 && adaptive) {
-        return ConnectionProfile::Balanced;
+    if (qp == QualityPreset::Balanced && fps > 20 && fps <= 37 && adaptive) {
+        return ConnectionProfile::BalancedBandwidth;
     }
-    if (qp == QualityPreset::Ultra && fps > 45 && !adaptive) {
-        return ConnectionProfile::UltraLAN;
+    if (qp == QualityPreset::Balanced && fps > 37 && fps <= 52 && adaptive) {
+        return ConnectionProfile::HighBandwidth;
+    }
+    if (qp == QualityPreset::Ultra && fps > 52 && !adaptive) {
+        return ConnectionProfile::VeryHighBandwidth;
     }
     return ConnectionProfile::Custom;
 }
