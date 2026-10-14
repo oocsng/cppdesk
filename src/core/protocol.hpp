@@ -16,8 +16,8 @@ namespace cppdesk {
 constexpr uint32_t PROTOCOL_MAGIC   = 0x43505044; // "CPPD" (CppDesk packet magic)
 constexpr uint32_t RELAY_MAGIC      = 0x4344534B; // "CDSK" (CppDesk relay magic)
 constexpr uint16_t PROTOCOL_VERSION = 3;
-constexpr const char* CPP_DESK_VERSION = "3.5.2";
-constexpr uint32_t CPP_DESK_VERSION_NUM = 0x030502;
+constexpr const char* CPP_DESK_VERSION = "3.5.3";
+constexpr uint32_t CPP_DESK_VERSION_NUM = 0x030503;
 
 struct SemanticVersion {
     int major = 0;

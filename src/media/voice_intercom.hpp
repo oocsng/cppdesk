@@ -22,12 +22,28 @@
 
 namespace cppdesk {
 
+struct AudioDeviceDesc {
+    int id = -1;
+    std::string name;
+    bool isDefault = false;
+};
+
 class VoiceIntercom {
 public:
     using AudioChunkCallback = std::function<void(const uint8_t* pcm, size_t bytes, uint32_t sampleRate, uint8_t channels)>;
 
     VoiceIntercom();
     ~VoiceIntercom();
+
+    // Audio device enumeration
+    static std::vector<AudioDeviceDesc> enumerateInputDevices();
+    static std::vector<AudioDeviceDesc> enumerateOutputDevices();
+
+    // Device selection
+    void setInputDeviceId(int id) { selectedInputDeviceId_ = id; }
+    void setOutputDeviceId(int id) { selectedOutputDeviceId_ = id; }
+    int inputDeviceId() const { return selectedInputDeviceId_; }
+    int outputDeviceId() const { return selectedOutputDeviceId_; }
 
     // Microphone capture (Win32 waveIn)
     bool startCapture(AudioChunkCallback onChunk, uint32_t sampleRate = 48000, uint8_t channels = 1);
@@ -69,6 +85,13 @@ private:
     AudioChunkCallback          onChunkCallback_;
     std::thread                 captureThread_;
 
+    int                         selectedInputDeviceId_{-1};
+    int                         selectedOutputDeviceId_{-1};
+    uint8_t                     hwChannels_{1};
+    uint32_t                    hwSampleRate_{48000};
+    uint8_t                     playbackChannels_{1};
+    uint32_t                    playbackSampleRate_{48000};
+
 #if defined(_WIN32)
     // Win32 waveIn handles & buffers
     HWAVEIN                     hWaveIn_{nullptr};
@@ -80,7 +103,7 @@ private:
     // Win32 waveOut handles & buffers
     mutable std::mutex          playbackMutex_;
     HWAVEOUT                    hWaveOut_{nullptr};
-    static constexpr size_t     NUM_PLAYBACK_BUFFERS = 3;
+    static constexpr size_t     NUM_PLAYBACK_BUFFERS = 8;
     WAVEHDR                     playbackHeaders_[NUM_PLAYBACK_BUFFERS]{};
     std::vector<uint8_t>        playbackBuffers_[NUM_PLAYBACK_BUFFERS];
     size_t                      currentPlayIdx_{0};
@@ -97,7 +120,7 @@ private:
     AudioQueueRef               outQueue_{nullptr};
     static constexpr size_t     NUM_CAPTURE_BUFFERS = 3;
     AudioQueueBufferRef         inBuffers_[NUM_CAPTURE_BUFFERS]{};
-    static constexpr size_t     NUM_PLAYBACK_BUFFERS = 3;
+    static constexpr size_t     NUM_PLAYBACK_BUFFERS = 8;
     AudioQueueBufferRef         outBuffers_[NUM_PLAYBACK_BUFFERS]{};
     size_t                      currentPlayIdx_{0};
     mutable std::mutex          playbackMutex_;

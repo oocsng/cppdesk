@@ -223,6 +223,7 @@ public:
     // Viewer: Outgoing connection & remote session control
     bool connectToRemote(const std::string& targetIdOrAddr, const std::string& password);
     void disconnectViewer();
+    bool isViewerActive() const { return viewerActive_.load(); }
 
     // Viewer 2FA synchronization
     void submitViewerTotpCode(const std::string& code);
@@ -239,6 +240,7 @@ public:
         int& outH,
         CursorState& outCursor,
         RECT* outDirtyBounds = nullptr) const;
+    void markViewerCanvasFullDirty();
 
     // Frame notification callback for event-driven 60 FPS viewer rendering
     void setOnFrameDecodedCallback(std::function<void()> cb);
@@ -364,7 +366,12 @@ public:
     void setVoiceIntercomMicMuted(bool muted);
     bool isVoiceIntercomMicMuted() const;
     float voiceIntercomInputLevel() const;
+    void setVoiceInputDevice(int id);
+    void setVoiceOutputDevice(int id);
     void handleIncomingVoiceChunk(const uint8_t* payload, size_t len);
+    bool startVoiceMonitor();
+    void stopVoiceMonitor();
+    bool isVoiceMonitoring() const;
 
     // Virtual Display Fit & Dynamic Resolution Matching (Feature 5)
     bool requestHostResolution(uint32_t width, uint32_t height, uint8_t mode = 2);

@@ -512,6 +512,10 @@ void testAppSettingsAndAdaptiveFps() {
         s.defaultPermissions = PERM_INPUT | PERM_CLIPBOARD;
         s.lockWorkstationOnDisconnect = true;
         s.hardwareAcceleration = false; // Hardware acceleration toggle
+        s.audioInputDeviceId = 2;
+        s.audioOutputDeviceId = 1;
+        s.audioInputDeviceName = "Studio Microphone USB";
+        s.audioOutputDeviceName = "High Definition Audio Headphones";
         idSave.updateSettings(s);
     }
     {
@@ -529,6 +533,10 @@ void testAppSettingsAndAdaptiveFps() {
         TEST_ASSERT(loaded.defaultPermissions == (PERM_INPUT | PERM_CLIPBOARD));
         TEST_ASSERT(loaded.lockWorkstationOnDisconnect == true);
         TEST_ASSERT(loaded.hardwareAcceleration == false);
+        TEST_ASSERT(loaded.audioInputDeviceId == 2);
+        TEST_ASSERT(loaded.audioOutputDeviceId == 1);
+        TEST_ASSERT(loaded.audioInputDeviceName == "Studio Microphone USB");
+        TEST_ASSERT(loaded.audioOutputDeviceName == "High Definition Audio Headphones");
 
         // Reset to defaults and verify
         idLoad.resetSettingsToDefault();
@@ -1153,8 +1161,8 @@ void testAutoUpdaterAndProtocolV3() {
     TEST_ASSERT(PROTOCOL_MAGIC == 0x43505044); // "CPPD"
     TEST_ASSERT(RELAY_MAGIC == 0x4344534B);    // "CDSK"
     TEST_ASSERT(PROTOCOL_VERSION == 3);
-    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.5.2");
-    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030502);
+    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.5.3");
+    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030503);
 
     // 2. Semantic Version Triad Parsing
     int maj = 0, min = 0, pat = 0;
@@ -1589,6 +1597,27 @@ void testBidirectionalVoiceIntercom() {
         // Enqueue playback chunk (should not crash even if device is missing or uninitialized)
         std::vector<int16_t> testSamples(480, 100);
         intercom.enqueuePlaybackChunk(reinterpret_cast<const uint8_t*>(testSamples.data()), testSamples.size() * sizeof(int16_t));
+
+        // 5. Audio Device Enumeration & Selection
+        auto inDevs = VoiceIntercom::enumerateInputDevices();
+        TEST_ASSERT(!inDevs.empty());
+        TEST_ASSERT(inDevs[0].id == -1);
+        TEST_ASSERT(inDevs[0].isDefault);
+
+        auto outDevs = VoiceIntercom::enumerateOutputDevices();
+        TEST_ASSERT(!outDevs.empty());
+        TEST_ASSERT(outDevs[0].id == -1);
+        TEST_ASSERT(outDevs[0].isDefault);
+
+        intercom.setInputDeviceId(2);
+        TEST_ASSERT(intercom.inputDeviceId() == 2);
+        intercom.setOutputDeviceId(3);
+        TEST_ASSERT(intercom.outputDeviceId() == 3);
+
+        IdentityManager testId(20);
+        NetworkEngine testNet(testId);
+        testNet.setVoiceInputDevice(2);
+        testNet.setVoiceOutputDevice(3);
     }
 }
 

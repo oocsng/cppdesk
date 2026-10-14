@@ -50,6 +50,10 @@ struct AppSettings {
     // Audio Controls & Persistence
     uint8_t       defaultAudioVolume = 100;              // 0 - 100%
     bool          audioMutedDefault = false;             // false = audible, true = muted
+    int           audioInputDeviceId = -1;               // -1 = Default (WAVE_MAPPER)
+    int           audioOutputDeviceId = -1;              // -1 = Default (WAVE_MAPPER)
+    std::string   audioInputDeviceName = "System Default";
+    std::string   audioOutputDeviceName = "System Default";
 
     // Virtual Multi-Display Driver & Headless Emulation
     bool          autoVirtualDisplay = true;             // Auto-provision virtual display for headless host
@@ -240,6 +244,7 @@ public:
 
     bool loadOrCreate();
     bool save() const;
+    bool saveConfig() const { return save(); }
 
     int instanceId() const { return instanceId_; }
     uint64_t deskId() const { return deskId_; }

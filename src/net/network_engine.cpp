@@ -1383,7 +1383,30 @@ void NetworkEngine::disconnectHostClient() {
                       enc ? &hostSendSeq_ : nullptr);
             hostCipher_.reset();
         }
-        closeWinSock(cs);
+        socket_t sock = toSocket(cs);
+        if (sock != INVALID_SOCKET_VAL) {
+            linger l{1, 0};
+            setsockopt(sock, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&l), sizeof(l));
+#if defined(_WIN32)
+            shutdown(sock, SD_BOTH);
+            closesocket(sock);
+#else
+            shutdown(sock, SHUT_RDWR);
+            close(sock);
+#endif
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(hostSessionThreadMutex_);
+        if (hostSessionThread_.joinable()) {
+            if (std::this_thread::get_id() != hostSessionThread_.get_id()) {
+                hostSessionThread_.join();
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(hostStatusMutex_);
+        hostStatus_ = HostSessionStatus{};
     }
 }
 
@@ -2783,7 +2806,18 @@ void NetworkEngine::disconnectViewer() {
                       enc ? &viewerSendSeq_ : nullptr);
             viewerCipher_.reset();
         }
-        closeWinSock(s);
+        socket_t sock = toSocket(s);
+        if (sock != INVALID_SOCKET_VAL) {
+            linger l{1, 0};
+            setsockopt(sock, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&l), sizeof(l));
+#if defined(_WIN32)
+            shutdown(sock, SD_BOTH);
+            closesocket(sock);
+#else
+            shutdown(sock, SHUT_RDWR);
+            close(sock);
+#endif
+        }
     }
     fileManager_.abortActiveTransfers();
     {
@@ -2793,14 +2827,26 @@ void NetworkEngine::disconnectViewer() {
         viewerTotpCv_.notify_all();
     }
     {
-        std::lock_guard<std::mutex> lock(viewerStatsMutex_);
-        if (viewerStats_.state != ViewerConnectionState::Error) {
-            viewerStats_.state = ViewerConnectionState::Disconnected;
-            viewerStats_.statusMessage = "Disconnected";
+        std::lock_guard<std::mutex> lk(viewerThreadMutex_);
+        if (viewerThread_.joinable()) {
+            if (std::this_thread::get_id() != viewerThread_.get_id()) {
+                viewerThread_.join();
+            }
         }
     }
     {
+        std::lock_guard<std::mutex> lock(viewerStatsMutex_);
+        viewerStats_ = ViewerSessionStats{};
+        viewerStats_.state = ViewerConnectionState::Disconnected;
+        viewerStats_.statusMessage = "Disconnected";
+    }
+    {
         std::lock_guard<std::mutex> lock(viewerFrameMutex_);
+        viewerCanvasBgra_.clear();
+        viewerCanvasBgra_.shrink_to_fit();
+        viewerCanvasW_ = 0;
+        viewerCanvasH_ = 0;
+        viewerFrameSeq_ = 0;
         viewerFullCanvasDirty_ = true;
         viewerDirtyBounds_ = RECT{0, 0, 0, 0};
     }
@@ -2852,12 +2898,13 @@ bool NetworkEngine::copyLatestViewerFrame(
         return false;
     }
 
+    bool missedFrames = (inOutSeq > 0 && viewerFrameSeq_ > inOutSeq + 1);
     bool resChanged = (outW != viewerCanvasW_ || outH != viewerCanvasH_ || outBgra.size() != viewerCanvasBgra_.size());
     inOutSeq = viewerFrameSeq_;
     outW = viewerCanvasW_;
     outH = viewerCanvasH_;
 
-    if (resChanged || viewerFullCanvasDirty_) {
+    if (resChanged || viewerFullCanvasDirty_ || missedFrames) {
         outBgra = viewerCanvasBgra_;
         if (outDirtyBounds) {
             *outDirtyBounds = RECT{0, 0, static_cast<LONG>(outW), static_cast<LONG>(outH)};
@@ -2883,6 +2930,14 @@ bool NetworkEngine::copyLatestViewerFrame(
         }
     }
     return true;
+}
+
+void NetworkEngine::markViewerCanvasFullDirty() {
+    std::lock_guard<std::mutex> lock(viewerFrameMutex_);
+    viewerFullCanvasDirty_ = true;
+    if (viewerCanvasW_ > 0 && viewerCanvasH_ > 0) {
+        viewerDirtyBounds_ = RECT{0, 0, static_cast<LONG>(viewerCanvasW_), static_cast<LONG>(viewerCanvasH_)};
+    }
 }
 
 void NetworkEngine::setOnFrameDecodedCallback(std::function<void()> cb) {
@@ -3497,6 +3552,8 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                 viewerCanvasW_ = fw;
                                 viewerCanvasH_ = fh;
                                 viewerCanvasBgra_.assign(static_cast<size_t>(fw) * fh * 4, 0);
+                                viewerFullCanvasDirty_ = true;
+                                viewerDirtyBounds_ = RECT{0, 0, static_cast<LONG>(fw), static_cast<LONG>(fh)};
                                 viewerFrameSeq_++;
                             }
                             {
@@ -3584,13 +3641,19 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                             viewerDirtyBounds_ = RECT{0, 0, static_cast<LONG>(fw), static_cast<LONG>(fh)};
                                         } else {
                                             if (maxX > minX && maxY > minY) {
-                                                viewerDirtyBounds_ = RECT{
-                                                    static_cast<LONG>(std::clamp(minX, 0, static_cast<int>(fw))),
-                                                    static_cast<LONG>(std::clamp(minY, 0, static_cast<int>(fh))),
-                                                    static_cast<LONG>(std::clamp(maxX, 0, static_cast<int>(fw))),
-                                                    static_cast<LONG>(std::clamp(maxY, 0, static_cast<int>(fh)))
-                                                };
-                                            } else {
+                                                LONG nLeft = static_cast<LONG>(std::clamp(minX, 0, static_cast<int>(fw)));
+                                                LONG nTop = static_cast<LONG>(std::clamp(minY, 0, static_cast<int>(fh)));
+                                                LONG nRight = static_cast<LONG>(std::clamp(maxX, 0, static_cast<int>(fw)));
+                                                LONG nBottom = static_cast<LONG>(std::clamp(maxY, 0, static_cast<int>(fh)));
+                                                if (viewerDirtyBounds_.right > viewerDirtyBounds_.left && viewerDirtyBounds_.bottom > viewerDirtyBounds_.top) {
+                                                    viewerDirtyBounds_.left = std::min(viewerDirtyBounds_.left, nLeft);
+                                                    viewerDirtyBounds_.top = std::min(viewerDirtyBounds_.top, nTop);
+                                                    viewerDirtyBounds_.right = std::max(viewerDirtyBounds_.right, nRight);
+                                                    viewerDirtyBounds_.bottom = std::max(viewerDirtyBounds_.bottom, nBottom);
+                                                } else {
+                                                    viewerDirtyBounds_ = RECT{ nLeft, nTop, nRight, nBottom };
+                                                }
+                                            } else if (viewerDirtyBounds_.right <= viewerDirtyBounds_.left) {
                                                 viewerDirtyBounds_ = RECT{0, 0, 0, 0};
                                             }
                                         }
@@ -4933,6 +4996,19 @@ bool NetworkEngine::startVoiceIntercom() {
 }
 
 void NetworkEngine::stopVoiceIntercom() {
+    VoiceChunkHeader hdr{};
+    hdr.sampleRate = 48000;
+    hdr.channels = 1;
+    hdr.bitsPerSample = 16;
+    hdr.flags = 0x04;
+    hdr.sampleFrames = 0;
+
+    if (viewerActive_.load()) {
+        sendViewerEncryptedPacket(PacketType::VOICE_INTERCOM_CHUNK, 0, &hdr, sizeof(hdr));
+    } else if (activeHostClientSock_.load() != ~uintptr_t(0)) {
+        sendHostEncryptedPacket(PacketType::VOICE_INTERCOM_CHUNK, 0, &hdr, sizeof(hdr));
+    }
+
     voiceIntercom_.stopCapture();
     voiceIntercom_.stopPlayback();
 }
@@ -4953,9 +5029,46 @@ float NetworkEngine::voiceIntercomInputLevel() const {
     return voiceIntercom_.inputLevel();
 }
 
+void NetworkEngine::setVoiceInputDevice(int id) {
+    bool wasMonitoring = (voiceIntercom_.isCapturing() && !viewerActive_.load() && activeHostClientSock_.load() == ~uintptr_t(0));
+    voiceIntercom_.setInputDeviceId(id);
+    if (wasMonitoring) {
+        voiceIntercom_.stopCapture();
+        voiceIntercom_.startCapture(nullptr, 48000, 1);
+    }
+}
+
+void NetworkEngine::setVoiceOutputDevice(int id) {
+    voiceIntercom_.setOutputDeviceId(id);
+}
+
+bool NetworkEngine::startVoiceMonitor() {
+    if (voiceIntercom_.isCapturing()) return true;
+    return voiceIntercom_.startCapture(nullptr, 48000, 1);
+}
+
+void NetworkEngine::stopVoiceMonitor() {
+    if (!viewerActive_.load() && activeHostClientSock_.load() == ~uintptr_t(0)) {
+        if (voiceIntercom_.isCapturing()) {
+            voiceIntercom_.stopCapture();
+        }
+    }
+}
+
+bool NetworkEngine::isVoiceMonitoring() const {
+    return voiceIntercom_.isCapturing();
+}
+
 void NetworkEngine::handleIncomingVoiceChunk(const uint8_t* payload, size_t len) {
     if (!payload || len < sizeof(VoiceChunkHeader)) return;
     const auto* hdr = reinterpret_cast<const VoiceChunkHeader*>(payload);
+
+    if (hdr->flags & 0x04) {
+        voiceIntercom_.stopCapture();
+        voiceIntercom_.stopPlayback();
+        return;
+    }
+
     const uint8_t* pcm = payload + sizeof(VoiceChunkHeader);
     size_t pcmBytes = len - sizeof(VoiceChunkHeader);
     if (pcmBytes == 0) return;
@@ -4967,6 +5080,10 @@ void NetworkEngine::handleIncomingVoiceChunk(const uint8_t* payload, size_t len)
         voiceIntercom_.startPlayback(srate, ch);
     }
     voiceIntercom_.enqueuePlaybackChunk(pcm, pcmBytes);
+
+    if (!voiceIntercom_.isCapturing() && activeHostClientSock_.load() != ~uintptr_t(0)) {
+        startVoiceIntercom();
+    }
 }
 
 // ---------------- Remote Terminal & TCP Port Forwarding (v2.1.0) ----------------

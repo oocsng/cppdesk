@@ -159,6 +159,8 @@ CppDeskWindow::CppDeskWindow(IdentityManager& identity, NetworkEngine& network, 
     scaleMode_ = static_cast<ScaleMode>(std::clamp<int>(s.defaultScaleMode, 0, 3));
     network_.setAudioVolume(s.defaultAudioVolume);
     network_.setAudioMuted(s.audioMutedDefault);
+    network_.setVoiceInputDevice(s.audioInputDeviceId);
+    network_.setVoiceOutputDevice(s.audioOutputDeviceId);
     network_.configurePrivacyCurtain(s.privacyCustomNotice, s.privacyBrandName, s.privacyShowDeskId);
     updateActivePalette(themeAnimT_);
     updateTotpQrMatrix();
@@ -207,8 +209,37 @@ void CppDeskWindow::applyWindowThemeAttribute() {
     DwmSetWindowAttribute(hwnd_, DWMWA_WINDOW_CORNER_PREFERENCE, &cornerPref, sizeof(cornerPref));
 }
 
+void CppDeskWindow::hardResetViewerUiState() {
+    frameBufferBgra_.clear();
+    frameBufferBgra_.shrink_to_fit();
+    frameBufferW_ = 0;
+    frameBufferH_ = 0;
+    displayedFrameSeq_ = 0;
+
+    if (remoteBitmap_) {
+        remoteBitmap_->Release();
+        remoteBitmap_ = nullptr;
+    }
+    bitmapW_ = 0;
+    bitmapH_ = 0;
+
+    rewindBuffer_.clear();
+    rewindCachedFrameBgra_.clear();
+    rewindCachedFrameBgra_.shrink_to_fit();
+    rewindCachedW_ = 0;
+    rewindCachedH_ = 0;
+    rewindFrozen_ = false;
+    rewindOffsetMs_ = 0;
+    showRewindScrubber_ = false;
+}
+
 void CppDeskWindow::switchTab(ActiveTab newTab) {
     if (activeTab_ == newTab) return;
+    if (activeTab_ == ActiveTab::Settings && newTab != ActiveTab::Settings) {
+        network_.stopVoiceMonitor();
+        showAudioInputMenu_ = false;
+        showAudioOutputMenu_ = false;
+    }
     if (activeTab_ == ActiveTab::RemoteSession && newTab != ActiveTab::RemoteSession) {
         if (sessionRecorder_.isRecording()) {
             sessionRecorder_.stopRecording();
@@ -236,8 +267,14 @@ void CppDeskWindow::switchTab(ActiveTab newTab) {
     activeTooltipText_.clear();
     if (newTab == ActiveTab::RemoteSession) {
         focusedField_ = FocusedField::RemoteCanvas;
+        displayedFrameSeq_ = 0;
+        network_.markViewerCanvasFullDirty();
         if (hwnd_) SetTimer(hwnd_, 1, 16, nullptr);
     } else {
+        if (newTab == ActiveTab::Settings) {
+            cachedInputDevices_ = VoiceIntercom::enumerateInputDevices();
+            cachedOutputDevices_ = VoiceIntercom::enumerateOutputDevices();
+        }
         if (hwnd_) SetTimer(hwnd_, 1, 32, nullptr);
         if (newTab == ActiveTab::Dashboard && focusedField_ == FocusedField::RemoteCanvas) {
             focusedField_ = FocusedField::RemoteId;
@@ -579,10 +616,16 @@ bool CppDeskWindow::stepAnimations(float dt) {
     if (stepSpring(qualityMenuAnimT_, qualityMenuAnimVel_, targetQualityMenu, 32.0f, 0.76f, dt)) active = true;
     float targetAudioPop = showAudioVolumePopup_ ? 1.0f : 0.0f;
     if (stepSpring(audioPopAnimT_, audioPopAnimVel_, targetAudioPop, 32.0f, 0.76f, dt)) active = true;
+    float targetAudioInputMenu = showAudioInputMenu_ ? 1.0f : 0.0f;
+    if (stepSpring(audioInputMenuAnimT_, audioInputMenuAnimVel_, targetAudioInputMenu, 32.0f, 0.76f, dt)) active = true;
+    float targetAudioOutputMenu = showAudioOutputMenu_ ? 1.0f : 0.0f;
+    if (stepSpring(audioOutputMenuAnimT_, audioOutputMenuAnimVel_, targetAudioOutputMenu, 32.0f, 0.76f, dt)) active = true;
 
     // 7. Fullscreen macOS Dynamic Island Floating Top Bar Spring
-    float pillHalfW = 355.0f;
-    bool islandHovered = (mouseInsideClient_ && (mouseY_ <= 42.0f || (mouseY_ <= floatingToolbarY_ + 54.0f && std::fabs(mouseX_ - winW * 0.5f) <= pillHalfW + 24.0f)));
+    float pillHalfW = 665.0f;
+    float centerX = winW * 0.5f;
+    bool inIslandX = std::fabs(mouseX_ - centerX) <= pillHalfW + 16.0f;
+    bool islandHovered = (mouseInsideClient_ && inIslandX && (mouseY_ <= (floatingToolbarY_ + 54.0f) || (floatingToolbarY_ <= -50.0f && mouseY_ <= 24.0f)));
     bool islandDropdownOpen = (showDisplayMenu_ || showAdminMenu_ || showQualityMenu_ || showAudioVolumePopup_ ||
                                displayMenuAnimT_ > 0.005f || adminMenuAnimT_ > 0.005f || qualityMenuAnimT_ > 0.005f || audioPopAnimT_ > 0.005f);
     float targetToolbarY = (isFullscreen_ && activeTab_ == ActiveTab::RemoteSession)
@@ -774,6 +817,11 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             if (notificationMgr_) {
                 notificationMgr_->stopFlash();
             }
+            if (activeTab_ == ActiveTab::RemoteSession) {
+                network_.markViewerCanvasFullDirty();
+                displayedFrameSeq_ = 0;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
             break;
         }
         case WM_SYSCOMMAND: {
@@ -788,6 +836,8 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 ShowWindow(hwnd_, SW_HIDE);
                 return 0;
             }
+            network_.disconnectViewer();
+            hardResetViewerUiState();
             DestroyWindow(hwnd_);
             return 0;
         }
@@ -1042,7 +1092,8 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
             static uint32_t idleTickCounter = 0;
             ++idleTickCounter;
-            if (inLiveSession || toastActive || (idleTickCounter % 4 == 0)) {
+            bool micMonitoringActive = (activeTab_ == ActiveTab::Settings && settingsSection_ == SettingsSection::AudioVoice && network_.isVoiceMonitoring());
+            if (inLiveSession || toastActive || micMonitoringActive || (idleTickCounter % 4 == 0)) {
                 InvalidateRect(hwnd_, nullptr, FALSE);
             }
             return 0;
@@ -1152,6 +1203,8 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_DESTROY:
             KillTimer(hwnd_, 1);
+            network_.disconnectViewer();
+            hardResetViewerUiState();
             PostQuitMessage(0);
             return 0;
     }
@@ -2671,6 +2724,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                        rewindFrozen_ = false;
                        rewindOffsetMs_ = 0;
                        network_.disconnectViewer();
+                       hardResetViewerUiState();
                        if (sessionTabs_.tabCount() > 0) {
                            closeSessionTab(sessionTabs_.activeTabId());
                        } else {
@@ -2988,6 +3042,8 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                 if (!showRewindScrubber_) {
                     rewindFrozen_ = false;
                     rewindOffsetMs_ = 0;
+                    displayedFrameSeq_ = 0;
+                    if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; bitmapW_ = 0; bitmapH_ = 0; }
                 }
                 showToast(showRewindScrubber_ ? "Rewind Scrubber Active" : "Snapped to Live");
                 InvalidateRect(hwnd_, nullptr, FALSE);
@@ -3106,6 +3162,14 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
 
     // Remote Desktop Canvas Stage
     fillRoundRect(stageRect, 0.0f, COL_STAGE_BG);
+
+    // If scrubber was closed without clicking Live, force snap back to live stream
+    if (!showRewindScrubber_ && rewindFrozen_) {
+        rewindFrozen_ = false;
+        rewindOffsetMs_ = 0;
+        displayedFrameSeq_ = 0;
+        if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; bitmapW_ = 0; bitmapH_ = 0; }
+    }
 
     RECT dirtyBounds{};
     if (network_.copyLatestViewerFrame(displayedFrameSeq_, frameBufferBgra_, frameBufferW_, frameBufferH_, remoteCursor_, &dirtyBounds)) {
@@ -3454,6 +3518,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                        COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
                            network_.cancelAutoReconnection();
                            network_.disconnectViewer();
+                           hardResetViewerUiState();
                            showToast("Auto-reconnection cancelled");
                        }, fmtSmall_, true, COL_BORDER);
         } else {
@@ -3502,6 +3567,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
     static const NavItem navItems[] = {
         { SettingsSection::Appearance,     "sett_sec_app",    "Appearance" },
         { SettingsSection::DisplayQuality, "sett_sec_disp",   "Display & Quality" },
+        { SettingsSection::AudioVoice,     "sett_sec_audio",  "Audio & Voice" },
         { SettingsSection::Permissions,    "sett_sec_perm",   "Permissions" },
         { SettingsSection::TwoFactorAuth,  "sett_sec_totp",   "Two-Factor Auth" },
         { SettingsSection::NetworkRelay,   "sett_sec_net",    "Network & Relay" },
@@ -3519,6 +3585,11 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                    isActive ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
                    8.0f, [this, sec = item.section]() {
+                       if (settingsSection_ == SettingsSection::AudioVoice && sec != SettingsSection::AudioVoice) {
+                           network_.stopVoiceMonitor();
+                       }
+                       showAudioInputMenu_ = false;
+                       showAudioOutputMenu_ = false;
                        settingsSection_ = sec;
                        settingsScrollOffset_ = 0.0f;
                        settingsScrollTarget_ = 0.0f;
@@ -3537,6 +3608,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
     switch (settingsSection_) {
         case SettingsSection::Appearance:     sectionContentH = 290.0f; break;
         case SettingsSection::DisplayQuality: sectionContentH = 550.0f; break;
+        case SettingsSection::AudioVoice:     sectionContentH = 380.0f; break;
         case SettingsSection::Permissions:    sectionContentH = 280.0f; break;
         case SettingsSection::TwoFactorAuth:  sectionContentH = 360.0f; break;
         case SettingsSection::NetworkRelay:   sectionContentH = 320.0f; break;
@@ -3883,6 +3955,165 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                          }, "Automatically spawn a virtual display driver when hosting on a headless machine.");
 
         cy = ovBox.bottom + 12.0f;
+    }
+    else if (settingsSection_ == SettingsSection::AudioVoice) {
+        if (!network_.isVoiceMonitoring()) {
+            network_.startVoiceMonitor();
+        }
+
+        drawText("Audio & Voice Intercom", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        cy += 25.0f;
+        drawText("Configure microphone, output audio devices, live input levels, and playback defaults.",
+                 { cx, cy, crx, cy + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        cy += 22.0f;
+
+        if (cachedInputDevices_.empty()) cachedInputDevices_ = VoiceIntercom::enumerateInputDevices();
+        if (cachedOutputDevices_.empty()) cachedOutputDevices_ = VoiceIntercom::enumerateOutputDevices();
+
+        // 1. Microphone Input Device & Live VU Meter
+        UiRect inBox = { cx, cy, crx, cy + 96.0f };
+        fillRoundRect(inBox, 12.0f, COL_BG_SUBTLE);
+        strokeRoundRect(inBox, 12.0f, COL_BORDER);
+
+        drawText("MICROPHONE & INPUT LEVEL",
+                 { inBox.left + 16.0f, inBox.top + 8.0f, inBox.right - 16.0f, inBox.top + 22.0f },
+                 fmtSmall_, COL_TEXT_ACCENT);
+
+        std::string activeInputName = "System Default";
+        for (const auto& dev : cachedInputDevices_) {
+            if (dev.id == s.audioInputDeviceId) {
+                activeInputName = dev.name;
+                break;
+            }
+        }
+
+        UiRect inBtnRect = { inBox.left + 16.0f, inBox.top + 25.0f, inBox.right - 16.0f, inBox.top + 53.0f };
+        audioInputBtnRect_ = inBtnRect;
+        std::string inBtnLabel = activeInputName + "  ▾";
+        drawButton("sett_audio_in_dropdown", inBtnRect, inBtnLabel,
+                   showAudioInputMenu_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+                   showAudioInputMenu_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                   showAudioInputMenu_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                   6.0f, [this]() {
+                       showAudioInputMenu_ = !showAudioInputMenu_;
+                       showAudioOutputMenu_ = false;
+                   }, fmtSmall_, !showAudioInputMenu_, COL_BORDER,
+                   showAudioInputMenu_ ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+
+        // Live VU Meter Bar
+        drawText("Input Level", { inBox.left + 16.0f, inBox.top + 64.0f, inBox.left + 90.0f, inBox.top + 82.0f },
+                 fmtSmall_, COL_TEXT_SECONDARY);
+        UiRect vuTrack = { inBox.left + 95.0f, inBox.top + 69.0f, inBox.right - 16.0f, inBox.top + 77.0f };
+        fillRoundRect(vuTrack, 4.0f, COL_STAGE_BG);
+        strokeRoundRect(vuTrack, 4.0f, COL_BORDER, 1.0f);
+
+        float rawLevel = network_.voiceIntercomInputLevel();
+        float targetVu = 0.0f;
+        if (rawLevel > 0.0001f) {
+            float db = 20.0f * std::log10(rawLevel);
+            targetVu = std::clamp((db + 45.0f) / 45.0f, 0.0f, 1.0f);
+        }
+        if (targetVu > vuSmoothLevel_) vuSmoothLevel_ = targetVu;
+        else vuSmoothLevel_ = vuSmoothLevel_ * 0.82f + targetVu * 0.18f;
+
+        float vuWidth = vuTrack.width() * vuSmoothLevel_;
+        if (vuWidth > 0.0f) {
+            D2D1_COLOR_F vuCol = (vuSmoothLevel_ > 0.85f) ? COL_DANGER : ((vuSmoothLevel_ > 0.65f) ? rgba(255, 185, 0, 1.0f) : COL_SUCCESS);
+            fillRoundRect({ vuTrack.left, vuTrack.top, vuTrack.left + vuWidth, vuTrack.bottom }, 4.0f, vuCol);
+        }
+
+        cy = inBox.bottom + 12.0f;
+
+        // 2. Output Device & Test Chime
+        UiRect outBox = { cx, cy, crx, cy + 68.0f };
+        fillRoundRect(outBox, 12.0f, COL_BG_SUBTLE);
+        strokeRoundRect(outBox, 12.0f, COL_BORDER);
+
+        drawText("OUTPUT DEVICE & CHIME",
+                 { outBox.left + 16.0f, outBox.top + 8.0f, outBox.right - 16.0f, outBox.top + 22.0f },
+                 fmtSmall_, COL_TEXT_ACCENT);
+
+        std::string activeOutputName = "System Default";
+        for (const auto& dev : cachedOutputDevices_) {
+            if (dev.id == s.audioOutputDeviceId) {
+                activeOutputName = dev.name;
+                break;
+            }
+        }
+
+        UiRect chimeBtnRect = { outBox.right - 104.0f, outBox.top + 26.0f, outBox.right - 16.0f, outBox.top + 52.0f };
+        drawButton("sett_audio_test_chime", chimeBtnRect, "Test Chime",
+                   COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 6.0f, []() {
+                       MessageBeep(MB_OK);
+                   }, fmtSmall_);
+
+        UiRect outBtnRect = { outBox.left + 16.0f, outBox.top + 26.0f, chimeBtnRect.left - 10.0f, outBox.top + 52.0f };
+        audioOutputBtnRect_ = outBtnRect;
+        std::string outBtnLabel = activeOutputName + "  ▾";
+        drawButton("sett_audio_out_dropdown", outBtnRect, outBtnLabel,
+                   showAudioOutputMenu_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+                   showAudioOutputMenu_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                   showAudioOutputMenu_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                   6.0f, [this]() {
+                       showAudioOutputMenu_ = !showAudioOutputMenu_;
+                       showAudioInputMenu_ = false;
+                   }, fmtSmall_, !showAudioOutputMenu_, COL_BORDER,
+                   showAudioOutputMenu_ ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+
+        cy = outBox.bottom + 12.0f;
+
+        // 3. Playback Defaults: Volume Slider & Mute Toggle
+        UiRect defBox = { cx, cy, crx, cy + 96.0f };
+        fillRoundRect(defBox, 12.0f, COL_BG_SUBTLE);
+        strokeRoundRect(defBox, 12.0f, COL_BORDER);
+
+        drawText("VOLUME & MUTE DEFAULTS",
+                 { defBox.left + 16.0f, defBox.top + 8.0f, defBox.right - 16.0f, defBox.top + 22.0f },
+                 fmtSmall_, COL_TEXT_ACCENT);
+
+        float vy = defBox.top + 32.0f;
+        drawText("Default Volume", { defBox.left + 16.0f, vy - 4.0f, defBox.left + 115.0f, vy + 16.0f },
+                 fmtSmall_, COL_TEXT_SECONDARY);
+        UiRect volTrack = { defBox.left + 120.0f, vy, defBox.right - 64.0f, vy + 8.0f };
+        fillRoundRect(volTrack, 4.0f, COL_STAGE_BG);
+        strokeRoundRect(volTrack, 4.0f, COL_BORDER, 1.0f);
+        float fillW = volTrack.width() * (static_cast<float>(s.defaultAudioVolume) / 100.0f);
+        if (fillW > 0.0f) {
+            fillRoundRect({ volTrack.left, volTrack.top, volTrack.left + fillW, volTrack.bottom }, 4.0f, COL_PRIMARY_ACCENT);
+        }
+        float thumbX = volTrack.left + fillW;
+        solidBrush_->SetColor(COL_PRIMARY_ACCENT);
+        renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(thumbX, volTrack.centerY()), 6.0f, 6.0f), solidBrush_);
+        solidBrush_->SetColor(rgba(255, 255, 255, 0.85f));
+        renderTarget_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(thumbX, volTrack.centerY()), 6.0f, 6.0f), solidBrush_, 1.5f);
+
+        UiRect volValRect = { volTrack.right + 10.0f, vy - 6.0f, defBox.right - 16.0f, vy + 14.0f };
+        drawText(std::to_string(s.defaultAudioVolume) + "%", volValRect, fmtSmall_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+        UiRect volClickZone = volTrack.inflate(0.0f, 8.0f);
+        clickRegions_.push_back(ClickRegion{ volClickZone, "sett_audio_vol_slider", [this, volTrack]() {
+            if (volTrack.width() > 1.0f) {
+                float frac = (mouseX_ - volTrack.left) / volTrack.width();
+                int newVol = std::clamp(static_cast<int>(frac * 100.0f + 0.5f), 0, 100);
+                AppSettings ns = identity_.settings();
+                ns.defaultAudioVolume = static_cast<uint8_t>(newVol);
+                identity_.updateSettings(ns);
+                identity_.saveConfig();
+                network_.setAudioVolume(newVol);
+            }
+        }, false });
+
+        float my = defBox.top + 60.0f;
+        drawToggleSwitch("sett_audio_mute_default", { defBox.left + 16.0f, my, defBox.right - 16.0f, my + 24.0f },
+                         s.audioMutedDefault, "Mute remote audio by default", [this]() {
+                             AppSettings ns = identity_.settings();
+                             ns.audioMutedDefault = !ns.audioMutedDefault;
+                             identity_.updateSettings(ns);
+                             identity_.saveConfig();
+                             network_.setAudioMuted(ns.audioMutedDefault);
+                         }, "Automatically mute incoming remote desktop audio stream upon connection.");
+
+        cy = defBox.bottom + 12.0f;
     }
     else if (settingsSection_ == SettingsSection::Permissions) {
         drawText("Access Permissions", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
@@ -4503,7 +4734,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         float chkW = 140.0f;
         UiRect chkBtn = { updateBanner.right - bPad - chkW, btnY, updateBanner.right - bPad, btnY + btnH };
-        drawButton("sett_check_updates_top", chkBtn, isCheckingUpdates_ ? "Checking..." : "Check for update",
+        drawButton("sett_check_updates_top", chkBtn, isCheckingUpdates_ ? "Checking..." : "Check for updates",
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT,
                    8.0f, [this]() {
                        triggerUpdateCheck(true);
@@ -4634,6 +4865,130 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         settingsScrollTrackRect_ = {};
         settingsScrollThumbRect_ = {};
     }
+
+    // Floating Acrylic Dropdown: Microphone Selection
+    if (settingsSection_ == SettingsSection::AudioVoice && audioInputMenuAnimT_ > 0.005f) {
+        float inMenuAlpha = std::clamp(audioInputMenuAnimT_, 0.0f, 1.0f);
+        if (showAudioInputMenu_) {
+            clickRegions_.push_back(ClickRegion{ UiRect{ 0.0f, 0.0f, bounds.right, bounds.bottom }, "audio_in_menu_scrim", [this]() {
+                showAudioInputMenu_ = false;
+            }, false });
+        }
+
+        const auto& inDevs = cachedInputDevices_.empty()
+            ? (cachedInputDevices_ = VoiceIntercom::enumerateInputDevices())
+            : cachedInputDevices_;
+        float itemH = 32.0f;
+        float dropH = static_cast<float>(inDevs.size()) * itemH + 16.0f;
+        float dropW = std::max(audioInputBtnRect_.width(), 280.0f);
+        float dropLeft = audioInputBtnRect_.left;
+        float dropRight = dropLeft + dropW;
+        if (dropRight > bounds.right - 16.0f) {
+            dropRight = bounds.right - 16.0f;
+            dropLeft = std::max(bounds.left + 16.0f, dropRight - dropW);
+        }
+
+        float dropTop = audioInputBtnRect_.bottom + 4.0f;
+        if (dropTop + dropH > bounds.bottom - 16.0f && audioInputBtnRect_.top - dropH - 4.0f >= bounds.top) {
+            dropTop = audioInputBtnRect_.top - dropH - 4.0f;
+        }
+        UiRect baseDropRect = { dropLeft, dropTop, dropRight, dropTop + dropH };
+        UiRect dropRect = UiPlatform::computeSpringRect(baseDropRect, audioInputMenuAnimT_, 0.0f);
+
+        if (showAudioInputMenu_) {
+            clickRegions_.push_back(ClickRegion{ dropRect, "audio_in_menu_absorb", []() {}, false });
+        }
+
+        drawCardShadow(dropRect, 14.0f, 0.95f * inMenuAlpha);
+        fillRoundRect(dropRect, 14.0f, withAlpha(COL_BG_CARD, 0.98f * inMenuAlpha));
+        strokeRoundRect(dropRect, 14.0f, withAlpha(COL_BORDER, inMenuAlpha), 1.2f);
+
+        float dy = dropRect.top + 8.0f;
+        const AppSettings curSettings = identity_.settings();
+        for (size_t i = 0; i < inDevs.size(); ++i) {
+            const auto& dev = inDevs[i];
+            bool isCur = (dev.id == curSettings.audioInputDeviceId);
+            UiRect itemR = { dropRect.left + 8.0f, dy, dropRect.right - 8.0f, dy + 28.0f };
+            std::string label = (isCur ? "✓  " : "    ") + dev.name;
+            std::string btnId = "sett_drop_in_" + std::to_string(i) + "_" + std::to_string(dev.id);
+
+            drawButton(btnId, itemR, label,
+                       isCur ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+                       isCur ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                       isCur ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                       6.0f, [this, dev]() {
+                           AppSettings ns = identity_.settings();
+                           ns.audioInputDeviceId = dev.id;
+                           identity_.updateSettings(ns);
+                           network_.setVoiceInputDevice(dev.id);
+                           showAudioInputMenu_ = false;
+                           showToast("Selected Microphone: " + dev.name);
+                       }, fmtSmall_, !isCur, COL_BORDER);
+            dy += itemH;
+        }
+    }
+
+    // Floating Acrylic Dropdown: Speaker Selection
+    if (settingsSection_ == SettingsSection::AudioVoice && audioOutputMenuAnimT_ > 0.005f) {
+        float outMenuAlpha = std::clamp(audioOutputMenuAnimT_, 0.0f, 1.0f);
+        if (showAudioOutputMenu_) {
+            clickRegions_.push_back(ClickRegion{ UiRect{ 0.0f, 0.0f, bounds.right, bounds.bottom }, "audio_out_menu_scrim", [this]() {
+                showAudioOutputMenu_ = false;
+            }, false });
+        }
+
+        const auto& outDevs = cachedOutputDevices_.empty()
+            ? (cachedOutputDevices_ = VoiceIntercom::enumerateOutputDevices())
+            : cachedOutputDevices_;
+        float itemH = 32.0f;
+        float dropH = static_cast<float>(outDevs.size()) * itemH + 16.0f;
+        float dropW = std::max(audioOutputBtnRect_.width(), 280.0f);
+        float dropLeft = audioOutputBtnRect_.left;
+        float dropRight = dropLeft + dropW;
+        if (dropRight > bounds.right - 16.0f) {
+            dropRight = bounds.right - 16.0f;
+            dropLeft = std::max(bounds.left + 16.0f, dropRight - dropW);
+        }
+
+        float dropTop = audioOutputBtnRect_.bottom + 4.0f;
+        if (dropTop + dropH > bounds.bottom - 16.0f && audioOutputBtnRect_.top - dropH - 4.0f >= bounds.top) {
+            dropTop = audioOutputBtnRect_.top - dropH - 4.0f;
+        }
+        UiRect baseDropRect = { dropLeft, dropTop, dropRight, dropTop + dropH };
+        UiRect dropRect = UiPlatform::computeSpringRect(baseDropRect, audioOutputMenuAnimT_, 0.0f);
+
+        if (showAudioOutputMenu_) {
+            clickRegions_.push_back(ClickRegion{ dropRect, "audio_out_menu_absorb", []() {}, false });
+        }
+
+        drawCardShadow(dropRect, 14.0f, 0.95f * outMenuAlpha);
+        fillRoundRect(dropRect, 14.0f, withAlpha(COL_BG_CARD, 0.98f * outMenuAlpha));
+        strokeRoundRect(dropRect, 14.0f, withAlpha(COL_BORDER, outMenuAlpha), 1.2f);
+
+        float dy = dropRect.top + 8.0f;
+        const AppSettings curSettings = identity_.settings();
+        for (size_t i = 0; i < outDevs.size(); ++i) {
+            const auto& dev = outDevs[i];
+            bool isCur = (dev.id == curSettings.audioOutputDeviceId);
+            UiRect itemR = { dropRect.left + 8.0f, dy, dropRect.right - 8.0f, dy + 28.0f };
+            std::string label = (isCur ? "✓  " : "    ") + dev.name;
+            std::string btnId = "sett_drop_out_" + std::to_string(i) + "_" + std::to_string(dev.id);
+
+            drawButton(btnId, itemR, label,
+                       isCur ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+                       isCur ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                       isCur ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                       6.0f, [this, dev]() {
+                           AppSettings ns = identity_.settings();
+                           ns.audioOutputDeviceId = dev.id;
+                           identity_.updateSettings(ns);
+                           network_.setVoiceOutputDevice(dev.id);
+                           showAudioOutputMenu_ = false;
+                           showToast("Selected Speaker: " + dev.name);
+                       }, fmtSmall_, !isCur, COL_BORDER);
+            dy += itemH;
+        }
+    }
 }
 
 // ---------------- Floating macOS Side Sheet Drawer ----------------
@@ -4663,116 +5018,109 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
     uint32_t unread = network_.unreadChatCount();
     std::string chatTabLbl = unread > 0 ? ("Chat (" + std::to_string(unread) + ")") : "Chat";
 
-    struct DrawerTabDef {
-        DrawerTab tab;
-        std::string id;
-        std::string label;
-        float width;
-        bool isActive;
-        std::function<void()> onClick;
-    };
+    if (drawerTab_ == DrawerTab::Diagnostics) {
+        drawText("Task Manager", { x, y + 2.0f, closeBtn.left - 8.0f, y + 28.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        y += 36.0f;
+    } else {
+        struct DrawerTabDef {
+            DrawerTab tab;
+            std::string id;
+            std::string label;
+            float width;
+            bool isActive;
+            std::function<void()> onClick;
+        };
 
-    std::vector<DrawerTabDef> drawerTabsList = {
-        { DrawerTab::FilesAndClip, "drawer_tab_files", "Files", 58.0f, (drawerTab_ == DrawerTab::FilesAndClip), [this]() {
-            if (drawerTab_ == DrawerTab::Diagnostics) network_.setDiagnosticsActive(false);
-            drawerTab_ = DrawerTab::FilesAndClip;
-        }},
-        { DrawerTab::LiveChat, "drawer_tab_chat", chatTabLbl, (unread > 0 ? 76.0f : 56.0f), (drawerTab_ == DrawerTab::LiveChat), [this]() {
-            if (drawerTab_ == DrawerTab::Diagnostics) network_.setDiagnosticsActive(false);
-            drawerTab_ = DrawerTab::LiveChat;
-            network_.markChatRead();
-        }},
-        { DrawerTab::RemoteTerminal, "drawer_tab_term", "Terminal", 74.0f, (drawerTab_ == DrawerTab::RemoteTerminal), [this]() {
-            if (drawerTab_ == DrawerTab::Diagnostics) network_.setDiagnosticsActive(false);
-            drawerTab_ = DrawerTab::RemoteTerminal;
-            focusedField_ = FocusedField::TerminalInput;
-        }},
-        { DrawerTab::Diagnostics, "drawer_tab_diag", "TaskMgr", 74.0f, (drawerTab_ == DrawerTab::Diagnostics), [this]() {
-            if (drawerTab_ != DrawerTab::Diagnostics) {
-                drawerTab_ = DrawerTab::Diagnostics;
-                network_.setDiagnosticsActive(true);
+        std::vector<DrawerTabDef> drawerTabsList = {
+            { DrawerTab::FilesAndClip, "drawer_tab_files", "Files", 58.0f, (drawerTab_ == DrawerTab::FilesAndClip), [this]() {
+                drawerTab_ = DrawerTab::FilesAndClip;
+            }},
+            { DrawerTab::LiveChat, "drawer_tab_chat", chatTabLbl, (unread > 0 ? 76.0f : 56.0f), (drawerTab_ == DrawerTab::LiveChat), [this]() {
+                drawerTab_ = DrawerTab::LiveChat;
+                network_.markChatRead();
+            }},
+            { DrawerTab::RemoteTerminal, "drawer_tab_term", "Terminal", 74.0f, (drawerTab_ == DrawerTab::RemoteTerminal), [this]() {
+                drawerTab_ = DrawerTab::RemoteTerminal;
+                focusedField_ = FocusedField::TerminalInput;
+            }},
+            { DrawerTab::ClipboardHistory, "drawer_tab_hist", "History", 70.0f, (drawerTab_ == DrawerTab::ClipboardHistory), [this]() {
+                drawerTab_ = DrawerTab::ClipboardHistory;
+                focusedField_ = FocusedField::ClipboardSearch;
+            }},
+            { DrawerTab::Sync, "drawer_tab_sync", "Sync", 58.0f, (drawerTab_ == DrawerTab::Sync), [this]() {
+                drawerTab_ = DrawerTab::Sync;
+            }},
+            { DrawerTab::Notes, "drawer_tab_notes", "Notes", 58.0f, (drawerTab_ == DrawerTab::Notes), [this]() {
+                drawerTab_ = DrawerTab::Notes;
+                focusedField_ = FocusedField::ScratchpadText;
+            }}
+        };
+
+        UiRect tabsViewport = { x, y, closeBtn.left - 8.0f, y + 32.0f };
+        float totalTabsW = 0.0f;
+        for (size_t i = 0; i < drawerTabsList.size(); ++i) {
+            if (i > 0) totalTabsW += 5.0f;
+            totalTabsW += drawerTabsList[i].width;
+        }
+
+        drawerTabsMaxScroll_ = std::max(0.0f, totalTabsW - tabsViewport.width());
+        drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_, 0.0f, drawerTabsMaxScroll_);
+
+        // Auto-scroll to ensure active tab is visible
+        float activeTabStart = 0.0f;
+        for (const auto& t : drawerTabsList) {
+            if (t.isActive) {
+                if (activeTabStart < drawerTabsScrollTarget_) {
+                    drawerTabsScrollTarget_ = activeTabStart;
+                } else if (activeTabStart + t.width > drawerTabsScrollTarget_ + tabsViewport.width()) {
+                    drawerTabsScrollTarget_ = activeTabStart + t.width - tabsViewport.width();
+                }
+                break;
             }
-        }},
-        { DrawerTab::ClipboardHistory, "drawer_tab_hist", "History", 70.0f, (drawerTab_ == DrawerTab::ClipboardHistory), [this]() {
-            if (drawerTab_ == DrawerTab::Diagnostics) network_.setDiagnosticsActive(false);
-            drawerTab_ = DrawerTab::ClipboardHistory;
-            focusedField_ = FocusedField::ClipboardSearch;
-        }},
-        { DrawerTab::Sync, "drawer_tab_sync", "Sync", 58.0f, (drawerTab_ == DrawerTab::Sync), [this]() {
-            if (drawerTab_ == DrawerTab::Diagnostics) network_.setDiagnosticsActive(false);
-            drawerTab_ = DrawerTab::Sync;
-        }},
-        { DrawerTab::Notes, "drawer_tab_notes", "Notes", 58.0f, (drawerTab_ == DrawerTab::Notes), [this]() {
-            if (drawerTab_ == DrawerTab::Diagnostics) network_.setDiagnosticsActive(false);
-            drawerTab_ = DrawerTab::Notes;
-            focusedField_ = FocusedField::ScratchpadText;
-        }}
-    };
+            activeTabStart += t.width + 5.0f;
+        }
+        drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_, 0.0f, drawerTabsMaxScroll_);
 
-    UiRect tabsViewport = { x, y, closeBtn.left - 8.0f, y + 32.0f };
-    float totalTabsW = 0.0f;
-    for (size_t i = 0; i < drawerTabsList.size(); ++i) {
-        if (i > 0) totalTabsW += 5.0f;
-        totalTabsW += drawerTabsList[i].width;
-    }
-
-    drawerTabsMaxScroll_ = std::max(0.0f, totalTabsW - tabsViewport.width());
-    drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_, 0.0f, drawerTabsMaxScroll_);
-
-    // Auto-scroll to ensure active tab is visible
-    float activeTabStart = 0.0f;
-    for (const auto& t : drawerTabsList) {
-        if (t.isActive) {
-            if (activeTabStart < drawerTabsScrollTarget_) {
-                drawerTabsScrollTarget_ = activeTabStart;
-            } else if (activeTabStart + t.width > drawerTabsScrollTarget_ + tabsViewport.width()) {
-                drawerTabsScrollTarget_ = activeTabStart + t.width - tabsViewport.width();
+        if (drawerTabsMaxScroll_ > 2.0f) {
+            if (drawerTabsScrollTarget_ > 2.0f) {
+                UiRect lBtn = { tabsViewport.left, tabsViewport.top + 2.0f, tabsViewport.left + 18.0f, tabsViewport.bottom - 2.0f };
+                drawButton("drawer_tab_scroll_l", lBtn, "◀", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
+                    drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_ - 60.0f, 0.0f, drawerTabsMaxScroll_);
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                tabsViewport.left += 22.0f;
             }
-            break;
+            if (drawerTabsScrollTarget_ < drawerTabsMaxScroll_ - 2.0f) {
+                UiRect rBtn = { tabsViewport.right - 18.0f, tabsViewport.top + 2.0f, tabsViewport.right, tabsViewport.bottom - 2.0f };
+                drawButton("drawer_tab_scroll_r", rBtn, "▶", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
+                    drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_ + 60.0f, 0.0f, drawerTabsMaxScroll_);
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                tabsViewport.right -= 22.0f;
+            }
         }
-        activeTabStart += t.width + 5.0f;
+
+        renderTarget_->PushAxisAlignedClip(
+            D2D1::RectF(tabsViewport.left, tabsViewport.top, tabsViewport.right, tabsViewport.bottom),
+            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
+        );
+
+        float curTabX = tabsViewport.left - drawerTabsScrollOffset_;
+        for (const auto& t : drawerTabsList) {
+            UiRect tRect = { curTabX, tabsViewport.top, curTabX + t.width, tabsViewport.bottom };
+            if (tRect.right > tabsViewport.left && tRect.left < tabsViewport.right) {
+                drawButton(t.id, tRect, t.label,
+                           t.isActive ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+                           t.isActive ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                           t.isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                           8.0f, t.onClick, fmtSmall_);
+            }
+            curTabX += t.width + 5.0f;
+        }
+
+        renderTarget_->PopAxisAlignedClip();
+        y += 44.0f;
     }
-    drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_, 0.0f, drawerTabsMaxScroll_);
-
-    if (drawerTabsMaxScroll_ > 2.0f) {
-        if (drawerTabsScrollTarget_ > 2.0f) {
-            UiRect lBtn = { tabsViewport.left, tabsViewport.top + 2.0f, tabsViewport.left + 18.0f, tabsViewport.bottom - 2.0f };
-            drawButton("drawer_tab_scroll_l", lBtn, "◀", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
-                drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_ - 60.0f, 0.0f, drawerTabsMaxScroll_);
-                InvalidateRect(hwnd_, nullptr, FALSE);
-            }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
-            tabsViewport.left += 22.0f;
-        }
-        if (drawerTabsScrollTarget_ < drawerTabsMaxScroll_ - 2.0f) {
-            UiRect rBtn = { tabsViewport.right - 18.0f, tabsViewport.top + 2.0f, tabsViewport.right, tabsViewport.bottom - 2.0f };
-            drawButton("drawer_tab_scroll_r", rBtn, "▶", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
-                drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_ + 60.0f, 0.0f, drawerTabsMaxScroll_);
-                InvalidateRect(hwnd_, nullptr, FALSE);
-            }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
-            tabsViewport.right -= 22.0f;
-        }
-    }
-
-    renderTarget_->PushAxisAlignedClip(
-        D2D1::RectF(tabsViewport.left, tabsViewport.top, tabsViewport.right, tabsViewport.bottom),
-        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
-    );
-
-    float curTabX = tabsViewport.left - drawerTabsScrollOffset_;
-    for (const auto& t : drawerTabsList) {
-        UiRect tRect = { curTabX, tabsViewport.top, curTabX + t.width, tabsViewport.bottom };
-        if (tRect.right > tabsViewport.left && tRect.left < tabsViewport.right) {
-            drawButton(t.id, tRect, t.label,
-                       t.isActive ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                       t.isActive ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                       t.isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                       8.0f, t.onClick, fmtSmall_);
-        }
-        curTabX += t.width + 5.0f;
-    }
-
-    renderTarget_->PopAxisAlignedClip();
-    y += 44.0f;
 
     if (drawerTab_ == DrawerTab::FilesAndClip) {
         drawText("Drop files anywhere or use the actions below.",
@@ -5663,7 +6011,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
     if (floatingToolbarY_ <= -58.0f) return;
 
     auto stats = network_.viewerStats();
-    float pillW = 1240.0f;
+    float pillW = std::min(1330.0f, width - 24.0f);
     float pillH = 42.0f;
     float pillLeft = (width - pillW) * 0.5f;
     float pillRight = pillLeft + pillW;
@@ -5811,6 +6159,26 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                (islandChatOpen || unreadChat > 0) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
     curX = islandChatBtn.right + 6.0f;
 
+    // Task Manager Button
+    bool islandDiagOpen = (showFileDrawer_ && drawerTab_ == DrawerTab::Diagnostics);
+    UiRect islandTaskMgrBtn = { curX, pillTop + 6.0f, curX + 76.0f, pillBottom - 6.0f };
+    drawButton("island_taskmgr_btn", islandTaskMgrBtn, "Task Mgr",
+               islandDiagOpen ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+               islandDiagOpen ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+               islandDiagOpen ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+               8.0f, [this, islandDiagOpen]() {
+                   if (islandDiagOpen) {
+                       network_.setDiagnosticsActive(false);
+                       showFileDrawer_ = false;
+                   } else {
+                       showFileDrawer_ = true;
+                       drawerTab_ = DrawerTab::Diagnostics;
+                       network_.setDiagnosticsActive(true);
+                   }
+               }, fmtSmall_, !islandDiagOpen, COL_BORDER,
+               islandDiagOpen ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+    curX = islandTaskMgrBtn.right + 6.0f;
+
     // HUD Toggle Button
     UiRect islandHudBtn = { curX, pillTop + 6.0f, curX + 58.0f, pillBottom - 6.0f };
     drawButton("island_hud_btn", islandHudBtn, showPerformanceHud_ ? "HUD: ON" : "HUD",
@@ -5823,15 +6191,6 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                }, fmtSmall_, !showPerformanceHud_, COL_BORDER);
     curX = islandHudBtn.right + 6.0f;
 
-    // 6. Shortcuts Button "?"
-    UiRect helpBtn = { curX, pillTop + 6.0f, curX + 32.0f, pillBottom - 6.0f };
-    drawButton("island_help_btn", helpBtn, "?",
-               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
-               8.0f, [this]() {
-                   toggleShortcutsModal();
-               }, fmtBodyBold_, true, COL_BORDER);
-    curX = helpBtn.right + 6.0f;
-
     // Rewind Button
     UiRect islandRewindBtn = { curX, pillTop + 6.0f, curX + 72.0f, pillBottom - 6.0f };
     drawButton("island_rewind_btn", islandRewindBtn, showRewindScrubber_ ? "Rewind: ON" : "Rewind",
@@ -5843,6 +6202,8 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                    if (!showRewindScrubber_) {
                        rewindFrozen_ = false;
                        rewindOffsetMs_ = 0;
+                       displayedFrameSeq_ = 0;
+                       if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; bitmapW_ = 0; bitmapH_ = 0; }
                    }
                    showToast(showRewindScrubber_ ? "Rewind Scrubber Active" : "Snapped to Live");
                    InvalidateRect(hwnd_, nullptr, FALSE);
@@ -5882,13 +6243,21 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                }, fmtSmall_, !floatingToolbarPinned_, COL_BORDER);
     curX = pinBtn.right + 6.0f;
 
-    // 7. Fullscreen Exit Button
-    UiRect fsBtn = { curX, pillTop + 6.0f, pillRight - 12.0f, pillBottom - 6.0f };
+    // Fullscreen Exit Button
+    UiRect fsBtn = { curX, pillTop + 6.0f, pillRight - 46.0f, pillBottom - 6.0f };
     drawButton("island_fs_btn", fsBtn, "Exit (F11)",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
                8.0f, [this]() {
                    toggleFullscreen();
                }, fmtSmall_, true, COL_BORDER);
+
+    // Shortcuts Button "?" (Relocated to far right unobtrusive corner)
+    UiRect helpBtn = { pillRight - 40.0f, pillTop + 6.0f, pillRight - 10.0f, pillBottom - 6.0f };
+    drawButton("island_help_btn", helpBtn, "?",
+               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
+               8.0f, [this]() {
+                   toggleShortcutsModal();
+               }, fmtBodyBold_, true, COL_BORDER);
 
     // Dropdown 1: Display Switcher Menu
     if (displayMenuAnimT_ > 0.005f) {
@@ -7919,8 +8288,16 @@ bool CppDeskWindow::mapCanvasPointToNormalized(float x, float y, float& outNormX
     if (modalAnimT_ > 0.004f || shortcutsModalAnimT_ > 0.004f || portForwardModalAnimT_ > 0.004f || addressBookModalAnimT_ > 0.004f || totpModalAnimT_ > 0.004f) {
         return false;
     }
-    if (isFullscreen_ && floatingToolbarY_ > -50.0f && y <= (floatingToolbarY_ + 50.0f)) {
-        return false;
+    if (isFullscreen_ && floatingToolbarY_ > -50.0f && hwnd_) {
+        RECT rc{};
+        GetClientRect(hwnd_, &rc);
+        float winW = static_cast<float>(rc.right - rc.left);
+        float pillHalfW = 665.0f;
+        float pillLeft = (winW * 0.5f) - pillHalfW;
+        float pillRight = (winW * 0.5f) + pillHalfW;
+        if (x >= pillLeft && x <= pillRight && y >= 0.0f && y <= (floatingToolbarY_ + 48.0f)) {
+            return false;
+        }
     }
     if (showDisplayMenu_ || showAdminMenu_ || showQualityMenu_ ||
         displayMenuAnimT_ > 0.005f || adminMenuAnimT_ > 0.005f || qualityMenuAnimT_ > 0.005f || audioPopAnimT_ > 0.005f) {
@@ -8253,6 +8630,11 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
 }
 
 void CppDeskWindow::onMouseWheel(int delta) {
+    if (showAudioInputMenu_ || showAudioOutputMenu_) {
+        showAudioInputMenu_ = false;
+        showAudioOutputMenu_ = false;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
     if (drawerAnimT_ > 0.004f && hwnd_) {
         RECT rc{};
         GetClientRect(hwnd_, &rc);
@@ -8520,6 +8902,12 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
             return;
         }
         if (vk == VK_ESCAPE) {
+            if (showAudioInputMenu_ || showAudioOutputMenu_) {
+                showAudioInputMenu_ = false;
+                showAudioOutputMenu_ = false;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            }
             if (showOmnibarModal_) {
                 showOmnibarModal_ = false;
                 focusedField_ = FocusedField::None;
@@ -8530,6 +8918,8 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
                 showRewindScrubber_ = false;
                 rewindFrozen_ = false;
                 rewindOffsetMs_ = 0;
+                displayedFrameSeq_ = 0;
+                if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; bitmapW_ = 0; bitmapH_ = 0; }
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 return;
             }
@@ -8800,7 +9190,8 @@ void CppDeskWindow::switchToSessionTab(uint32_t tabId, bool force) {
 
     // 5. Check if connection target matches current network engine connection
     auto vStats = network_.viewerStats();
-    bool isSameDesk = (newTab->deskId != 0 && vStats.remoteDeskId == newTab->deskId);
+    bool isSameDesk = (newTab->deskId != 0 && vStats.remoteDeskId == newTab->deskId &&
+                       vStats.state == ViewerConnectionState::Connected && network_.isViewerActive());
     if (!isSameDesk) {
         if (sessionRecorder_.isRecording()) {
             sessionRecorder_.stopRecording();
@@ -8810,6 +9201,7 @@ void CppDeskWindow::switchToSessionTab(uint32_t tabId, bool force) {
         }
         prevViewerState_ = ViewerConnectionState::Disconnected;
         network_.disconnectViewer();
+        hardResetViewerUiState();
         if (!newTab->targetInput.empty()) {
             network_.connectToRemote(newTab->targetInput, newTab->password);
         }
@@ -8843,6 +9235,7 @@ void CppDeskWindow::closeSessionTab(uint32_t tabId) {
         rewindOffsetMs_ = 0;
         prevViewerState_ = ViewerConnectionState::Disconnected;
         network_.disconnectViewer();
+        hardResetViewerUiState();
     }
 
     sessionTabs_.closeTab(tabId);
@@ -9233,6 +9626,7 @@ void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
                    rewindOffsetMs_ = 0;
                    rewindFrozen_ = false;
                    showRewindScrubber_ = false;
+                   displayedFrameSeq_ = 0;
                    if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; bitmapW_ = 0; bitmapH_ = 0; }
                    showToast("Snapped to live stream");
                    InvalidateRect(hwnd_, nullptr, FALSE);

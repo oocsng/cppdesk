@@ -501,6 +501,14 @@ bool IdentityManager::loadOrCreate() {
                 } catch (...) {}
             } else if (key == "audio_muted_default") {
                 settings_.audioMutedDefault = (val == "1" || val == "true");
+            } else if (key == "audio_input_device_id") {
+                try { settings_.audioInputDeviceId = std::stoi(val); } catch (...) {}
+            } else if (key == "audio_output_device_id") {
+                try { settings_.audioOutputDeviceId = std::stoi(val); } catch (...) {}
+            } else if (key == "audio_input_device_name") {
+                settings_.audioInputDeviceName = val;
+            } else if (key == "audio_output_device_name") {
+                settings_.audioOutputDeviceName = val;
             } else if (key == "auto_virtual_display") {
                 settings_.autoVirtualDisplay = (val == "1" || val == "true");
             } else if (key == "privacy_notice") {
@@ -625,6 +633,10 @@ bool IdentityManager::save() const {
     out << "hardware_acceleration=" << (settings_.hardwareAcceleration ? "1" : "0") << "\n";
     out << "default_audio_volume=" << static_cast<int>(settings_.defaultAudioVolume) << "\n";
     out << "audio_muted_default=" << (settings_.audioMutedDefault ? "1" : "0") << "\n";
+    out << "audio_input_device_id=" << settings_.audioInputDeviceId << "\n";
+    out << "audio_output_device_id=" << settings_.audioOutputDeviceId << "\n";
+    out << "audio_input_device_name=" << settings_.audioInputDeviceName << "\n";
+    out << "audio_output_device_name=" << settings_.audioOutputDeviceName << "\n";
     out << "auto_virtual_display=" << (settings_.autoVirtualDisplay ? "1" : "0") << "\n";
     auto sanitizeIniValue = [](const std::string& in) -> std::string {
         std::string out;

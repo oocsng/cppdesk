@@ -166,23 +166,42 @@ bool CommandPaletteManager::executeSync(const std::string& cmdLine,
         outOutput = "Error: Failed to create stdout pipe";
         return false;
     }
-
     SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    // Create stdin pipe so child receives a valid inheritable standard input handle
+    HANDLE hStdinRead = NULL;
+    HANDLE hStdinWrite = NULL;
+    if (!CreatePipe(&hStdinRead, &hStdinWrite, &sa, 0)) {
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+        outOutput = "Error: Failed to create stdin pipe";
+        return false;
+    }
+    SetHandleInformation(hStdinWrite, HANDLE_FLAG_INHERIT, 0);
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.hStdInput = hStdinRead;
     si.hStdOutput = hWritePipe;
     si.hStdError = hWritePipe;
-    si.hStdInput = NULL;
     si.wShowWindow = SW_HIDE;
 
     PROCESS_INFORMATION pi{};
+
+    // Proper MultiByteToWideChar UTF-8 conversion
     std::wstring cmdW;
-    cmdW.reserve(cmdLine.size());
-    for (char c : cmdLine) {
-        cmdW.push_back(static_cast<wchar_t>(static_cast<unsigned char>(c)));
+    int len = MultiByteToWideChar(CP_UTF8, 0, cmdLine.c_str(), -1, nullptr, 0);
+    if (len > 0) {
+        cmdW.resize(len);
+        MultiByteToWideChar(CP_UTF8, 0, cmdLine.c_str(), -1, &cmdW[0], len);
+        if (!cmdW.empty() && cmdW.back() == L'\0') {
+            cmdW.pop_back();
+        }
+    } else {
+        cmdW.assign(cmdLine.begin(), cmdLine.end());
     }
+
     std::vector<wchar_t> cmdBuf(cmdW.begin(), cmdW.end());
     cmdBuf.push_back(L'\0');
 
@@ -199,7 +218,10 @@ bool CommandPaletteManager::executeSync(const std::string& cmdLine,
         &pi
     );
 
+    // Immediately close handles child inherited or no longer needed
     CloseHandle(hWritePipe);
+    CloseHandle(hStdinRead);
+    CloseHandle(hStdinWrite); // Closing write end signals immediate EOF to child process stdin
 
     if (!created) {
         CloseHandle(hReadPipe);

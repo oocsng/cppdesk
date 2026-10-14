@@ -47,12 +47,13 @@ enum class ActiveTab : uint8_t {
 enum class SettingsSection : uint8_t {
     Appearance      = 0,
     DisplayQuality  = 1,
-    Permissions     = 2,
-    TwoFactorAuth   = 3,
-    NetworkRelay    = 4,
-    CurtainPrivacy  = 5,
-    SystemService   = 6,
-    About           = 7
+    AudioVoice      = 2,
+    Permissions     = 3,
+    TwoFactorAuth   = 4,
+    NetworkRelay    = 5,
+    CurtainPrivacy  = 6,
+    SystemService   = 7,
+    About           = 8
 };
 
 enum class FocusedField : uint8_t {
@@ -227,6 +228,7 @@ private:
     void closeRecordingPlayer();
     void switchToSessionTab(uint32_t tabId, bool force = false);
     void closeSessionTab(uint32_t tabId);
+    void hardResetViewerUiState();
     void showToast(const std::string& message, bool isError = false, uint32_t durationMs = 3000);
     void restoreFromTray(NotificationType contextType = NotificationType::GeneralInfo);
     bool mapCanvasPointToNormalized(float x, float y, float& outNormX, float& outNormY) const;
@@ -405,7 +407,18 @@ private:
     float                   diagnosticsScrollOffset_ = 0.0f;
 
     // Settings Tab vertical scroll & section state
-    SettingsSection         settingsSection_ = SettingsSection::Appearance;
+    SettingsSection              settingsSection_ = SettingsSection::Appearance;
+    std::vector<AudioDeviceDesc> cachedInputDevices_;
+    std::vector<AudioDeviceDesc> cachedOutputDevices_;
+    bool                         showAudioInputMenu_ = false;
+    bool                         showAudioOutputMenu_ = false;
+    float                        audioInputMenuAnimT_ = 0.0f;
+    float                        audioInputMenuAnimVel_ = 0.0f;
+    float                        audioOutputMenuAnimT_ = 0.0f;
+    float                        audioOutputMenuAnimVel_ = 0.0f;
+    float                        vuSmoothLevel_ = 0.0f;
+    UiRect                       audioInputBtnRect_{};
+    UiRect                       audioOutputBtnRect_{};
     float                   settingsScrollOffset_ = 0.0f;
     float                   settingsScrollTarget_ = 0.0f;
     float                   settingsScrollVel_ = 0.0f;
@@ -487,7 +500,7 @@ private:
     float                   updateModalAnimT_ = 0.0f;
     float                   updateModalAnimVel_ = 0.0f;
     bool                    isCheckingUpdates_ = false;
-    std::string             updateStatusText_ = "Version v3.5.2 (Up to date)";
+    std::string             updateStatusText_ = "Version v3.5.3 (Up to date)";
     UpdateInfo              latestUpdateInfo_{};
     float                   startupUpdateCheckTimer_ = 2.0f;
     bool                    startupCheckTriggered_ = false;
