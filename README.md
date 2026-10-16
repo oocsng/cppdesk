@@ -1,21 +1,21 @@
 <p align="center">
   <img src="assets/icon.png" width="96" height="96" alt="CppDesk App Icon"><br>
   <b>CppDesk</b><br>
-  <span>Fast, lightweight, standalone Remote Desktop for Windows</span><br><br>
+  <span>Portable remote desktop client and host for Windows</span><br><br>
   <a href="#features">Features</a> •
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#how-to-build-from-source">Build</a> •
+  <a href="#quick-start">Quick start</a> •
+  <a href="#building-from-source">Build</a> •
   <a href="#project-structure">Structure</a> •
-  <a href="assets/CppDeskShowcase.mp4">Video Demo</a> •
-  <a href="https://github.com/nmnghia2527/cppdesk/releases">Releases</a> •
-  <a href="#issues--support">Issues</a>
+  <a href="assets/CppDeskShowcase.mp4">Video demo</a> •
+  <a href="https://github.com/oocsng/cppdesk/releases">Releases</a> •
+  <a href="#issues-and-support">Issues</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/nmnghia2527/cppdesk/releases/latest">
-    <img src="https://img.shields.io/github/v/release/nmnghia2527/cppdesk?style=for-the-badge&color=D97757&label=DOWNLOAD%20CPPDESK&sort=semver&labelColor=262320" alt="Download CppDesk">
+  <a href="https://github.com/oocsng/cppdesk/releases/latest">
+    <img src="https://img.shields.io/github/v/release/oocsng/cppdesk?style=for-the-badge&color=D97757&label=DOWNLOAD%20CPPDESK&sort=semver&labelColor=262320" alt="Download CppDesk">
   </a>
-  <a href="https://github.com/nmnghia2527/cppdesk/blob/main/LICENSE">
+  <a href="https://github.com/oocsng/cppdesk/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-D97757?style=for-the-badge&labelColor=262320" alt="License: MIT">
   </a>
   <img src="https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-D97757?style=for-the-badge&logo=windows&logoColor=white&labelColor=262320" alt="Platform: Windows">
@@ -28,110 +28,95 @@
   <br>
   <sub>
     <a href="assets/CppDeskShowcase.mp4">
-      <b>Watch Full Video (1080p 60 FPS • Audio & Voiceover)</b>
+      <b>Watch demo video (1080p 60 FPS with audio)</b>
     </a>
   </sub>
 </p>
 
----
+CppDesk is a portable remote desktop application for Windows built with modern C++ and Direct2D. It ships as a single standalone executable (`CppDesk.exe`) with no installer, registry clutter, or external runtime requirements. Sessions authenticate via ephemeral or permanent keys and run end-to-end encrypted over direct LAN, NAT hole punching (STUN), or an optional relay server.
 
-CppDesk is a zero-install remote desktop application for Windows distributed as a single portable executable (**`CppDesk.exe`**). It works out of the box with no configuration or external dependencies required. You have full control of your connection and data, with end-to-end encrypted sessions.
-
-Connect across networks using a **9-Digit Desk ID** (`XXX XXX XXX`) with a permanent password or interactive approval.
-
----
+Hosts and clients identify each other with a 9-digit desk ID (`XXX XXX XXX`). Access can be granted with a password or through interactive on-screen approval.
 
 ## Features
 
-- **Screen Sharing**: Smooth, low-latency remote desktop streaming with multi-monitor switching, borderless fullscreen, and adjustable quality settings.
-- **Display Matching**: Fit remote displays to eliminate black bars, or dynamically adapt the remote computer's resolution to match your local window.
-- **Multi-Session Tabs**: Manage multiple simultaneous connections in clean browser-style tabs with live status indicators, unread chat counters, and fast keyboard shortcuts.
-- **File & Folder Transfer**: Drag and drop files and complete folders directly onto the remote screen with real-time transfer tracking and integrity verification.
-- **Voice Intercom & Audio**: Stream host system audio and talk back with real-time two-way voice communication and instant mute controls.
-- **Session Recording**: Record remote sessions directly to seekable video files with one click.
-- **Privacy Mode**: Blank out the remote screen and block local keyboard and mouse input while you work securely.
-- **TCP Port Forwarding**: Access remote services securely through local ports with quick presets for Remote Desktop (RDP), SSH, Web, and VNC.
-- **Remote Terminal**: Built-in command prompt and PowerShell console accessible directly from the side drawer for quick administrative tasks.
-- **Screen Whiteboard**: Draw and annotate together in real time using pens, highlighters, arrows, and laser pointers.
-- **Address Book**: Save and organize frequent computers with custom names, category tags, and instant search.
-- **End-to-End Security**: Protected with encrypted handshakes, authenticated stream encryption, brute-force lockout protection, and security code verification.
-- **Automatic Updates**: Built-in update notifications keeping your client secure and synchronized with new releases.
+- Screen streaming: Low-latency desktop capture using DXGI Desktop Duplication with GDI fallback, multi-monitor selection, resolution matching, and manual or adaptive FPS targets (15 to 60 FPS).
+- Multi-session management: Tabbed interface for controlling multiple remote machines at once, with live ping indicators and unread chat counters.
+- File transfer: Drag and drop files or directories straight onto the viewer window, with chunked progress tracking and SHA-256 integrity checks.
+- Two-way voice intercom and system audio: Full-duplex microphone chat with WASAPI/WinMM device selection, VU meters, and remote system sound streaming.
+- Session recording and instant rewind: Record sessions directly into self-contained video files, or scrub backwards through a rolling frame cache without interrupting the live connection.
+- Terminal and process control: Built-in remote command prompt, PowerShell execution, and a live task manager with process killing and resource monitoring.
+- Security: X25519 key exchange, ChaCha20-Poly1305 authenticated encryption, optional TOTP 2FA, brute-force rate limiting, and privacy mode (blank screen with remote input lock).
+- Whiteboard and collaboration: In-session screen drawing tools with pens, highlighters, pointers, and shared clipboard sync.
+- Built-in networking tools: Port forwarding presets (RDP, SSH, VNC, HTTP), STUN diagnostics, and address book with quick tags.
 
----
+## Quick start
 
-## Quick Start
-
-### 1. Download & Run
-Download **[`CppDesk.exe`](https://github.com/nmnghia2527/cppdesk/releases/latest)** (no installation required). Double-click to launch.
+### 1. Download and run
+Grab `CppDesk.exe` from the latest release. No installation needed.
 
 ```powershell
 .\CppDesk.exe
 ```
 
-> **Testing locally?** You can launch multiple isolated instances on one PC:
-> ```powershell
-> .\CppDesk.exe --instance 1
-> .\CppDesk.exe --instance 2
-> ```
+To test connections locally on a single machine, open two isolated instances:
+
+```powershell
+.\CppDesk.exe --instance 1
+.\CppDesk.exe --instance 2
+```
 
 ### 2. Connect
-1. **On the Host PC**: Share your **9-Digit ID** (`XXX XXX XXX`) and one-time session code (or set a permanent password in Settings).
-2. **On the Viewer PC**: Enter the Host's 9-digit ID, enter the password (or leave blank for interactive approval), and click **Connect**.
+1. On the host: Note your 9-digit ID and one-time session password (or set a permanent password in settings).
+2. On the viewer: Enter the host's 9-digit ID, type the password (or leave blank to prompt the host user for approval), and click Connect.
 
----
+## Building from source
 
-## How to Build from Source
+### Requirements
+- Windows 10 or 11 (x64)
+- C++20 compiler (such as MinGW-w64 from MSYS2 or LLVM/Clang)
 
-### Prerequisites
-- **Windows 10 / 11 (x64)**
-- **C++20 compiler** (such as MSYS2 MinGW-w64)
+### Build commands
 
-### Build Commands
 ```powershell
-# Compile standalone CppDesk.exe
+# Build standalone CppDesk.exe
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 
-# Run the automated verification test suite
+# Run the test suite
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Test
 ```
 
----
-
-## Project Structure
+## Project structure
 
 ```text
 ├── CppDesk.exe                   # Standalone portable Windows executable
 ├── build.ps1                     # Build and test automation script
 ├── src/
-│   ├── capture/                  # Screen capture and display management
-│   ├── control/                  # Input handling, session tabs, and whiteboard
-│   ├── core/                     # Networking protocol, security, and address book
-│   ├── media/                    # Voice intercom and session recording
-│   ├── net/                      # Connection engine, audio streaming, and updater
-│   ├── simd/                     # Performance acceleration
-│   └── ui/                       # Direct2D user interface
-├── relay-dotnet/                 # Optional self-hosted relay server
-├── scripts/                      # Verification and benchmark scripts
-└── tests/                        # Automated test suite
+│   ├── audio/                    # WASAPI audio capture and playback
+│   ├── capture/                  # DXGI/GDI screen capture and display management
+│   ├── control/                  # Input injection, session tabs, and whiteboard
+│   ├── core/                     # Protocol definitions, crypto identity, and settings
+│   ├── media/                    # Voice intercom, frame playback, and recording
+│   ├── net/                      # Socket engine, NAT traversal, and auto-updater
+│   ├── simd/                     # Vectorized image conversion and diffing
+│   └── ui/                       # Direct2D rendering and window management
+├── relay-dotnet/                 # Optional self-hosted relay server (.NET 8)
+├── scripts/                      # Verification and benchmark utilities
+└── tests/                        # Automated unit and integration test suite
 ```
 
----
+## Issues and support
 
-## Issues & Support
+If you hit a bug, connection failure, or want to suggest an improvement:
 
-If you run into any bugs, unexpected behavior, connection issues, or have feature ideas:
+- [Open an issue](https://github.com/oocsng/cppdesk/issues/new)
+- [Browse open reports](https://github.com/oocsng/cppdesk/issues)
 
-- **Report a Bug or Request a Feature**: [Open a New Issue](https://github.com/nmnghia2527/cppdesk/issues/new)
-- **Browse Existing Reports**: [GitHub Issues](https://github.com/nmnghia2527/cppdesk/issues)
-
-When opening an issue, include:
-- Windows version (e.g. Windows 11 23H2 x64)
-- CppDesk version (e.g. v3.5.3)
-- Connection topology (Direct LAN, STUN NAT traversal, or Relay)
-- Steps to reproduce the issue along with any displayed status text or error messages
-
----
+Include the following in your report to help diagnose the issue:
+- Windows build version (for example, Windows 11 23H2 x64)
+- CppDesk version (for example, v3.5.3)
+- Connection type (Direct LAN, STUN NAT traversal, or Relay)
+- Steps to reproduce, along with relevant log lines or status messages
 
 ## License
 
-Licensed under the [MIT License](LICENSE). Copyright (c) 2026 CppDesk.
+CppDesk is licensed under the [MIT License](LICENSE). Copyright (c) 2026 CppDesk.
