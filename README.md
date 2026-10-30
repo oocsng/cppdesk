@@ -1,7 +1,7 @@
 <p align="center">
   <img src="assets/icon.png" width="96" height="96" alt="CppDesk App Icon"><br>
   <b>CppDesk</b><br>
-  <span>Portable remote desktop client and host for Windows</span><br><br>
+  <span>Portable remote desktop client and host for Windows and macOS</span><br><br>
   <a href="#features">Features</a> •
   <a href="#quick-start">Quick start</a> •
   <a href="#building-from-source">Build</a> •
@@ -18,7 +18,7 @@
   <a href="https://github.com/oocsng/cppdesk/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-D97757?style=for-the-badge&labelColor=262320" alt="License: MIT">
   </a>
-  <img src="https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-D97757?style=for-the-badge&logo=windows&logoColor=white&labelColor=262320" alt="Platform: Windows">
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-D97757?style=for-the-badge&logo=windows&logoColor=white&labelColor=262320" alt="Platform: Windows | macOS">
 </p>
 
 <p align="center">
@@ -33,20 +33,20 @@
   </sub>
 </p>
 
-CppDesk is a portable remote desktop application for Windows built with modern C++ and Direct2D. It ships as a single standalone executable (`CppDesk.exe`) with no installer, registry clutter, or external runtime requirements. Sessions authenticate via ephemeral or permanent keys and run end-to-end encrypted over direct LAN, NAT hole punching (STUN), or an optional relay server.
+CppDesk is a portable remote desktop application built with modern C++ and hardware-accelerated rendering (Direct2D on Windows, Cocoa and Metal on macOS). It runs standalone with no installer, registry clutter, or external runtime requirements. Sessions authenticate via ephemeral or permanent keys and run end-to-end encrypted over direct LAN, NAT hole punching (STUN), or an optional relay server.
 
 Hosts and clients identify each other with a 9-digit desk ID (`XXX XXX XXX`). Access can be granted with a password or through interactive on-screen approval.
 
 ## Features
 
-- Screen streaming: Low-latency desktop capture using DXGI Desktop Duplication with GDI fallback, multi-monitor selection, resolution matching, and manual or adaptive FPS targets (15 to 60 FPS).
+- Screen streaming: Low-latency desktop capture using DXGI Desktop Duplication with GDI fallback on Windows (and AVFoundation / CoreGraphics on macOS), multi-monitor selection, dynamic resolution matching, and 4-tier quality presets (Low Bandwidth 15 FPS, Balanced 30 FPS, High Bandwidth 45 FPS, Ultra LAN 60 FPS).
 - Multi-session management: Tabbed interface for controlling multiple remote machines at once, with live ping indicators and unread chat counters.
-- File transfer: Drag and drop files or directories straight onto the viewer window, with chunked progress tracking and SHA-256 integrity checks.
-- Two-way voice intercom and system audio: Full-duplex microphone chat with WASAPI/WinMM device selection, VU meters, and remote system sound streaming.
-- Session recording and instant rewind: Record sessions directly into self-contained video files, or scrub backwards through a rolling frame cache without interrupting the live connection.
-- Terminal and process control: Built-in remote command prompt, PowerShell execution, and a live task manager with process killing and resource monitoring.
-- Security: X25519 key exchange, ChaCha20-Poly1305 authenticated encryption, optional TOTP 2FA, brute-force rate limiting, and privacy mode (blank screen with remote input lock).
-- Whiteboard and collaboration: In-session screen drawing tools with pens, highlighters, pointers, and shared clipboard sync.
+- File transfer and directory sync: Drag-and-drop file delivery with chunked progress tracking, SHA-256 integrity checks, and background bidirectional folder mirroring.
+- Audio and voice intercom: Full-duplex microphone chat with live VU meters, device selection dropdowns, and remote system loopback sound streaming.
+- Session recording and instant rewind: Record sessions directly into self-contained video files with an integrated in-app player, or scrub backwards through a rolling frame cache without interrupting the connection.
+- Terminal, process control, and command palette: Built-in remote command prompt, PowerShell execution, live task manager with process killing, and an omnibar command palette (`Ctrl+K`).
+- Security and privacy: ECDH (NIST P-256) key exchange, AES-256-GCM AEAD authenticated encryption, optional TOTP 2FA (RFC 6238) with QR setup, brute-force rate limiting, curtain screen privacy mode, and real-time privacy cloak redaction zones.
+- Collaboration tools: In-session screen drawing tools (pens, highlighters, pointers), shared clipboard sync, and a real-time collaborative scratchpad.
 - Built-in networking tools: Port forwarding presets (RDP, SSH, VNC, HTTP), STUN diagnostics, and address book with quick tags.
 
 ## Quick start
@@ -72,36 +72,41 @@ To test connections locally on a single machine, open two isolated instances:
 ## Building from source
 
 ### Requirements
-- Windows 10 or 11 (x64)
-- C++20 compiler (such as MinGW-w64 from MSYS2 or LLVM/Clang)
+- Windows 10 or 11 (x64) or macOS 12+
+- C++20 compiler (such as MinGW-w64 from MSYS2, MSVC, or Apple Clang)
+- CMake 3.20+ (for cross-platform builds)
 
 ### Build commands
 
 ```powershell
-# Build standalone CppDesk.exe
+# Build standalone CppDesk.exe via PowerShell (Windows)
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 
-# Run the test suite
+# Run the automated test suite (Windows)
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Test
+
+# Or build via CMake (Windows & macOS)
+cmake -B build
+cmake --build build --config Release
 ```
 
 ## Project structure
 
 ```text
 ├── CppDesk.exe                   # Standalone portable Windows executable
-├── build.ps1                     # Build and test automation script
+├── build.ps1                     # Windows build and test automation script
+├── CMakeLists.txt                # Cross-platform CMake build configuration
 ├── src/
-│   ├── audio/                    # WASAPI audio capture and playback
-│   ├── capture/                  # DXGI/GDI screen capture and display management
-│   ├── control/                  # Input injection, session tabs, and whiteboard
-│   ├── core/                     # Protocol definitions, crypto identity, and settings
-│   ├── media/                    # Voice intercom, frame playback, and recording
+│   ├── capture/                  # Screen capture, display management, and rewind buffer
+│   ├── control/                  # Input injection, session tabs, whiteboard, scratchpad, command palette
+│   ├── core/                     # Protocol definitions, crypto identity, and TOTP 2FA
+│   ├── media/                    # Voice intercom, session recorder, and player
 │   ├── net/                      # Socket engine, NAT traversal, and auto-updater
-│   ├── simd/                     # Vectorized image conversion and diffing
-│   └── ui/                       # Direct2D rendering and window management
-├── relay-dotnet/                 # Optional self-hosted relay server (.NET 8)
+│   ├── simd/                     # Vectorized image conversion and diffing (AVX2 & scalar fallback)
+│   └── ui/                       # Direct2D (Windows) and Cocoa/Metal (macOS) interface
+├── relay-dotnet/                 # Optional self-hosted relay server (.NET 10)
 ├── scripts/                      # Verification and benchmark utilities
-└── tests/                        # Automated unit and integration test suite
+└── tests/                        # Automated unit and integration test suite (51 suites)
 ```
 
 ## Issues and support
