@@ -12,6 +12,7 @@ internal static class Program
     private const uint ProtocolMagic = 0x4344534B; // "CDSK"
     private const int DefaultRelayPort = 50999;
     private const int MaxPayloadSize = 32 * 1024 * 1024;
+    private const int MaxControlFrame = 64 * 1024;
 
     private const byte PacketPing              = 0x07;
     private const byte PacketPong              = 0x08;
@@ -31,10 +32,14 @@ internal static class Program
         ushort TcpPort,
         NetworkStream ControlStream,
         SemaphoreSlim WriteLock,
-        DateTime RegisteredAtUtc);
+        DateTime RegisteredAtUtc)
+    {
+        public DateTime LastSeenUtc { get; set; } = RegisteredAtUtc;
+    }
 
     private static readonly ConcurrentDictionary<ulong, RegisteredHost> Hosts = new();
     private static readonly ConcurrentDictionary<ulong, TaskCompletionSource<TcpClient>> PendingBridges = new();
+    private static readonly SemaphoreSlim ClientSlots = new(256, 256);
     private static long _totalLookups;
     private static long _activeBridges;
 
@@ -92,7 +97,22 @@ internal static class Program
             {
                 TcpClient client = await listener.AcceptTcpClientAsync(ct);
                 client.NoDelay = true;
-                _ = Task.Run(() => HandleClientAsync(client, ct), ct);
+                _ = Task.Run(async () =>
+                {
+                    if (!await ClientSlots.WaitAsync(100, ct))
+                    {
+                        client.Dispose();
+                        return;
+                    }
+                    try
+                    {
+                        await HandleClientAsync(client, ct);
+                    }
+                    finally
+                    {
+                        ClientSlots.Release();
+                    }
+                }, ct);
             }
             catch (OperationCanceledException)
             {
@@ -129,6 +149,13 @@ internal static class Program
                         ip = ep.Address.ToString();
                     }
 
+                    if (Hosts.TryGetValue(deskId, out var existing) &&
+                        (DateTime.UtcNow - existing.LastSeenUtc) < TimeSpan.FromSeconds(45))
+                    {
+                        await WriteFrameAsync(stream, PacketRelayRegisterAck, 0, new byte[] { 0 }, ct);
+                        return;
+                    }
+
                     var host = new RegisteredHost(deskId, hostname, ip, tcpPort, stream, new SemaphoreSlim(1, 1), DateTime.UtcNow);
                     Hosts[deskId] = host;
 
@@ -136,12 +163,16 @@ internal static class Program
                     Log($"Registered Host {FormatDeskId(deskId)} ({hostname} @ {ip}:{tcpPort}) | Active Hosts: {Hosts.Count}");
 
                     keepAlive = true;
+                    using var pingCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    pingCts.CancelAfter(TimeSpan.FromSeconds(90));
                     try
                     {
                         while (!ct.IsCancellationRequested)
                         {
-                            var (pOk, pType, _, _) = await ReadFrameAsync(stream, ct);
+                            var (pOk, pType, _, _) = await ReadFrameAsync(stream, pingCts.Token);
                             if (!pOk) break;
+                            host.LastSeenUtc = DateTime.UtcNow;
+                            pingCts.CancelAfter(TimeSpan.FromSeconds(90));
                             if (pType == PacketPing)
                             {
                                 await host.WriteLock.WaitAsync(ct);
@@ -158,9 +189,10 @@ internal static class Program
                     }
                     finally
                     {
-                        if (Hosts.TryRemove(deskId, out var removedHost))
+                        if (((ICollection<KeyValuePair<ulong, RegisteredHost>>)Hosts)
+                                .Remove(new KeyValuePair<ulong, RegisteredHost>(deskId, host)))
                         {
-                            removedHost.WriteLock.Dispose();
+                            host.WriteLock.Dispose();
                         }
                         client.Dispose();
                         Log($"Unregistered Host {FormatDeskId(deskId)} | Active Hosts: {Hosts.Count}");
@@ -176,6 +208,20 @@ internal static class Program
 
                     using var ms = new MemoryStream();
                     if (Hosts.TryGetValue(targetId, out RegisteredHost? foundHost))
+                    {
+                        if ((DateTime.UtcNow - foundHost.LastSeenUtc) > TimeSpan.FromSeconds(90))
+                        {
+                            if (((ICollection<KeyValuePair<ulong, RegisteredHost>>)Hosts)
+                                    .Remove(new KeyValuePair<ulong, RegisteredHost>(targetId, foundHost)))
+                            {
+                                foundHost.WriteLock.Dispose();
+                                try { foundHost.ControlStream.Dispose(); } catch { }
+                            }
+                            foundHost = null;
+                        }
+                    }
+
+                    if (foundHost is not null)
                     {
                         ms.WriteByte(1);
                         WriteString(ms, foundHost.Ip);
@@ -231,7 +277,19 @@ internal static class Program
                     }
                     catch
                     {
-                        PendingBridges.TryRemove(token, out _);
+                        if (PendingBridges.TryRemove(token, out _))
+                        {
+                            tcs.TrySetCanceled();
+                        }
+                        else
+                        {
+                            try
+                            {
+                                var orphan = await tcs.Task;
+                                orphan?.Dispose();
+                            }
+                            catch { }
+                        }
                     }
 
                     if (hostBridgeClient is null)
@@ -249,9 +307,12 @@ internal static class Program
                     try
                     {
                         NetworkStream hostBridgeStream = hostBridgeClient.GetStream();
-                        Task t1 = stream.CopyToAsync(hostBridgeStream, ct);
-                        Task t2 = hostBridgeStream.CopyToAsync(stream, ct);
+                        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        Task t1 = stream.CopyToAsync(hostBridgeStream, linked.Token);
+                        Task t2 = hostBridgeStream.CopyToAsync(stream, linked.Token);
                         await Task.WhenAny(t1, t2);
+                        linked.Cancel();
+                        try { await Task.WhenAll(t1, t2); } catch (OperationCanceledException) { } catch (IOException) { }
                     }
                     finally
                     {
@@ -299,7 +360,12 @@ internal static class Program
         byte type = hdr[4];
         byte flags = hdr[5];
         uint size = BinaryPrimitives.ReadUInt32LittleEndian(hdr.AsSpan(6, 4));
-        if (size > MaxPayloadSize) return (false, 0, 0, Array.Empty<byte>());
+        uint cap = type switch
+        {
+            PacketRelayRegister or PacketRelayLookup or PacketRelayConnectReq or PacketRelayBridgeAccept => MaxControlFrame,
+            _ => MaxPayloadSize
+        };
+        if (size > cap) return (false, 0, 0, Array.Empty<byte>());
 
         byte[] payload = size > 0 ? new byte[size] : Array.Empty<byte>();
         if (size > 0 && !await ReadExactAsync(stream, payload, ct))

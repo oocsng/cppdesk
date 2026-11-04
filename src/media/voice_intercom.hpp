@@ -54,7 +54,7 @@ public:
     bool startPlayback(uint32_t sampleRate = 48000, uint8_t channels = 1);
     void stopPlayback();
     bool isPlaying() const { return playing_.load(); }
-    void enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes);
+    void enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes, uint8_t sourceChannels = 1);
 
     // Mute & Volume controls
     void setMicMuted(bool muted) { micMuted_.store(muted); }

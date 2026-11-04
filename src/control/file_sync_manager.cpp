@@ -26,6 +26,23 @@ std::wstring utf8ToWide(const std::string& str) {
     return w;
 }
 
+bool isPathInside(const std::string& childPath, const std::string& parentPath) {
+    if (parentPath.empty() || childPath.empty()) return false;
+    std::filesystem::path cp = std::filesystem::path(childPath).lexically_normal();
+    std::filesystem::path pp = std::filesystem::path(parentPath).lexically_normal();
+    std::string childNorm = cp.generic_string();
+    std::string parentNorm = pp.generic_string();
+    if (!parentNorm.empty() && parentNorm.back() != '/') {
+        parentNorm.push_back('/');
+    }
+    if (childNorm.size() >= parentNorm.size() - 1) {
+        std::string parentNoSlash = parentNorm.substr(0, parentNorm.size() - 1);
+        if (childNorm == parentNoSlash) return true;
+        if (childNorm.rfind(parentNorm, 0) == 0) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 FileSyncManager::FileSyncManager() {
@@ -621,8 +638,7 @@ bool FileSyncManager::startSync() {
     return true;
 }
 
-void FileSyncManager::cancelSync() {
-    std::lock_guard<std::mutex> lock(mutex_);
+void FileSyncManager::cancelSyncLocked() {
     state_ = SyncState::Cancelled;
     pendingBlocks_.clear();
     outgoingFiles_.clear();
@@ -635,6 +651,11 @@ void FileSyncManager::cancelSync() {
         }
     }
     incomingFiles_.clear();
+}
+
+void FileSyncManager::cancelSync() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    cancelSyncLocked();
 }
 
 void FileSyncManager::reset() {
@@ -842,12 +863,25 @@ void FileSyncManager::registerIncomingFile(
     uint64_t mtimeSec)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    constexpr size_t MAX_INCOMING_FILES = 64;
+    if (incomingFiles_.find(fileId) == incomingFiles_.end() && incomingFiles_.size() >= MAX_INCOMING_FILES) {
+        auto oldestIt = incomingFiles_.begin();
+        if (!oldestIt->second.partFullPath.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(oldestIt->second.partFullPath, ec);
+        }
+        incomingFiles_.erase(oldestIt);
+    }
     auto& in = incomingFiles_[fileId];
     in.fileId = fileId;
     in.relativePath = normalizePath(relativePath);
     in.totalSize = totalSize;
     in.mtimeSec = mtimeSec;
-    in.totalBlocks = (totalSize > 0) ? static_cast<uint32_t>((totalSize + SYNC_BLOCK_SIZE - 1) / SYNC_BLOCK_SIZE) : 1;
+    constexpr uint32_t MAX_BLOCKS_PER_FILE =
+        static_cast<uint32_t>((2ull * 1024 * 1024 * 1024) / SYNC_BLOCK_SIZE);
+    uint32_t tb = (totalSize > 0) ? static_cast<uint32_t>((totalSize + SYNC_BLOCK_SIZE - 1) / SYNC_BLOCK_SIZE) : 1;
+    if (tb > MAX_BLOCKS_PER_FILE) tb = MAX_BLOCKS_PER_FILE;
+    in.totalBlocks = tb;
     in.receivedBlocks = 0;
     in.blockReceived.assign(in.totalBlocks, false);
     in.initialized = false;
@@ -881,12 +915,29 @@ void FileSyncManager::queueOutgoingFile(
 
 bool FileSyncManager::handleDeltaBlock(const SyncDeltaBlockPayload& block) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ != SyncState::Syncing) return false;
+    if (block.syncId != activeSyncId_) return false;
+
+    constexpr uint32_t MAX_BLOCKS_PER_FILE =
+        static_cast<uint32_t>((2ull * 1024 * 1024 * 1024) / SYNC_BLOCK_SIZE);
+    if (block.blockIndex >= MAX_BLOCKS_PER_FILE) return false;
+    if (block.totalBlocks == 0 || block.totalBlocks > MAX_BLOCKS_PER_FILE) return false;
 
     // 1. Verify CNG SHA-256 integrity of the payload
     auto calculated = CryptoUtils::sha256(block.blockData.data(), block.blockData.size());
     if (calculated != block.blockHash) {
         errorMessage_ = "Block SHA-256 digest validation failed for fileId " + std::to_string(block.fileId);
         return false;
+    }
+
+    constexpr size_t MAX_INCOMING_FILES = 64;
+    if (incomingFiles_.find(block.fileId) == incomingFiles_.end() && incomingFiles_.size() >= MAX_INCOMING_FILES) {
+        auto oldestIt = incomingFiles_.begin();
+        if (!oldestIt->second.partFullPath.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(oldestIt->second.partFullPath, ec);
+        }
+        incomingFiles_.erase(oldestIt);
     }
 
     auto& in = incomingFiles_[block.fileId];
@@ -935,13 +986,17 @@ bool FileSyncManager::handleDeltaBlock(const SyncDeltaBlockPayload& block) {
         }
 
         std::string root = resolveTargetRoot();
+        if (root.empty()) {
+            errorMessage_ = "Target root directory not configured";
+            return false;
+        }
         std::filesystem::path rootP = std::filesystem::path(root).lexically_normal();
         std::filesystem::path targetP = (rootP / in.relativePath).lexically_normal();
 
         // Security check: ensure target path is strictly contained within root
         std::string normalTarget = targetP.generic_string();
         std::string normalRoot = rootP.generic_string();
-        if (normalTarget.rfind(normalRoot, 0) != 0) {
+        if (!isPathInside(normalTarget, normalRoot)) {
             errorMessage_ = "Path traversal rejected: " + in.relativePath;
             return false;
         }
@@ -1004,7 +1059,7 @@ bool FileSyncManager::handleDeltaBlock(const SyncDeltaBlockPayload& block) {
     }
 
     if (block.blockIndex >= in.blockReceived.size()) {
-        in.blockReceived.resize(block.blockIndex + 1, false);
+        in.blockReceived.resize(static_cast<size_t>(block.blockIndex) + 1u, false);
     }
     if (!in.blockReceived[block.blockIndex]) {
         in.blockReceived[block.blockIndex] = true;
@@ -1076,7 +1131,18 @@ bool FileSyncManager::handleActionReq(const SyncActionReqPayload& req, SyncActio
     }
 
     std::string root = resolveTargetRoot();
-    std::filesystem::path full = std::filesystem::path(root) / norm;
+    if (root.empty()) {
+        resp.statusCode = 2; // AccessDenied
+        resp.message = "Target root directory not configured";
+        return false;
+    }
+    std::filesystem::path rootP = std::filesystem::path(root).lexically_normal();
+    std::filesystem::path full = (rootP / norm).lexically_normal();
+    if (!isPathInside(full.generic_string(), rootP.generic_string())) {
+        resp.statusCode = 2; // AccessDenied
+        resp.message = "Path traversal rejected";
+        return false;
+    }
     std::error_code ec;
 
     switch (static_cast<SyncActionType>(req.actionType)) {
@@ -1093,7 +1159,7 @@ bool FileSyncManager::handleActionReq(const SyncActionReqPayload& req, SyncActio
             if (ec) { resp.statusCode = 1; resp.message = ec.message(); }
             break;
         case SyncActionType::AbortSync:
-            cancelSync();
+            cancelSyncLocked();
             break;
         case SyncActionType::RequestFile: {
             if (std::filesystem::exists(full, ec) && !std::filesystem::is_directory(full, ec)) {
@@ -1140,9 +1206,13 @@ bool FileSyncManager::handleActionResp(const SyncActionRespPayload& resp) {
 bool FileSyncManager::handleScanReqHost(const SyncScanReqPayload& req, SyncScanRespPayload& resp) {
     resp.scanId = req.scanId;
     resp.rootPath = req.rootPath;
+    if (localRoot().empty()) {
+        resp.statusCode = 2; // AccessDenied
+        return false;
+    }
     std::string scanRoot = req.rootPath.empty() ? localRoot() : req.rootPath;
-    if (scanRoot.empty()) {
-        resp.statusCode = 1; // DirectoryNotFound
+    if (!isPathInside(scanRoot, localRoot())) {
+        resp.statusCode = 2; // AccessDenied
         return false;
     }
 
@@ -1152,7 +1222,6 @@ bool FileSyncManager::handleScanReqHost(const SyncScanReqPayload& req, SyncScanR
         return false;
     }
 
-    setLocalRoot(scanRoot);
     if (!scanLocalDirectory(scanRoot, resp.entries)) {
         resp.statusCode = 3; // Error
         return false;
@@ -1164,14 +1233,32 @@ bool FileSyncManager::handleScanReqHost(const SyncScanReqPayload& req, SyncScanR
 bool FileSyncManager::handleHashReqHost(const SyncHashReqPayload& req, SyncHashRespPayload& resp) {
     resp.syncId = req.syncId;
     resp.fileId = req.fileId;
-    std::string norm = normalizePath(req.relativePath);
     std::string root = localRoot().empty() ? remoteRoot() : localRoot();
-    std::filesystem::path full = std::filesystem::path(root) / norm;
-    std::error_code ec;
+    if (root.empty()) {
+        resp.targetFileSize = 0;
+        resp.blockHashes.clear();
+        return false;
+    }
+
+    std::string norm = normalizePath(req.relativePath);
+    if (norm.empty()) {
+        resp.targetFileSize = 0;
+        resp.blockHashes.clear();
+        return false;
+    }
+
+    std::filesystem::path rootP = std::filesystem::path(root).lexically_normal();
+    std::filesystem::path full = (rootP / norm).lexically_normal();
+    if (!isPathInside(full.generic_string(), rootP.generic_string())) {
+        resp.targetFileSize = 0;
+        resp.blockHashes.clear();
+        return false;
+    }
 
     // Register incoming file mapping for reverse or subsequent writes
     registerIncomingFile(req.fileId, norm, 0, 0);
 
+    std::error_code ec;
     if (!std::filesystem::exists(full, ec) || std::filesystem::is_directory(full, ec)) {
         resp.targetFileSize = 0;
         resp.blockHashes.clear();
@@ -1179,6 +1266,15 @@ bool FileSyncManager::handleHashReqHost(const SyncHashReqPayload& req, SyncHashR
     }
 
     uint64_t sz = std::filesystem::file_size(full, ec);
+    constexpr uint32_t MAX_BLOCKS_PER_FILE =
+        static_cast<uint32_t>((2ull * 1024 * 1024 * 1024) / SYNC_BLOCK_SIZE);
+    uint32_t tb = (sz > 0) ? static_cast<uint32_t>((sz + SYNC_BLOCK_SIZE - 1) / SYNC_BLOCK_SIZE) : 1;
+    if (tb > MAX_BLOCKS_PER_FILE) {
+        resp.targetFileSize = 0;
+        resp.blockHashes.clear();
+        return false;
+    }
+
     resp.targetFileSize = sz;
     computeBlockHashes(full.string(), sz, resp.blockHashes);
     return true;

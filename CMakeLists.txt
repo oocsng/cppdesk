@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(CppDesk VERSION 3.5.3 LANGUAGES C CXX ASM)
+project(CppDesk VERSION 3.6.0 LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -114,18 +114,22 @@ else()
 endif()
 
 # Automated test suite target
-add_executable(CppDeskTests
-    ${CORE_SOURCES}
-    tests/test_suite.cpp
-)
-target_link_libraries(CppDeskTests PRIVATE ${PLATFORM_LIBS})
+if(WIN32)
+    add_executable(CppDeskTests
+        ${CORE_SOURCES}
+        tests/test_suite.cpp
+    )
+    target_link_libraries(CppDeskTests PRIVATE ${PLATFORM_LIBS})
+endif()
 
 # Application executable
 if(WIN32)
+    enable_language(RC)
     add_executable(CppDesk
         ${CORE_SOURCES}
         src/ui/ui_window.cpp
         src/main.cpp
+        src/cppdesk.rc
     )
     target_link_libraries(CppDesk PRIVATE ${PLATFORM_LIBS})
 elseif(APPLE)
@@ -138,8 +142,8 @@ elseif(APPLE)
         MACOSX_BUNDLE_BUNDLE_NAME "CppDesk"
         MACOSX_BUNDLE_BUNDLE_IDENTIFIER "com.oocsng.cppdesk"
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/Info.plist"
-        MACOSX_BUNDLE_SHORT_VERSION_STRING "3.5.3"
-        MACOSX_BUNDLE_LONG_VERSION_STRING "3.5.3"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "3.6.0"
+        MACOSX_BUNDLE_LONG_VERSION_STRING "3.6.0"
     )
     target_link_libraries(CppDesk PRIVATE
         ${PLATFORM_LIBS}

@@ -1521,17 +1521,20 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
 
         // Initialize Ephemeral ECDH (NIST P-256) for forward secrecy
         EcdhKeyExchange hostEcdh;
-        hostEcdh.initialize();
-
-        // 1. Receive HELLO
-        FrameHeader hdr{};
-        std::vector<uint8_t> payload;
-        if (!recvFrame(clientSock, hdr, payload) || static_cast<PacketType>(hdr.type) != PacketType::HELLO) {
+        if (!hostEcdh.initialize() || hostEcdh.localPublicKey().empty()) {
             cleanup();
             return;
         }
 
-        ByteReader helloReader(payload);
+        // 1. Receive HELLO
+        FrameHeader hdr{};
+        std::vector<uint8_t> handshakePayload;
+        if (!recvFrame(clientSock, hdr, handshakePayload) || static_cast<PacketType>(hdr.type) != PacketType::HELLO) {
+            cleanup();
+            return;
+        }
+
+        ByteReader helloReader(handshakePayload);
         uint16_t protoVer = helloReader.readU16();
         uint64_t viewerId = helloReader.readU64();
         std::string viewerHostname = helloReader.readString();
@@ -1577,12 +1580,12 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         }
 
         // 3. Receive AUTH_RESPONSE
-        if (!recvFrame(clientSock, hdr, payload) || static_cast<PacketType>(hdr.type) != PacketType::AUTH_RESPONSE) {
+        if (!recvFrame(clientSock, hdr, handshakePayload) || static_cast<PacketType>(hdr.type) != PacketType::AUTH_RESPONSE) {
             cleanup();
             return;
         }
 
-        ByteReader authReader(payload);
+        ByteReader authReader(handshakePayload);
         uint8_t hasPassword = authReader.readU8();
         std::array<uint8_t, 32> clientDigest{};
         authReader.readBytes(clientDigest.data(), clientDigest.size());
@@ -1635,7 +1638,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                     setSocketTimeoutMs(toWinSock(clientSock), 45000);
 
                     while (totpAttempts < maxTotpAttempts && running_.load()) {
-                        if (!recvFrame(clientSock, hdr, payload)) {
+                        if (!recvFrame(clientSock, hdr, handshakePayload)) {
                             cleanup();
                             return;
                         }
@@ -1644,7 +1647,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             return;
                         }
 
-                        ByteReader totpReader(payload);
+                        ByteReader totpReader(handshakePayload);
                         std::string codeStr = totpReader.readString();
                         uint64_t currentUnixTime = static_cast<uint64_t>(std::time(nullptr));
 
@@ -1756,12 +1759,13 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
 
         // Clear handshake timeout & activate mandatory end-to-end AES-256-GCM AEAD encryption!
         setSocketTimeoutMs(toWinSock(clientSock), 0);
-        if (!viewerPubBlob.empty()) {
-            hostEcdh.computeSharedSessionKey(
+        if (viewerPubBlob.empty() ||
+            !hostEcdh.computeSharedSessionKey(
                 viewerPubBlob.data(), viewerPubBlob.size(),
-                identity_.deskId(), viewerId, nonce, hostSessionKey_);
-        } else {
-            hostSessionKey_ = CryptoUtils::deriveSessionKey(identity_.deskId(), viewerId, nonce);
+                identity_.deskId(), viewerId, nonce, hostSessionKey_) ||
+            !CryptoUtils::isUsableKey(hostSessionKey_)) {
+            cleanup();
+            return;
         }
 
         {
@@ -1932,12 +1936,6 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                 }
 
                 totalBytesSent += item.payload.size();
-                // Periodic rekeying ratchet every 1 GB (Option 4A)
-                if (totalBytesSent >= 1024ULL * 1024ULL * 1024ULL) {
-                    totalBytesSent = 0;
-                    std::lock_guard<std::mutex> lock(hostCipherMutex_);
-                    hostCipher_.ratchetKey();
-                }
 
                 if (item.isVideoTile) {
                     float sendDur = static_cast<float>(nowTickMs() - sendT0);
@@ -2066,7 +2064,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                         }
                         case PacketType::VIRTUAL_DISPLAY_CMD: {
                             VirtualDisplayCmdPayload cmd{};
-                            if (deserializeVirtualDisplayCmd(payload.data(), payload.size(), cmd)) {
+                            if (deserializeVirtualDisplayCmd(rpay.data(), rpay.size(), cmd)) {
                                 VirtualDisplayStatusPayload status{};
                                 status.displayId = cmd.displayId;
                                 status.width = cmd.width;
@@ -2283,7 +2281,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                         }
                         case PacketType::CHAT_MEDIA_MESSAGE: {
                             ChatMediaPayload p{};
-                            if (deserializeChatMedia(payload.data(), payload.size(), p)) {
+                            if (deserializeChatMedia(rpay.data(), rpay.size(), p)) {
                                 {
                                     std::lock_guard<std::mutex> cl(chatMutex_);
                                     chatHistory_.push_back({ p.senderName, p.captionText, false, p.timestampMs, true, std::move(p.jpegData), p.imgWidth, p.imgHeight });
@@ -2329,7 +2327,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             break;
                         }
                         case PacketType::AUDIO_CONTROL: {
-                            if (r.hasRemaining(sizeof(AudioControlPayload))) {
+                            if ((perms & PERM_INPUT) != 0 && r.hasRemaining(sizeof(AudioControlPayload))) {
                                 AudioControlPayload p{};
                                 r.readBytes(&p, sizeof(p));
                                 hostAudioSuspended_.store(p.isMuted != 0);
@@ -2337,7 +2335,9 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             break;
                         }
                         case PacketType::VOICE_INTERCOM_CHUNK: {
-                            handleIncomingVoiceChunk(payload.data(), payload.size());
+                            if (perms & PERM_INPUT) {
+                                handleIncomingVoiceChunk(rpay.data(), rpay.size());
+                            }
                             break;
                         }
                         case PacketType::TUNNEL_OPEN: {
@@ -2440,6 +2440,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             break;
                         }
                         case PacketType::DIAGNOSTICS_REQ: {
+                            if ((perms & PERM_INPUT) == 0) { hostDiagnosticsStreamActive_.store(false); break; }
                             uint8_t act = r.readU8();
                             hostDiagnosticsStreamActive_.store(act != 0);
                             if (act != 0) {
@@ -2467,7 +2468,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                         case PacketType::SYNC_SCAN_REQ: {
                             if (perms & PERM_FILE_TRANSFER) {
                                 SyncScanReqPayload req;
-                                if (deserializeSyncScanReq(payload.data(), payload.size(), req)) {
+                                if (deserializeSyncScanReq(rpay.data(), rpay.size(), req)) {
                                     SyncScanRespPayload resp;
                                     fileSyncMgr_.handleScanReqHost(req, resp);
                                     std::vector<uint8_t> respBuf;
@@ -2480,7 +2481,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                         case PacketType::SYNC_HASH_REQ: {
                             if (perms & PERM_FILE_TRANSFER) {
                                 SyncHashReqPayload req;
-                                if (deserializeSyncHashReq(payload.data(), payload.size(), req)) {
+                                if (deserializeSyncHashReq(rpay.data(), rpay.size(), req)) {
                                     SyncHashRespPayload resp;
                                     fileSyncMgr_.handleHashReqHost(req, resp);
                                     std::vector<uint8_t> respBuf;
@@ -2493,7 +2494,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                         case PacketType::SYNC_DELTA_BLOCK: {
                             if (perms & PERM_FILE_TRANSFER) {
                                 SyncDeltaBlockPayload block;
-                                if (deserializeSyncDeltaBlock(payload.data(), payload.size(), block)) {
+                                if (deserializeSyncDeltaBlock(rpay.data(), rpay.size(), block)) {
                                     fileSyncMgr_.handleDeltaBlock(block);
                                 }
                             }
@@ -2502,7 +2503,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                         case PacketType::SYNC_ACTION_REQ: {
                             if (perms & PERM_FILE_TRANSFER) {
                                 SyncActionReqPayload req;
-                                if (deserializeSyncActionReq(payload.data(), payload.size(), req)) {
+                                if (deserializeSyncActionReq(rpay.data(), rpay.size(), req)) {
                                     SyncActionRespPayload resp;
                                     fileSyncMgr_.handleActionReq(req, resp);
                                     std::vector<uint8_t> respBuf;
@@ -2514,14 +2515,14 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                         }
                         case PacketType::SYNC_STATUS_UPDATE: {
                             SyncStatusUpdatePayload status;
-                            if (deserializeSyncStatusUpdate(payload.data(), payload.size(), status)) {
+                            if (deserializeSyncStatusUpdate(rpay.data(), rpay.size(), status)) {
                                 fileSyncMgr_.handleStatusUpdate(status);
                             }
                             break;
                         }
                         case PacketType::VERSION_UPGRADE_NOTICE: {
                             VersionUpgradeNoticePayload notice;
-                            if (deserializeVersionUpgradeNotice(payload.data(), payload.size(), notice)) {
+                            if (deserializeVersionUpgradeNotice(rpay.data(), rpay.size(), notice)) {
                                 std::function<void(const VersionUpgradeNoticePayload&)> cb;
                                 {
                                     std::lock_guard<std::mutex> lk(peerVersionMutex_);
@@ -2535,7 +2536,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                         }
                         case PacketType::SCRATCHPAD_UPDATE: {
                             ScratchpadUpdatePayload pad{};
-                            if (deserializeScratchpadUpdate(payload.data(), payload.size(), pad)) {
+                            if (deserializeScratchpadUpdate(rpay.data(), rpay.size(), pad)) {
                                 if (scratchpadMgr_.handleRemoteUpdate(pad)) {
                                     std::function<void(const ScratchpadUpdatePayload&)> cb;
                                     {
@@ -2550,7 +2551,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                         case PacketType::COMMAND_PALETTE_EXEC: {
                             if (perms & PERM_INPUT) {
                                 CommandPaletteExecPayload execReq{};
-                                if (deserializeCommandPaletteExec(payload.data(), payload.size(), execReq)) {
+                                if (deserializeCommandPaletteExec(rpay.data(), rpay.size(), execReq)) {
                                     uint32_t cmdId = execReq.commandId;
                                     std::string runCmd = execReq.customCommand.empty() ? execReq.commandKey : execReq.customCommand;
                                     commandPaletteMgr_.executeAsync(runCmd, [this, cmdId](int32_t exitCode, const std::string& output) {
@@ -3099,7 +3100,14 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
 
             // Initialize Ephemeral ECDH (NIST P-256) for forward secrecy
             EcdhKeyExchange viewerEcdh;
-            viewerEcdh.initialize();
+            if (!viewerEcdh.initialize() || viewerEcdh.localPublicKey().empty()) {
+                if (!isReconnecting) {
+                    setStatus(ViewerConnectionState::Error, "Failed to initialize key exchange.");
+                }
+                closeWinSock(vSock);
+                viewerSock_.store(~uintptr_t(0));
+                return false;
+            }
 
             // 1. Send HELLO
             {
@@ -3324,12 +3332,17 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                     }
 
                     // Activate mandatory end-to-end stream encryption
-                    if (!hostPubBlob.empty()) {
-                        viewerEcdh.computeSharedSessionKey(
+                    if (hostPubBlob.empty() ||
+                        !viewerEcdh.computeSharedSessionKey(
                             hostPubBlob.data(), hostPubBlob.size(),
-                            remoteId, identity_.deskId(), nonce, viewerSessionKey_);
-                    } else {
-                        viewerSessionKey_ = CryptoUtils::deriveSessionKey(remoteId, identity_.deskId(), nonce);
+                            remoteId, identity_.deskId(), nonce, viewerSessionKey_) ||
+                        !CryptoUtils::isUsableKey(viewerSessionKey_)) {
+                        if (!isReconnecting) {
+                            setStatus(ViewerConnectionState::Error, "Failed to establish secure session.");
+                        }
+                        closeWinSock(vSock);
+                        viewerSock_.store(~uintptr_t(0));
+                        return false;
                     }
 
                     std::string sasFingerprint;
@@ -3549,9 +3562,14 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             }
                             {
                                 std::lock_guard<std::mutex> lock(viewerFrameMutex_);
+
+
+                                std::vector<uint8_t> fresh(static_cast<size_t>(fw) * fh * 4, 0);
+                                viewerCanvasBgra_.swap(fresh);
                                 viewerCanvasW_ = fw;
                                 viewerCanvasH_ = fh;
-                                viewerCanvasBgra_.assign(static_cast<size_t>(fw) * fh * 4, 0);
+    
+    
                                 viewerFullCanvasDirty_ = true;
                                 viewerDirtyBounds_ = RECT{0, 0, static_cast<LONG>(fw), static_cast<LONG>(fh)};
                                 viewerFrameSeq_++;
@@ -3590,15 +3608,21 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             uint16_t fw = r.readU16();
                             uint16_t fh = r.readU16();
                             uint16_t tileCount = r.readU16();
+                            if (fw < 32 || fw > 8192 || fh < 32 || fh > 8192) break;
 
                             auto decStart = std::chrono::steady_clock::now();
                             {
                                 std::lock_guard<std::mutex> lock(viewerFrameMutex_);
                                 bool resChanged = (viewerCanvasW_ != fw || viewerCanvasH_ != fh);
                                 if (resChanged) {
-                                    viewerCanvasW_ = fw;
-                                    viewerCanvasH_ = fh;
-                                    viewerCanvasBgra_.assign(static_cast<size_t>(fw) * fh * 4, 0);
+    
+    
+                                    std::vector<uint8_t> fresh(static_cast<size_t>(fw) * fh * 4, 0);
+                                viewerCanvasBgra_.swap(fresh);
+                                viewerCanvasW_ = fw;
+                                viewerCanvasH_ = fh;
+    
+    
                                     viewerFullCanvasDirty_ = true;
                                     viewerDirtyBounds_ = RECT{0, 0, static_cast<LONG>(fw), static_cast<LONG>(fh)};
                                 }
@@ -5079,7 +5103,7 @@ void NetworkEngine::handleIncomingVoiceChunk(const uint8_t* payload, size_t len)
     if (!voiceIntercom_.isPlaying()) {
         voiceIntercom_.startPlayback(srate, ch);
     }
-    voiceIntercom_.enqueuePlaybackChunk(pcm, pcmBytes);
+    voiceIntercom_.enqueuePlaybackChunk(pcm, pcmBytes, ch);
 
     if (!voiceIntercom_.isCapturing() && activeHostClientSock_.load() != ~uintptr_t(0)) {
         startVoiceIntercom();

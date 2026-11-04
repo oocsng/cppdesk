@@ -460,8 +460,12 @@ void AutoUpdater::downloadUpdateAssetAsync(
 
             DWORD toRead = std::min<DWORD>(bytesAvailable, BUF_SIZE);
             DWORD bytesRead = 0;
-            if (!WinHttpReadData(hRequest, buffer.data(), toRead, &bytesRead) || bytesRead == 0) {
-                readSuccess = (bytesRead == 0);
+            if (!WinHttpReadData(hRequest, buffer.data(), toRead, &bytesRead)) {
+                readSuccess = false;
+                break;
+            }
+            if (bytesRead == 0) {
+                readSuccess = true;
                 break;
             }
 
@@ -491,7 +495,7 @@ void AutoUpdater::downloadUpdateAssetAsync(
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
 
-        if (!readSuccess || (totalBytes > 0 && downloadedBytes < totalBytes)) {
+        if (!readSuccess || (totalBytes > 0 && downloadedBytes != totalBytes)) {
             DeleteFileW(targetPath.c_str());
             if (onComplete) onComplete(false, "Download stream truncated or failed");
             return;
@@ -579,7 +583,8 @@ int AutoUpdater::applySelfUpdateAndRestart(
 
     bool copied = false;
     for (int attempt = 0; attempt < 30; ++attempt) {
-        if (CopyFileW(sourceExePath.c_str(), targetExePath.c_str(), FALSE)) {
+        if (MoveFileExW(sourceExePath.c_str(), targetExePath.c_str(), MOVEFILE_REPLACE_EXISTING) ||
+            CopyFileW(sourceExePath.c_str(), targetExePath.c_str(), FALSE)) {
             copied = true;
             break;
         }
@@ -595,9 +600,20 @@ int AutoUpdater::applySelfUpdateAndRestart(
         std::wstring quotedCmd = L"\"" + targetExePath + L"\"";
         std::vector<wchar_t> cmdBuf(quotedCmd.begin(), quotedCmd.end());
         cmdBuf.push_back(L'\0');
-        if (CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        if (CreateProcessW(targetExePath.c_str(), cmdBuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
+        } else {
+            ZeroMemory(&si, sizeof(si));
+            si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_SHOWNORMAL;
+            cmdBuf.assign(quotedCmd.begin(), quotedCmd.end());
+            cmdBuf.push_back(L'\0');
+            if (CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
         }
     }
     return copied ? 0 : 1;
@@ -627,9 +643,9 @@ bool AutoUpdater::launchSelfUpdate(const std::wstring& newExePath, const std::ws
     std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
     cmdBuf.push_back(L'\0');
 
-    // Launch target new executable directly as GUI process (zero console window popup)
+    // Launch target new executable directly as GUI process with explicit lpApplicationName
     BOOL res = CreateProcessW(
-        nullptr,
+        newExePath.c_str(),
         cmdBuf.data(),
         nullptr,
         nullptr,
@@ -647,17 +663,23 @@ bool AutoUpdater::launchSelfUpdate(const std::wstring& newExePath, const std::ws
         return true;
     }
 
-    // Fallback: spawn command line helper if direct launch fails
-    std::wstring fbCmd = buildSelfUpdateCommand(newExePath, currentExePath);
-    std::vector<wchar_t> fbBuf(fbCmd.begin(), fbCmd.end());
-    fbBuf.push_back(L'\0');
+    // Fallback attempt: reinitialize si and retry with command line
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    ZeroMemory(&pi, sizeof(pi));
+
+    cmdBuf.assign(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+
     res = CreateProcessW(
         nullptr,
-        fbBuf.data(),
+        cmdBuf.data(),
         nullptr,
         nullptr,
         FALSE,
-        CREATE_NO_WINDOW,
+        0,
         nullptr,
         nullptr,
         &si,

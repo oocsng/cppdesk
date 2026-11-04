@@ -97,6 +97,81 @@ std::array<uint8_t, 32> CryptoUtils::sha256(const void* data, size_t len) {
     }
 #elif defined(__APPLE__)
     CC_SHA256(data, static_cast<CC_LONG>(len), digest.data());
+#else
+// Portable fallback SHA-256 implementation for generic Unix
+namespace {
+    inline uint32_t ror(uint32_t val, uint32_t shift) { return (val >> shift) | (val << (32 - shift)); }
+    inline uint32_t ch(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (~x & z); }
+    inline uint32_t maj(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (x & z) ^ (y & z); }
+    inline uint32_t sig0(uint32_t x) { return ror(x, 2) ^ ror(x, 13) ^ ror(x, 22); }
+    inline uint32_t sig1(uint32_t x) { return ror(x, 6) ^ ror(x, 11) ^ ror(x, 25); }
+    inline uint32_t gam0(uint32_t x) { return ror(x, 7) ^ ror(x, 18) ^ (x >> 3); }
+    inline uint32_t gam1(uint32_t x) { return ror(x, 17) ^ ror(x, 19) ^ (x >> 10); }
+
+    const uint32_t K256[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+    };
+
+    void sha256Transform(uint32_t state[8], const uint8_t block[64]) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (static_cast<uint32_t>(block[i * 4]) << 24) |
+                   (static_cast<uint32_t>(block[i * 4 + 1]) << 16) |
+                   (static_cast<uint32_t>(block[i * 4 + 2]) << 8) |
+                   (static_cast<uint32_t>(block[i * 4 + 3]));
+        }
+        for (int i = 16; i < 64; ++i) {
+            w[i] = gam1(w[i - 2]) + w[i - 7] + gam0(w[i - 15]) + w[i - 16];
+        }
+        uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+        uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+        for (int i = 0; i < 64; ++i) {
+            uint32_t t1 = h + sig1(e) + ch(e, f, g) + K256[i] + w[i];
+            uint32_t t2 = sig0(a) + maj(a, b, c);
+            h = g; g = f; f = e; e = d + t1;
+            d = c; c = b; b = a; a = t1 + t2;
+        }
+        state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+        state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+    }
+
+    void portableSha256Calc(const uint8_t* msg, size_t len, uint8_t out[32]) {
+        uint32_t state[8] = {
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+        };
+        size_t rem = len % 64;
+        size_t blocks = len / 64;
+        for (size_t i = 0; i < blocks; ++i) {
+            sha256Transform(state, msg + i * 64);
+        }
+        uint8_t tail[128] = {0};
+        if (rem > 0) std::memcpy(tail, msg + blocks * 64, rem);
+        tail[rem] = 0x80;
+        size_t padLen = (rem < 56) ? 64 : 128;
+        uint64_t bitLen = static_cast<uint64_t>(len) * 8ULL;
+        for (int i = 0; i < 8; ++i) {
+            tail[padLen - 1 - i] = static_cast<uint8_t>((bitLen >> (i * 8)) & 0xFF);
+        }
+        for (size_t i = 0; i < padLen; i += 64) {
+            sha256Transform(state, tail + i);
+        }
+        for (int i = 0; i < 8; ++i) {
+            out[i * 4] = static_cast<uint8_t>((state[i] >> 24) & 0xFF);
+            out[i * 4 + 1] = static_cast<uint8_t>((state[i] >> 16) & 0xFF);
+            out[i * 4 + 2] = static_cast<uint8_t>((state[i] >> 8) & 0xFF);
+            out[i * 4 + 3] = static_cast<uint8_t>(state[i] & 0xFF);
+        }
+    }
+}
+    portableSha256Calc(static_cast<const uint8_t*>(data), len, digest.data());
 #endif
     return digest;
 }
@@ -204,6 +279,27 @@ std::array<uint8_t, 32> CryptoUtils::hmacSha256(const void* key, size_t keyLen, 
     CCHmac(kCCHmacAlgSHA256, key, keyLen, msg, msgLen, digest.data());
     return digest;
 #else
+    uint8_t k0[64] = {0};
+    if (keyLen > 64) {
+        portableSha256Calc(static_cast<const uint8_t*>(key), keyLen, k0);
+    } else if (key && keyLen > 0) {
+        std::memcpy(k0, key, keyLen);
+    }
+    uint8_t ipad[64];
+    uint8_t opad[64];
+    for (int i = 0; i < 64; ++i) {
+        ipad[i] = k0[i] ^ 0x36;
+        opad[i] = k0[i] ^ 0x5c;
+    }
+    std::vector<uint8_t> inner(64 + msgLen);
+    std::memcpy(inner.data(), ipad, 64);
+    if (msg && msgLen > 0) std::memcpy(inner.data() + 64, msg, msgLen);
+    uint8_t innerHash[32];
+    portableSha256Calc(inner.data(), inner.size(), innerHash);
+    uint8_t outer[64 + 32];
+    std::memcpy(outer, opad, 64);
+    std::memcpy(outer + 64, innerHash, 32);
+    portableSha256Calc(outer, sizeof(outer), digest.data());
     return digest;
 #endif
 }
@@ -241,12 +337,7 @@ std::array<uint8_t, 32> CryptoUtils::deriveSessionKey(
         return hkdfSha256(ecdhSecret, ecdhSecretLen, nonce.data(), nonce.size(), infoStr);
     }
 
-    ByteWriter w;
-    w.writeString("CppDesk-SessionKey-v1");
-    w.writeU64(hostId);
-    w.writeU64(clientId);
-    w.writeBytes(nonce.data(), nonce.size());
-    return sha256(w.buffer().data(), w.buffer().size());
+    return std::array<uint8_t, 32>{};
 }
 
 std::string CryptoUtils::sessionFingerprintHex(const std::array<uint8_t, 32>& sessionKey) {
@@ -591,9 +682,8 @@ bool IdentityManager::loadOrCreate() {
         modified = true;
     }
 
-    if (unattendedVerifier_.empty()) {
-        unattendedVerifier_ = CryptoUtils::hashPassword(sessionCode_, std::to_string(deskId_));
-        modified = true;
+    if (!unattendedEnabled_) {
+        unattendedVerifier_.clear();
     }
 
     if (modified) {
@@ -671,6 +761,9 @@ bool IdentityManager::save() const {
 
 void IdentityManager::setUnattendedEnabled(bool enabled) {
     unattendedEnabled_ = enabled;
+    if (!enabled) {
+        unattendedVerifier_.clear();
+    }
     save();
 }
 
@@ -695,26 +788,22 @@ bool IdentityManager::verifyChallengeResponse(
     const std::array<uint8_t, 32>& nonce,
     const std::array<uint8_t, 32>& clientDigest) const
 {
-    if (!unattendedEnabled_) {
-        return false;
-    }
-
-    // 1. Check against stored salted SHA-256 unattended password verifier
-    if (!unattendedVerifier_.empty()) {
-        auto expected = CryptoUtils::computeChallengeResponseFromToken(
-            unattendedVerifier_, deskId_, clientId, nonce
-        );
-        if (constantTimeEquals32(expected, clientDigest)) {
-            return true;
-        }
-    }
-
-    // 2. Check against active One-Time Session Code
+    // 1. Check against active One-Time Session Code
     if (!sessionCode_.empty()) {
         auto expectedCode = CryptoUtils::computeChallengeResponse(
             sessionCode_, deskId_, clientId, nonce
         );
         if (constantTimeEquals32(expectedCode, clientDigest)) {
+            return true;
+        }
+    }
+
+    // 2. Check against stored unattended password verifier (only when unattended access is enabled)
+    if (unattendedEnabled_ && !unattendedVerifier_.empty()) {
+        auto expected = CryptoUtils::computeChallengeResponseFromToken(
+            unattendedVerifier_, deskId_, clientId, nonce
+        );
+        if (constantTimeEquals32(expected, clientDigest)) {
             return true;
         }
     }
@@ -940,6 +1029,7 @@ bool EcdhKeyExchange::computeSharedSessionKey(
     const std::array<uint8_t, 32>& nonce,
     std::array<uint8_t, 32>& outSessionKey)
 {
+    outSessionKey.fill(0);
     if (!initialized_ || !peerPubBlob || peerPubLen == 0 || !hAlg_ || !hKey_) return false;
 
     BCRYPT_ALG_HANDLE hAlg = reinterpret_cast<BCRYPT_ALG_HANDLE>(hAlg_);
@@ -1144,6 +1234,9 @@ bool AesGcmSessionCipher::decrypt(
     const uint8_t* ciphertext = encryptedPayload + 12;
     size_t cipherLen = payloadLen - 28;
     const uint8_t* tag = encryptedPayload + 12 + cipherLen;
+
+    const char* expect = isHost_ ? "VIW1" : "HST1";
+    if (std::memcmp(nonce, expect, 4) != 0) return false;
 
     uint64_t seq = 0;
     std::memcpy(&seq, nonce + 4, 8);

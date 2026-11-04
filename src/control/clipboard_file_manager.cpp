@@ -992,18 +992,46 @@ void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalByt
     }
 }
 
-void FileTransferManager::handleFileChunk(uint32_t transferId, uint64_t /*offset*/, const uint8_t* chunkData, size_t chunkLen) {
+void FileTransferManager::handleFileChunk(uint32_t transferId, uint64_t offset, const uint8_t* chunkData, size_t chunkLen) {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto& inc : incomingStreams_) {
+    for (auto it = incomingStreams_.begin(); it != incomingStreams_.end(); ++it) {
+        auto& inc = *it;
         if (inc->transferId == transferId) {
-            if (inc->stream.is_open() && chunkLen > 0) {
-                if (inc->receivedBytes + chunkLen <= MAX_TRANSFER_FILE_BYTES) {
-                    inc->stream.write(reinterpret_cast<const char*>(chunkData), static_cast<std::streamsize>(chunkLen));
-                    if (inc->hasher) {
-                        inc->hasher->update(chunkData, chunkLen);
+            if (chunkLen == 0 || inc->receivedBytes + chunkLen > inc->totalBytes || offset != inc->receivedBytes) {
+                if (inc->stream.is_open()) inc->stream.close();
+                std::error_code ec;
+                std::filesystem::remove(inc->partPath, ec);
+                for (auto& item : items_) {
+                    if (item.transferId == transferId && !item.isOutgoing) {
+                        item.status = TransferStatus::Failed;
+                        item.statusText = "Transfer aborted: size limit exceeded or offset mismatch";
+                        break;
                     }
-                    inc->receivedBytes += chunkLen;
                 }
+                incomingStreams_.erase(it);
+                return;
+            }
+
+            if (inc->stream.is_open()) {
+                inc->stream.write(reinterpret_cast<const char*>(chunkData), static_cast<std::streamsize>(chunkLen));
+                if (!inc->stream.good()) {
+                    inc->stream.close();
+                    std::error_code ec;
+                    std::filesystem::remove(inc->partPath, ec);
+                    for (auto& item : items_) {
+                        if (item.transferId == transferId && !item.isOutgoing) {
+                            item.status = TransferStatus::Failed;
+                            item.statusText = "Transfer aborted: disk write error";
+                            break;
+                        }
+                    }
+                    incomingStreams_.erase(it);
+                    return;
+                }
+                if (inc->hasher) {
+                    inc->hasher->update(chunkData, chunkLen);
+                }
+                inc->receivedBytes += chunkLen;
             }
 
             uint64_t nowMs = currentTimeMs();
@@ -1242,10 +1270,20 @@ bool ClipboardFileTransferManager::pollLocalClipboardFiles(const SendPacketFn& s
 void ClipboardFileTransferManager::handleRemoteFileList(uint32_t transferId, const std::vector<VirtualFileEntry>& files, const SendPacketFn& sendPacket) {
     if (files.empty()) return;
 
-    uint64_t totalBytes = 0;
-    for (const auto& f : files) totalBytes += f.fileSize;
-
     constexpr uint64_t MAX_CAP = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+    uint64_t totalBytes = 0;
+    for (const auto& f : files) {
+        if (f.fileSize > MAX_CAP || totalBytes > MAX_CAP - f.fileSize) {
+            if (sendPacket) {
+                ClipboardFileCancelHeader cancelHdr{ transferId, 2 }; // 2 = size limit exceeded
+                std::vector<uint8_t> pkt(sizeof(cancelHdr));
+                std::memcpy(pkt.data(), &cancelHdr, sizeof(cancelHdr));
+                sendPacket(PacketType::CLIPBOARD_FILE_CANCEL, pkt);
+            }
+            return;
+        }
+        totalBytes += f.fileSize;
+    }
     if (totalBytes > MAX_CAP) {
         if (sendPacket) {
             ClipboardFileCancelHeader cancelHdr{ transferId, 2 }; // 2 = size limit exceeded

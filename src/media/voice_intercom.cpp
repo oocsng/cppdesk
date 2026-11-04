@@ -485,7 +485,7 @@ bool VoiceIntercom::startPlayback(uint32_t sampleRate, uint8_t channels) {
     return true;
 }
 
-void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes) {
+void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes, uint8_t sourceChannels) {
     bytes = (bytes / sizeof(int16_t)) * sizeof(int16_t);
     if (!pcm || bytes < sizeof(int16_t) || bytes > 192000) return;
     std::lock_guard<std::mutex> lk(playbackMutex_);
@@ -516,7 +516,7 @@ void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes) {
     std::vector<uint8_t> convertedBuf;
     const uint8_t* sendPcm = pcm;
     size_t sendBytes = bytes;
-    if (playbackChannels_ == 2) {
+    if (sourceChannels == 1 && playbackChannels_ == 2) {
         // Mono to stereo upmixing
         size_t sampleCount = bytes / sizeof(int16_t);
         convertedBuf.resize(sampleCount * 2 * sizeof(int16_t));
@@ -525,6 +525,18 @@ void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes) {
         for (size_t i = 0; i < sampleCount; ++i) {
             outSamples[i * 2] = inSamples[i];
             outSamples[i * 2 + 1] = inSamples[i];
+        }
+        sendPcm = convertedBuf.data();
+        sendBytes = convertedBuf.size();
+    } else if (sourceChannels == 2 && playbackChannels_ == 1) {
+        // Stereo to mono downmixing by averaging
+        size_t frameCount = bytes / (2 * sizeof(int16_t));
+        convertedBuf.resize(frameCount * sizeof(int16_t));
+        const int16_t* inSamples = reinterpret_cast<const int16_t*>(pcm);
+        int16_t* outSamples = reinterpret_cast<int16_t*>(convertedBuf.data());
+        for (size_t i = 0; i < frameCount; ++i) {
+            int32_t mixed = (static_cast<int32_t>(inSamples[i * 2]) + static_cast<int32_t>(inSamples[i * 2 + 1])) / 2;
+            outSamples[i] = static_cast<int16_t>(mixed);
         }
         sendPcm = convertedBuf.data();
         sendBytes = convertedBuf.size();

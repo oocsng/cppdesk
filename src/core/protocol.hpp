@@ -16,8 +16,8 @@ namespace cppdesk {
 constexpr uint32_t PROTOCOL_MAGIC   = 0x43505044; // "CPPD" (CppDesk packet magic)
 constexpr uint32_t RELAY_MAGIC      = 0x4344534B; // "CDSK" (CppDesk relay magic)
 constexpr uint16_t PROTOCOL_VERSION = 3;
-constexpr const char* CPP_DESK_VERSION = "3.5.3";
-constexpr uint32_t CPP_DESK_VERSION_NUM = 0x030503;
+constexpr const char* CPP_DESK_VERSION = "3.6.0";
+constexpr uint32_t CPP_DESK_VERSION_NUM = 0x030600;
 
 struct SemanticVersion {
     int major = 0;
@@ -572,7 +572,7 @@ public:
     ByteReader(const uint8_t* data, size_t size) : data_(data), size_(size), pos_(0) {}
     explicit ByteReader(const std::vector<uint8_t>& vec) : data_(vec.data()), size_(vec.size()), pos_(0) {}
 
-    bool hasRemaining(size_t n) const { return pos_ + n <= size_; }
+    bool hasRemaining(size_t n) const { return n <= size_ && pos_ <= size_ - n; }
     size_t remaining() const { return size_ - pos_; }
 
     std::vector<uint8_t> readBytesVector(size_t n) {
@@ -850,6 +850,7 @@ inline bool deserializeClipboardFileList(const uint8_t* data, size_t size, uint3
         r.readBytes(&hdr, sizeof(hdr));
         outTransferId = hdr.transferId;
         outFiles.clear();
+        if (hdr.fileCount > r.remaining() / sizeof(ClipboardFileDescHeader)) return false;
         outFiles.reserve(hdr.fileCount);
 
         for (uint32_t i = 0; i < hdr.fileCount; ++i) {
@@ -1274,6 +1275,7 @@ inline bool deserializeSyncScanResp(const uint8_t* data, size_t size, SyncScanRe
         out.rootPath = r.readString();
         uint32_t count = r.readU32();
         out.entries.clear();
+        if (count > r.remaining() / (2 + 8 + 8 + 1)) return false;
         out.entries.reserve(count);
         for (uint32_t i = 0; i < count; ++i) {
             SyncFileEntry e;
@@ -1331,6 +1333,7 @@ inline bool deserializeSyncHashResp(const uint8_t* data, size_t size, SyncHashRe
         out.targetFileSize = r.readU64();
         uint32_t count = r.readU32();
         out.blockHashes.clear();
+        if (count > r.remaining() / 32) return false;
         out.blockHashes.resize(count);
         for (uint32_t i = 0; i < count; ++i) {
             r.readBytes(out.blockHashes[i].data(), 32);

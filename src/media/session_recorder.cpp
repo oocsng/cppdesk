@@ -107,14 +107,19 @@ void SessionRecorder::pushFrame(const uint8_t* bgra, int width, int height) {
     if (!recording_.load() || !bgra) return;
     if (width != width_ || height != height_) return;
 
-    size_t frameBytes = static_cast<size_t>(width * height * 4);
+    size_t frameBytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
     std::vector<uint8_t> frameBuf(bgra, bgra + frameBytes);
 
     {
-        std::lock_guard<std::mutex> lock(queueMutex_);
-        // Backpressure guard: drop oldest frame if slow disk queue exceeds 60 frames
+        std::unique_lock<std::mutex> lock(queueMutex_);
         if (frameQueue_.size() >= 60) {
-            frameQueue_.pop();
+            queueCv_.wait_for(lock, std::chrono::milliseconds(20), [&]() {
+                return frameQueue_.size() < 60 || !recording_.load();
+            });
+        }
+        if (frameQueue_.size() >= 60) {
+            droppedFrames_++;
+            return;
         }
         frameQueue_.push(std::move(frameBuf));
     }
@@ -280,6 +285,7 @@ void SessionRecorder::workerLoop() {
             if (!frameQueue_.empty()) {
                 frame = std::move(frameQueue_.front());
                 frameQueue_.pop();
+                queueCv_.notify_one();
             }
         }
 

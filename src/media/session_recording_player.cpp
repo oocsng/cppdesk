@@ -291,7 +291,11 @@ bool SessionRecordingPlayer::open(const std::string& filePath) {
     filePath_ = filePath;
     isOpen_.store(true);
 
-    seekToFrame(0);
+    if (!seekToFrame(0)) {
+        fileStream_.close();
+        isOpen_.store(false);
+        return false;
+    }
     startPlaybackThread();
     return true;
 }
@@ -396,16 +400,16 @@ bool SessionRecordingPlayer::decodeFramePayload(
     // 2. Uncompressed DIB branch
     int w = bmpInfoHeader_.biWidth > 0 ? bmpInfoHeader_.biWidth : frameWidth_;
     int rawH = bmpInfoHeader_.biHeight != 0 ? bmpInfoHeader_.biHeight : frameHeight_;
-    if (w <= 0 || rawH == 0) return false;
+    if (w <= 0 || w > 16384 || rawH == 0 || std::abs(rawH) > 16384) return false;
 
     bool isBottomUp = (rawH > 0);
     int h = std::abs(rawH);
     outW = w;
     outH = h;
-    outBgra.resize(static_cast<size_t>(w * h * 4));
+    size_t expectedSize = static_cast<size_t>(w) * static_cast<size_t>(h) * 4;
+    outBgra.resize(expectedSize);
 
     if (bmpInfoHeader_.biBitCount == 32) {
-        size_t expectedSize = static_cast<size_t>(w * h * 4);
         if (size < expectedSize) return false;
         size_t rowBytes = static_cast<size_t>(w * 4);
         uint8_t* dst = outBgra.data();
@@ -580,7 +584,10 @@ void SessionRecordingPlayer::playbackWorkerLoop() {
             isPlaying_.store(false);
         } else {
             lock.unlock();
-            seekToFrame(next);
+            if (!seekToFrame(next)) {
+                isPlaying_.store(false);
+                break;
+            }
             lock.lock();
         }
 

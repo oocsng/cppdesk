@@ -37,6 +37,7 @@ public:
 
     bool isRecording() const { return recording_.load(); }
     uint64_t recordedFrames() const { return frameCount_.load(); }
+    uint64_t droppedFrames() const { return droppedFrames_.load(); }
     uint64_t recordedBytes() const { return bytesWritten_.load(); }
     uint32_t elapsedSeconds() const;
     uint32_t durationSeconds() const { return elapsedSeconds(); }
@@ -50,6 +51,7 @@ private:
     std::atomic<bool>               recording_{false};
     std::atomic<bool>               workerStopping_{false};
     std::atomic<uint64_t>           frameCount_{0};
+    std::atomic<uint64_t>           droppedFrames_{0};
     std::atomic<uint64_t>           bytesWritten_{0};
     uint64_t                        startTick_{0};
 

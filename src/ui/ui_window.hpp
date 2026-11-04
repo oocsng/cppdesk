@@ -36,7 +36,16 @@ namespace cppdesk {
 #if defined(_WIN32)
 static constexpr UINT WM_DESK_UPDATE_CHECK_DONE = WM_USER + 102;
 static constexpr UINT WM_APP_FRAME_READY        = WM_APP + 101;
+static constexpr UINT WM_APP_SCRATCHPAD_UPDATE  = WM_APP + 102;
+static constexpr UINT WM_APP_COMMAND_PALETTE    = WM_APP + 103;
+static constexpr UINT WM_APP_UPDATE_PROGRESS    = WM_APP + 104;
 #endif
+
+struct UpdateProgressData {
+    uint64_t downloaded;
+    uint64_t total;
+    double speed;
+};
 
 enum class ActiveTab : uint8_t {
     Dashboard     = 0,
@@ -231,6 +240,7 @@ private:
     void hardResetViewerUiState();
     void showToast(const std::string& message, bool isError = false, uint32_t durationMs = 3000);
     void restoreFromTray(NotificationType contextType = NotificationType::GeneralInfo);
+    bool anyModalActive() const;
     bool mapCanvasPointToNormalized(float x, float y, float& outNormX, float& outNormY) const;
     std::string* activeFocusedTextBuffer();
 
@@ -408,6 +418,8 @@ private:
 
     // Settings Tab vertical scroll & section state
     SettingsSection              settingsSection_ = SettingsSection::Appearance;
+    bool                         voiceMonitorAttempted_ = false;
+    std::string                  voiceMonitorError_;
     std::vector<AudioDeviceDesc> cachedInputDevices_;
     std::vector<AudioDeviceDesc> cachedOutputDevices_;
     bool                         showAudioInputMenu_ = false;
@@ -500,7 +512,7 @@ private:
     float                   updateModalAnimT_ = 0.0f;
     float                   updateModalAnimVel_ = 0.0f;
     bool                    isCheckingUpdates_ = false;
-    std::string             updateStatusText_ = "Version v3.5.3 (Up to date)";
+    std::string             updateStatusText_ = "Version v3.6.0 (Up to date)";
     UpdateInfo              latestUpdateInfo_{};
     float                   startupUpdateCheckTimer_ = 2.0f;
     bool                    startupCheckTriggered_ = false;

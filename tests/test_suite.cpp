@@ -25,6 +25,7 @@
 #include "../src/control/command_palette.hpp"
 #include "../src/ui/ui_platform.hpp"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -32,6 +33,7 @@
 #include <objbase.h>
 #ifdef DeleteFile
 #undef DeleteFile
+#endif
 #endif
 
 #include <iostream>
@@ -114,7 +116,9 @@ void testDeskIdAndCrypto() {
     TEST_ASSERT(hostReloaded.verifyChallengeResponse(clientId, nonce, codeResp2));
 
     // Stream cipher round-trip & SAS fingerprint ("XXXX-XXXX")
-    auto sessionKey = CryptoUtils::deriveSessionKey(hostReloaded.deskId(), clientId, nonce);
+    const uint8_t mockSecret[32] = {0x42};
+    auto sessionKey = CryptoUtils::deriveSessionKey(hostReloaded.deskId(), clientId, nonce, mockSecret, sizeof(mockSecret));
+    TEST_ASSERT(CryptoUtils::isUsableKey(sessionKey));
     std::string fp = CryptoUtils::sessionFingerprintHex(sessionKey);
     TEST_ASSERT(fp.size() == 9);
 
@@ -314,7 +318,13 @@ void testEndToEndSessionAndFileTransfer() {
 
     // Test live permission updates from Host -> Viewer
     hostNet.updateHostSessionPermissions(PERM_CLIPBOARD | PERM_FILE_TRANSFER); // Disable PERM_INPUT
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    {
+        auto tStart = std::chrono::steady_clock::now();
+        while ((viewerNet.viewerStats().grantedPermissions & PERM_INPUT) != 0 &&
+               std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tStart).count() < 1000) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
     TEST_ASSERT((viewerNet.viewerStats().grantedPermissions & PERM_INPUT) == 0);
     TEST_ASSERT((viewerNet.viewerStats().grantedPermissions & PERM_FILE_TRANSFER) != 0);
 
@@ -737,8 +747,19 @@ void testEcdhAndAesGcmEngine() {
 
     // 5. InputInjector UAC Desktop Elevation Query (Option 5A)
     bool isElev = InputInjector::isElevated();
-    (void)isElev; // Querying elevated token status executes without throwing or crashing
-    TEST_ASSERT(true);
+    HANDLE hToken = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        TOKEN_ELEVATION elev{};
+        DWORD retLen = 0;
+        if (GetTokenInformation(hToken, TokenElevation, &elev, sizeof(elev), &retLen)) {
+            TEST_ASSERT(isElev == (elev.TokenIsElevated != 0));
+        } else {
+            TEST_ASSERT(!isElev);
+        }
+        CloseHandle(hToken);
+    } else {
+        TEST_ASSERT(!isElev);
+    }
 }
 
 void testV201FeaturesAndResilience() {
@@ -843,10 +864,22 @@ void testV201FeaturesAndResilience() {
 
     // 7. InputInjector Elevation & Safe Desktop Sync
     bool isElev = InputInjector::isElevated();
-    TEST_ASSERT(isElev == true || isElev == false);
-    // Desktop sync does not crash or invalidate handles
+    HANDLE hToken = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        TOKEN_ELEVATION elev{};
+        DWORD retLen = 0;
+        if (GetTokenInformation(hToken, TokenElevation, &elev, sizeof(elev), &retLen)) {
+            TEST_ASSERT(isElev == (elev.TokenIsElevated != 0));
+        }
+        CloseHandle(hToken);
+    }
+    HDESK hPreSync = GetThreadDesktop(GetCurrentThreadId());
     bool syncOk = InputInjector::syncToInputDesktop();
-    (void)syncOk; // May be true or false depending on execution environment
+    HDESK hPostSync = GetThreadDesktop(GetCurrentThreadId());
+    TEST_ASSERT(hPostSync != nullptr);
+    if (syncOk) {
+        TEST_ASSERT(hPostSync == hPreSync || hPostSync != nullptr);
+    }
 
     // 8. Hardware Cursor & Mouse Move Bounds Clamping
     MonitorDesc testMon{ 0, 0, 0, 1920, 1080, true, "TestMon" };
@@ -1161,8 +1194,8 @@ void testAutoUpdaterAndProtocolV3() {
     TEST_ASSERT(PROTOCOL_MAGIC == 0x43505044); // "CPPD"
     TEST_ASSERT(RELAY_MAGIC == 0x4344534B);    // "CDSK"
     TEST_ASSERT(PROTOCOL_VERSION == 3);
-    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.5.3");
-    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030503);
+    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.6.0");
+    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030600);
 
     // 2. Semantic Version Triad Parsing
     int maj = 0, min = 0, pat = 0;
@@ -1480,7 +1513,13 @@ void testSessionRecorderAndAviContainer() {
     recorder.pushFrame(frameBlue.data(), width, height);
 
     // Give background worker time to encode and write
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    {
+        auto recStart = std::chrono::steady_clock::now();
+        while (recorder.recordedFrames() < 2 &&
+               std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - recStart).count() < 1000) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
 
     // 3. Stop recording
     recorder.stopRecording();
@@ -3119,14 +3158,14 @@ void testScatterGatherFrameSendAndSocketBuffers() {
     int optLen = sizeof(sndBuf);
     int res = getsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&sndBuf), &optLen);
     TEST_ASSERT(res == 0);
-    // On Windows, requested 2MB buffer should scale well above default 64KB
-    TEST_ASSERT(sndBuf >= 65536);
+    // On Windows, requested 2MB buffer should scale well above default 64KB (at least 1MB)
+    TEST_ASSERT(sndBuf >= 1048576);
 
     int rcvBuf = 0;
     optLen = sizeof(rcvBuf);
     res = getsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char*>(&rcvBuf), &optLen);
     TEST_ASSERT(res == 0);
-    TEST_ASSERT(rcvBuf >= 65536);
+    TEST_ASSERT(rcvBuf >= 1048576);
     closesocket(s);
 
     // 2. Setup Loopback Sockets for I/O
@@ -3613,8 +3652,12 @@ void testInputCoalescingAndZeroAllocEvents() {
 
         // Verify injectMouseMove executes smoothly using cached metrics
         InputInjector::injectMouseMove(0.5f, 0.5f, mon);
+        POINT pt1{};
+        GetCursorPos(&pt1);
         InputInjector::injectMouseMove(0.6f, 0.6f, mon);
-        TEST_ASSERT(true);
+        POINT pt2{};
+        GetCursorPos(&pt2);
+        TEST_ASSERT(pt1.x >= 0 && pt1.y >= 0 && pt2.x >= 0 && pt2.y >= 0);
     }
 }
 
@@ -4246,8 +4289,19 @@ void testVirtualDisplayManagerAndHeadlessEmulation() {
         TEST_ASSERT(!viewer.requestSetVirtualDisplayMode(1, 1280, 720, 60));
 
         // Test status payload storage in ViewerSessionStats
+        VirtualDisplayStatusPayload vStatus{};
+        vStatus.statusCode = static_cast<uint8_t>(VirtualDisplayStatusCode::Success);
+        vStatus.displayId = 42;
+        vStatus.width = 2560;
+        vStatus.height = 1440;
+        std::vector<uint8_t> vBytes;
+        serializeVirtualDisplayStatus(vStatus, vBytes);
+        VirtualDisplayStatusPayload vDec{};
+        TEST_ASSERT(deserializeVirtualDisplayStatus(vBytes.data(), vBytes.size(), vDec));
+        TEST_ASSERT(vDec.displayId == 42);
+        TEST_ASSERT(vDec.width == 2560 && vDec.height == 1440);
         auto stats = viewer.viewerStats();
-        TEST_ASSERT(stats.monitors.empty() || !stats.monitors.empty());
+        TEST_ASSERT(stats.lastVirtualDisplayStatus.displayId == 0);
     }
 }
 
@@ -4321,9 +4375,11 @@ void testHardwareDpmsAndScreenBlanking() {
     }
 
     // 5. DPMS API Execution
+    bool preActive = ScreenBlankManager::instance().isBlankActive();
+    TEST_ASSERT(!preActive);
     ScreenBlankManager::powerDownDisplays();
     ScreenBlankManager::wakeDisplays();
-    TEST_ASSERT(true);
+    TEST_ASSERT(ScreenBlankManager::instance().isBlankActive() == preActive);
 
     // 6. Low-Level Hook Filter Logic
     // Mouse tests

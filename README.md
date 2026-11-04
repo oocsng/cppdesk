@@ -118,7 +118,7 @@ If you hit a bug, connection failure, or want to suggest an improvement:
 
 Include the following in your report to help diagnose the issue:
 - Windows build version (for example, Windows 11 23H2 x64)
-- CppDesk version (for example, v3.5.3)
+- CppDesk version (for example, v3.6.0)
 - Connection type (Direct LAN, STUN NAT traversal, or Relay)
 - Steps to reproduce, along with relevant log lines or status messages
 

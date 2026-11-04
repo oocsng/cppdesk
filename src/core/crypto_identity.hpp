@@ -123,6 +123,13 @@ public:
         const uint8_t* ecdhSecret = nullptr,
         size_t ecdhSecretLen = 0);
 
+    static bool isUsableKey(const std::array<uint8_t, 32>& key) {
+        for (uint8_t b : key) {
+            if (b != 0) return true;
+        }
+        return false;
+    }
+
     // 8-character uppercase SAS fingerprint ("XXXX-XXXX") derived from sessionKey to verify zero MITM
     static std::string sessionFingerprintHex(const std::array<uint8_t, 32>& sessionKey);
 

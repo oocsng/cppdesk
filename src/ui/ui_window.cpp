@@ -167,18 +167,19 @@ CppDeskWindow::CppDeskWindow(IdentityManager& identity, NetworkEngine& network, 
     privacyKeywordsEdit_ = s.privacyCloakKeywords;
 
     network_.setOnScratchpadUpdateCallback([this](const ScratchpadUpdatePayload& p) {
-        if (focusedField_ != FocusedField::ScratchpadText) {
-            scratchpadTextEdit_ = p.text;
+        if (!hwnd_) return;
+        auto* copy = new ScratchpadUpdatePayload(p);
+        if (!PostMessageW(hwnd_, WM_APP_SCRATCHPAD_UPDATE, reinterpret_cast<WPARAM>(copy), 0)) {
+            delete copy;
         }
-        lastSeenScratchpadRev_ = p.revision;
-        if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
     });
 
     network_.setOnCommandPaletteOutputCallback([this](const CommandPaletteOutputPayload& p) {
-        omnibarLastOutput_ = p.stdoutData.empty() ? p.errorMessage : p.stdoutData;
-        omnibarLastExitCode_ = p.exitCode;
-        omnibarHasOutput_ = true;
-        if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+        if (!hwnd_) return;
+        auto* copy = new CommandPaletteOutputPayload(p);
+        if (!PostMessageW(hwnd_, WM_APP_COMMAND_PALETTE, reinterpret_cast<WPARAM>(copy), 0)) {
+            delete copy;
+        }
     });
 
     LARGE_INTEGER freq{}, now{};
@@ -604,7 +605,8 @@ bool CppDeskWindow::stepAnimations(float dt) {
     float targetToast = toastVisible ? 1.0f : 0.0f;
     if (stepSpring(toastAnimT_, toastAnimVel_, targetToast, 28.0f, 0.72f, dt)) active = true;
     float estTextW = static_cast<float>(toastText_.size()) * 7.6f + 64.0f;
-    float targetToastW = std::clamp(estTextW, 220.0f, std::min(560.0f, winW - 40.0f));
+    float hiToast = std::max(220.0f, std::min(560.0f, winW - 40.0f));
+    float targetToastW = std::min(std::max(estTextW, 220.0f), hiToast);
     if (stepSpring(toastWidth_, toastWidthVel_, targetToastW, 30.0f, 0.75f, dt)) active = true;
 
     // Floating Toolbar Dropdown Spring Menus
@@ -1192,6 +1194,50 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_GETMINMAXINFO: {
+            auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+            mmi->ptMinTrackSize.x = 900;
+            mmi->ptMinTrackSize.y = 600;
+            return 0;
+        }
+
+        case WM_APP_SCRATCHPAD_UPDATE: {
+            std::unique_ptr<ScratchpadUpdatePayload> own(reinterpret_cast<ScratchpadUpdatePayload*>(wParam));
+            if (own) {
+                if (focusedField_ != FocusedField::ScratchpadText) {
+                    scratchpadTextEdit_ = own->text;
+                }
+                lastSeenScratchpadRev_ = own->revision;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_APP_COMMAND_PALETTE: {
+            std::unique_ptr<CommandPaletteOutputPayload> own(reinterpret_cast<CommandPaletteOutputPayload*>(wParam));
+            if (own) {
+                omnibarLastOutput_ = own->stdoutData.empty() ? own->errorMessage : own->stdoutData;
+                omnibarLastExitCode_ = own->exitCode;
+                omnibarHasOutput_ = true;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_APP_UPDATE_PROGRESS: {
+            std::unique_ptr<UpdateProgressData> own(reinterpret_cast<UpdateProgressData*>(wParam));
+            if (own) {
+                updateDownloadedBytes_ = own->downloaded;
+                updateTotalBytes_ = own->total;
+                updateSpeedBps_ = own->speed;
+                if (own->total > 0) {
+                    updateDownloadProgress_ = static_cast<float>(own->downloaded) / static_cast<float>(own->total);
+                }
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return 0;
+        }
+
         case WM_APP_FRAME_READY: {
             frameRedrawPending_.store(false);
             if (hasPendingMouseMove_) {
@@ -1203,6 +1249,12 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_DESTROY:
             KillTimer(hwnd_, 1);
+            if (sessionRecorder_.isRecording()) {
+                sessionRecorder_.stopRecording();
+            }
+            if (notificationMgr_) {
+                notificationMgr_->shutdown();
+            }
             network_.disconnectViewer();
             hardResetViewerUiState();
             PostQuitMessage(0);
@@ -3587,6 +3639,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                    8.0f, [this, sec = item.section]() {
                        if (settingsSection_ == SettingsSection::AudioVoice && sec != SettingsSection::AudioVoice) {
                            network_.stopVoiceMonitor();
+                           voiceMonitorAttempted_ = false;
                        }
                        showAudioInputMenu_ = false;
                        showAudioOutputMenu_ = false;
@@ -3957,8 +4010,11 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         cy = ovBox.bottom + 12.0f;
     }
     else if (settingsSection_ == SettingsSection::AudioVoice) {
-        if (!network_.isVoiceMonitoring()) {
-            network_.startVoiceMonitor();
+        if (!voiceMonitorAttempted_) {
+            voiceMonitorAttempted_ = true;
+            if (!network_.startVoiceMonitor()) {
+                voiceMonitorError_ = "No microphone available";
+            }
         }
 
         drawText("Audio & Voice Intercom", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
@@ -7102,14 +7158,12 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
                    AutoUpdater::downloadUpdateAssetAsync(
                        dlUrl,
                        targetPath,
-                       [this, h](uint64_t downloaded, uint64_t total, double speed) {
-                           updateDownloadedBytes_ = downloaded;
-                           updateTotalBytes_ = total;
-                           updateSpeedBps_ = speed;
-                           if (total > 0) {
-                               updateDownloadProgress_ = static_cast<float>(downloaded) / static_cast<float>(total);
+                       [h](uint64_t downloaded, uint64_t total, double speed) {
+                           if (!h) return;
+                           auto* p = new UpdateProgressData{ downloaded, total, speed };
+                           if (!PostMessageW(h, WM_APP_UPDATE_PROGRESS, reinterpret_cast<WPARAM>(p), 0)) {
+                               delete p;
                            }
-                           if (h) InvalidateRect(h, nullptr, FALSE);
                        },
                        [this, h, targetPath, currExePath](bool success, const std::string& err) {
                            if (!success) {
@@ -8141,7 +8195,8 @@ void CppDeskWindow::drawToastBanner(float width, float height, float toastProgre
         return;
     }
     float alpha = std::clamp(toastProgress, 0.0f, 1.0f);
-    float bw = std::clamp(toastWidth_, 220.0f, std::min(560.0f, width - 40.0f));
+    float hiBw = std::max(220.0f, std::min(560.0f, width - 40.0f));
+    float bw = std::min(std::max(toastWidth_, 220.0f), hiBw);
     float bh = 40.0f;
     float slideY = (1.0f - toastProgress) * 26.0f;
     UiRect r = UiRect{ (width - bw) * 0.5f, height - bh - 22.0f, (width + bw) * 0.5f, height - 22.0f }.offset(0.0f, slideY);
@@ -8272,6 +8327,14 @@ void CppDeskWindow::drawAudioVolumePopup(float anchorX, float anchorY) {
 
 // ---------------- Input & Interaction Handlers ----------------
 
+bool CppDeskWindow::anyModalActive() const {
+    return modalAnimT_ > 0.004f || shortcutsModalAnimT_ > 0.004f || portForwardModalAnimT_ > 0.004f ||
+           addressBookModalAnimT_ > 0.004f || totpModalAnimT_ > 0.004f || omnibarModalAnimT_ > 0.004f ||
+           recordingPlayerModalAnimT_ > 0.004f || updateModalAnimT_ > 0.004f ||
+           rebootModalAnimT_ > 0.004f || hwAccelModalAnimT_ > 0.004f || showPeerMismatchModal_ ||
+           showUpdateRequiredModal_;
+}
+
 bool CppDeskWindow::mapCanvasPointToNormalized(float x, float y, float& outNormX, float& outNormY) const {
     if (renderedCanvasRect_.width() <= 1.0f || renderedCanvasRect_.height() <= 1.0f) {
         return false;
@@ -8285,7 +8348,7 @@ bool CppDeskWindow::mapCanvasPointToNormalized(float x, float y, float& outNormX
         }
     }
 
-    if (modalAnimT_ > 0.004f || shortcutsModalAnimT_ > 0.004f || portForwardModalAnimT_ > 0.004f || addressBookModalAnimT_ > 0.004f || totpModalAnimT_ > 0.004f) {
+    if (anyModalActive()) {
         return false;
     }
     if (isFullscreen_ && floatingToolbarY_ > -50.0f && hwnd_) {
@@ -8508,12 +8571,13 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
             if (isDown) {
                 for (auto it = clickRegions_.rbegin(); it != clickRegions_.rend(); ++it) {
                     if (it->rect.contains(x, y) && it->id.rfind("update_modal_", 0) == 0) {
+                        std::function<void()> cb = it->onClick;
                         pressedWidgetId_ = it->id;
                         auto& anim = widgetAnims_[it->id];
                         anim.rippleT = 0.0f;
                         anim.rippleX = x;
                         anim.rippleY = y;
-                        if (it->onClick) it->onClick();
+                        if (cb) cb();
                         InvalidateRect(hwnd_, nullptr, FALSE);
                         return;
                     }
@@ -8562,12 +8626,13 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
 
             for (auto it = clickRegions_.rbegin(); it != clickRegions_.rend(); ++it) {
                 if (it->rect.contains(x, y)) {
+                    std::function<void()> cb = it->onClick;
                     pressedWidgetId_ = it->id;
                     auto& anim = widgetAnims_[it->id];
                     anim.rippleT = 0.0f;
                     anim.rippleX = x;
                     anim.rippleY = y;
-                    if (it->onClick) it->onClick();
+                    if (cb) cb();
                     InvalidateRect(hwnd_, nullptr, FALSE);
                     return;
                 }
@@ -8630,6 +8695,7 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
 }
 
 void CppDeskWindow::onMouseWheel(int delta) {
+    if (anyModalActive()) return;
     if (showAudioInputMenu_ || showAudioOutputMenu_) {
         showAudioInputMenu_ = false;
         showAudioOutputMenu_ = false;
@@ -9077,7 +9143,7 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
         }
     }
 
-    if (activeTab_ == ActiveTab::RemoteSession && focusedField_ == FocusedField::RemoteCanvas && remoteInputEnabled_) {
+    if (activeTab_ == ActiveTab::RemoteSession && focusedField_ == FocusedField::RemoteCanvas && remoteInputEnabled_ && !anyModalActive()) {
         flushPendingMouseMove();
         network_.sendKeyEvent(vk, scan, isDown, isExtended);
     }
@@ -9567,7 +9633,10 @@ void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
         clickRegions_.push_back({ { trackLeft - 6.0f, trackY - 12.0f, trackRight + 6.0f, trackY + 12.0f }, "rewind_scrubber_track", [this, trackLeft, trackRight]() {
             draggingRewindScrubber_ = true;
             SetCapture(hwnd_);
-            float f = std::clamp((mouseX_ - trackLeft) / (trackRight - trackLeft), 0.0f, 1.0f);
+            float trackW = trackRight - trackLeft;
+            if (trackW <= 1.0f) return;
+            float f = std::clamp((mouseX_ - trackLeft) / trackW, 0.0f, 1.0f);
+            if (!std::isfinite(f)) return;
             rewindOffsetMs_ = static_cast<int64_t>((1.0f - f) * 60000.0f);
             rewindFrozen_ = (rewindOffsetMs_ > 0);
             if (rewindFrozen_) {

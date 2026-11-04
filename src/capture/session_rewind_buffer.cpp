@@ -14,15 +14,24 @@ void SessionRewindBuffer::pushFrame(uint64_t timestampMs, const uint8_t* bgra, i
     if (!bgra || width <= 0 || height <= 0) return;
 
     // Throttle to approximately INTERVAL_MS intervals
+    uint64_t prevTs = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (count_ > 0 && timestampMs > lastPushedTs_ && (timestampMs - lastPushedTs_) < (INTERVAL_MS - 50)) {
             return;
         }
+        prevTs = lastPushedTs_;
+        lastPushedTs_ = timestampMs;
     }
 
     std::vector<uint8_t> jpeg = TileCodec::encodeJpeg(bgra, width, height, 70);
-    if (jpeg.empty()) return;
+    if (jpeg.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (lastPushedTs_ == timestampMs) {
+            lastPushedTs_ = prevTs;
+        }
+        return;
+    }
 
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -39,7 +48,6 @@ void SessionRewindBuffer::pushFrame(uint64_t timestampMs, const uint8_t* bgra, i
     buffer_[slot].width = width;
     buffer_[slot].height = height;
     buffer_[slot].jpegData = std::move(jpeg);
-    lastPushedTs_ = timestampMs;
 }
 
 bool SessionRewindBuffer::getFrameAtIndex(size_t index, std::vector<uint8_t>& outBgra, int& outW, int& outH, uint64_t& outActualTs) const {

@@ -46,12 +46,13 @@ public:
     static bool decodeBase32(const std::string& input, std::vector<uint8_t>& out);
 
     // Dynamic truncation & HOTP calculation per RFC 4226 / RFC 6238
-    static uint32_t computeHotpCode(
+    static bool computeHotpCode(
         TotpAlgorithm alg,
         const uint8_t* key,
         size_t keyLen,
         uint64_t timeStep,
-        int digits = 6);
+        int digits,
+        uint32_t& outCode);
 
     // Big-endian 64-bit HMAC computation using Windows CNG BCrypt
     static bool computeHmac(

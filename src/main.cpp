@@ -165,8 +165,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
     if (hMutex) CloseHandle(hMutex);
     OleUninitialize();
 
-    // Terminate all process threads cleanly
-    ExitProcess(static_cast<UINT>(exitCode));
     return exitCode;
 }
 

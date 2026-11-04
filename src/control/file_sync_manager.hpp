@@ -246,6 +246,7 @@ private:
 
     void queueBlocksForTask(OutgoingFileTask& task);
     std::string resolveTargetRoot() const;
+    void cancelSyncLocked();
 
     mutable std::mutex mutex_;
     std::string localRoot_;

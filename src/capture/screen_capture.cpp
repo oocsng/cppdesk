@@ -551,8 +551,8 @@ void TileThreadPool::parallelEncode(std::vector<RectTask>& tasks) {
         remainingTasks_.store(tasks.size());
         cvTask_.notify_all();
 
-        cvDone_.wait_for(lock, std::chrono::milliseconds(250), [&]() {
-            return remainingTasks_.load() == 0 || stop_.load();
+        cvDone_.wait(lock, [&]() {
+            return remainingTasks_.load() == 0;
         });
         activeBatch_.clear();
     }
@@ -587,8 +587,8 @@ void TileThreadPool::parallelDecode(std::vector<DecodeTask>& tasks) {
         remainingTasks_.store(tasks.size());
         cvTask_.notify_all();
 
-        cvDone_.wait_for(lock, std::chrono::milliseconds(250), [&]() {
-            return remainingTasks_.load() == 0 || stop_.load();
+        cvDone_.wait(lock, [&]() {
+            return remainingTasks_.load() == 0;
         });
         activeDecodeBatch_.clear();
     }
@@ -875,7 +875,14 @@ bool ScreenCapturer::initDxgiForMonitor(int monitorIndex) {
     texDesc.Height = duplDesc.ModeDesc.Height;
     texDesc.MipLevels = 1;
     texDesc.ArraySize = 1;
-    texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    DXGI_FORMAT srcFmt = duplDesc.ModeDesc.Format;
+    if (srcFmt == DXGI_FORMAT_B8G8R8A8_UNORM || srcFmt == DXGI_FORMAT_R8G8B8A8_UNORM) {
+        texDesc.Format = srcFmt;
+    } else {
+        dxgiRecoveryState_ = DxgiRecoveryState::FallbackGdi;   // let GDI handle HDR desktops
+        releaseDxgi();
+        return false;
+    }
     texDesc.SampleDesc.Count = 1;
     texDesc.Usage = D3D11_USAGE_STAGING;
     texDesc.BindFlags = 0;

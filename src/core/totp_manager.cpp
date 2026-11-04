@@ -82,7 +82,10 @@ std::string TotpManager::generateCode(uint64_t unixTime, int digits) const {
         unixTime = static_cast<uint64_t>(std::time(nullptr));
     }
     uint64_t timeStep = unixTime / 30;
-    uint32_t codeNum = computeHotpCode(algorithm_, secretBytes_.data(), secretBytes_.size(), timeStep, digits);
+    uint32_t codeNum = 0;
+    if (!computeHotpCode(algorithm_, secretBytes_.data(), secretBytes_.size(), timeStep, digits, codeNum)) {
+        return "";
+    }
     char buf[16];
     std::snprintf(buf, sizeof(buf), "%0*u", digits, codeNum);
     return std::string(buf);
@@ -127,7 +130,10 @@ bool TotpManager::verifyCode(const std::string& code, uint64_t unixTime, int dri
             continue;
         }
         uint64_t step = static_cast<uint64_t>(stepCandidate);
-        uint32_t computed = computeHotpCode(algorithm_, secretBytes_.data(), secretBytes_.size(), step, digits);
+        uint32_t computed = 0;
+        if (!computeHotpCode(algorithm_, secretBytes_.data(), secretBytes_.size(), step, digits, computed)) {
+            continue;
+        }
         char buf[16];
         std::snprintf(buf, sizeof(buf), "%0*u", digits, computed);
         if (cleanCode == buf) {
@@ -282,13 +288,15 @@ bool TotpManager::computeHmac(
 #endif
 }
 
-uint32_t TotpManager::computeHotpCode(
+bool TotpManager::computeHotpCode(
     TotpAlgorithm alg,
     const uint8_t* key,
     size_t keyLen,
     uint64_t timeStep,
-    int digits)
+    int digits,
+    uint32_t& outCode)
 {
+    outCode = 0;
     uint8_t counterBytes[8];
     for (int i = 7; i >= 0; --i) {
         counterBytes[i] = static_cast<uint8_t>(timeStep & 0xFF);
@@ -297,12 +305,12 @@ uint32_t TotpManager::computeHotpCode(
 
     std::vector<uint8_t> digest;
     if (!computeHmac(alg, key, keyLen, counterBytes, sizeof(counterBytes), digest) || digest.empty()) {
-        return 0;
+        return false;
     }
 
     int offset = digest[digest.size() - 1] & 0x0F;
     if (static_cast<size_t>(offset + 4) > digest.size()) {
-        return 0;
+        return false;
     }
 
     uint32_t binaryCode = ((static_cast<uint32_t>(digest[offset]) & 0x7F) << 24)
@@ -311,7 +319,8 @@ uint32_t TotpManager::computeHotpCode(
                         | (static_cast<uint32_t>(digest[offset + 3]) & 0xFF);
 
     uint32_t mod = (digits >= 1 && digits <= 8) ? kPowersOf10[digits] : 1000000;
-    return binaryCode % mod;
+    outCode = binaryCode % mod;
+    return true;
 }
 
 } // namespace cppdesk
