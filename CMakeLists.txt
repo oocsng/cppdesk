@@ -102,6 +102,38 @@ elseif(APPLE)
         ${LIB_ZSTD}
         pthread
     )
+elseif(UNIX AND NOT APPLE)
+    list(APPEND CORE_SOURCES
+        src/simd/simd_fallback.cpp
+    )
+
+    find_package(X11 QUIET)
+    find_package(JPEG QUIET)
+    find_library(LIB_ZSTD zstd REQUIRED)
+    find_library(LIB_XTST Xtst)
+    find_library(LIB_XRANDR Xrandr)
+    find_library(LIB_XEXT Xext)
+
+    set(PLATFORM_LIBS
+        ${LIB_ZSTD}
+        pthread
+        dl
+    )
+    if(X11_FOUND)
+        list(APPEND PLATFORM_LIBS ${X11_LIBRARIES})
+    endif()
+    if(LIB_XEXT)
+        list(APPEND PLATFORM_LIBS ${LIB_XEXT})
+    endif()
+    if(LIB_XTST)
+        list(APPEND PLATFORM_LIBS ${LIB_XTST})
+    endif()
+    if(LIB_XRANDR)
+        list(APPEND PLATFORM_LIBS ${LIB_XRANDR})
+    endif()
+    if(JPEG_FOUND)
+        list(APPEND PLATFORM_LIBS ${JPEG_LIBRARIES})
+    endif()
 else()
     list(APPEND CORE_SOURCES
         src/simd/simd_fallback.cpp
@@ -115,6 +147,12 @@ endif()
 
 # Automated test suite target
 if(WIN32)
+    add_executable(CppDeskTests
+        ${CORE_SOURCES}
+        tests/test_suite.cpp
+    )
+    target_link_libraries(CppDeskTests PRIVATE ${PLATFORM_LIBS})
+elseif(UNIX AND NOT APPLE)
     add_executable(CppDeskTests
         ${CORE_SOURCES}
         tests/test_suite.cpp
@@ -152,4 +190,11 @@ elseif(APPLE)
         ${METAL_FRAMEWORK}
         ${QUARTZ_CORE}
     )
+elseif(UNIX AND NOT APPLE)
+    add_executable(CppDesk
+        ${CORE_SOURCES}
+        src/ui/ui_window_linux.cpp
+        src/main.cpp
+    )
+    target_link_libraries(CppDesk PRIVATE ${PLATFORM_LIBS})
 endif()

@@ -1,9 +1,23 @@
 #include "session_recorder.hpp"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#endif
+#include <chrono>
+
+namespace {
+static inline uint64_t getNowTickMs() {
+#if defined(_WIN32)
+    return GetTickCount64();
+#else
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+}
+} // namespace
 #include <filesystem>
 #include <iostream>
 #include <algorithm>
@@ -92,7 +106,7 @@ bool SessionRecorder::startRecording(const std::string& outputPath, int width, i
     fps_ = fps;
     frameCount_.store(0);
     bytesWritten_.store(0);
-    startTick_ = GetTickCount64();
+    startTick_ = getNowTickMs();
     indexEntries_.clear();
 
     writeAviHeaders(width, height, fps);
@@ -146,7 +160,7 @@ void SessionRecorder::stopRecording() {
 
 uint32_t SessionRecorder::elapsedSeconds() const {
     if (!recording_.load() || startTick_ == 0) return 0;
-    return static_cast<uint32_t>((GetTickCount64() - startTick_) / 1000);
+    return static_cast<uint32_t>((getNowTickMs() - startTick_) / 1000);
 }
 
 std::string SessionRecorder::currentFilePath() const {

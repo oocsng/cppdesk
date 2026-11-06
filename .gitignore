@@ -2,8 +2,13 @@
 .planning/
 .claude/
 .gemini/
+.superpowers/
 graphify-out/
 AGENTS.md
+
+# Build artifacts & binaries
+build/
+bin/
 
 # Compiler / IDE / .NET / Python temporaries
 *.o

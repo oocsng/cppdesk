@@ -1,9 +1,17 @@
 #pragma once
 
+#if defined(_WIN32)
+#if defined(_WIN32)
+#if defined(_WIN32)
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#endif
+#endif
+#endif
+#endif
 
 #include "../core/protocol.hpp"
 
@@ -77,10 +85,17 @@ private:
 
     struct SurfaceState {
         VirtualDisplayInfo info;
+#if defined(_WIN32)
         HDC                hdc = nullptr;
         HBITMAP            hbm = nullptr;
         void*              pBits = nullptr;
         HGDIOBJ            hOldBm = nullptr;
+#else
+        void*              hdc = nullptr;
+        void*              hbm = nullptr;
+        void*              pBits = nullptr;
+        void*              hOldBm = nullptr;
+#endif
     };
 
     bool allocateSoftwareSurface(SurfaceState& surface, uint32_t width, uint32_t height);

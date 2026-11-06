@@ -1,12 +1,13 @@
 #include "privacy_cloak_manager.hpp"
+#if defined(_WIN32)
 #include <dwmapi.h>
-#include <cwctype>
-#include <algorithm>
-#include <sstream>
-
 #ifndef DWMWA_CLOAKED
 #define DWMWA_CLOAKED 14
 #endif
+#endif
+#include <cwctype>
+#include <algorithm>
+#include <sstream>
 
 namespace cppdesk {
 
@@ -22,11 +23,15 @@ std::wstring toLowerW(const std::wstring& str) {
 
 std::wstring utf8ToWide(const std::string& str) {
     if (str.empty()) return L"";
+#if defined(_WIN32)
     int len = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), nullptr, 0);
     if (len <= 0) return L"";
     std::wstring w(static_cast<size_t>(len), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), w.data(), len);
     return w;
+#else
+    return std::wstring(str.begin(), str.end());
+#endif
 }
 
 std::string wideToUtf8(const std::wstring& wstr) {
@@ -119,6 +124,9 @@ struct CloakEnumContext {
 };
 
 std::vector<RECT> PrivacyCloakManager::findSensitiveWindowRects() const {
+#if !defined(_WIN32)
+    return {};
+#else
     CloakEnumContext ctx;
     ctx.self = this;
 
@@ -149,6 +157,7 @@ std::vector<RECT> PrivacyCloakManager::findSensitiveWindowRects() const {
     }, reinterpret_cast<LPARAM>(&ctx));
 
     return ctx.rects;
+#endif
 }
 
 void PrivacyCloakManager::redactCaptureBuffer(

@@ -179,6 +179,7 @@ private:
     bool captureViaDxgi(bool& outFrameUpdated, std::vector<RECT>& outDirtyRects, bool& outHasExplicitDirtyRects);
     bool captureViaGdi();
     bool captureViaCoreGraphics();
+    bool captureViaX11();
     CursorState captureCursorState() const;
 
     struct DxgiImpl;

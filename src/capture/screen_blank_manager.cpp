@@ -13,6 +13,8 @@
 
 namespace cppdesk {
 
+#if defined(_WIN32)
+
 struct ScreenBlankCurtainConfig {
     std::wstring brandName;
     std::wstring noticeText;
@@ -442,5 +444,27 @@ void ScreenBlankManager::destroyCurtainWindow() {
         hwndCurtain_ = nullptr;
     }
 }
+
+#else
+
+ScreenBlankManager& ScreenBlankManager::instance() {
+    static ScreenBlankManager s_inst;
+    return s_inst;
+}
+ScreenBlankManager::ScreenBlankManager() = default;
+ScreenBlankManager::~ScreenBlankManager() = default;
+void ScreenBlankManager::powerDownDisplays() {}
+void ScreenBlankManager::wakeDisplays() {}
+bool ScreenBlankManager::startBlanking(ScreenBlankMode, const std::string&, const std::string&, bool, uint64_t) { return false; }
+void ScreenBlankManager::stopBlanking() {}
+bool ScreenBlankManager::isBlankActive() const { return false; }
+ScreenBlankMode ScreenBlankManager::currentMode() const { return ScreenBlankMode::CurtainOnly; }
+void ScreenBlankManager::setEmergencyWakeCallback(std::function<void()>) {}
+void ScreenBlankManager::triggerEmergencyWake() {}
+void ScreenBlankManager::blankingThreadFunc() {}
+void ScreenBlankManager::createCurtainWindow() {}
+void ScreenBlankManager::destroyCurtainWindow() {}
+
+#endif
 
 } // namespace cppdesk

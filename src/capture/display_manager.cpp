@@ -6,6 +6,7 @@
 namespace cppdesk {
 
 DisplayResolutionManager::DisplayResolutionManager() {
+#if defined(_WIN32)
     DEVMODEW dm{};
     dm.dmSize = sizeof(DEVMODEW);
     if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm)) {
@@ -15,6 +16,10 @@ DisplayResolutionManager::DisplayResolutionManager() {
         originalWidth_ = static_cast<uint32_t>(std::max(800, GetSystemMetrics(SM_CXSCREEN)));
         originalHeight_ = static_cast<uint32_t>(std::max(600, GetSystemMetrics(SM_CYSCREEN)));
     }
+#else
+    originalWidth_ = 1920;
+    originalHeight_ = 1080;
+#endif
     currentWidth_.store(originalWidth_);
     currentHeight_.store(originalHeight_);
 }
@@ -25,6 +30,7 @@ DisplayResolutionManager::~DisplayResolutionManager() {
 
 std::vector<DisplayModeEntry> DisplayResolutionManager::enumerateDisplayModes(const std::wstring& deviceName) {
     std::vector<DisplayModeEntry> results;
+#if defined(_WIN32)
     const wchar_t* pDev = deviceName.empty() ? nullptr : deviceName.c_str();
 
     DEVMODEW dm{};
@@ -45,6 +51,9 @@ std::vector<DisplayModeEntry> DisplayResolutionManager::enumerateDisplayModes(co
         }
         ++modeNum;
     }
+#else
+    (void)deviceName;
+#endif
 
     if (results.empty()) {
         results.push_back({ 1920, 1080, 60 });
@@ -99,6 +108,10 @@ DisplayModeEntry DisplayResolutionManager::findBestResolutionMatch(
 }
 
 bool DisplayResolutionManager::changeResolution(uint32_t width, uint32_t height, const std::wstring& deviceName) {
+#if !defined(_WIN32)
+    (void)width; (void)height; (void)deviceName;
+    return false;
+#else
     if (width == 0 || height == 0) {
         return restoreResolution(deviceName);
     }
@@ -139,9 +152,14 @@ bool DisplayResolutionManager::changeResolution(uint32_t width, uint32_t height,
     }
 
     return false;
+#endif
 }
 
 bool DisplayResolutionManager::restoreResolution(const std::wstring& deviceName) {
+#if !defined(_WIN32)
+    (void)deviceName;
+    return true;
+#else
     if (!resolutionChanged_.load()) return true;
 
     const wchar_t* pDev = deviceName.empty() ? (activeDeviceName_.empty() ? nullptr : activeDeviceName_.c_str()) : deviceName.c_str();
@@ -153,6 +171,7 @@ bool DisplayResolutionManager::restoreResolution(const std::wstring& deviceName)
         return true;
     }
     return false;
+#endif
 }
 
 } // namespace cppdesk

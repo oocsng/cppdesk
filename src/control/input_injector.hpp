@@ -19,6 +19,7 @@ public:
     static void injectKeyEvent(uint16_t vkCode, uint16_t scanCode, bool isDown, bool isExtended);
     static void releaseAllModifiers();
     static uint16_t mapVkToMacKeyCode(uint16_t vk);
+    static uint32_t mapVkToX11KeySym(uint16_t vk);
 
     // Option 5A: Windows UAC & Desktop Elevation helpers
     static bool syncToInputDesktop();

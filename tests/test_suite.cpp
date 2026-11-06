@@ -6678,6 +6678,75 @@ void testCrossPlatformUiWindowingAndMacOsViewer() {
     }
 }
 
+void testLinuxPlatformSupport() {
+    std::cout << "[TEST 52] Linux Native X11 Platform Support, KeySym Mapping & Clipboard...\n";
+
+    // 1. VK to X11 KeySym mapping validation
+    {
+        // Navigation and control
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x0D) == 0xFF0D); // Return -> XK_Return
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x08) == 0xFF08); // Backspace -> XK_BackSpace
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x09) == 0xFF09); // Tab -> XK_Tab
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x1B) == 0xFF1B); // Escape -> XK_Escape
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x20) == 0x0020); // Space -> XK_space
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x25) == 0xFF51); // Left -> XK_Left
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x26) == 0xFF52); // Up -> XK_Up
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x27) == 0xFF53); // Right -> XK_Right
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x28) == 0xFF54); // Down -> XK_Down
+
+        // Modifiers
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x10) == 0xFFE1); // Shift -> XK_Shift_L
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x11) == 0xFFE3); // Control -> XK_Control_L
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x12) == 0xFFE9); // Alt -> XK_Alt_L
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x5B) == 0xFFEB); // Super/LWin -> XK_Super_L
+
+        // Alphanumeric
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x30) == 0x0030); // '0' -> XK_0
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x39) == 0x0039); // '9' -> XK_9
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x41) == 0x0061); // 'A' -> XK_a
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x5A) == 0x007A); // 'Z' -> XK_z
+
+        // Function keys
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x70) == 0xFFBE); // F1 -> XK_F1
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0x7B) == 0xFFC9); // F12 -> XK_F12
+
+        // Unmapped key fallback
+        TEST_ASSERT(InputInjector::mapVkToX11KeySym(0xFFFF) == 0);
+    }
+
+    // 2. ShellClipboard text get/set interface validation
+    {
+        std::string testString = "CppDesk Linux X11 Clipboard Test Text - UTF-8: \xE6\xB5\x8B\xE8\xAF\x95";
+        bool setOk = ShellClipboard::setLocalClipboardText(testString);
+        TEST_ASSERT(setOk);
+
+        std::string retrieved = ShellClipboard::getLocalClipboardText();
+        TEST_ASSERT(retrieved == testString);
+    }
+
+    // 3. ScreenCapturer monitor enumeration and headless fallback
+    {
+        ScreenCapturer capturer;
+        capturer.setAutoHeadless(true);
+        auto monitors = capturer.enumerateMonitors();
+        TEST_ASSERT(!monitors.empty());
+        TEST_ASSERT(monitors[0].width > 0 && monitors[0].height > 0);
+    }
+
+    // 4. Linux Viewport Geometry and Normalized Mapping
+    {
+        ViewportGeometry geo = UiPlatform::calculateViewportGeometry(1280.0f, 720.0f, 1920, 1080, ScaleMode::FillAspect);
+        TEST_ASSERT(geo.scaleX > 0.0f);
+        TEST_ASSERT(geo.scaleY > 0.0f);
+
+        float nx = 0.0f, ny = 0.0f;
+        bool inside = UiPlatform::mapPointToNormalized(640.0f, 360.0f, geo, nx, ny);
+        TEST_ASSERT(inside);
+        TEST_ASSERT(std::abs(nx - 0.5f) < 0.01f);
+        TEST_ASSERT(std::abs(ny - 0.5f) < 0.01f);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -6741,6 +6810,7 @@ int main() {
         testNovelBreakthroughPowerFeatures(); std::cout << "Test 49 done\n" << std::flush;
         testCrossPlatformMacOsAndWindowsFoundation(); std::cout << "Test 50 done\n" << std::flush;
         testCrossPlatformUiWindowingAndMacOsViewer(); std::cout << "Test 51 done\n" << std::flush;
+        testLinuxPlatformSupport(); std::cout << "Test 52 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";

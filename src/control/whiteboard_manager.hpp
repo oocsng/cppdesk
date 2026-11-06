@@ -2,11 +2,13 @@
 
 #include "../core/protocol.hpp"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <d2d1.h>
+#endif
 
 #include <vector>
 #include <mutex>
@@ -72,7 +74,9 @@ public:
     void updateHostOverlayCanvas();
 
 private:
+#if defined(_WIN32)
     static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+#endif
 
     WhiteboardTool          activeTool_ = WhiteboardTool::Pen;
     uint32_t                activeColor_ = 0xFFFF3B30;
@@ -91,7 +95,11 @@ private:
     uint64_t                laserTimestampMs_ = 0;
 
     // Host click-through transparent layered window
+#if defined(_WIN32)
     HWND                    hwndOverlay_ = nullptr;
+#else
+    void*                   hwndOverlay_ = nullptr;
+#endif
 };
 
 } // namespace cppdesk

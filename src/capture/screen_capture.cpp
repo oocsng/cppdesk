@@ -42,6 +42,31 @@ extern "C" {
     bool CGRequestScreenCaptureAccess(void);
 }
 #endif
+#elif defined(__linux__) || defined(__unix__)
+#if __has_include(<X11/Xlib.h>)
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/extensions/XShm.h>
+#include <X11/extensions/Xrandr.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#endif
+#if __has_include(<jpeglib.h>)
+#include <jpeglib.h>
+#include <csetjmp>
+
+namespace {
+struct SafeJpegErrorManager {
+    struct jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+
+static void safeJpegErrorExit(j_common_ptr cinfo) {
+    auto* myerr = reinterpret_cast<SafeJpegErrorManager*>(cinfo->err);
+    longjmp(myerr->setjmp_buffer, 1);
+}
+} // namespace
+#endif
 #endif
 #include <zstd.h>
 
@@ -173,6 +198,8 @@ bool TileCodec::decompressZstd(const void* src, size_t srcLen, void* dst, size_t
     return !ZSTD_isError(dSize) && dSize == dstCapacity;
 }
 
+#if defined(_WIN32)
+
 std::vector<uint8_t> TileCodec::encodeJpeg(const uint8_t* bgra, int width, int height, int quality) {
     std::lock_guard<std::mutex> gdiLock(g_gdiplusCodecMutex);
     initGdiPlus();
@@ -285,6 +312,168 @@ bool TileCodec::decodeJpegIntoCanvas(
     pStream->Release();
     return ok;
 }
+
+#elif (defined(__linux__) || defined(__unix__)) && __has_include(<jpeglib.h>)
+
+std::vector<uint8_t> TileCodec::encodeJpeg(const uint8_t* bgra, int width, int height, int quality) {
+    if (!bgra || width <= 0 || height <= 0) return {};
+
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
+
+    unsigned char* outbuffer = nullptr;
+    unsigned long outsize = 0;
+    jpeg_mem_dest(&cinfo, &outbuffer, &outsize);
+
+    cinfo.image_width = width;
+    cinfo.image_height = height;
+    cinfo.input_components = 3;
+    cinfo.in_color_space = JCS_RGB;
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, std::clamp(quality, 15, 100), TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    std::vector<uint8_t> rowBuffer(width * 3);
+    while (cinfo.next_scanline < cinfo.image_height) {
+        const uint8_t* srcRow = bgra + cinfo.next_scanline * width * 4;
+        for (int i = 0; i < width; ++i) {
+            rowBuffer[i * 3 + 0] = srcRow[i * 4 + 2]; // R
+            rowBuffer[i * 3 + 1] = srcRow[i * 4 + 1]; // G
+            rowBuffer[i * 3 + 2] = srcRow[i * 4 + 0]; // B
+        }
+        JSAMPROW rowPtr = rowBuffer.data();
+        jpeg_write_scanlines(&cinfo, &rowPtr, 1);
+    }
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+
+    std::vector<uint8_t> result;
+    if (outbuffer && outsize > 0) {
+        result.assign(outbuffer, outbuffer + outsize);
+        free(outbuffer);
+    }
+    return result;
+}
+
+bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<uint8_t>& outBgra, int& outW, int& outH) {
+    if (!jpegData || jpegLen == 0) return false;
+
+    struct jpeg_decompress_struct cinfo;
+    SafeJpegErrorManager jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = safeJpegErrorExit;
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, jpegData, jpegLen);
+
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+
+    cinfo.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&cinfo);
+
+    outW = static_cast<int>(cinfo.output_width);
+    outH = static_cast<int>(cinfo.output_height);
+    outBgra.resize(static_cast<size_t>(outW) * outH * 4);
+
+    std::vector<uint8_t> rowBuffer(outW * 3);
+    while (cinfo.output_scanline < cinfo.output_height) {
+        int r = static_cast<int>(cinfo.output_scanline);
+        JSAMPROW rowPtr = rowBuffer.data();
+        jpeg_read_scanlines(&cinfo, &rowPtr, 1);
+
+        uint8_t* dstRow = outBgra.data() + static_cast<size_t>(r) * outW * 4;
+        for (int i = 0; i < outW; ++i) {
+            dstRow[i * 4 + 0] = rowBuffer[i * 3 + 2]; // B
+            dstRow[i * 4 + 1] = rowBuffer[i * 3 + 1]; // G
+            dstRow[i * 4 + 2] = rowBuffer[i * 3 + 0]; // R
+            dstRow[i * 4 + 3] = 0xFF;                 // A
+        }
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    return true;
+}
+
+bool TileCodec::decodeJpegIntoCanvas(
+    const uint8_t* jpegData, size_t jpegLen,
+    uint8_t* canvasBgra, int canvasW, int canvasH,
+    uint16_t x, uint16_t y, uint16_t width, uint16_t height)
+{
+    if (!jpegData || jpegLen == 0 || !canvasBgra || width == 0 || height == 0) return false;
+    if (static_cast<int>(x) + width > canvasW || static_cast<int>(y) + height > canvasH) return false;
+
+    struct jpeg_decompress_struct cinfo;
+    SafeJpegErrorManager jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = safeJpegErrorExit;
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, jpegData, jpegLen);
+
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+
+    if (cinfo.image_width != width || cinfo.image_height != height) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+
+    cinfo.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&cinfo);
+
+    std::vector<uint8_t> rowBuffer(width * 3);
+    std::vector<uint8_t> bgraRow(width * 4);
+
+    while (cinfo.output_scanline < cinfo.output_height) {
+        int r = static_cast<int>(cinfo.output_scanline);
+        JSAMPROW rowPtr = rowBuffer.data();
+        jpeg_read_scanlines(&cinfo, &rowPtr, 1);
+
+        for (int i = 0; i < width; ++i) {
+            bgraRow[i * 4 + 0] = rowBuffer[i * 3 + 2]; // B
+            bgraRow[i * 4 + 1] = rowBuffer[i * 3 + 1]; // G
+            bgraRow[i * 4 + 2] = rowBuffer[i * 3 + 0]; // R
+            bgraRow[i * 4 + 3] = 0xFF;                 // A
+        }
+
+        uint8_t* dstRow = canvasBgra + (static_cast<size_t>(y + r) * canvasW + x) * 4;
+        SimdKernels::blitRowBgraOpaque(dstRow, bgraRow.data(), width);
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    return true;
+}
+
+#else
+
+std::vector<uint8_t> TileCodec::encodeJpeg(const uint8_t*, int, int, int) {
+    return {};
+}
+
+bool TileCodec::decodeJpeg(const uint8_t*, size_t, std::vector<uint8_t>&, int&, int&) {
+    return false;
+}
+
+bool TileCodec::decodeJpegIntoCanvas(const uint8_t*, size_t, uint8_t*, int, int, uint16_t, uint16_t, uint16_t, uint16_t) {
+    return false;
+}
+
+#endif
 
 EncodedTile TileCodec::encodeRect(
     uint16_t x,
@@ -685,6 +874,57 @@ std::vector<MonitorDesc> ScreenCapturer::enumerateMonitors() {
             monitors_.push_back(d);
         }
     }
+#elif defined(__linux__) || defined(__unix__)
+#if __has_include(<X11/Xlib.h>)
+    Display* dpy = XOpenDisplay(nullptr);
+    if (dpy) {
+        int screen = DefaultScreen(dpy);
+        Window root = RootWindow(dpy, screen);
+#if __has_include(<X11/extensions/Xrandr.h>)
+        XRRScreenResources* res = XRRGetScreenResourcesCurrent(dpy, root);
+        if (res) {
+            RROutput primaryOutput = XRRGetOutputPrimary(dpy, root);
+            int validIdx = 0;
+            for (int i = 0; i < res->noutput; ++i) {
+                XRROutputInfo* outputInfo = XRRGetOutputInfo(dpy, res, res->outputs[i]);
+                if (outputInfo && outputInfo->connection == RR_Connected && outputInfo->crtc) {
+                    XRRCrtcInfo* crtcInfo = XRRGetCrtcInfo(dpy, res, outputInfo->crtc);
+                    if (crtcInfo && crtcInfo->width > 0 && crtcInfo->height > 0) {
+                        MonitorDesc d;
+                        d.index = validIdx++;
+                        d.x = crtcInfo->x;
+                        d.y = crtcInfo->y;
+                        d.width = static_cast<int32_t>(crtcInfo->width);
+                        d.height = static_cast<int32_t>(crtcInfo->height);
+                        d.isPrimary = (primaryOutput != 0) ? (res->outputs[i] == primaryOutput) : (d.index == 0);
+                        d.name = outputInfo->name ? std::string(outputInfo->name) : ("Display " + std::to_string(d.index + 1));
+                        d.isVirtual = false;
+                        d.virtualId = 0;
+                        monitors_.push_back(d);
+                    }
+                    if (crtcInfo) XRRFreeCrtcInfo(crtcInfo);
+                }
+                if (outputInfo) XRRFreeOutputInfo(outputInfo);
+            }
+            XRRFreeScreenResources(res);
+        }
+#endif
+        if (monitors_.empty()) {
+            MonitorDesc d;
+            d.index = 0;
+            d.x = 0;
+            d.y = 0;
+            d.width = DisplayWidth(dpy, screen);
+            d.height = DisplayHeight(dpy, screen);
+            d.isPrimary = true;
+            d.name = "X11 Display (" + std::to_string(d.width) + "x" + std::to_string(d.height) + ")";
+            d.isVirtual = false;
+            d.virtualId = 0;
+            monitors_.push_back(d);
+        }
+        XCloseDisplay(dpy);
+    }
+#endif
 #endif
 
     // If host has 0 physical monitors and auto-headless is active, provision fallback virtual display
@@ -1172,6 +1412,83 @@ bool ScreenCapturer::captureViaCoreGraphics() {
 #endif
 }
 
+bool ScreenCapturer::captureViaX11() {
+#if (defined(__linux__) || defined(__unix__)) && __has_include(<X11/Xlib.h>)
+    Display* dpy = XOpenDisplay(nullptr);
+    if (!dpy) return false;
+
+    int screen = DefaultScreen(dpy);
+    Window root = RootWindow(dpy, screen);
+
+    int capX = activeMonitor_.x;
+    int capY = activeMonitor_.y;
+    int capW = activeMonitor_.width;
+    int capH = activeMonitor_.height;
+
+    if (capW <= 0 || capH <= 0) {
+        capW = DisplayWidth(dpy, screen);
+        capH = DisplayHeight(dpy, screen);
+    }
+
+    frameW_ = capW;
+    frameH_ = capH;
+    currentFrame_.resize(static_cast<size_t>(frameW_) * frameH_ * 4);
+
+    bool captured = false;
+
+#if __has_include(<X11/extensions/XShm.h>)
+    if (XShmQueryExtension(dpy)) {
+        XShmSegmentInfo shminfo{};
+        XImage* img = XShmCreateImage(dpy, DefaultVisual(dpy, screen), DefaultDepth(dpy, screen),
+                                      ZPixmap, nullptr, &shminfo, capW, capH);
+        if (img) {
+            shminfo.shmid = shmget(IPC_PRIVATE, img->bytes_per_line * img->height, IPC_CREAT | 0777);
+            if (shminfo.shmid >= 0) {
+                shminfo.shmaddr = img->data = static_cast<char*>(shmat(shminfo.shmid, nullptr, 0));
+                shminfo.readOnly = False;
+                if (shminfo.shmaddr != reinterpret_cast<char*>(-1) && XShmAttach(dpy, &shminfo)) {
+                    if (XShmGetImage(dpy, root, img, capX, capY, AllPlanes)) {
+                        for (int r = 0; r < capH; ++r) {
+                            const uint8_t* srcRow = reinterpret_cast<const uint8_t*>(img->data + r * img->bytes_per_line);
+                            uint8_t* dstRow = currentFrame_.data() + static_cast<size_t>(r) * frameW_ * 4;
+                            std::memcpy(dstRow, srcRow, static_cast<size_t>(frameW_) * 4);
+                        }
+                        captured = true;
+                    }
+                    XShmDetach(dpy, &shminfo);
+                }
+                if (shminfo.shmaddr != reinterpret_cast<char*>(-1)) {
+                    shmdt(shminfo.shmaddr);
+                }
+                shmctl(shminfo.shmid, IPC_RMID, nullptr);
+            }
+            img->data = nullptr;
+            XDestroyImage(img);
+        }
+    }
+#endif
+
+    if (!captured) {
+        XImage* img = XGetImage(dpy, root, capX, capY, capW, capH, AllPlanes, ZPixmap);
+        if (img) {
+            for (int r = 0; r < capH; ++r) {
+                const uint8_t* srcRow = reinterpret_cast<const uint8_t*>(img->data + r * img->bytes_per_line);
+                uint8_t* dstRow = currentFrame_.data() + static_cast<size_t>(r) * frameW_ * 4;
+                std::memcpy(dstRow, srcRow, static_cast<size_t>(frameW_) * 4);
+            }
+            XDestroyImage(img);
+            captured = true;
+        }
+    }
+
+    XCloseDisplay(dpy);
+    hasValidFrame_ = captured;
+    return captured;
+#else
+    return false;
+#endif
+}
+
 CursorState ScreenCapturer::captureCursorState() const {
     CursorState cs;
 #if defined(_WIN32)
@@ -1210,6 +1527,24 @@ CursorState ScreenCapturer::captureCursorState() const {
         cs.normX = std::clamp(static_cast<float>(relX) / std::max(1, frameW_), 0.0f, 1.0f);
         cs.normY = std::clamp(static_cast<float>(relY) / std::max(1, frameH_), 0.0f, 1.0f);
     }
+#elif defined(__linux__) || defined(__unix__)
+#if __has_include(<X11/Xlib.h>)
+    Display* dpy = XOpenDisplay(nullptr);
+    if (dpy) {
+        Window root = DefaultRootWindow(dpy);
+        Window rootRet, childRet;
+        int rootX = 0, rootY = 0, winX = 0, winY = 0;
+        unsigned int mask = 0;
+        if (XQueryPointer(dpy, root, &rootRet, &childRet, &rootX, &rootY, &winX, &winY, &mask)) {
+            int relX = rootX - activeMonitor_.x;
+            int relY = rootY - activeMonitor_.y;
+            cs.visible = true;
+            cs.normX = std::clamp(static_cast<float>(relX) / std::max(1, frameW_), 0.0f, 1.0f);
+            cs.normY = std::clamp(static_cast<float>(relY) / std::max(1, frameH_), 0.0f, 1.0f);
+        }
+        XCloseDisplay(dpy);
+    }
+#endif
 #endif
     return cs;
 }
@@ -1264,6 +1599,10 @@ bool ScreenCapturer::captureDirtyTiles(
         }
 #elif defined(__APPLE__)
         if (!captureViaCoreGraphics()) {
+            return false;
+        }
+#elif defined(__linux__) || defined(__unix__)
+        if (!captureViaX11()) {
             return false;
         }
 #endif

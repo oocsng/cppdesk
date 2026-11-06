@@ -616,7 +616,7 @@ private:
     float                   tooltipAnimVel_ = 0.0f;
 };
 
-#elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
+#elif defined(__APPLE__)
 
 struct CppDeskWindowMacImpl;
 
@@ -634,6 +634,26 @@ private:
     NetworkEngine& network_;
     std::string autoConnectTarget_;
     std::unique_ptr<CppDeskWindowMacImpl> pImpl_;
+};
+
+#elif defined(__linux__) || defined(__unix__)
+
+struct CppDeskWindowLinuxImpl;
+
+class CppDeskWindow {
+public:
+    CppDeskWindow(IdentityManager& identity, NetworkEngine& network, const std::string& autoConnectTarget = "");
+    ~CppDeskWindow();
+
+    bool create(void* displayContext = nullptr, int showCommand = 1);
+    int messageLoop();
+    void close();
+
+private:
+    IdentityManager& identity_;
+    NetworkEngine& network_;
+    std::string autoConnectTarget_;
+    std::unique_ptr<CppDeskWindowLinuxImpl> pImpl_;
 };
 
 #endif

@@ -178,6 +178,12 @@ std::vector<uint8_t> WhiteboardManager::serializeClearPacket() {
 
 // ---------------- Host Click-Through Layered Window ----------------
 
+#if !defined(_WIN32)
+void WhiteboardManager::showHostOverlay() {}
+void WhiteboardManager::hideHostOverlay() {}
+void WhiteboardManager::updateHostOverlayCanvas() {}
+#else
+
 LRESULT CALLBACK WhiteboardManager::OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_ERASEBKGND) {
         return 1;
@@ -324,5 +330,6 @@ void WhiteboardManager::updateHostOverlayCanvas() {
         InvalidateRect(hwndOverlay_, nullptr, FALSE);
     }
 }
+#endif
 
 } // namespace cppdesk

@@ -546,8 +546,13 @@ private:
     // Audio Capture & Playback state
     std::thread             hostAudioThread_;
     std::atomic<bool>       hostAudioActive_{false};
+#if defined(_WIN32)
     HWAVEOUT                hWaveOut_ = nullptr;
     WAVEHDR                 waveHeaders_[3]{};
+#else
+    void*                   hWaveOut_ = nullptr;
+    char                    waveHeaders_[3][64]{};
+#endif
     std::vector<uint8_t>    waveBuffers_[3];
     size_t                  currentWaveIdx_ = 0;
     mutable std::mutex      audioPlaybackMutex_;
@@ -557,7 +562,11 @@ private:
 
     // Privacy Mode state
     std::atomic<bool>       hostPrivacyModeActive_{false};
+#if defined(_WIN32)
     HWND                    hwndPrivacyCurtain_ = nullptr;
+#else
+    void*                   hwndPrivacyCurtain_ = nullptr;
+#endif
     std::atomic<bool>       viewerPrivacyModeActive_{false};
     std::string             privacyCurtainNotice_;
     std::string             privacyCurtainBrand_;
@@ -569,10 +578,17 @@ private:
     void hostTerminalReaderLoop();
     void injectHostTerminalStdin(const std::string& input);
 
+#if defined(_WIN32)
     HANDLE              hChildStdinWrite_ = nullptr;
     HANDLE              hChildStdoutRead_ = nullptr;
     HANDLE              hChildProcess_ = nullptr;
     HANDLE              hChildThread_ = nullptr;
+#else
+    void*               hChildStdinWrite_ = nullptr;
+    void*               hChildStdoutRead_ = nullptr;
+    void*               hChildProcess_ = nullptr;
+    void*               hChildThread_ = nullptr;
+#endif
     std::thread         hostTerminalThread_;
     std::atomic<bool>   hostTerminalActive_{false};
 

@@ -1,9 +1,13 @@
 #pragma once
 
+#if defined(_WIN32)
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#endif
+#endif
 
 #include "../core/protocol.hpp"
 
@@ -28,10 +32,14 @@ public:
     static void powerDownDisplays();
     static void wakeDisplays();
 
+#if defined(_WIN32)
+#if defined(_WIN32)
     // Input Filtering Helpers for Low-Level Windows Hooks
     static bool isPhysicalEvent(DWORD flags, bool isMouse);
     static bool isPhysicalMouseInput(const MSLLHOOKSTRUCT& hookStruct);
     static bool isPhysicalKeyboardInput(const KBDLLHOOKSTRUCT& hookStruct);
+#endif
+#endif
 
     // Lifecycle
     bool engageBlanking(
@@ -63,7 +71,11 @@ private:
 
     std::atomic<bool> blankActive_{false};
     std::atomic<ScreenBlankMode> currentMode_{ScreenBlankMode::CurtainOnly};
+#if defined(_WIN32)
     std::atomic<DWORD> blankThreadId_{0};
+#else
+    std::atomic<uint32_t> blankThreadId_{0};
+#endif
 
     std::mutex stateMutex_;
     std::thread blankThread_;
@@ -78,9 +90,15 @@ private:
     bool showDeskId_{true};
     uint64_t deskId_{0};
 
+#if defined(_WIN32)
     HWND hwndCurtain_{nullptr};
     HHOOK hMouseHook_{nullptr};
     HHOOK hKbdHook_{nullptr};
+#else
+    void* hwndCurtain_{nullptr};
+    void* hMouseHook_{nullptr};
+    void* hKbdHook_{nullptr};
+#endif
 };
 
 } // namespace cppdesk

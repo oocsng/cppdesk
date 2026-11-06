@@ -183,8 +183,11 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, handlePosixSignal);
     std::signal(SIGTERM, handlePosixSignal);
 
+
+
     int instanceId = 1;
     bool headlessRelayOnly = false;
+    bool headlessHostOnly = false;
     uint16_t relayPort = cppdesk::DEFAULT_RELAY_PORT;
     std::string connectTarget;
 
@@ -196,6 +199,8 @@ int main(int argc, char* argv[]) {
             } catch (...) {}
         } else if (arg == "--connect" && i + 1 < argc) {
             connectTarget = argv[++i];
+        } else if (arg == "--daemon" || arg == "--service-run" || arg == "--host-only") {
+            headlessHostOnly = true;
         } else if (arg == "--relay-server") {
             headlessRelayOnly = true;
             if (i + 1 < argc) {
@@ -238,6 +243,24 @@ int main(int argc, char* argv[]) {
 
     cppdesk::NetworkEngine network(identity);
     network.start();
+
+#if defined(__linux__) || defined(__unix__)
+    if (!std::getenv("DISPLAY")) {
+        setenv("DISPLAY", ":0", 0);
+    }
+#endif
+
+    if (headlessHostOnly) {
+        std::cout << "CppDesk Host Daemon running (ID: " << identity.deskId() << ")...\n";
+        while (network.isRunning() && !g_shutdownRequested.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        network.stop();
+        flock(lockFd, LOCK_UN);
+        close(lockFd);
+        unlink(lockPath.c_str());
+        return 0;
+    }
 
     cppdesk::CppDeskWindow window(identity, network, connectTarget);
     if (!window.create()) {

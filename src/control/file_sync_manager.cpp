@@ -1,11 +1,13 @@
 #include "file_sync_manager.hpp"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #ifdef DeleteFile
 #undef DeleteFile
+#endif
 #endif
 
 #include <cmath>
@@ -19,11 +21,15 @@ namespace {
 
 std::wstring utf8ToWide(const std::string& str) {
     if (str.empty()) return std::wstring();
+#if defined(_WIN32)
     int len = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, nullptr, 0);
     if (len <= 1) return std::wstring();
     std::wstring w(len - 1, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, w.data(), len);
     return w;
+#else
+    return std::wstring(str.begin(), str.end());
+#endif
 }
 
 bool isPathInside(const std::string& childPath, const std::string& parentPath) {
@@ -1079,6 +1085,7 @@ bool FileSyncManager::handleDeltaBlock(const SyncDeltaBlockPayload& block) {
             std::filesystem::rename(in.partFullPath, in.targetFullPath, ec);
         }
 
+#if defined(_WIN32)
         if (in.mtimeSec > 0) {
             HANDLE hFile = CreateFileW(
                 targetW.c_str(),
@@ -1098,6 +1105,7 @@ bool FileSyncManager::handleDeltaBlock(const SyncDeltaBlockPayload& block) {
                 CloseHandle(hFile);
             }
         }
+#endif
         incomingFiles_.erase(block.fileId);
     }
 

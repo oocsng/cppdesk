@@ -7,7 +7,11 @@ namespace cppdesk {
 
 namespace {
 
+#if defined(_WIN32)
 void renderSyntheticDesktopInternal(VirtualDisplayInfo& info, HDC hdc, void* pBits, const std::string& hostStatusText) {
+#else
+void renderSyntheticDesktopInternal(VirtualDisplayInfo& info, void* /*hdc*/, void* pBits, const std::string& /*hostStatusText*/) {
+#endif
     if (!pBits) return;
     uint32_t w = info.width;
     uint32_t h = info.height;
@@ -29,6 +33,7 @@ void renderSyntheticDesktopInternal(VirtualDisplayInfo& info, HDC hdc, void* pBi
         }
     }
 
+#if defined(_WIN32)
     if (hdc) {
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, RGB(220, 225, 235));
@@ -58,6 +63,7 @@ void renderSyntheticDesktopInternal(VirtualDisplayInfo& info, HDC hdc, void* pBi
             }
         }
     }
+#endif
 }
 
 } // namespace
@@ -74,12 +80,19 @@ VirtualDisplayManager::~VirtualDisplayManager() {
 }
 
 bool VirtualDisplayManager::isHostHeadless() {
+#if !defined(_WIN32)
+    return false;
+#else
     int metricsMonitors = GetSystemMetrics(SM_CMONITORS);
     uint32_t enumMonitors = getPhysicalMonitorCount();
     return (metricsMonitors == 0 || enumMonitors == 0);
+#endif
 }
 
 uint32_t VirtualDisplayManager::getPhysicalMonitorCount() {
+#if !defined(_WIN32)
+    return 1;
+#else
     struct CountCtx {
         uint32_t count = 0;
     } ctx;
@@ -94,9 +107,13 @@ uint32_t VirtualDisplayManager::getPhysicalMonitorCount() {
         reinterpret_cast<LPARAM>(&ctx)
     );
     return ctx.count;
+#endif
 }
 
 bool VirtualDisplayManager::hasIddCxDriver() {
+#if !defined(_WIN32)
+    return false;
+#else
     HANDLE h1 = CreateFileA("\\\\.\\ParsecVirtualDisplay",
                             GENERIC_READ | GENERIC_WRITE,
                             FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -114,9 +131,14 @@ bool VirtualDisplayManager::hasIddCxDriver() {
         return true;
     }
     return false;
+#endif
 }
 
 bool VirtualDisplayManager::allocateSoftwareSurface(SurfaceState& surface, uint32_t width, uint32_t height) {
+#if !defined(_WIN32)
+    (void)surface; (void)width; (void)height;
+    return false;
+#else
     if (width == 0 || height == 0 || width > 8192 || height > 8192) {
         return false;
     }
@@ -141,9 +163,13 @@ bool VirtualDisplayManager::allocateSoftwareSurface(SurfaceState& surface, uint3
 
     surface.hOldBm = SelectObject(surface.hdc, surface.hbm);
     return true;
+#endif
 }
 
 void VirtualDisplayManager::releaseSoftwareSurface(SurfaceState& surface) {
+#if !defined(_WIN32)
+    (void)surface;
+#else
     if (surface.hdc) {
         if (surface.hOldBm) {
             SelectObject(surface.hdc, surface.hOldBm);
@@ -157,10 +183,14 @@ void VirtualDisplayManager::releaseSoftwareSurface(SurfaceState& surface) {
         surface.hbm = nullptr;
     }
     surface.pBits = nullptr;
+#endif
 }
 
 int32_t VirtualDisplayManager::computeNextVirtualX_Locked(uint32_t /*width*/) const {
     int32_t maxX = 0;
+#if !defined(_WIN32)
+    maxX = 1920;
+#else
     struct BoundsCtx {
         int32_t maxX = 0;
     } bctx;
@@ -181,6 +211,7 @@ int32_t VirtualDisplayManager::computeNextVirtualX_Locked(uint32_t /*width*/) co
         reinterpret_cast<LPARAM>(&bctx)
     );
     maxX = bctx.maxX;
+#endif
 
     for (const auto& kv : displays_) {
         int32_t right = kv.second.info.x + static_cast<int32_t>(kv.second.info.width);

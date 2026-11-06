@@ -106,6 +106,126 @@ uint16_t InputInjector::mapVkToMacKeyCode(uint16_t vk) {
     }
 }
 
+uint32_t InputInjector::mapVkToX11KeySym(uint16_t vk) {
+    switch (vk) {
+        // Navigation and control
+        case 0x0D: return 0xFF0D; // VK_RETURN -> XK_Return
+        case 0x09: return 0xFF09; // VK_TAB -> XK_Tab
+        case 0x20: return 0x0020; // VK_SPACE -> XK_space
+        case 0x08: return 0xFF08; // VK_BACK -> XK_BackSpace
+        case 0x2E: return 0xFFFF; // VK_DELETE -> XK_Delete
+        case 0x1B: return 0xFF1B; // VK_ESCAPE -> XK_Escape
+        case 0x25: return 0xFF51; // VK_LEFT -> XK_Left
+        case 0x27: return 0xFF53; // VK_RIGHT -> XK_Right
+        case 0x26: return 0xFF52; // VK_UP -> XK_Up
+        case 0x28: return 0xFF54; // VK_DOWN -> XK_Down
+        case 0x24: return 0xFF50; // VK_HOME -> XK_Home
+        case 0x23: return 0xFF57; // VK_END -> XK_End
+        case 0x21: return 0xFF55; // VK_PRIOR -> XK_Page_Up
+        case 0x22: return 0xFF56; // VK_NEXT -> XK_Page_Down
+
+        // Modifiers
+        case 0x10: return 0xFFE1; // VK_SHIFT -> XK_Shift_L
+        case 0xA0: return 0xFFE1; // VK_LSHIFT -> XK_Shift_L
+        case 0xA1: return 0xFFE2; // VK_RSHIFT -> XK_Shift_R
+        case 0x11: return 0xFFE3; // VK_CONTROL -> XK_Control_L
+        case 0xA2: return 0xFFE3; // VK_LCONTROL -> XK_Control_L
+        case 0xA3: return 0xFFE4; // VK_RCONTROL -> XK_Control_R
+        case 0x12: return 0xFFE9; // VK_MENU -> XK_Alt_L
+        case 0xA4: return 0xFFE9; // VK_LMENU -> XK_Alt_L
+        case 0xA5: return 0xFFEA; // VK_RMENU -> XK_Alt_R
+        case 0x5B: return 0xFFEB; // VK_LWIN -> XK_Super_L
+        case 0x5C: return 0xFFEC; // VK_RWIN -> XK_Super_R
+        case 0x14: return 0xFFE5; // VK_CAPITAL -> XK_Caps_Lock
+
+        // Numbers 0-9
+        case 0x30: return 0x0030; // '0'
+        case 0x31: return 0x0031; // '1'
+        case 0x32: return 0x0032; // '2'
+        case 0x33: return 0x0033; // '3'
+        case 0x34: return 0x0034; // '4'
+        case 0x35: return 0x0035; // '5'
+        case 0x36: return 0x0036; // '6'
+        case 0x37: return 0x0037; // '7'
+        case 0x38: return 0x0038; // '8'
+        case 0x39: return 0x0039; // '9'
+
+        // Letters A-Z -> XK_a - XK_z
+        case 0x41: return 0x0061; // 'A' -> 'a'
+        case 0x42: return 0x0062; // 'B' -> 'b'
+        case 0x43: return 0x0063; // 'C' -> 'c'
+        case 0x44: return 0x0064; // 'D' -> 'd'
+        case 0x45: return 0x0065; // 'E' -> 'e'
+        case 0x46: return 0x0066; // 'F' -> 'f'
+        case 0x47: return 0x0067; // 'G' -> 'g'
+        case 0x48: return 0x0068; // 'H' -> 'h'
+        case 0x49: return 0x0069; // 'I' -> 'i'
+        case 0x4A: return 0x006A; // 'J' -> 'j'
+        case 0x4B: return 0x006B; // 'K' -> 'k'
+        case 0x4C: return 0x006C; // 'L' -> 'l'
+        case 0x4D: return 0x006D; // 'M' -> 'm'
+        case 0x4E: return 0x006E; // 'N' -> 'n'
+        case 0x4F: return 0x006F; // 'O' -> 'o'
+        case 0x50: return 0x0070; // 'P' -> 'p'
+        case 0x51: return 0x0071; // 'Q' -> 'q'
+        case 0x52: return 0x0072; // 'R' -> 'r'
+        case 0x53: return 0x0073; // 'S' -> 's'
+        case 0x54: return 0x0074; // 'T' -> 't'
+        case 0x55: return 0x0075; // 'U' -> 'u'
+        case 0x56: return 0x0076; // 'V' -> 'v'
+        case 0x57: return 0x0077; // 'W' -> 'w'
+        case 0x58: return 0x0078; // 'X' -> 'x'
+        case 0x59: return 0x0079; // 'Y' -> 'y'
+        case 0x5A: return 0x007A; // 'Z' -> 'z'
+
+        // Function keys F1-F12
+        case 0x70: return 0xFFBE; // F1
+        case 0x71: return 0xFFBF; // F2
+        case 0x72: return 0xFFC0; // F3
+        case 0x73: return 0xFFC1; // F4
+        case 0x74: return 0xFFC2; // F5
+        case 0x75: return 0xFFC3; // F6
+        case 0x76: return 0xFFC4; // F7
+        case 0x77: return 0xFFC5; // F8
+        case 0x78: return 0xFFC6; // F9
+        case 0x79: return 0xFFC7; // F10
+        case 0x7A: return 0xFFC8; // F11
+        case 0x7B: return 0xFFC9; // F12
+
+        // Punctuation & symbols
+        case 0xBA: return 0x003B; // VK_OEM_1 -> XK_semicolon
+        case 0xBB: return 0x003D; // VK_OEM_PLUS -> XK_equal
+        case 0xBC: return 0x002C; // VK_OEM_COMMA -> XK_comma
+        case 0xBD: return 0x002D; // VK_OEM_MINUS -> XK_minus
+        case 0xBE: return 0x002E; // VK_OEM_PERIOD -> XK_period
+        case 0xBF: return 0x002F; // VK_OEM_2 -> XK_slash
+        case 0xC0: return 0x0060; // VK_OEM_3 -> XK_grave
+        case 0xDB: return 0x005B; // VK_OEM_4 -> XK_bracketleft
+        case 0xDC: return 0x005C; // VK_OEM_5 -> XK_backslash
+        case 0xDD: return 0x005D; // VK_OEM_6 -> XK_bracketright
+        case 0xDE: return 0x0027; // VK_OEM_7 -> XK_apostrophe
+
+        // Numpad 0-9
+        case 0x60: return 0xFFB0; // VK_NUMPAD0 -> XK_KP_0
+        case 0x61: return 0xFFB1; // VK_NUMPAD1 -> XK_KP_1
+        case 0x62: return 0xFFB2; // VK_NUMPAD2 -> XK_KP_2
+        case 0x63: return 0xFFB3; // VK_NUMPAD3 -> XK_KP_3
+        case 0x64: return 0xFFB4; // VK_NUMPAD4 -> XK_KP_4
+        case 0x65: return 0xFFB5; // VK_NUMPAD5 -> XK_KP_5
+        case 0x66: return 0xFFB6; // VK_NUMPAD6 -> XK_KP_6
+        case 0x67: return 0xFFB7; // VK_NUMPAD7 -> XK_KP_7
+        case 0x68: return 0xFFB8; // VK_NUMPAD8 -> XK_KP_8
+        case 0x69: return 0xFFB9; // VK_NUMPAD9 -> XK_KP_9
+        case 0x6A: return 0xFFAA; // VK_MULTIPLY -> XK_KP_Multiply
+        case 0x6B: return 0xFFAB; // VK_ADD -> XK_KP_Add
+        case 0x6D: return 0xFFAD; // VK_SUBTRACT -> XK_KP_Subtract
+        case 0x6E: return 0xFFAE; // VK_DECIMAL -> XK_KP_Decimal
+        case 0x6F: return 0xFFAF; // VK_DIVIDE -> XK_KP_Divide
+
+        default: return 0;
+    }
+}
+
 namespace {
 
 #if defined(_WIN32)
@@ -506,6 +626,152 @@ void InputInjector::releaseAllModifiers() {
             CFRelease(ev);
         }
     }
+}
+
+bool InputInjector::syncToInputDesktop() {
+    return true;
+}
+
+bool InputInjector::isElevated() {
+    return false;
+}
+
+bool InputInjector::relaunchAsAdmin(void*) {
+    return false;
+}
+
+bool InputInjector::executeSystemAction(SystemActionType) {
+    return false;
+}
+
+#elif defined(__linux__) || defined(__unix__)
+
+#if __has_include(<X11/Xlib.h>)
+#include <X11/Xlib.h>
+#endif
+#if __has_include(<X11/extensions/XTest.h>)
+#include <X11/extensions/XTest.h>
+#endif
+
+namespace {
+#if __has_include(<X11/Xlib.h>)
+static std::mutex s_x11InputMutex;
+Display* getCachedX11Display() {
+    static Display* s_dpy = nullptr;
+    static bool s_inited = false;
+    std::lock_guard<std::mutex> lk(s_x11InputMutex);
+    if (!s_inited) {
+        XInitThreads();
+        s_inited = true;
+    }
+    if (!s_dpy) {
+        s_dpy = XOpenDisplay(nullptr);
+    }
+    return s_dpy;
+}
+#endif
+} // namespace
+
+void InputInjector::injectMouseMove(float normX, float normY, const MonitorDesc& monitor) {
+#if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
+    Display* dpy = getCachedX11Display();
+    if (!dpy) return;
+
+    normX = std::clamp(normX, 0.0f, 1.0f);
+    normY = std::clamp(normY, 0.0f, 1.0f);
+    int rootX = monitor.x + static_cast<int>(normX * std::max(1, monitor.width - 1));
+    int rootY = monitor.y + static_cast<int>(normY * std::max(1, monitor.height - 1));
+
+    XTestFakeMotionEvent(dpy, -1, rootX, rootY, CurrentTime);
+    XFlush(dpy);
+#else
+    (void)normX; (void)normY; (void)monitor;
+#endif
+}
+
+void InputInjector::injectMouseButton(MouseButtonId button, bool isDown, float normX, float normY, const MonitorDesc& monitor) {
+#if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
+    Display* dpy = getCachedX11Display();
+    if (!dpy) return;
+
+    normX = std::clamp(normX, 0.0f, 1.0f);
+    normY = std::clamp(normY, 0.0f, 1.0f);
+    int rootX = monitor.x + static_cast<int>(normX * std::max(1, monitor.width - 1));
+    int rootY = monitor.y + static_cast<int>(normY * std::max(1, monitor.height - 1));
+
+    XTestFakeMotionEvent(dpy, -1, rootX, rootY, CurrentTime);
+
+    unsigned int xBtn = 1;
+    if (button == MouseButtonId::Right) xBtn = 3;
+    else if (button == MouseButtonId::Middle) xBtn = 2;
+
+    XTestFakeButtonEvent(dpy, xBtn, isDown ? True : False, CurrentTime);
+    XFlush(dpy);
+#else
+    (void)button; (void)isDown; (void)normX; (void)normY; (void)monitor;
+#endif
+}
+
+void InputInjector::injectMouseWheel(int32_t verticalDelta, int32_t horizontalDelta) {
+#if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
+    Display* dpy = getCachedX11Display();
+    if (!dpy) return;
+
+    if (verticalDelta > 0) {
+        XTestFakeButtonEvent(dpy, 4, True, CurrentTime);
+        XTestFakeButtonEvent(dpy, 4, False, CurrentTime);
+    } else if (verticalDelta < 0) {
+        XTestFakeButtonEvent(dpy, 5, True, CurrentTime);
+        XTestFakeButtonEvent(dpy, 5, False, CurrentTime);
+    }
+
+    if (horizontalDelta > 0) {
+        XTestFakeButtonEvent(dpy, 7, True, CurrentTime);
+        XTestFakeButtonEvent(dpy, 7, False, CurrentTime);
+    } else if (horizontalDelta < 0) {
+        XTestFakeButtonEvent(dpy, 6, True, CurrentTime);
+        XTestFakeButtonEvent(dpy, 6, False, CurrentTime);
+    }
+    XFlush(dpy);
+#else
+    (void)verticalDelta; (void)horizontalDelta;
+#endif
+}
+
+void InputInjector::injectKeyEvent(uint16_t vkCode, uint16_t scanCode, bool isDown, bool isExtended) {
+    (void)scanCode;
+    (void)isExtended;
+#if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
+    Display* dpy = getCachedX11Display();
+    if (!dpy) return;
+
+    uint32_t sym = mapVkToX11KeySym(vkCode);
+    if (sym != 0) {
+        KeyCode kc = XKeysymToKeycode(dpy, static_cast<KeySym>(sym));
+        if (kc != 0) {
+            XTestFakeKeyEvent(dpy, kc, isDown ? True : False, CurrentTime);
+            XFlush(dpy);
+        }
+    }
+#else
+    (void)vkCode; (void)isDown;
+#endif
+}
+
+void InputInjector::releaseAllModifiers() {
+#if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
+    Display* dpy = getCachedX11Display();
+    if (!dpy) return;
+
+    uint32_t mods[] = { 0xFFE1, 0xFFE2, 0xFFE3, 0xFFE4, 0xFFE9, 0xFFEA, 0xFFEB, 0xFFEC };
+    for (uint32_t sym : mods) {
+        KeyCode kc = XKeysymToKeycode(dpy, static_cast<KeySym>(sym));
+        if (kc != 0) {
+            XTestFakeKeyEvent(dpy, kc, False, CurrentTime);
+        }
+    }
+    XFlush(dpy);
+#endif
 }
 
 bool InputInjector::syncToInputDesktop() {

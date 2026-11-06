@@ -1,7 +1,7 @@
 <p align="center">
   <img src="assets/icon.png" width="96" height="96" alt="CppDesk App Icon"><br>
   <b>CppDesk</b><br>
-  <span>Portable remote desktop client and host for Windows and macOS</span><br><br>
+  <span>Portable remote desktop client and host for Windows, macOS, and Linux</span><br><br>
   <a href="#features">Features</a> •
   <a href="#quick-start">Quick start</a> •
   <a href="#building-from-source">Build</a> •
@@ -18,7 +18,7 @@
   <a href="https://github.com/oocsng/cppdesk/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-D97757?style=for-the-badge&labelColor=262320" alt="License: MIT">
   </a>
-  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-D97757?style=for-the-badge&logo=windows&logoColor=white&labelColor=262320" alt="Platform: Windows | macOS">
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-D97757?style=for-the-badge&logo=linux&logoColor=white&labelColor=262320" alt="Platform: Windows | macOS | Linux">
 </p>
 
 <p align="center">
@@ -33,18 +33,18 @@
   </sub>
 </p>
 
-CppDesk is a portable remote desktop application built with modern C++ and hardware-accelerated rendering (Direct2D on Windows, Cocoa and Metal on macOS). It runs standalone with no installer, registry clutter, or external runtime requirements. Sessions authenticate via ephemeral or permanent keys and run end-to-end encrypted over direct LAN, NAT hole punching (STUN), or an optional relay server.
+CppDesk is a portable remote desktop application built with modern C++ and hardware-accelerated rendering (Direct2D on Windows, Cocoa and Metal on macOS, X11 and MIT-SHM on Linux). It runs standalone with no installer, registry clutter, or external runtime requirements. Sessions authenticate via ephemeral or permanent keys and run end-to-end encrypted over direct LAN, NAT hole punching (STUN), or an optional relay server.
 
 Hosts and clients identify each other with a 9-digit desk ID (`XXX XXX XXX`). Access can be granted with a password or through interactive on-screen approval.
 
 ## Features
 
-- Screen streaming: Low-latency desktop capture using DXGI Desktop Duplication with GDI fallback on Windows (and AVFoundation / CoreGraphics on macOS), multi-monitor selection, dynamic resolution matching, and 4-tier quality presets (Low Bandwidth 15 FPS, Balanced 30 FPS, High Bandwidth 45 FPS, Ultra LAN 60 FPS).
+- Screen streaming: Low-latency desktop capture using DXGI Desktop Duplication with GDI fallback on Windows, AVFoundation / CoreGraphics on macOS, and MIT-SHM / X11 on Linux; multi-monitor selection, dynamic resolution matching, and 4-tier quality presets (Low Bandwidth 15 FPS, Balanced 30 FPS, High Bandwidth 45 FPS, Ultra LAN 60 FPS).
 - Multi-session management: Tabbed interface for controlling multiple remote machines at once, with live ping indicators and unread chat counters.
 - File transfer and directory sync: Drag-and-drop file delivery with chunked progress tracking, SHA-256 integrity checks, and background bidirectional folder mirroring.
 - Audio and voice intercom: Full-duplex microphone chat with live VU meters, device selection dropdowns, and remote system loopback sound streaming.
 - Session recording and instant rewind: Record sessions directly into self-contained video files with an integrated in-app player, or scrub backwards through a rolling frame cache without interrupting the connection.
-- Terminal, process control, and command palette: Built-in remote command prompt, PowerShell execution, live task manager with process killing, and an omnibar command palette (`Ctrl+K`).
+- Terminal, process control, and command palette: Built-in remote command prompt, PowerShell / bash execution, live task manager with process killing, and an omnibar command palette (`Ctrl+K`).
 - Security and privacy: ECDH (NIST P-256) key exchange, AES-256-GCM AEAD authenticated encryption, optional TOTP 2FA (RFC 6238) with QR setup, brute-force rate limiting, curtain screen privacy mode, and real-time privacy cloak redaction zones.
 - Collaboration tools: In-session screen drawing tools (pens, highlighters, pointers), shared clipboard sync, and a real-time collaborative scratchpad.
 - Built-in networking tools: Port forwarding presets (RDP, SSH, VNC, HTTP), STUN diagnostics, and address book with quick tags.
@@ -52,10 +52,14 @@ Hosts and clients identify each other with a 9-digit desk ID (`XXX XXX XXX`). Ac
 ## Quick start
 
 ### 1. Download and run
-Grab `CppDesk.exe` from the latest release. No installation needed.
+Grab `CppDesk.exe` (Windows) or the platform binary from the latest release. No installation needed.
 
 ```powershell
+# Windows
 .\CppDesk.exe
+
+# Linux
+./CppDesk
 ```
 
 To test connections locally on a single machine, open two isolated instances:
@@ -65,6 +69,12 @@ To test connections locally on a single machine, open two isolated instances:
 .\CppDesk.exe --instance 2
 ```
 
+Headless Linux host / service mode:
+```bash
+./CppDesk --daemon              # Headless background host
+./CppDesk --host-only           # Run host engine only without UI
+```
+
 ### 2. Connect
 1. On the host: Note your 9-digit ID and one-time session password (or set a permanent password in settings).
 2. On the viewer: Enter the host's 9-digit ID, type the password (or leave blank to prompt the host user for approval), and click Connect.
@@ -72,9 +82,14 @@ To test connections locally on a single machine, open two isolated instances:
 ## Building from source
 
 ### Requirements
-- Windows 10 or 11 (x64) or macOS 12+
-- C++20 compiler (such as MinGW-w64 from MSYS2, MSVC, or Apple Clang)
+- Windows 10 or 11 (x64), macOS 12+, or Linux (X11 desktop)
+- C++20 compiler (such as MinGW-w64 from MSYS2, MSVC, Apple Clang, or GCC 11+)
 - CMake 3.20+ (for cross-platform builds)
+
+On Linux (Debian / Ubuntu / derivatives):
+```bash
+sudo apt install build-essential cmake libx11-dev libxext-dev libxtst-dev libxrandr-dev libzstd-dev libjpeg-turbo8-dev
+```
 
 ### Build commands
 
@@ -85,9 +100,12 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 # Run the automated test suite (Windows)
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Test
 
-# Or build via CMake (Windows & macOS)
+# Or build via CMake (Windows, macOS, Linux)
 cmake -B build
 cmake --build build --config Release
+
+# Run automated tests (52 test suites)
+./build/CppDeskTests
 ```
 
 ## Project structure
@@ -97,16 +115,16 @@ cmake --build build --config Release
 ├── build.ps1                     # Windows build and test automation script
 ├── CMakeLists.txt                # Cross-platform CMake build configuration
 ├── src/
-│   ├── capture/                  # Screen capture, display management, and rewind buffer
-│   ├── control/                  # Input injection, session tabs, whiteboard, scratchpad, command palette
+│   ├── capture/                  # Screen capture (DXGI, GDI, AVFoundation, X11 SHM), display management, rewind buffer
+│   ├── control/                  # Input injection (SendInput, CGEvent, XTest), session tabs, whiteboard, scratchpad
 │   ├── core/                     # Protocol definitions, crypto identity, and TOTP 2FA
 │   ├── media/                    # Voice intercom, session recorder, and player
 │   ├── net/                      # Socket engine, NAT traversal, and auto-updater
 │   ├── simd/                     # Vectorized image conversion and diffing (AVX2 & scalar fallback)
-│   └── ui/                       # Direct2D (Windows) and Cocoa/Metal (macOS) interface
+│   └── ui/                       # Direct2D (Windows), Cocoa/Metal (macOS), and X11 (Linux) interface
 ├── relay-dotnet/                 # Optional self-hosted relay server (.NET 10)
 ├── scripts/                      # Verification and benchmark utilities
-└── tests/                        # Automated unit and integration test suite (51 suites)
+└── tests/                        # Automated unit and integration test suite (52 suites)
 ```
 
 ## Issues and support
@@ -117,7 +135,7 @@ If you hit a bug, connection failure, or want to suggest an improvement:
 - [Browse open reports](https://github.com/oocsng/cppdesk/issues)
 
 Include the following in your report to help diagnose the issue:
-- Windows build version (for example, Windows 11 23H2 x64)
+- Operating system and version (for example, Windows 11 23H2 x64, macOS 14.5, Ubuntu 24.04 X11)
 - CppDesk version (for example, v3.6.0)
 - Connection type (Direct LAN, STUN NAT traversal, or Relay)
 - Steps to reproduce, along with relevant log lines or status messages

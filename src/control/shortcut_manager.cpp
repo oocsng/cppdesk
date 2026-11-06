@@ -1,5 +1,6 @@
 #include "shortcut_manager.hpp"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -8,6 +9,7 @@
 #include <shlobj.h>
 #include <objbase.h>
 #include <shlwapi.h>
+#endif
 
 #include <vector>
 #include <sstream>
@@ -30,6 +32,10 @@ std::string ShortcutManager::sanitizeDeskId(const std::string& input) {
 }
 
 bool ShortcutManager::createDesktopShortcut(const std::string& deskId, const std::string& customAlias) {
+#if !defined(_WIN32)
+    (void)deskId; (void)customAlias;
+    return false;
+#else
     std::string cleanId = sanitizeDeskId(deskId);
     if (cleanId.size() != 9) {
         return false;
@@ -109,9 +115,13 @@ bool ShortcutManager::createDesktopShortcut(const std::string& deskId, const std
         CoUninitialize();
     }
     return success;
+#endif
 }
 
 bool ShortcutManager::isUriProtocolRegistered() {
+#if !defined(_WIN32)
+    return false;
+#else
     HKEY hKey = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Classes\\cppdesk", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         RegCloseKey(hKey);
@@ -157,13 +167,25 @@ bool ShortcutManager::setUriProtocolRegistered(bool enable) {
     RegCloseKey(hCmdKey);
 
     return true;
+#endif
 }
 
 std::string ShortcutManager::parseStartupConnectTarget(const std::wstring& cmdLine) {
     if (cmdLine.empty()) {
         return "";
     }
-
+#if !defined(_WIN32)
+    std::string s(cmdLine.begin(), cmdLine.end());
+    size_t pos = s.find("--connect ");
+    if (pos != std::string::npos) {
+        return sanitizeDeskId(s.substr(pos + 10));
+    }
+    pos = s.find("cppdesk://");
+    if (pos != std::string::npos) {
+        return sanitizeDeskId(s.substr(pos + 10));
+    }
+    return "";
+#else
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(cmdLine.c_str(), &argc);
     if (!argv || argc <= 0) {
@@ -214,6 +236,7 @@ std::string ShortcutManager::parseStartupConnectTarget(const std::wstring& cmdLi
 
     LocalFree(argv);
     return targetId;
+#endif
 }
 
 } // namespace cppdesk

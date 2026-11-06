@@ -44,6 +44,9 @@ public:
     // Clear local clipboard
     static void clearClipboard();
 
+    static std::string getLocalClipboardText();
+    static bool setLocalClipboardText(const std::string& text);
+
     // Conflict resolution helpers: appends (1), (2), etc. if destination already exists
     static std::wstring resolveConflictFilenameW(const std::wstring& directory, const std::wstring& filename);
     static std::string resolveConflictFilename(const std::string& directory, const std::string& filename);
@@ -147,6 +150,9 @@ public:
     static bool getLocalClipboardFiles(std::vector<VirtualFileEntry>&, std::vector<std::wstring>&) { return false; }
     static bool setVirtualClipboardFiles(const std::vector<VirtualFileEntry>&, VirtualChunkReadFn) { return false; }
     static void clearClipboard() {}
+
+    static std::string getLocalClipboardText();
+    static bool setLocalClipboardText(const std::string& text);
 
     static std::wstring resolveConflictFilenameW(const std::wstring& directory, const std::wstring& filename);
     static std::string resolveConflictFilename(const std::string& directory, const std::string& filename);

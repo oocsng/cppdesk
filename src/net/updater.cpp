@@ -1,10 +1,12 @@
 #include "updater.hpp"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <winhttp.h>
+#endif
 
 #include <sstream>
 #include <vector>
@@ -17,11 +19,15 @@ namespace {
 
 std::wstring toWide(const std::string& str) {
     if (str.empty()) return L"";
+#if defined(_WIN32)
     int len = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, nullptr, 0);
     if (len <= 1) return L"";
     std::wstring out(len - 1, 0);
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, &out[0], len);
     return out;
+#else
+    return std::wstring(str.begin(), str.end());
+#endif
 }
 
 } // namespace
@@ -126,6 +132,7 @@ UpdateInfo AutoUpdater::queryLatestReleaseSync(
     info.currentVersion = currentVersion;
     info.downloadUrl = "https://github.com/" + repoOwner + "/" + repoName + "/releases/latest";
 
+#if defined(_WIN32)
     HINTERNET hSession = WinHttpOpen(
         L"CppDesk-Updater/3.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -247,6 +254,10 @@ UpdateInfo AutoUpdater::queryLatestReleaseSync(
     }
 
     return info;
+#else
+    info.errorMessage = "Auto-update not supported on this platform";
+    return info;
+#endif
 }
 
 void AutoUpdater::checkForUpdatesAsync(
@@ -308,6 +319,9 @@ void AutoUpdater::downloadUpdateAssetAsync(
     UpdateProgressCallback onProgress,
     std::function<void(bool success, const std::string& error)> onComplete)
 {
+#if !defined(_WIN32)
+    if (onComplete) onComplete(false, "Auto-updater not supported on this platform");
+#else
     std::thread([downloadUrl, targetPath, onProgress, onComplete]() {
         if (downloadUrl.empty() || targetPath.empty()) {
             if (onComplete) onComplete(false, "Invalid URL or target path");
@@ -509,8 +523,16 @@ void AutoUpdater::downloadUpdateAssetAsync(
             onComplete(true, "");
         }
     }).detach();
+#endif
 }
 
+#if !defined(_WIN32)
+bool AutoUpdater::validatePeBinary(const std::wstring&) { return false; }
+int AutoUpdater::applySelfUpdateAndRestart(const std::wstring&, const std::wstring&, uint32_t, bool) { return 1; }
+int AutoUpdater::applySelfUpdateAndRestart(const std::wstring&, uint32_t) { return 1; }
+std::wstring AutoUpdater::buildSelfUpdateCommand(const std::wstring&, const std::wstring&) { return L""; }
+bool AutoUpdater::launchSelfUpdate(const std::wstring&, const std::wstring&) { return false; }
+#else
 bool AutoUpdater::validatePeBinary(const std::wstring& filePath) {
     if (filePath.empty()) return false;
 
@@ -692,5 +714,6 @@ bool AutoUpdater::launchSelfUpdate(const std::wstring& newExePath, const std::ws
     }
     return false;
 }
+#endif
 
 } // namespace cppdesk

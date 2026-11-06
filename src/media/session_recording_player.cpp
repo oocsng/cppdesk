@@ -1,12 +1,14 @@
 #include "session_recording_player.hpp"
 #include "../capture/screen_capture.hpp"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <objidl.h>
 #include <gdiplus.h>
+#endif
 #include <filesystem>
 #include <iostream>
 #include <cstring>
@@ -17,6 +19,7 @@ namespace cppdesk {
 
 namespace {
 
+#if defined(_WIN32)
 int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
     UINT num = 0;
     UINT size = 0;
@@ -33,6 +36,7 @@ int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
     }
     return -1;
 }
+#endif
 
 } // namespace
 
@@ -658,6 +662,10 @@ bool SessionRecordingPlayer::exportSnapshotBmp(const std::string& outputPath) {
 }
 
 bool SessionRecordingPlayer::exportSnapshotPng(const std::string& outputPath) {
+#if !defined(_WIN32)
+    (void)outputPath;
+    return false;
+#else
     std::vector<uint8_t> bgra;
     int w = 0, h = 0;
     copyCurrentFrameBgra(bgra, w, h);
@@ -682,6 +690,7 @@ bool SessionRecordingPlayer::exportSnapshotPng(const std::string& outputPath) {
     Gdiplus::Bitmap bmp(w, h, w * 4, PixelFormat32bppARGB, bgra.data());
     Gdiplus::Status st = bmp.Save(widePath.c_str(), &pngClsid, nullptr);
     return (st == Gdiplus::Ok);
+#endif
 }
 
 bool SessionRecordingPlayer::exportSnapshot(const std::string& outputPath) {

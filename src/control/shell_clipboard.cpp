@@ -1,4 +1,5 @@
 #include "shell_clipboard.hpp"
+#include "clipboard_file_manager.hpp"
 
 #include <cstring>
 #include <algorithm>
@@ -121,6 +122,14 @@ std::wstring ShellClipboard::resolveConflictFilenameW(const std::wstring& direct
 
 std::string ShellClipboard::resolveConflictFilename(const std::string& directory, const std::string& filename) {
     return resolveConflictFilenameImpl(directory, filename);
+}
+
+std::string ShellClipboard::getLocalClipboardText() {
+    return ClipboardManager::getClipboardUtf8();
+}
+
+bool ShellClipboard::setLocalClipboardText(const std::string& text) {
+    return ClipboardManager::setClipboardUtf8(text);
 }
 
 #if defined(_WIN32)

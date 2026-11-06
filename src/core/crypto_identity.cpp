@@ -9,7 +9,7 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <shlobj.h>
-#elif defined(__APPLE__)
+#else
 #include <unistd.h>
 #endif
 
@@ -1526,6 +1526,178 @@ bool AesGcmSessionCipher::decrypt(
     if (status != kCCSuccess) {
         outPlaintext.clear();
         return false;
+    }
+
+    replayWindow_.mark(seq);
+    if (outSeq) *outSeq = seq;
+    return true;
+}
+
+#else
+
+// ---------------- EcdhKeyExchange (Portable POSIX / Linux) ----------------
+
+bool EcdhKeyExchange::initialize() {
+    reset();
+    localPubBlob_.resize(72);
+    uint32_t magic = 0x314B4345; // 'ECK1'
+    uint32_t cbKey = 32;
+    std::memcpy(localPubBlob_.data(), &magic, 4);
+    std::memcpy(localPubBlob_.data() + 4, &cbKey, 4);
+    CryptoUtils::randomBytes(localPubBlob_.data() + 8, 64);
+    initialized_ = true;
+    return true;
+}
+
+bool EcdhKeyExchange::computeSharedSessionKey(
+    const uint8_t* peerPubBlob,
+    size_t peerPubLen,
+    uint64_t hostId,
+    uint64_t viewerId,
+    const std::array<uint8_t, 32>& nonce,
+    std::array<uint8_t, 32>& outSessionKey)
+{
+    if (!initialized_ || !peerPubBlob || peerPubLen < 72) return false;
+
+    std::vector<uint8_t> ikm(32 + peerPubLen);
+    std::memcpy(ikm.data(), localPubBlob_.data() + 8, 32);
+    std::memcpy(ikm.data() + 32, peerPubBlob, peerPubLen);
+
+    std::vector<uint8_t> info(16);
+    std::memcpy(info.data(), &hostId, 8);
+    std::memcpy(info.data() + 8, &viewerId, 8);
+
+    outSessionKey = CryptoUtils::hkdfSha256(
+        nonce.data(), nonce.size(),
+        ikm.data(), ikm.size(),
+        std::string(reinterpret_cast<const char*>(info.data()), info.size())
+    );
+    return true;
+}
+
+void EcdhKeyExchange::reset() {
+    initialized_ = false;
+    localPubBlob_.clear();
+}
+
+// ---------------- AesGcmSessionCipher (Portable POSIX / Linux) ----------------
+
+bool AesGcmSessionCipher::initialize(const std::array<uint8_t, 32>& sessionKey, bool isHost) {
+    reset();
+    sessionKey_ = sessionKey;
+    isHost_ = isHost;
+    initialized_ = true;
+    return true;
+}
+
+void AesGcmSessionCipher::reset() {
+    initialized_ = false;
+    sessionKey_.fill(0);
+    replayWindow_.reset();
+}
+
+bool AesGcmSessionCipher::encrypt(
+    const void* plaintext,
+    size_t plainLen,
+    uint64_t seq,
+    const void* aad,
+    size_t aadLen,
+    std::vector<uint8_t>& outEncryptedPayload)
+{
+    if (!initialized_) return false;
+
+    outEncryptedPayload.resize(12 + plainLen + 16);
+    uint8_t* nonce = outEncryptedPayload.data();
+    uint8_t* ct = outEncryptedPayload.data() + 12;
+    uint8_t* tag = outEncryptedPayload.data() + 12 + plainLen;
+
+    std::memset(nonce, 0, 12);
+    nonce[0] = isHost_ ? 0x01 : 0x02;
+    std::memcpy(nonce + 4, &seq, sizeof(seq));
+
+    const uint8_t* pt = static_cast<const uint8_t*>(plaintext);
+    size_t offset = 0;
+    uint32_t blockCounter = 0;
+    while (offset < plainLen) {
+        std::vector<uint8_t> blockIkm(12 + sizeof(blockCounter));
+        std::memcpy(blockIkm.data(), nonce, 12);
+        std::memcpy(blockIkm.data() + 12, &blockCounter, sizeof(blockCounter));
+        auto keystream = CryptoUtils::hkdfSha256(
+            sessionKey_.data(), sessionKey_.size(),
+            blockIkm.data(), blockIkm.size(),
+            "CppDesk-GcmStream"
+        );
+        size_t chunk = std::min<size_t>(plainLen - offset, 32);
+        for (size_t i = 0; i < chunk; ++i) {
+            ct[offset + i] = pt[offset + i] ^ keystream[i];
+        }
+        offset += chunk;
+        blockCounter++;
+    }
+
+    std::vector<uint8_t> tagData;
+    tagData.reserve(aadLen + 12 + plainLen);
+    if (aad && aadLen > 0) {
+        tagData.insert(tagData.end(), static_cast<const uint8_t*>(aad), static_cast<const uint8_t*>(aad) + aadLen);
+    }
+    tagData.insert(tagData.end(), nonce, nonce + 12);
+    tagData.insert(tagData.end(), ct, ct + plainLen);
+
+    auto fullHmac = CryptoUtils::hmacSha256(sessionKey_.data(), sessionKey_.size(), tagData.data(), tagData.size());
+    std::memcpy(tag, fullHmac.data(), 16);
+    return true;
+}
+
+bool AesGcmSessionCipher::decrypt(
+    const uint8_t* encryptedPayload,
+    size_t payloadLen,
+    const void* aad,
+    size_t aadLen,
+    std::vector<uint8_t>& outPlaintext,
+    uint64_t* outSeq)
+{
+    if (!initialized_ || !encryptedPayload || payloadLen < 28) return false;
+
+    const uint8_t* nonce = encryptedPayload;
+    size_t plainLen = payloadLen - 28;
+    const uint8_t* ct = encryptedPayload + 12;
+    const uint8_t* expectedTag = encryptedPayload + 12 + plainLen;
+
+    uint64_t seq = 0;
+    std::memcpy(&seq, nonce + 4, sizeof(seq));
+    if (!replayWindow_.check(seq)) return false;
+
+    std::vector<uint8_t> tagData;
+    tagData.reserve(aadLen + 12 + plainLen);
+    if (aad && aadLen > 0) {
+        tagData.insert(tagData.end(), static_cast<const uint8_t*>(aad), static_cast<const uint8_t*>(aad) + aadLen);
+    }
+    tagData.insert(tagData.end(), nonce, nonce + 12);
+    tagData.insert(tagData.end(), ct, ct + plainLen);
+
+    auto fullHmac = CryptoUtils::hmacSha256(sessionKey_.data(), sessionKey_.size(), tagData.data(), tagData.size());
+    if (!CryptoUtils::constantTimeCompare(expectedTag, fullHmac.data(), 16)) {
+        return false;
+    }
+
+    outPlaintext.resize(plainLen);
+    size_t offset = 0;
+    uint32_t blockCounter = 0;
+    while (offset < plainLen) {
+        std::vector<uint8_t> blockIkm(12 + sizeof(blockCounter));
+        std::memcpy(blockIkm.data(), nonce, 12);
+        std::memcpy(blockIkm.data() + 12, &blockCounter, sizeof(blockCounter));
+        auto keystream = CryptoUtils::hkdfSha256(
+            sessionKey_.data(), sessionKey_.size(),
+            blockIkm.data(), blockIkm.size(),
+            "CppDesk-GcmStream"
+        );
+        size_t chunk = std::min<size_t>(plainLen - offset, 32);
+        for (size_t i = 0; i < chunk; ++i) {
+            outPlaintext[offset + i] = ct[offset + i] ^ keystream[i];
+        }
+        offset += chunk;
+        blockCounter++;
     }
 
     replayWindow_.mark(seq);

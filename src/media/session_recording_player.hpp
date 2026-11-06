@@ -14,6 +14,7 @@
 
 #include "session_recorder.hpp"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -25,6 +26,7 @@
 #endif
 #ifdef FOURCC_LIST
 #undef FOURCC_LIST
+#endif
 #endif
 
 namespace cppdesk {

@@ -1,9 +1,18 @@
 #pragma once
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+struct RECT {
+    int32_t left = 0;
+    int32_t top = 0;
+    int32_t right = 0;
+    int32_t bottom = 0;
+};
+#endif
 #include <vector>
 #include <string>
 #include <mutex>

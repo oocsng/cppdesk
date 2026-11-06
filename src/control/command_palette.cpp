@@ -148,6 +148,24 @@ void CommandPaletteManager::registerCommand(const OmnibarCommand& cmd) {
     catalog_.push_back(cmd);
 }
 
+#if !defined(_WIN32)
+bool CommandPaletteManager::executeSync(const std::string& cmdLine,
+                                        int32_t& outExitCode,
+                                        std::string& outOutput,
+                                        uint32_t /*timeoutMs*/) {
+    outOutput.clear();
+    outExitCode = -1;
+    FILE* fp = popen(cmdLine.c_str(), "r");
+    if (!fp) return false;
+    char buf[512];
+    while (fgets(buf, sizeof(buf), fp)) {
+        outOutput += buf;
+    }
+    int status = pclose(fp);
+    outExitCode = status;
+    return true;
+}
+#else
 bool CommandPaletteManager::executeSync(const std::string& cmdLine,
                                         int32_t& outExitCode,
                                         std::string& outOutput,
@@ -284,6 +302,7 @@ bool CommandPaletteManager::executeSync(const std::string& cmdLine,
 
     return true;
 }
+#endif
 
 void CommandPaletteManager::executeAsync(const std::string& cmdLine,
                                          std::function<void(int32_t exitCode, const std::string& output)> onComplete) {
