@@ -30,6 +30,10 @@ D2D1_COLOR_F COL_TEXT_ACCENT{};
 D2D1_COLOR_F COL_TEXT_ON_ACCENT{};
 D2D1_COLOR_F COL_STAGE_BG{};
 D2D1_COLOR_F COL_HUD_BG{};
+D2D1_COLOR_F COL_HUD_TEXT{};
+D2D1_COLOR_F COL_HUD_TEXT_SECONDARY{};
+D2D1_COLOR_F COL_HUD_TEXT_MUTED{};
+D2D1_COLOR_F COL_HUD_TEXT_ACCENT{};
 
 namespace {
 
@@ -61,6 +65,10 @@ const PaletteToken kTokens[] = {
     { "COL_TEXT_ON_ACCENT",    &COL_TEXT_ON_ACCENT,    rgba(255, 255, 255), rgba(255, 255, 255) },
     { "COL_STAGE_BG",          &COL_STAGE_BG,          rgba(235, 229, 219), rgba(20, 19, 18) },
     { "COL_HUD_BG",            &COL_HUD_BG,            rgba(28, 27, 25, 0.94f), rgba(28, 27, 25, 0.94f) },
+    { "COL_HUD_TEXT",           &COL_HUD_TEXT,           rgba(250, 247, 242), rgba(250, 247, 242) },
+    { "COL_HUD_TEXT_SECONDARY", &COL_HUD_TEXT_SECONDARY, rgba(184, 177, 166), rgba(184, 177, 166) },
+    { "COL_HUD_TEXT_MUTED",     &COL_HUD_TEXT_MUTED,     rgba(168, 161, 150), rgba(168, 161, 150) },
+    { "COL_HUD_TEXT_ACCENT",    &COL_HUD_TEXT_ACCENT,    rgba(228, 138, 108), rgba(228, 138, 108) },
 };
 
 // Live tokens hold light values from startup, before any window calls updateActivePalette.

@@ -253,12 +253,25 @@ bool CppDeskWindow::create(HINSTANCE hInstance, int nCmdShow) {
         return false;
     }
 
-    // The window may have opened on a monitor whose DPI differs from the system DPI.
+    // The window may have opened on a monitor whose DPI differs from the system DPI. Size it for that monitor
+    // and keep it inside the work area: 1220x760 DIPs at 150% is taller than a 1080p screen.
     dpi_ = GetDpiForWindow(hwnd_);
     if (dpi_ == 0) dpi_ = 96;
-    if (dpi_ != systemDpi) {
-        SetWindowPos(hwnd_, nullptr, 0, 0, dipToPx(kInitialWidthDips, dpi_), dipToPx(kInitialHeightDips, dpi_),
-                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    {
+        const int widthPx = dipToPx(kInitialWidthDips, dpi_);
+        const int heightPx = dipToPx(kInitialHeightDips, dpi_);
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        RECT placed{};
+        GetWindowRect(hwnd_, &placed);
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
+            const RECT& work = monitorInfo.rcWork;
+            const SpanFit x = fitSpanToWork(placed.left, widthPx, work.left, work.right);
+            const SpanFit y = fitSpanToWork(placed.top, heightPx, work.top, work.bottom);
+            SetWindowPos(hwnd_, nullptr, x.pos, y.pos, x.size, y.size, SWP_NOZORDER | SWP_NOACTIVATE);
+        } else if (dpi_ != systemDpi) {
+            SetWindowPos(hwnd_, nullptr, 0, 0, widthPx, heightPx, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
     }
 
     applyWindowThemeAttribute();
@@ -3253,6 +3266,11 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
 
         float left = stageRect.left + (stageRect.width() - drawW) * 0.5f;
         float top  = stageRect.top + (stageRect.height() - drawH) * 0.5f;
+        if (scaleMode_ == ScaleMode::Original) {
+            // Whole physical pixels, or the 1:1 image is resampled and soft at fractional scales.
+            left = snapToPx(left, dpi_);
+            top = snapToPx(top, dpi_);
+        }
         renderedCanvasRect_ = { left, top, left + drawW, top + drawH };
 
         if (!isFullscreen_) {
@@ -3395,10 +3413,10 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                      fmtBodyBold_, COL_PRIMARY_ACCENT);
 
             drawText(activeItem->fileName, { hudPill.left + 26.0f, hudPill.top + 6.0f, hudPill.right - 50.0f, hudPill.top + 22.0f },
-                     fmtSmall_, COL_TEXT_PRIMARY);
+                     fmtSmall_, COL_HUD_TEXT);
 
             drawText(pctBuf, { hudPill.right - 48.0f, hudPill.top + 6.0f, hudPill.right - 10.0f, hudPill.top + 22.0f },
-                     fmtSmall_, COL_TEXT_ACCENT, DWRITE_TEXT_ALIGNMENT_TRAILING);
+                     fmtSmall_, COL_HUD_TEXT_ACCENT, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
             UiRect barBg = { hudPill.left + 10.0f, hudPill.bottom - 14.0f, hudPill.right - 10.0f, hudPill.bottom - 8.0f };
             fillRoundRect(barBg, 3.0f, rgba(255, 255, 255, 0.08f));
@@ -3500,11 +3518,11 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
 
             drawPulseDot(bannerRect.centerX(), bannerRect.top + 28.0f, 5.0f, COL_PRIMARY_ACCENT);
             drawText("Host Restarting...", { bannerRect.left + 20.0f, bannerRect.top + 42.0f, bannerRect.right - 20.0f, bannerRect.top + 68.0f },
-                     fmtHeading_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_CENTER);
+                     fmtHeading_, COL_HUD_TEXT, DWRITE_TEXT_ALIGNMENT_CENTER);
 
             std::string subText = "Auto-reconnecting with security token...\nWaiting for remote system to come back online.";
             drawText(subText, { bannerRect.left + 20.0f, bannerRect.top + 70.0f, bannerRect.right - 20.0f, bannerRect.bottom - 46.0f },
-                     fmtSmall_, COL_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_CENTER);
+                     fmtSmall_, COL_HUD_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_CENTER);
 
             UiRect cancelBtn = { bannerRect.centerX() - 70.0f, bannerRect.bottom - 38.0f, bannerRect.centerX() + 70.0f, bannerRect.bottom - 10.0f };
             drawButton("btn_cancel_reboot_rec", cancelBtn, "Cancel Reconnect",
@@ -8041,7 +8059,7 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
     drawPulseDot(curX + 4.0f, hudCard.top + 16.0f, 3.6f, rgba(16, 185, 129, hudProgress), hudProgress);
     curX += 16.0f;
     drawText("DIAGNOSTICS & TELEMETRY", { curX, hudCard.top + 8.0f, hudCard.right - 36.0f, hudCard.top + 26.0f },
-             fmtSmall_, withAlpha(COL_TEXT_PRIMARY, hudProgress));
+             fmtSmall_, withAlpha(COL_HUD_TEXT, hudProgress));
 
     UiRect closeBtn = { hudCard.right - 28.0f, hudCard.top + 7.0f, hudCard.right - 8.0f, hudCard.top + 27.0f };
     drawButton("hud_close_btn", closeBtn, "×",
@@ -8073,20 +8091,20 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
                              (stats.qualityPreset == QualityPreset::Balanced) ? "Balanced" : "Low";
     std::snprintf(resBuf, sizeof(resBuf), "%dx%d • %s", stats.frameWidth, stats.frameHeight, presetName);
     drawText(resBuf, { hudCard.left + 160.0f, cy, hudCard.right - 14.0f, cy + 18.0f },
-             fmtSmall_, withAlpha(COL_TEXT_SECONDARY, hudProgress), DWRITE_TEXT_ALIGNMENT_TRAILING);
+             fmtSmall_, withAlpha(COL_HUD_TEXT_SECONDARY, hudProgress), DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     cy += 24.0f;
 
     // Row 2: Latency Pipeline (Capture | Encode | Decode)
     drawText("LATENCY PIPELINE", { hudCard.left + 14.0f, cy, hudCard.right - 14.0f, cy + 14.0f },
-             fmtSmall_, withAlpha(COL_TEXT_MUTED, hudProgress * 0.85f));
+             fmtSmall_, withAlpha(COL_HUD_TEXT_MUTED, hudProgress * 0.85f));
     cy += 16.0f;
 
     char pipeBuf[80];
     std::snprintf(pipeBuf, sizeof(pipeBuf), "Cap: %.1f ms   Enc: %.1f ms   Dec: %.1f ms",
                   stats.captureLatencyMs, stats.encodeLatencyMs, stats.decodeLatencyMs);
     drawText(pipeBuf, { hudCard.left + 14.0f, cy, hudCard.right - 14.0f, cy + 18.0f },
-             fmtMono_ ? fmtMono_ : fmtSmall_, withAlpha(COL_TEXT_PRIMARY, hudProgress));
+             fmtMono_ ? fmtMono_ : fmtSmall_, withAlpha(COL_HUD_TEXT, hudProgress));
 
     cy += 24.0f;
 
@@ -8104,7 +8122,7 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
                   ((std::isfinite(stats.compressionRatio) && stats.compressionRatio > 0.1f) ? stats.compressionRatio : 1.0f),
                   stats.deltaTilesCount);
     drawText(compBuf, { hudCard.left + 160.0f, cy, hudCard.right - 14.0f, cy + 18.0f },
-             fmtSmall_, withAlpha(COL_TEXT_SECONDARY, hudProgress), DWRITE_TEXT_ALIGNMENT_TRAILING);
+             fmtSmall_, withAlpha(COL_HUD_TEXT_SECONDARY, hudProgress), DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     cy += 20.0f;
 
@@ -8116,7 +8134,7 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
         UiRect sparkRect = { hudCard.left + 14.0f, cy, hudCard.right - 14.0f, cy + 28.0f };
         fillRoundRect(sparkRect, 4.0f, withAlpha(COL_BG_SUBTLE, hudProgress * 0.5f));
         drawText("Sampling network latency...", sparkRect, fmtSmall_,
-                 withAlpha(COL_TEXT_MUTED, hudProgress), DWRITE_TEXT_ALIGNMENT_CENTER);
+                 withAlpha(COL_HUD_TEXT_MUTED, hudProgress), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
     cy += 34.0f;
@@ -8124,7 +8142,7 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
     // Row 5: Hotkey helper
     drawText("Press Ctrl + Shift + O to toggle overlay",
              { hudCard.left + 14.0f, cy, hudCard.right - 14.0f, cy + 16.0f },
-             fmtSmall_, withAlpha(COL_TEXT_MUTED, hudProgress * 0.70f), DWRITE_TEXT_ALIGNMENT_CENTER);
+             fmtSmall_, withAlpha(COL_HUD_TEXT_MUTED, hudProgress * 0.70f), DWRITE_TEXT_ALIGNMENT_CENTER);
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }

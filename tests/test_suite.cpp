@@ -6828,6 +6828,13 @@ void testThemePaletteContrast() {
 
         // Not covered: COL_STAGE_BG (sits behind the remote canvas, no text) and the rewind-bar label (drawn over video).
         TEST_ASSERT(std::fabs(COL_HUD_BG.a - 0.94f) < 1e-5f);
+
+        // Text on always-dark overlays (transfer pill, performance HUD, reconnect banner) uses fixed light
+        // tokens: theme text tokens turn dark in light mode and would be unreadable on those fills.
+        CONTRAST_CHECK(COL_HUD_TEXT, COL_HUD_BG, 4.5);
+        CONTRAST_CHECK(COL_HUD_TEXT_SECONDARY, COL_HUD_BG, 4.5);
+        CONTRAST_CHECK(COL_HUD_TEXT_MUTED, COL_HUD_BG, 4.5);
+        CONTRAST_CHECK(COL_HUD_TEXT_ACCENT, COL_HUD_BG, 4.5);
     }
 }
 #undef CONTRAST_CHECK
@@ -6885,6 +6892,22 @@ void testDpiConversion() {
         TEST_ASSERT(dipToPx(pxToDip(1331.0f, dpi), dpi) == 1331);
         TEST_ASSERT(dipToPx(pxToDip(777.0f, dpi), dpi) == 777);
     }
+
+    // The initial window must fit the monitor work area: 1220x760 DIPs at 150% is taller than a 1080p screen.
+    SpanFit h = fitSpanToWork(70, dipToPx(760.0f, 144), 0, 1040);
+    TEST_ASSERT(h.size == 1040 && h.pos == 0);
+    SpanFit w = fitSpanToWork(100, dipToPx(1220.0f, 144), 0, 1920);
+    TEST_ASSERT(w.size == 1830 && w.pos == 90);
+    SpanFit fits = fitSpanToWork(100, 1220, 0, 1920);
+    TEST_ASSERT(fits.size == 1220 && fits.pos == 100);
+    SpanFit secondMonitor = fitSpanToWork(50, 800, 1920, 3840);
+    TEST_ASSERT(secondMonitor.size == 800 && secondMonitor.pos == 1920);
+
+    // 1:1 mode: the canvas origin must land on a whole physical pixel, or the image is resampled and soft.
+    float snapped = snapToPx(10.4f, 144);
+    TEST_ASSERT(dipToPx(snapped, 144) == 16);
+    TEST_ASSERT(std::fabs(snapToPx(snapped, 144) - snapped) < 1e-4f);
+    TEST_ASSERT(snapToPx(10.4f, 0) == 10.0f);
 }
 
 } // namespace

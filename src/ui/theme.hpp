@@ -54,6 +54,10 @@ extern D2D1_COLOR_F COL_TEXT_ACCENT;
 extern D2D1_COLOR_F COL_TEXT_ON_ACCENT;
 extern D2D1_COLOR_F COL_STAGE_BG;
 extern D2D1_COLOR_F COL_HUD_BG;   // floating overlay pill; dark in both modes
+extern D2D1_COLOR_F COL_HUD_TEXT;            // text on always-dark overlays: fixed light colors in both modes
+extern D2D1_COLOR_F COL_HUD_TEXT_SECONDARY;
+extern D2D1_COLOR_F COL_HUD_TEXT_MUTED;
+extern D2D1_COLOR_F COL_HUD_TEXT_ACCENT;
 
 // Sets every live COL_* token to lerp(light, dark, darkT). darkT is clamped to 0..1.
 void updateActivePalette(float darkT);

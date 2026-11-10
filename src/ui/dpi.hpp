@@ -20,4 +20,19 @@ inline int dipToPx(float dip, unsigned dpi) {
     return static_cast<int>(std::lround(dip * dpiScale(dpi)));
 }
 
+// Rounds a DIP coordinate to the nearest whole physical pixel, so bitmaps drawn there are not resampled.
+inline float snapToPx(float dip, unsigned dpi) {
+    return pxToDip(static_cast<float>(dipToPx(dip, dpi)), dpi);
+}
+
+struct SpanFit { int pos; int size; };
+
+// Shrinks and moves a window span (one axis, physical pixels) so it lies inside the work area [workStart, workEnd].
+inline SpanFit fitSpanToWork(int pos, int size, int workStart, int workEnd) {
+    if (size > workEnd - workStart) size = workEnd - workStart;
+    if (pos + size > workEnd) pos = workEnd - size;
+    if (pos < workStart) pos = workStart;
+    return { pos, size };
+}
+
 } // namespace cppdesk
