@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ui_platform.hpp"
+#include "dpi.hpp"
 #include "../core/protocol.hpp"
 #include "../core/crypto_identity.hpp"
 #include "../net/network_engine.hpp"
@@ -244,9 +245,15 @@ private:
     bool mapCanvasPointToNormalized(float x, float y, float& outNormX, float& outNormY) const;
     std::string* activeFocusedTextBuffer();
 
+    // Layout and drawing are in DIPs; Win32 sizes and mouse coordinates are physical pixels.
+    float toDip(int px) const { return pxToDip(static_cast<float>(px), dpi_); }
+    D2D1_SIZE_F clientSizeDips() const;
+    D2D1_SIZE_U clientSizePx() const;
+
     IdentityManager&        identity_;
     NetworkEngine&          network_;
     HWND                    hwnd_ = nullptr;
+    unsigned                dpi_ = 96;
     std::unique_ptr<NotificationManager> notificationMgr_;
 
     // Direct2D & DirectWrite resources

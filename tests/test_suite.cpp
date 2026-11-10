@@ -24,6 +24,7 @@
 #include "../src/control/scratchpad_manager.hpp"
 #include "../src/control/command_palette.hpp"
 #include "../src/ui/ui_platform.hpp"
+#include "../src/ui/dpi.hpp"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -6864,6 +6865,28 @@ void testThemeScales() {
 }
 #endif
 
+void testDpiConversion() {
+    std::cout << "[TEST 56] DPI Pixel/DIP Conversion..." << std::endl;
+    TEST_ASSERT(dipToPx(1220.0f, 96) == 1220);
+    TEST_ASSERT(dipToPx(1220.0f, 120) == 1525);   // 125%
+    TEST_ASSERT(dipToPx(760.0f, 144) == 1140);    // 150%
+    TEST_ASSERT(dipToPx(760.0f, 168) == 1330);    // 175%
+    TEST_ASSERT(dipToPx(760.0f, 192) == 1520);    // 200%
+    TEST_ASSERT(std::fabs(pxToDip(1525.0f, 120) - 1220.0f) < 1e-3f);
+    TEST_ASSERT(std::fabs(pxToDip(150.0f, 120) - 120.0f) < 1e-3f);
+
+    // A failed DPI query (0) must behave as 96, never divide by zero.
+    TEST_ASSERT(dpiScale(0) == 1.0f);
+    TEST_ASSERT(pxToDip(100.0f, 0) == 100.0f);
+    TEST_ASSERT(dipToPx(100.0f, 0) == 100);
+
+    // Fractional scales: a whole-pixel size survives a round trip without drifting.
+    for (unsigned dpi : { 96u, 120u, 144u, 168u, 192u }) {
+        TEST_ASSERT(dipToPx(pxToDip(1331.0f, dpi), dpi) == 1331);
+        TEST_ASSERT(dipToPx(pxToDip(777.0f, dpi), dpi) == 777);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -6933,6 +6956,7 @@ int main() {
         testThemePaletteContrast(); std::cout << "Test 54 done\n" << std::flush;
         testThemeScales(); std::cout << "Test 55 done\n" << std::flush;
 #endif
+        testDpiConversion(); std::cout << "Test 56 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";

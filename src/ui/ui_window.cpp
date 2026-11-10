@@ -231,6 +231,9 @@ bool CppDeskWindow::create(HINSTANCE hInstance, int nCmdShow) {
     std::wstring wTitle = utf8ToWide(title);
 
     int offset = (identity_.instanceId() - 1) * 44;
+    constexpr float kInitialWidthDips = 1220.0f;
+    constexpr float kInitialHeightDips = 760.0f;
+    const unsigned systemDpi = GetDpiForSystem();
     hwnd_ = CreateWindowExW(
         WS_EX_ACCEPTFILES,
         wc.lpszClassName,
@@ -238,8 +241,8 @@ bool CppDeskWindow::create(HINSTANCE hInstance, int nCmdShow) {
         WS_OVERLAPPEDWINDOW,
         100 + offset,
         70 + offset,
-        1220,
-        760,
+        dipToPx(kInitialWidthDips, systemDpi),
+        dipToPx(kInitialHeightDips, systemDpi),
         nullptr,
         nullptr,
         hInstance,
@@ -248,6 +251,14 @@ bool CppDeskWindow::create(HINSTANCE hInstance, int nCmdShow) {
 
     if (!hwnd_) {
         return false;
+    }
+
+    // The window may have opened on a monitor whose DPI differs from the system DPI.
+    dpi_ = GetDpiForWindow(hwnd_);
+    if (dpi_ == 0) dpi_ = 96;
+    if (dpi_ != systemDpi) {
+        SetWindowPos(hwnd_, nullptr, 0, 0, dipToPx(kInitialWidthDips, dpi_), dipToPx(kInitialHeightDips, dpi_),
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     applyWindowThemeAttribute();
@@ -518,9 +529,7 @@ bool CppDeskWindow::stepAnimations(float dt) {
     if (stepSpring(modalAnimT_, modalAnimVel_, targetModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // Window dimensions for dynamic springs
-    RECT rcCl{};
-    GetClientRect(hwnd_, &rcCl);
-    float winW = static_cast<float>(std::max<LONG>(1, rcCl.right - rcCl.left));
+    float winW = clientSizeDips().width;
 
     // 6. Dynamic Island / Capsule Toast Spring
     bool toastVisible = (!toastText_.empty() && GetTickCount64() <= toastExpireTick_);
@@ -817,6 +826,17 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
+        case WM_DPICHANGED: {
+            dpi_ = HIWORD(wParam);
+            if (dpi_ == 0) dpi_ = 96;
+            const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
+            SetWindowPos(hwnd_, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left, suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            if (renderTarget_) renderTarget_->SetDpi(static_cast<float>(dpi_), static_cast<float>(dpi_));
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+        }
         case WM_SIZE: {
             if (renderTarget_) {
                 RECT rc{};
@@ -1033,32 +1053,32 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 1;
 
         case WM_MOUSEMOVE:
-            onMouseMove(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseMove(toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_LBUTTONDOWN:
             SetFocus(hwnd_);
-            onMouseButton(MouseButtonId::Left, true, static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseButton(MouseButtonId::Left, true, toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_LBUTTONUP:
-            onMouseButton(MouseButtonId::Left, false, static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseButton(MouseButtonId::Left, false, toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_RBUTTONDOWN:
-            onMouseButton(MouseButtonId::Right, true, static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseButton(MouseButtonId::Right, true, toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_RBUTTONUP:
-            onMouseButton(MouseButtonId::Right, false, static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseButton(MouseButtonId::Right, false, toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_MBUTTONDOWN:
-            onMouseButton(MouseButtonId::Middle, true, static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseButton(MouseButtonId::Middle, true, toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_MBUTTONUP:
-            onMouseButton(MouseButtonId::Middle, false, static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseButton(MouseButtonId::Middle, false, toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_MOUSEWHEEL:
@@ -1118,8 +1138,8 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_GETMINMAXINFO: {
             auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
-            mmi->ptMinTrackSize.x = 900;
-            mmi->ptMinTrackSize.y = 600;
+            mmi->ptMinTrackSize.x = dipToPx(900.0f, dpi_);
+            mmi->ptMinTrackSize.y = dipToPx(600.0f, dpi_);
             return 0;
         }
 
@@ -1658,21 +1678,19 @@ void CppDeskWindow::onPaint() {
 
     updateActivePalette(smoothStepEase(themeAnimT_));
 
-    RECT rc{};
-    GetClientRect(hwnd_, &rc);
-    float width = static_cast<float>(std::max<LONG>(1, rc.right - rc.left));
-    float height = static_cast<float>(std::max<LONG>(1, rc.bottom - rc.top));
+    const D2D1_SIZE_F clientDips = clientSizeDips();
+    float width = clientDips.width;
+    float height = clientDips.height;
 
     if (!renderTarget_) {
         D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties();
         rtProps.type = identity_.settings().hardwareAcceleration
             ? D2D1_RENDER_TARGET_TYPE_DEFAULT
             : D2D1_RENDER_TARGET_TYPE_SOFTWARE;
-        rtProps.dpiX = 96.0f;
-        rtProps.dpiY = 96.0f;
-        D2D1_HWND_RENDER_TARGET_PROPERTIES hwndProps = D2D1::HwndRenderTargetProperties(
-            hwnd_, D2D1::SizeU(static_cast<UINT32>(width), static_cast<UINT32>(height))
-        );
+        // Target DPI = window DPI, so every layout number below is a DIP and Direct2D scales it to pixels.
+        rtProps.dpiX = static_cast<float>(dpi_);
+        rtProps.dpiY = static_cast<float>(dpi_);
+        D2D1_HWND_RENDER_TARGET_PROPERTIES hwndProps = D2D1::HwndRenderTargetProperties(hwnd_, clientSizePx());
         if (FAILED(d2dFactory_->CreateHwndRenderTarget(rtProps, hwndProps, &renderTarget_)) || !renderTarget_) {
             return;
         }
@@ -3228,8 +3246,9 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             drawW = bitmapW_ * scale;
             drawH = bitmapH_ * scale;
         } else if (scaleMode_ == ScaleMode::Original) {
-            drawW = std::min(availW, static_cast<float>(bitmapW_));
-            drawH = std::min(availH, static_cast<float>(bitmapH_));
+            // 1:1 means one remote pixel per physical pixel, which is 96/dpi DIPs.
+            drawW = std::min(availW, pxToDip(static_cast<float>(bitmapW_), dpi_));
+            drawH = std::min(availH, pxToDip(static_cast<float>(bitmapH_), dpi_));
         }
 
         float left = stageRect.left + (stageRect.width() - drawW) * 0.5f;
@@ -8138,10 +8157,9 @@ void CppDeskWindow::drawAudioVolumePopup(float anchorX, float anchorY) {
     if (audioPopAnimT_ <= 0.005f) return;
     float popAlpha = std::clamp(audioPopAnimT_, 0.0f, 1.0f);
 
-    RECT rcCl{};
-    GetClientRect(hwnd_, &rcCl);
-    float winW = static_cast<float>(std::max<LONG>(1, rcCl.right - rcCl.left));
-    float winH = static_cast<float>(std::max<LONG>(1, rcCl.bottom - rcCl.top));
+    const D2D1_SIZE_F clientDips = clientSizeDips();
+    float winW = clientDips.width;
+    float winH = clientDips.height;
 
     bool isMuted = network_.isAudioMuted();
     int curVol = network_.audioVolume();
@@ -8257,6 +8275,18 @@ bool CppDeskWindow::anyModalActive() const {
            showUpdateRequiredModal_;
 }
 
+D2D1_SIZE_U CppDeskWindow::clientSizePx() const {
+    RECT rc{};
+    if (hwnd_) GetClientRect(hwnd_, &rc);
+    return D2D1::SizeU(static_cast<UINT32>(std::max<LONG>(1, rc.right - rc.left)),
+                       static_cast<UINT32>(std::max<LONG>(1, rc.bottom - rc.top)));
+}
+
+D2D1_SIZE_F CppDeskWindow::clientSizeDips() const {
+    D2D1_SIZE_U px = clientSizePx();
+    return D2D1::SizeF(pxToDip(static_cast<float>(px.width), dpi_), pxToDip(static_cast<float>(px.height), dpi_));
+}
+
 bool CppDeskWindow::mapCanvasPointToNormalized(float x, float y, float& outNormX, float& outNormY) const {
     if (renderedCanvasRect_.width() <= 1.0f || renderedCanvasRect_.height() <= 1.0f) {
         return false;
@@ -8274,9 +8304,7 @@ bool CppDeskWindow::mapCanvasPointToNormalized(float x, float y, float& outNormX
         return false;
     }
     if (isFullscreen_ && floatingToolbarY_ > -50.0f && hwnd_) {
-        RECT rc{};
-        GetClientRect(hwnd_, &rc);
-        float winW = static_cast<float>(rc.right - rc.left);
+        float winW = clientSizeDips().width;
         float pillHalfW = 665.0f;
         float pillLeft = (winW * 0.5f) - pillHalfW;
         float pillRight = (winW * 0.5f) + pillHalfW;
@@ -8290,9 +8318,7 @@ bool CppDeskWindow::mapCanvasPointToNormalized(float x, float y, float& outNormX
     }
 
     if (drawerAnimT_ > 0.004f && hwnd_) {
-        RECT rc{};
-        GetClientRect(hwnd_, &rc);
-        float w = static_cast<float>(rc.right - rc.left);
+        float w = clientSizeDips().width;
         float drawerW = std::min(drawerWidth_, w * 0.48f);
         if (x >= (w - drawerW - 14.0f)) {
             return false;
@@ -8514,9 +8540,7 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
 
     bool insideDrawer = false;
     if (drawerAnimT_ > 0.004f && hwnd_) {
-        RECT rc{};
-        GetClientRect(hwnd_, &rc);
-        float w = static_cast<float>(rc.right - rc.left);
+        float w = clientSizeDips().width;
         float drawerW = std::min(drawerWidth_, w * 0.48f);
         if (x >= (w - drawerW - 14.0f)) {
             insideDrawer = true;
@@ -8624,9 +8648,7 @@ void CppDeskWindow::onMouseWheel(int delta) {
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
     if (drawerAnimT_ > 0.004f && hwnd_) {
-        RECT rc{};
-        GetClientRect(hwnd_, &rc);
-        float w = static_cast<float>(rc.right - rc.left);
+        float w = clientSizeDips().width;
         float drawerW = std::min(drawerWidth_, w * 0.48f);
         if (mouseX_ >= (w - drawerW - 14.0f)) {
             // Horizontal scroll for drawer tabs header if mouse is at the top
@@ -9076,9 +9098,12 @@ void CppDeskWindow::onDropFiles(HDROP hDrop) {
     DragQueryPoint(hDrop, &pt);
 
     float nx = 0.0f, ny = 0.0f;
+    // DragQueryPoint returns physical client pixels; hit-testing uses DIPs.
+    const float dropX = toDip(pt.x);
+    const float dropY = toDip(pt.y);
     bool droppedOnCanvas = (activeTab_ == ActiveTab::RemoteSession &&
-                            renderedCanvasRect_.contains(static_cast<float>(pt.x), static_cast<float>(pt.y)) &&
-                            mapCanvasPointToNormalized(static_cast<float>(pt.x), static_cast<float>(pt.y), nx, ny));
+                            renderedCanvasRect_.contains(dropX, dropY) &&
+                            mapCanvasPointToNormalized(dropX, dropY, nx, ny));
 
     FileOfferTarget targetHint = droppedOnCanvas ? FileOfferTarget::Desktop : FileOfferTarget::DefaultDownloads;
 
