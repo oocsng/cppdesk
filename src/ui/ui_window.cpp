@@ -3361,7 +3361,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                                renderedCanvasRect_.right - 16.0f,
                                renderedCanvasRect_.bottom - 16.0f };
 
-            fillRoundRect(hudPill, 9.0f, rgba(28, 27, 25, 0.94f));
+            fillRoundRect(hudPill, 9.0f, COL_HUD_BG);
             strokeRoundRect(hudPill, 9.0f, COL_BORDER_ALT);
 
             float pct = (activeItem->totalBytes > 0)

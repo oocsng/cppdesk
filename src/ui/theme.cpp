@@ -1,5 +1,8 @@
 #include "theme.hpp"
 
+#include <cmath>
+#include <utility>
+
 namespace cppdesk {
 
 D2D1_COLOR_F COL_BG_MAIN{};
@@ -26,6 +29,7 @@ D2D1_COLOR_F COL_TEXT_MUTED{};
 D2D1_COLOR_F COL_TEXT_ACCENT{};
 D2D1_COLOR_F COL_TEXT_ON_ACCENT{};
 D2D1_COLOR_F COL_STAGE_BG{};
+D2D1_COLOR_F COL_HUD_BG{};
 
 namespace {
 
@@ -47,15 +51,16 @@ const PaletteToken kTokens[] = {
     { "COL_SEC_BTN_BG",        &COL_SEC_BTN_BG,        rgba(240, 234, 225), rgba(44, 42, 38) },
     { "COL_SEC_BTN_HV",        &COL_SEC_BTN_HV,        rgba(230, 222, 210), rgba(58, 55, 49) },
     { "COL_SUCCESS",           &COL_SUCCESS,           rgba(46, 125, 96),   rgba(46, 125, 96) },
-    { "COL_WARNING",           &COL_WARNING,           rgba(217, 130, 43),  rgba(217, 130, 43) },
+    { "COL_WARNING",           &COL_WARNING,           rgba(168, 92, 18),   rgba(217, 130, 43) },
     { "COL_DANGER",            &COL_DANGER,            rgba(199, 62, 58),   rgba(199, 62, 58) },
     { "COL_DANGER_HV",         &COL_DANGER_HV,         rgba(173, 50, 47),   rgba(173, 50, 47) },
     { "COL_TEXT_PRIMARY",      &COL_TEXT_PRIMARY,      rgba(38, 35, 32),    rgba(250, 247, 242) },
-    { "COL_TEXT_SECONDARY",    &COL_TEXT_SECONDARY,    rgba(105, 98, 89),   rgba(184, 177, 166) },
-    { "COL_TEXT_MUTED",        &COL_TEXT_MUTED,        rgba(148, 140, 130), rgba(128, 121, 111) },
-    { "COL_TEXT_ACCENT",       &COL_TEXT_ACCENT,       rgba(193, 95, 60),   rgba(228, 138, 108) },
+    { "COL_TEXT_SECONDARY",    &COL_TEXT_SECONDARY,    rgba(84, 78, 70),     rgba(184, 177, 166) },
+    { "COL_TEXT_MUTED",        &COL_TEXT_MUTED,        rgba(104, 97, 88),    rgba(168, 161, 150) },
+    { "COL_TEXT_ACCENT",       &COL_TEXT_ACCENT,       rgba(160, 70, 38),   rgba(228, 138, 108) },
     { "COL_TEXT_ON_ACCENT",    &COL_TEXT_ON_ACCENT,    rgba(255, 255, 255), rgba(255, 255, 255) },
     { "COL_STAGE_BG",          &COL_STAGE_BG,          rgba(235, 229, 219), rgba(20, 19, 18) },
+    { "COL_HUD_BG",            &COL_HUD_BG,            rgba(28, 27, 25, 0.94f), rgba(28, 27, 25, 0.94f) },
 };
 
 // Live tokens hold light values from startup, before any window calls updateActivePalette.
@@ -73,6 +78,22 @@ void updateActivePalette(float darkT) {
 
 std::span<const PaletteToken> paletteTokens() {
     return kTokens;
+}
+
+namespace {
+double relativeLuminance(const D2D1_COLOR_F& c) {
+    auto lin = [](float v) {
+        return v <= 0.03928f ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+}
+} // namespace
+
+double contrastRatio(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b) {
+    double la = relativeLuminance(a);
+    double lb = relativeLuminance(b);
+    if (la < lb) std::swap(la, lb);
+    return (la + 0.05) / (lb + 0.05);
 }
 
 } // namespace cppdesk

@@ -6784,6 +6784,52 @@ void testThemeTableEndpoints() {
         }
     }
 }
+
+void contrastCheck(const char* fgName, const D2D1_COLOR_F& fg, const char* bgName,
+                   const D2D1_COLOR_F& bg, double minRatio, float darkT) {
+    double ratio = contrastRatio(fg, bg);
+    if (ratio < minRatio) {
+        std::cerr << "[CONTRAST] " << fgName << " on " << bgName << " at darkT=" << darkT
+                  << " is " << ratio << ", need " << minRatio << "\n";
+    }
+    TEST_ASSERT(ratio >= minRatio);
+}
+#define CONTRAST_CHECK(fg, bg, minRatio) contrastCheck(#fg, fg, #bg, bg, minRatio, darkT)
+
+void testThemePaletteContrast() {
+    std::cout << "[TEST 54] Theme Palette WCAG Contrast..." << std::endl;
+    TEST_ASSERT(std::fabs(contrastRatio(rgba(255, 255, 255), rgba(0, 0, 0)) - 21.0) < 0.01);
+    TEST_ASSERT(std::fabs(contrastRatio(rgba(120, 80, 40), rgba(120, 80, 40)) - 1.0) < 1e-9);
+
+    for (float darkT : { 0.0f, 1.0f }) {
+        updateActivePalette(darkT);
+        const D2D1_COLOR_F surfaces[] = { COL_BG_MAIN, COL_BG_NAV, COL_BG_CARD, COL_BG_SUBTLE, COL_BG_CARD_ALT,
+                                          COL_BG_INPUT, COL_BG_INPUT_FOCUS, COL_SEC_BTN_BG, COL_SEC_BTN_HV };
+        for (const auto& bg : surfaces) {
+            CONTRAST_CHECK(COL_TEXT_PRIMARY, bg, 4.5);
+            CONTRAST_CHECK(COL_TEXT_SECONDARY, bg, 4.5);
+            CONTRAST_CHECK(COL_TEXT_MUTED, bg, 4.5);
+            CONTRAST_CHECK(COL_TEXT_ACCENT, bg, 4.5);
+        }
+
+        // Status colors drawn as text on page and card surfaces.
+        CONTRAST_CHECK(COL_WARNING, COL_BG_MAIN, 4.5);
+        CONTRAST_CHECK(COL_WARNING, COL_BG_CARD, 4.5);
+        double statusMin = (darkT == 0.0f) ? 4.5 : 3.0;  // Exemption: dark COL_DANGER/COL_SUCCESS also fill buttons under
+                                                          // white labels; raise them with the screen sub-projects.
+        CONTRAST_CHECK(COL_DANGER, COL_BG_MAIN, statusMin);
+        CONTRAST_CHECK(COL_DANGER, COL_BG_CARD, statusMin);
+        CONTRAST_CHECK(COL_SUCCESS, COL_BG_MAIN, statusMin);
+        CONTRAST_CHECK(COL_SUCCESS, COL_BG_CARD, statusMin);
+
+        // Exemption: white label on the terracotta fill is about 3.1:1; the Connect-screen sub-project owns the button design.
+        CONTRAST_CHECK(COL_TEXT_ON_ACCENT, COL_PRIMARY_ACCENT, 3.0);
+
+        // Not covered: COL_STAGE_BG (sits behind the remote canvas, no text) and the rewind-bar label (drawn over video).
+        TEST_ASSERT(std::fabs(COL_HUD_BG.a - 0.94f) < 1e-5f);
+    }
+}
+#undef CONTRAST_CHECK
 #endif
 
 } // namespace
@@ -6852,6 +6898,7 @@ int main() {
         testLinuxPlatformSupport(); std::cout << "Test 52 done\n" << std::flush;
 #if defined(_WIN32)
         testThemeTableEndpoints(); std::cout << "Test 53 done\n" << std::flush;
+        testThemePaletteContrast(); std::cout << "Test 54 done\n" << std::flush;
 #endif
 
         std::cout << "---------------------------------------------------------\n";

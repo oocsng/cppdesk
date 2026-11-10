@@ -53,6 +53,7 @@ extern D2D1_COLOR_F COL_TEXT_MUTED;
 extern D2D1_COLOR_F COL_TEXT_ACCENT;
 extern D2D1_COLOR_F COL_TEXT_ON_ACCENT;
 extern D2D1_COLOR_F COL_STAGE_BG;
+extern D2D1_COLOR_F COL_HUD_BG;   // floating overlay pill; dark in both modes
 
 // Sets every live COL_* token to lerp(light, dark, darkT). darkT is clamped to 0..1.
 void updateActivePalette(float darkT);
@@ -65,5 +66,8 @@ struct PaletteToken {
 };
 
 std::span<const PaletteToken> paletteTokens();
+
+// WCAG 2.x contrast ratio (1..21) between two opaque colors; alpha is ignored.
+double contrastRatio(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b);
 
 } // namespace cppdesk
