@@ -2485,6 +2485,77 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             }
                             break;
                         }
+                        case PacketType::PROCESS_LAUNCH_REQ: {
+                            ProcessLaunchReqPayload req;
+                            if (deserializeProcessLaunchReq(rpay.data(), rpay.size(), req)) {
+                                ProcessLaunchRespPayload resp;
+                                resp.launchId = req.launchId;
+                                uint32_t outPid = 0;
+                                std::string outErr;
+                                bool ok = executeProcessLaunch(req.commandLine, req.workingDir, perms, outPid, outErr);
+                                resp.success = ok ? 1 : 0;
+                                resp.pid = outPid;
+                                resp.statusMessage = ok ? ("Launched PID " + std::to_string(outPid)) : outErr;
+                                std::vector<uint8_t> respBuf;
+                                serializeProcessLaunchResp(resp, respBuf);
+                                sendPacketHelper(PacketType::PROCESS_LAUNCH_RESP, respBuf);
+                            }
+                            break;
+                        }
+                        case PacketType::FILE_BROWSER_LIST_REQ: {
+                            if (perms & PERM_FILE_TRANSFER) {
+                                FileBrowserListReqPayload req;
+                                if (deserializeFileBrowserListReq(rpay.data(), rpay.size(), req)) {
+                                    FileBrowserListRespPayload resp;
+                                    resp.requestId = req.requestId;
+                                    std::string outCanon, outErr;
+                                    bool ok = RemoteFileBrowserManager::listLocalDirectory(req.path, resp.entries, outCanon, outErr);
+                                    resp.statusCode = ok ? 0 : 1;
+                                    resp.currentPath = outCanon;
+                                    resp.errorMessage = outErr;
+                                    std::vector<uint8_t> respBuf;
+                                    serializeFileBrowserListResp(resp, respBuf);
+                                    sendPacketHelper(PacketType::FILE_BROWSER_LIST_RESP, respBuf);
+                                }
+                            }
+                            break;
+                        }
+                        case PacketType::FILE_BROWSER_ACTION_REQ: {
+                            if (perms & PERM_FILE_TRANSFER) {
+                                FileBrowserActionReqPayload req;
+                                if (deserializeFileBrowserActionReq(rpay.data(), rpay.size(), req)) {
+                                    FileBrowserActionRespPayload resp;
+                                    resp.actionId = req.actionId;
+                                    resp.actionType = req.actionType;
+                                    std::string outErr;
+                                    bool ok = false;
+                                    if (req.actionType == 1) { // CreateDir
+                                        ok = RemoteFileBrowserManager::createLocalDirectory(req.targetPath, outErr);
+                                    } else if (req.actionType == 2) { // Delete
+                                        ok = RemoteFileBrowserManager::deleteLocalItem(req.targetPath, outErr);
+                                    } else if (req.actionType == 3) { // Rename
+                                        ok = RemoteFileBrowserManager::renameLocalItem(req.targetPath, req.newOrDestName, outErr);
+                                    }
+                                    resp.statusCode = ok ? 0 : 1;
+                                    resp.message = ok ? "Success" : outErr;
+                                    std::vector<uint8_t> respBuf;
+                                    serializeFileBrowserActionResp(resp, respBuf);
+                                    sendPacketHelper(PacketType::FILE_BROWSER_ACTION_RESP, respBuf);
+                                }
+                            }
+                            break;
+                        }
+                        case PacketType::FILE_BROWSER_DOWNLOAD_REQ: {
+                            if (perms & PERM_FILE_TRANSFER) {
+                                FileBrowserDownloadReqPayload req;
+                                if (deserializeFileBrowserDownloadReq(rpay.data(), rpay.size(), req)) {
+                                    fileManager_.startOutgoingFile(req.remoteFilePath, [&](PacketType pt, const std::vector<uint8_t>& pbuf) {
+                                        return sendPacketHelper(pt, pbuf);
+                                    });
+                                }
+                            }
+                            break;
+                        }
                         case PacketType::RESOLUTION_CHANGE_REQ: {
                             handleIncomingResolutionChangeReq(r.currentPtr(), r.remaining(), perms);
                             break;
@@ -4110,6 +4181,33 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                     cb = onCommandPaletteOutput_;
                                 }
                                 if (cb) cb(outPayload);
+                            }
+                            break;
+                        }
+                        case PacketType::PROCESS_LAUNCH_RESP: {
+                            ProcessLaunchRespPayload resp{};
+                            if (deserializeProcessLaunchResp(payload.data(), payload.size(), resp)) {
+                                std::lock_guard<std::mutex> lk(processLaunchMutex_);
+                                latestProcessLaunchResp_ = std::move(resp);
+                                hasNewProcessLaunchResp_ = true;
+                            }
+                            break;
+                        }
+                        case PacketType::FILE_BROWSER_LIST_RESP: {
+                            FileBrowserListRespPayload resp{};
+                            if (deserializeFileBrowserListResp(payload.data(), payload.size(), resp)) {
+                                std::lock_guard<std::mutex> lk(fileBrowserMutex_);
+                                latestRemoteFileList_ = std::move(resp);
+                                hasNewRemoteFileList_ = true;
+                            }
+                            break;
+                        }
+                        case PacketType::FILE_BROWSER_ACTION_RESP: {
+                            FileBrowserActionRespPayload resp{};
+                            if (deserializeFileBrowserActionResp(payload.data(), payload.size(), resp)) {
+                                std::lock_guard<std::mutex> lk(fileBrowserMutex_);
+                                latestRemoteFileAction_ = std::move(resp);
+                                hasNewRemoteFileAction_ = true;
                             }
                             break;
                         }
@@ -5787,8 +5885,8 @@ SystemDiagnosticsPayload NetworkEngine::sampleHostDiagnostics() {
                 return a.workingSetBytes > b.workingSetBytes;
             });
 
-            // Keep top 15
-            size_t maxProcs = std::min<size_t>(candidates.size(), 15);
+            // Keep top 60
+            size_t maxProcs = std::min<size_t>(candidates.size(), 60);
             diag.processes.assign(candidates.begin(), candidates.begin() + maxProcs);
         }
         CloseHandle(hSnap);
@@ -5939,6 +6037,138 @@ void NetworkEngine::sendProcessKill(uint32_t pid) {
 SystemDiagnosticsPayload NetworkEngine::latestDiagnostics() const {
     std::lock_guard<std::mutex> lk(diagnosticsMutex_);
     return latestDiagnostics_;
+}
+
+bool NetworkEngine::executeProcessLaunch(const std::string& commandLine, const std::string& workingDir,
+                                        uint8_t callerPermissions, uint32_t& outPid, std::string& outError) {
+    outPid = 0;
+    outError.clear();
+    if ((callerPermissions & PERM_INPUT) == 0) {
+        outError = "Input permission denied";
+        return false;
+    }
+    if (commandLine.empty()) {
+        outError = "Empty command line";
+        return false;
+    }
+
+#if defined(_WIN32)
+    std::wstring wCmd = utf8ToWide(commandLine);
+    std::wstring wDir = utf8ToWide(workingDir);
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+
+    std::vector<wchar_t> cmdBuf(wCmd.begin(), wCmd.end());
+    cmdBuf.push_back(L'\0');
+
+    const wchar_t* pDir = wDir.empty() ? nullptr : wDir.c_str();
+
+    BOOL ok = CreateProcessW(
+        nullptr,
+        cmdBuf.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NEW_CONSOLE,
+        nullptr,
+        pDir,
+        &si,
+        &pi
+    );
+
+    if (!ok) {
+        DWORD err = GetLastError();
+        outError = "CreateProcess error: " + std::to_string(err);
+        return false;
+    }
+
+    outPid = pi.dwProcessId;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+#else
+    (void)workingDir;
+    outError = "Not supported on non-Windows host";
+    return false;
+#endif
+}
+
+void NetworkEngine::sendProcessLaunch(const std::string& commandLine, const std::string& workingDir) {
+    ProcessLaunchReqPayload req;
+    req.launchId = static_cast<uint32_t>(GetTickCount64());
+    req.commandLine = commandLine;
+    req.workingDir = workingDir;
+    std::vector<uint8_t> buf;
+    serializeProcessLaunchReq(req, buf);
+    sendViewerEncryptedPacket(PacketType::PROCESS_LAUNCH_REQ, 0, buf.data(), buf.size());
+}
+
+ProcessLaunchRespPayload NetworkEngine::latestProcessLaunchResp() const {
+    std::lock_guard<std::mutex> lk(processLaunchMutex_);
+    return latestProcessLaunchResp_;
+}
+
+bool NetworkEngine::hasNewProcessLaunchResp() {
+    std::lock_guard<std::mutex> lk(processLaunchMutex_);
+    bool val = hasNewProcessLaunchResp_;
+    hasNewProcessLaunchResp_ = false;
+    return val;
+}
+
+void NetworkEngine::requestRemoteFileList(const std::string& path) {
+    FileBrowserListReqPayload req;
+    req.requestId = static_cast<uint32_t>(GetTickCount64());
+    req.path = path;
+    std::vector<uint8_t> buf;
+    serializeFileBrowserListReq(req, buf);
+    sendViewerEncryptedPacket(PacketType::FILE_BROWSER_LIST_REQ, 0, buf.data(), buf.size());
+}
+
+void NetworkEngine::sendRemoteFileAction(uint8_t actionType, const std::string& targetPath, const std::string& newOrDestName) {
+    FileBrowserActionReqPayload req;
+    req.actionId = static_cast<uint32_t>(GetTickCount64());
+    req.actionType = actionType;
+    req.targetPath = targetPath;
+    req.newOrDestName = newOrDestName;
+    std::vector<uint8_t> buf;
+    serializeFileBrowserActionReq(req, buf);
+    sendViewerEncryptedPacket(PacketType::FILE_BROWSER_ACTION_REQ, 0, buf.data(), buf.size());
+}
+
+void NetworkEngine::sendRemoteFileDownload(const std::string& remoteFilePath, const std::string& destFileName) {
+    FileBrowserDownloadReqPayload req;
+    req.requestId = static_cast<uint32_t>(GetTickCount64());
+    req.remoteFilePath = remoteFilePath;
+    req.destFileName = destFileName;
+    std::vector<uint8_t> buf;
+    serializeFileBrowserDownloadReq(req, buf);
+    sendViewerEncryptedPacket(PacketType::FILE_BROWSER_DOWNLOAD_REQ, 0, buf.data(), buf.size());
+}
+
+FileBrowserListRespPayload NetworkEngine::latestRemoteFileList() const {
+    std::lock_guard<std::mutex> lk(fileBrowserMutex_);
+    return latestRemoteFileList_;
+}
+
+bool NetworkEngine::hasNewRemoteFileList() {
+    std::lock_guard<std::mutex> lk(fileBrowserMutex_);
+    bool val = hasNewRemoteFileList_;
+    hasNewRemoteFileList_ = false;
+    return val;
+}
+
+FileBrowserActionRespPayload NetworkEngine::latestRemoteFileAction() const {
+    std::lock_guard<std::mutex> lk(fileBrowserMutex_);
+    return latestRemoteFileAction_;
+}
+
+bool NetworkEngine::hasNewRemoteFileAction() {
+    std::lock_guard<std::mutex> lk(fileBrowserMutex_);
+    bool val = hasNewRemoteFileAction_;
+    hasNewRemoteFileAction_ = false;
+    return val;
 }
 
 // ---------------- Virtual Display Fit & Dynamic Resolution Matching (Feature 5) ----------------

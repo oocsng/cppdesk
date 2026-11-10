@@ -10,6 +10,7 @@
 #include "../media/voice_intercom.hpp"
 #include "../capture/display_manager.hpp"
 #include "../control/file_sync_manager.hpp"
+#include "../control/remote_file_browser.hpp"
 #include "../control/scratchpad_manager.hpp"
 #include "../control/command_palette.hpp"
 
@@ -359,6 +360,21 @@ public:
     void sendProcessKill(uint32_t pid);
     SystemDiagnosticsPayload latestDiagnostics() const;
 
+    // Interactive Remote Process Launching
+    bool executeProcessLaunch(const std::string& commandLine, const std::string& workingDir, uint8_t callerPermissions, uint32_t& outPid, std::string& outError);
+    void sendProcessLaunch(const std::string& commandLine, const std::string& workingDir);
+    ProcessLaunchRespPayload latestProcessLaunchResp() const;
+    bool hasNewProcessLaunchResp();
+
+    // Remote File Browser & Directory Management
+    void requestRemoteFileList(const std::string& path);
+    void sendRemoteFileAction(uint8_t actionType, const std::string& targetPath, const std::string& newOrDestName);
+    void sendRemoteFileDownload(const std::string& remoteFilePath, const std::string& destFileName);
+    FileBrowserListRespPayload latestRemoteFileList() const;
+    bool hasNewRemoteFileList();
+    FileBrowserActionRespPayload latestRemoteFileAction() const;
+    bool hasNewRemoteFileAction();
+
     // Bidirectional Voice Intercom (VoIP Microphone & Playback - Feature 4)
     bool startVoiceIntercom();
     void stopVoiceIntercom();
@@ -639,6 +655,18 @@ private:
     std::atomic<bool>                          hostDiagnosticsStreamActive_{false};
     mutable std::mutex                         diagnosticsMutex_;
     SystemDiagnosticsPayload                   latestDiagnostics_;
+
+    // Process Launch State
+    mutable std::mutex                         processLaunchMutex_;
+    ProcessLaunchRespPayload                   latestProcessLaunchResp_;
+    bool                                       hasNewProcessLaunchResp_ = false;
+
+    // Remote File Browser State
+    mutable std::mutex                         fileBrowserMutex_;
+    FileBrowserListRespPayload                 latestRemoteFileList_;
+    bool                                       hasNewRemoteFileList_ = false;
+    FileBrowserActionRespPayload               latestRemoteFileAction_;
+    bool                                       hasNewRemoteFileAction_ = false;
 
     // Voice Intercom State (Feature 4)
     VoiceIntercom                              voiceIntercom_;

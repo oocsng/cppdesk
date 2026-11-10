@@ -92,7 +92,14 @@ enum class FocusedField : uint8_t {
     SyncRemotePath     = 23,
     ScratchpadText     = 24,
     OmnibarInput       = 25,
-    PrivacyKeywords    = 26
+    PrivacyKeywords    = 26,
+    ProcessSearch      = 27,
+    RunTaskCommand     = 28,
+    RunTaskWorkingDir  = 29,
+    FileBrowserLocalPath = 30,
+    FileBrowserRemotePath = 31,
+    FileBrowserNewDir  = 32,
+    FileBrowserRename  = 33
 };
 
 enum class DrawerTab : uint8_t {
@@ -102,7 +109,8 @@ enum class DrawerTab : uint8_t {
     Diagnostics      = 3,
     ClipboardHistory = 4,
     Sync             = 5,
-    Notes            = 6
+    Notes            = 6,
+    FileManager      = 7
 };
 
 // UiRect is provided by ui_platform.hpp (using UiRect = UiPlatformRect;)
@@ -161,8 +169,11 @@ private:
     void drawRemoteSessionView(const UiRect& bounds, float alpha = 1.0f);
     void drawSettingsView(const UiRect& bounds, float alpha = 1.0f);
     void drawFileTransferDrawer(const UiRect& bounds, float slideProgress);
+    void drawFileManagerDrawer(const UiRect& contentRect);
     void drawSyncDrawer(const UiRect& contentRect);
     void drawIncomingApprovalModal(float width, float height, float modalProgress);
+    void drawRunTaskModal(float width, float height, float modalProgress);
+    void drawFileBrowserActionModal(float width, float height, float modalProgress);
     void drawDynamicIslandToolbar(float width, float height);
     void drawClipboardTransferPill(float width, float height);
     void drawShortcutsModal(float width, float height, float modalProgress);
@@ -299,6 +310,32 @@ private:
     int32_t                 chatScrollOffset_ = 0;
     std::string             clipSearchQuery_;
     int32_t                 clipHistoryScrollOffset_ = 0;
+
+    // Interactive Remote Process Manager State
+    std::string             processSearchQuery_;
+    enum class ProcessSortColumn : uint8_t { Name = 0, Pid = 1, Memory = 2 };
+    ProcessSortColumn       processSortColumn_ = ProcessSortColumn::Memory;
+    bool                    processSortAsc_ = false;
+    uint32_t                selectedProcessPid_ = 0;
+    bool                    showRunTaskModal_ = false;
+    float                   runTaskModalAnimT_ = 0.0f;
+    std::string             runTaskCommandInput_;
+    std::string             runTaskWorkingDirInput_;
+
+    // Dual-Pane Remote File Manager State
+    FileBrowserPaneState    localFilePane_;
+    FileBrowserPaneState    remoteFilePane_;
+    int                     activeFilePane_ = 0; // 0 = local, 1 = remote
+    std::string             fileBrowserInputLocalPath_;
+    std::string             fileBrowserInputRemotePath_;
+    std::string             fileBrowserNewDirName_;
+    std::string             fileBrowserRenameName_;
+    bool                    showFileBrowserNewDirModal_ = false;
+    bool                    showFileBrowserRenameModal_ = false;
+    bool                    showFileBrowserDeleteModal_ = false;
+    float                   fileBrowserModalAnimT_ = 0.0f;
+    float                   localFileScrollOffset_ = 0.0f;
+    float                   remoteFileScrollOffset_ = 0.0f;
 
     // Pending incoming request local permission checkboxes
     uint8_t                 modalPermissions_ = PERM_ALL;

@@ -21,6 +21,7 @@ $CoreSources = @(
     "src/control/clipboard_file_manager.cpp",
     "src/control/whiteboard_manager.cpp",
     "src/control/file_sync_manager.cpp",
+    "src/control/remote_file_browser.cpp",
     "src/net/network_engine.cpp",
     "src/net/updater.cpp",
     "src/ui/notification_manager.cpp",
@@ -105,17 +106,32 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "  -> Built CppDesk.exe ($((Get-Item 'CppDesk.exe').Length / 1KB -as [int]) KB)" -ForegroundColor Green
 
-if ($BuildRelay -or $Test -or $Benchmark) {
+$hasDotnetSdk = $false
+try {
+    $sdks = (& dotnet --list-sdks 2>$null)
+    if ($sdks) { $hasDotnetSdk = $true }
+} catch {}
+
+if ($BuildRelay -or (($Test -or $Benchmark) -and $hasDotnetSdk)) {
     Write-Host "[2/3] Building C# (.NET 10) Standalone Relay Server..." -ForegroundColor Cyan
     & dotnet build "relay-dotnet/CppDeskRelay.csproj" -c Release --nologo -v q
     if ($LASTEXITCODE -ne 0) {
-        throw "Failed to build C# CppDeskRelay.csproj"
+        if ($BuildRelay) {
+            throw "Failed to build C# CppDeskRelay.csproj"
+        } else {
+            Write-Host "  -> Warning: Failed to build C# CppDeskRelay.csproj" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  -> Verified C# .NET 10 Relay Server (--self-test)..." -ForegroundColor Green
+        & dotnet "relay-dotnet/bin/Release/net10.0/CppDeskRelay.dll" --port 51998 --self-test
+        if ($LASTEXITCODE -ne 0) {
+            throw "C# CppDeskRelay self-test failed"
+        }
     }
-    Write-Host "  -> Verified C# .NET 10 Relay Server (--self-test)..." -ForegroundColor Green
-    & dotnet "relay-dotnet/bin/Release/net10.0/CppDeskRelay.dll" --port 51998 --self-test
-    if ($LASTEXITCODE -ne 0) {
-        throw "C# CppDeskRelay self-test failed"
-    }
+} elseif ($BuildRelay) {
+    throw "No .NET SDK found to compile C# Relay Server"
+} else {
+    Write-Host "[2/3] Skipping C# Relay Server build (no .NET SDK installed)..." -ForegroundColor Yellow
 }
 
 if ($Test) {

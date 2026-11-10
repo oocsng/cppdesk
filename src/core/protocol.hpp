@@ -115,6 +115,8 @@ enum class PacketType : uint8_t {
     RESOLUTION_CHANGE_REQ=0x2A, // Viewer -> Host: Request host resolution change or aspect fit
     PERFORMANCE_HUD_METRICS=0x2B, // Host -> Viewer: Real-time capture & encode latency telemetry
     AUDIO_CONTROL          = 0x2C, // Viewer -> Host: Mute state & volume percentage sync
+    PROCESS_LAUNCH_REQ     = 0x2D, // Viewer -> Host: Request launching a new executable or task
+    PROCESS_LAUNCH_RESP    = 0x2E, // Host -> Viewer: Process launch result acknowledgment
 
     // Clipboard, File Transfer & Live Chat
     CLIPBOARD_TEXT      = 0x30,
@@ -150,6 +152,13 @@ enum class PacketType : uint8_t {
     SCRATCHPAD_UPDATE       = 0x49, // Bidirectional: Live collaborative notepad synchronization
     COMMAND_PALETTE_EXEC    = 0x4A, // Viewer -> Host: Execute remote administrative omnibar action
     COMMAND_PALETTE_OUTPUT  = 0x4B, // Host -> Viewer: Piped output stream from omnibar action
+
+    // Remote File Browser & Directory Management
+    FILE_BROWSER_LIST_REQ   = 0x4C, // Viewer -> Host: Request directory listing or drive roots
+    FILE_BROWSER_LIST_RESP  = 0x4D, // Host -> Viewer: Directory entries or drive root list
+    FILE_BROWSER_ACTION_REQ = 0x4E, // Viewer -> Host: Create folder, delete file/folder, rename
+    FILE_BROWSER_ACTION_RESP= 0x4F, // Host -> Viewer: Result acknowledgment of file action
+    FILE_BROWSER_DOWNLOAD_REQ=0x58, // Viewer -> Host: Request host to initiate outgoing file transfer for remote file
 
     // Relay & Rendezvous Protocol
     RELAY_REGISTER      = 0x50,
@@ -1576,6 +1585,242 @@ inline bool deserializeCommandPaletteOutput(const uint8_t* data, size_t size, Co
         out.isCompleted = (r.readU8() != 0);
         out.stdoutData = r.readString();
         out.errorMessage = r.readString();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Remote Process Launch
+struct ProcessLaunchReqPayload {
+    uint32_t launchId = 0;
+    std::string commandLine;
+    std::string workingDir;
+};
+
+inline void serializeProcessLaunchReq(const ProcessLaunchReqPayload& p, std::vector<uint8_t>& out) {
+    ByteWriter w;
+    w.writeU32(p.launchId);
+    w.writeString(p.commandLine);
+    w.writeString(p.workingDir);
+    out = w.takeBuffer();
+}
+
+inline bool deserializeProcessLaunchReq(const uint8_t* data, size_t size, ProcessLaunchReqPayload& out) {
+    if (!data || size < 4) return false;
+    try {
+        ByteReader r(data, size);
+        out.launchId = r.readU32();
+        out.commandLine = r.readString();
+        out.workingDir = r.readString();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+struct ProcessLaunchRespPayload {
+    uint32_t launchId = 0;
+    uint8_t  success = 0;
+    uint32_t pid = 0;
+    std::string statusMessage;
+};
+
+inline void serializeProcessLaunchResp(const ProcessLaunchRespPayload& p, std::vector<uint8_t>& out) {
+    ByteWriter w;
+    w.writeU32(p.launchId);
+    w.writeU8(p.success);
+    w.writeU32(p.pid);
+    w.writeString(p.statusMessage);
+    out = w.takeBuffer();
+}
+
+inline bool deserializeProcessLaunchResp(const uint8_t* data, size_t size, ProcessLaunchRespPayload& out) {
+    if (!data || size < 9) return false;
+    try {
+        ByteReader r(data, size);
+        out.launchId = r.readU32();
+        out.success = r.readU8();
+        out.pid = r.readU32();
+        out.statusMessage = r.readString();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Remote File Browser & Directory Management
+struct FileBrowserItemEntry {
+    std::string name;
+    uint64_t    sizeBytes = 0;
+    uint8_t     isDirectory = 0;
+    uint64_t    mtimeSec = 0;
+    uint32_t    attributes = 0;
+};
+
+struct FileBrowserListReqPayload {
+    uint32_t    requestId = 0;
+    std::string path;
+};
+
+inline void serializeFileBrowserListReq(const FileBrowserListReqPayload& p, std::vector<uint8_t>& out) {
+    ByteWriter w;
+    w.writeU32(p.requestId);
+    w.writeString(p.path);
+    out = w.takeBuffer();
+}
+
+inline bool deserializeFileBrowserListReq(const uint8_t* data, size_t size, FileBrowserListReqPayload& out) {
+    if (!data || size < 6) return false;
+    try {
+        ByteReader r(data, size);
+        out.requestId = r.readU32();
+        out.path = r.readString();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+struct FileBrowserListRespPayload {
+    uint32_t requestId = 0;
+    uint8_t  statusCode = 0; // 0 = Success, 1 = Error/Access Denied
+    std::string currentPath;
+    std::string errorMessage;
+    std::vector<FileBrowserItemEntry> entries;
+};
+
+inline void serializeFileBrowserListResp(const FileBrowserListRespPayload& p, std::vector<uint8_t>& out) {
+    ByteWriter w;
+    w.writeU32(p.requestId);
+    w.writeU8(p.statusCode);
+    w.writeString(p.currentPath);
+    w.writeString(p.errorMessage);
+    uint32_t count = static_cast<uint32_t>(p.entries.size());
+    w.writeU32(count);
+    for (const auto& e : p.entries) {
+        w.writeString(e.name);
+        w.writeU64(e.sizeBytes);
+        w.writeU8(e.isDirectory);
+        w.writeU64(e.mtimeSec);
+        w.writeU32(e.attributes);
+    }
+    out = w.takeBuffer();
+}
+
+inline bool deserializeFileBrowserListResp(const uint8_t* data, size_t size, FileBrowserListRespPayload& out) {
+    if (!data || size < 9) return false;
+    try {
+        ByteReader r(data, size);
+        out.requestId = r.readU32();
+        out.statusCode = r.readU8();
+        out.currentPath = r.readString();
+        out.errorMessage = r.readString();
+        uint32_t count = r.readU32();
+        out.entries.clear();
+        out.entries.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            FileBrowserItemEntry e;
+            e.name = r.readString();
+            e.sizeBytes = r.readU64();
+            e.isDirectory = r.readU8();
+            e.mtimeSec = r.readU64();
+            e.attributes = r.readU32();
+            out.entries.push_back(std::move(e));
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+enum class FileBrowserActionType : uint8_t {
+    CreateDir = 1,
+    Delete    = 2,
+    Rename    = 3
+};
+
+struct FileBrowserActionReqPayload {
+    uint32_t actionId = 0;
+    uint8_t  actionType = 0; // 1 = CreateDir, 2 = Delete, 3 = Rename
+    std::string targetPath;
+    std::string newOrDestName;
+};
+
+inline void serializeFileBrowserActionReq(const FileBrowserActionReqPayload& p, std::vector<uint8_t>& out) {
+    ByteWriter w;
+    w.writeU32(p.actionId);
+    w.writeU8(p.actionType);
+    w.writeString(p.targetPath);
+    w.writeString(p.newOrDestName);
+    out = w.takeBuffer();
+}
+
+inline bool deserializeFileBrowserActionReq(const uint8_t* data, size_t size, FileBrowserActionReqPayload& out) {
+    if (!data || size < 9) return false;
+    try {
+        ByteReader r(data, size);
+        out.actionId = r.readU32();
+        out.actionType = r.readU8();
+        out.targetPath = r.readString();
+        out.newOrDestName = r.readString();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+struct FileBrowserActionRespPayload {
+    uint32_t actionId = 0;
+    uint8_t  actionType = 0;
+    uint8_t  statusCode = 0; // 0 = Success, 1 = Error
+    std::string message;
+};
+
+inline void serializeFileBrowserActionResp(const FileBrowserActionRespPayload& p, std::vector<uint8_t>& out) {
+    ByteWriter w;
+    w.writeU32(p.actionId);
+    w.writeU8(p.actionType);
+    w.writeU8(p.statusCode);
+    w.writeString(p.message);
+    out = w.takeBuffer();
+}
+
+inline bool deserializeFileBrowserActionResp(const uint8_t* data, size_t size, FileBrowserActionRespPayload& out) {
+    if (!data || size < 8) return false;
+    try {
+        ByteReader r(data, size);
+        out.actionId = r.readU32();
+        out.actionType = r.readU8();
+        out.statusCode = r.readU8();
+        out.message = r.readString();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+struct FileBrowserDownloadReqPayload {
+    uint32_t requestId = 0;
+    std::string remoteFilePath;
+    std::string destFileName;
+};
+
+inline void serializeFileBrowserDownloadReq(const FileBrowserDownloadReqPayload& p, std::vector<uint8_t>& out) {
+    ByteWriter w;
+    w.writeU32(p.requestId);
+    w.writeString(p.remoteFilePath);
+    w.writeString(p.destFileName);
+    out = w.takeBuffer();
+}
+
+inline bool deserializeFileBrowserDownloadReq(const uint8_t* data, size_t size, FileBrowserDownloadReqPayload& out) {
+    if (!data || size < 8) return false;
+    try {
+        ByteReader r(data, size);
+        out.requestId = r.readU32();
+        out.remoteFilePath = r.readString();
+        out.destFileName = r.readString();
         return true;
     } catch (...) {
         return false;

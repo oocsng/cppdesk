@@ -587,7 +587,7 @@ bool CppDeskWindow::stepAnimations(float dt) {
     // 4. Floating Side Sheet Drawer Spring
     float targetDrawer = showFileDrawer_ ? 1.0f : 0.0f;
     if (stepSpring(drawerAnimT_, drawerAnimVel_, targetDrawer, 26.0f, 0.80f, dt)) active = true;
-    float targetDrawerW = (drawerTab_ == DrawerTab::Sync) ? 440.0f : 395.0f;
+    float targetDrawerW = (drawerTab_ == DrawerTab::FileManager) ? 580.0f : ((drawerTab_ == DrawerTab::Sync) ? 440.0f : 395.0f);
     if (stepSpring(drawerWidth_, drawerWidthVel_, targetDrawerW, 26.0f, 0.82f, dt)) active = true;
 
     // 5. Sheet Modal Spring (with subtle macOS pop overshoot)
@@ -693,7 +693,18 @@ bool CppDeskWindow::stepAnimations(float dt) {
     float targetOmniModal = showOmnibarModal_ ? 1.0f : 0.0f;
     if (stepSpring(omnibarModalAnimT_, omnibarModalAnimVel_, targetOmniModal, 28.0f, 0.74f, dt)) active = true;
 
-    // 18. Settings Tab Smooth Scroll Spring
+    // 18. Run Task Modal Spring
+    float targetRunTaskModal = showRunTaskModal_ ? 1.0f : 0.0f;
+    float runTaskVel = 0.0f;
+    if (stepSpring(runTaskModalAnimT_, runTaskVel, targetRunTaskModal, 28.0f, 0.74f, dt)) active = true;
+
+    // 19. File Browser Action Modals Spring
+    bool anyFileModal = (showFileBrowserNewDirModal_ || showFileBrowserRenameModal_ || showFileBrowserDeleteModal_);
+    float targetFileModal = anyFileModal ? 1.0f : 0.0f;
+    float fileModalVel = 0.0f;
+    if (stepSpring(fileBrowserModalAnimT_, fileModalVel, targetFileModal, 28.0f, 0.74f, dt)) active = true;
+
+    // 20. Settings Tab Smooth Scroll Spring
     if (!draggingSettingsScrollbar_) {
         settingsScrollTarget_ = std::clamp(settingsScrollTarget_, 0.0f, settingsMaxScroll_);
         if (stepSpring(settingsScrollOffset_, settingsScrollVel_, settingsScrollTarget_, 32.0f, 0.88f, dt, 0.15f)) {
@@ -1873,6 +1884,16 @@ void CppDeskWindow::onPaint() {
     // Spotlight Omnibar Command Palette Modal
     if (omnibarModalAnimT_ > 0.004f) {
         drawOmnibarModal(width, height, omnibarModalAnimT_);
+    }
+
+    // Interactive Run Task Modal
+    if (runTaskModalAnimT_ > 0.004f) {
+        drawRunTaskModal(width, height, runTaskModalAnimT_);
+    }
+
+    // Dual-Pane File Browser Action Modal
+    if (fileBrowserModalAnimT_ > 0.004f) {
+        drawFileBrowserActionModal(width, height, fileBrowserModalAnimT_);
     }
 
     // Floating Capsule Toast
@@ -5050,6 +5071,30 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 // ---------------- Floating macOS Side Sheet Drawer ----------------
 
 void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
+    if (network_.hasNewRemoteFileList()) {
+        auto resp = network_.latestRemoteFileList();
+        remoteFilePane_.isLoading = false;
+        if (resp.statusCode == 0) {
+            remoteFilePane_.currentPath = resp.currentPath;
+            remoteFilePane_.entries = std::move(resp.entries);
+            fileBrowserInputRemotePath_ = resp.currentPath;
+            remoteFilePane_.statusMessage.clear();
+        } else {
+            remoteFilePane_.statusMessage = resp.errorMessage;
+            showToast("Remote file error: " + resp.errorMessage, true);
+        }
+    }
+    if (network_.hasNewRemoteFileAction()) {
+        auto resp = network_.latestRemoteFileAction();
+        showToast(resp.message, resp.statusCode != 0);
+        network_.requestRemoteFileList(remoteFilePane_.currentPath.empty() ? "$DRIVES$" : remoteFilePane_.currentPath);
+    }
+    if (network_.hasNewProcessLaunchResp()) {
+        auto resp = network_.latestProcessLaunchResp();
+        showToast(resp.statusMessage, resp.success == 0);
+        network_.setDiagnosticsActive(true);
+    }
+
     float slideOffsetX = (bounds.width() + 24.0f) * (1.0f - slideProgress);
     UiRect r = bounds.offset(slideOffsetX, 0.0f);
 
@@ -5090,6 +5135,20 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         std::vector<DrawerTabDef> drawerTabsList = {
             { DrawerTab::FilesAndClip, "drawer_tab_files", "Files", 58.0f, (drawerTab_ == DrawerTab::FilesAndClip), [this]() {
                 drawerTab_ = DrawerTab::FilesAndClip;
+            }},
+            { DrawerTab::FileManager, "drawer_tab_filemgr", "Explorer", 72.0f, (drawerTab_ == DrawerTab::FileManager), [this]() {
+                drawerTab_ = DrawerTab::FileManager;
+                if (localFilePane_.entries.empty()) {
+                    std::string canon, err;
+                    RemoteFileBrowserManager::listLocalDirectory("$DRIVES$", localFilePane_.entries, canon, err);
+                    localFilePane_.currentPath = canon;
+                    localFilePane_.availableDrives = RemoteFileBrowserManager::getLocalDrives();
+                    fileBrowserInputLocalPath_ = canon;
+                }
+                if (remoteFilePane_.entries.empty()) {
+                    network_.requestRemoteFileList("$DRIVES$");
+                    remoteFilePane_.isLoading = true;
+                }
             }},
             { DrawerTab::LiveChat, "drawer_tab_chat", chatTabLbl, (unread > 0 ? 76.0f : 56.0f), (drawerTab_ == DrawerTab::LiveChat), [this]() {
                 drawerTab_ = DrawerTab::LiveChat;
@@ -5523,48 +5582,142 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
 
         y = metricsBox.bottom + 14.0f;
 
-        // 2. Process Table Header
-        drawText("TOP PROCESSES (MEMORY FOOTPRINT)",
-                 { x, y, rx, y + 16.0f }, fmtSmall_, COL_TEXT_ACCENT);
-        y += 20.0f;
+        // 2. Process Manager Controls Bar
+        UiRect procSearchField = { x, y, rx - 146.0f, y + 30.0f };
+        drawTextField("field_proc_search", FocusedField::ProcessSearch, procSearchField,
+                      processSearchQuery_, "Filter processes or PID...", false);
 
+        UiRect runTaskBtn = { rx - 140.0f, y, rx - 42.0f, y + 30.0f };
+        drawButton("btn_open_run_task", runTaskBtn, "+ Run Task",
+                   COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 7.0f, [this]() {
+                       showRunTaskModal_ = true;
+                       runTaskCommandInput_.clear();
+                       runTaskWorkingDirInput_.clear();
+                       focusedField_ = FocusedField::RunTaskCommand;
+                   }, fmtSmall_);
+
+        UiRect refreshProcsBtn = { rx - 36.0f, y, rx, y + 30.0f };
+        drawButton("btn_refresh_procs", refreshProcsBtn, "↺",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.0f, [this]() {
+                       network_.setDiagnosticsActive(true);
+                       showToast("Refreshing process telemetry...");
+                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+
+        y += 36.0f;
+
+        // Process Table Box
         UiRect tableBox = { x, y, rx, r.bottom - 16.0f };
         fillRoundRect(tableBox, 11.0f, COL_BG_SUBTLE);
         strokeRoundRect(tableBox, 11.0f, COL_BORDER);
 
-        if (diag.processes.empty()) {
-            drawText("Sampling host processes...",
+        // Table Column Header (Sortable)
+        UiRect colHeader = { tableBox.left + 8.0f, tableBox.top + 6.0f, tableBox.right - 8.0f, tableBox.top + 28.0f };
+        fillRoundRect(colHeader, 5.0f, withAlpha(COL_BORDER, 0.25f));
+
+        std::string sortNameLbl = "Name" + std::string(processSortColumn_ == ProcessSortColumn::Name ? (processSortAsc_ ? " ▲" : " ▼") : "");
+        std::string sortPidLbl = "PID" + std::string(processSortColumn_ == ProcessSortColumn::Pid ? (processSortAsc_ ? " ▲" : " ▼") : "");
+        std::string sortRamLbl = "RAM" + std::string(processSortColumn_ == ProcessSortColumn::Memory ? (processSortAsc_ ? " ▲" : " ▼") : "");
+
+        UiRect hdrName = { colHeader.left + 6.0f, colHeader.top, colHeader.right - 200.0f, colHeader.bottom };
+        drawButton("proc_hdr_name", hdrName, sortNameLbl,
+                   D2D1::ColorF(0,0,0,0), withAlpha(COL_PRIMARY_ACCENT, 0.15f), COL_TEXT_ACCENT, 4.0f, [this]() {
+                       if (processSortColumn_ == ProcessSortColumn::Name) processSortAsc_ = !processSortAsc_;
+                       else { processSortColumn_ = ProcessSortColumn::Name; processSortAsc_ = true; }
+                   }, fmtSmall_);
+
+        UiRect hdrPid = { colHeader.right - 195.0f, colHeader.top, colHeader.right - 130.0f, colHeader.bottom };
+        drawButton("proc_hdr_pid", hdrPid, sortPidLbl,
+                   D2D1::ColorF(0,0,0,0), withAlpha(COL_PRIMARY_ACCENT, 0.15f), COL_TEXT_ACCENT, 4.0f, [this]() {
+                       if (processSortColumn_ == ProcessSortColumn::Pid) processSortAsc_ = !processSortAsc_;
+                       else { processSortColumn_ = ProcessSortColumn::Pid; processSortAsc_ = false; }
+                   }, fmtSmall_);
+
+        UiRect hdrRam = { colHeader.right - 125.0f, colHeader.top, colHeader.right - 65.0f, colHeader.bottom };
+        drawButton("proc_hdr_ram", hdrRam, sortRamLbl,
+                   D2D1::ColorF(0,0,0,0), withAlpha(COL_PRIMARY_ACCENT, 0.15f), COL_TEXT_ACCENT, 4.0f, [this]() {
+                       if (processSortColumn_ == ProcessSortColumn::Memory) processSortAsc_ = !processSortAsc_;
+                       else { processSortColumn_ = ProcessSortColumn::Memory; processSortAsc_ = false; }
+                   }, fmtSmall_);
+
+        UiRect hdrAction = { colHeader.right - 60.0f, colHeader.top, colHeader.right - 4.0f, colHeader.bottom };
+        drawText("Action", hdrAction, fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        // Filter and Sort Processes
+        std::vector<ProcessTelemetryItem> filteredProcs;
+        filteredProcs.reserve(diag.processes.size());
+        std::string queryLower = processSearchQuery_;
+        std::transform(queryLower.begin(), queryLower.end(), queryLower.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+
+        for (const auto& p : diag.processes) {
+            if (!queryLower.empty()) {
+                std::string pNameLower = p.name;
+                std::transform(pNameLower.begin(), pNameLower.end(), pNameLower.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+                std::string pidStr = std::to_string(p.pid);
+                if (pNameLower.find(queryLower) == std::string::npos && pidStr.find(queryLower) == std::string::npos) {
+                    continue;
+                }
+            }
+            filteredProcs.push_back(p);
+        }
+
+        std::sort(filteredProcs.begin(), filteredProcs.end(), [this](const ProcessTelemetryItem& a, const ProcessTelemetryItem& b) {
+            if (processSortColumn_ == ProcessSortColumn::Name) {
+                return processSortAsc_ ? (a.name < b.name) : (a.name > b.name);
+            } else if (processSortColumn_ == ProcessSortColumn::Pid) {
+                return processSortAsc_ ? (a.pid < b.pid) : (a.pid > b.pid);
+            } else {
+                return processSortAsc_ ? (a.workingSetBytes < b.workingSetBytes) : (a.workingSetBytes > b.workingSetBytes);
+            }
+        });
+
+        if (filteredProcs.empty()) {
+            std::string emptyMsg = diag.processes.empty() ? "Sampling host processes..." : "No matching processes found";
+            drawText(emptyMsg,
                      { tableBox.left + 14.0f, tableBox.centerY() - 12.0f, tableBox.right - 14.0f, tableBox.centerY() + 12.0f },
                      fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
         } else {
             float rowH = 34.0f;
-            int maxVisible = std::max(1, static_cast<int>((tableBox.height() - 8.0f) / rowH));
-            int totalProcs = static_cast<int>(diag.processes.size());
+            float listTop = colHeader.bottom + 4.0f;
+            int maxVisible = std::max(1, static_cast<int>((tableBox.bottom - listTop - 8.0f) / rowH));
+            int totalProcs = static_cast<int>(filteredProcs.size());
             int maxScroll = std::max(0, totalProcs - maxVisible);
             int scroll = std::clamp(static_cast<int>(diagnosticsScrollOffset_), 0, maxScroll);
 
-            float py = tableBox.top + 6.0f;
+            float py = listTop;
             for (int i = scroll; i < totalProcs && (i - scroll) < maxVisible; ++i) {
-                const auto& proc = diag.processes[i];
+                const auto& proc = filteredProcs[i];
                 UiRect rowRect = { tableBox.left + 8.0f, py, tableBox.right - 8.0f, py + rowH - 4.0f };
 
+                bool isSelected = (selectedProcessPid_ == proc.pid);
                 bool isRowHovered = rowRect.contains(mouseX_, mouseY_);
-                if (isRowHovered) {
+                if (isSelected) {
+                    fillRoundRect(rowRect, 6.0f, withAlpha(COL_PRIMARY_ACCENT, 0.22f));
+                    strokeRoundRect(rowRect, 6.0f, COL_PRIMARY_ACCENT, 1.2f);
+                } else if (isRowHovered) {
                     fillRoundRect(rowRect, 6.0f, withAlpha(COL_PRIMARY_ACCENT, 0.10f));
                 } else if ((i % 2) == 1) {
                     fillRoundRect(rowRect, 6.0f, withAlpha(COL_TEXT_PRIMARY, 0.035f));
                 }
 
-                // Process Name & PID
-                std::string procLine = proc.name;
-                drawText(procLine, { rowRect.left + 8.0f, rowRect.top + 2.0f, rowRect.right - 140.0f, rowRect.bottom },
+                // Click row to select
+                std::string rowId = "proc_row_" + std::to_string(proc.pid);
+                clickRegions_.push_back({ rowRect, rowId, [this, pid = proc.pid]() {
+                    selectedProcessPid_ = pid;
+                }, false });
+
+                // Process Name
+                drawText(proc.name, { rowRect.left + 8.0f, rowRect.top + 2.0f, rowRect.right - 200.0f, rowRect.bottom },
                          fmtBodyBold_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+                // PID
+                drawText(std::to_string(proc.pid), { rowRect.right - 195.0f, rowRect.top + 2.0f, rowRect.right - 130.0f, rowRect.bottom },
+                         fmtMono_, COL_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_LEADING);
 
                 // Memory in MB
                 double memMb = proc.workingSetBytes / (1024.0 * 1024.0);
                 char memBuf[32];
                 std::snprintf(memBuf, sizeof(memBuf), "%.0f MB", memMb);
-                drawText(memBuf, { rowRect.right - 145.0f, rowRect.top + 2.0f, rowRect.right - 68.0f, rowRect.bottom },
+                drawText(memBuf, { rowRect.right - 130.0f, rowRect.top + 2.0f, rowRect.right - 68.0f, rowRect.bottom },
                          fmtSmall_, COL_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
                 // "End Task" action button
@@ -5582,6 +5735,8 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                 py += rowH;
             }
         }
+    } else if (drawerTab_ == DrawerTab::FileManager) {
+        drawFileManagerDrawer({ x, y, rx, r.bottom - 16.0f });
     } else if (drawerTab_ == DrawerTab::ClipboardHistory) {
         drawText("In-Session Clipboard History Hub",
                  { x, y, rx, y + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
@@ -8408,6 +8563,13 @@ std::string* CppDeskWindow::activeFocusedTextBuffer() {
     if (focusedField_ == FocusedField::ScratchpadText) return &scratchpadTextEdit_;
     if (focusedField_ == FocusedField::OmnibarInput) return &omnibarQuery_;
     if (focusedField_ == FocusedField::PrivacyKeywords) return &privacyKeywordsEdit_;
+    if (focusedField_ == FocusedField::ProcessSearch) return &processSearchQuery_;
+    if (focusedField_ == FocusedField::RunTaskCommand) return &runTaskCommandInput_;
+    if (focusedField_ == FocusedField::RunTaskWorkingDir) return &runTaskWorkingDirInput_;
+    if (focusedField_ == FocusedField::FileBrowserLocalPath) return &fileBrowserInputLocalPath_;
+    if (focusedField_ == FocusedField::FileBrowserRemotePath) return &fileBrowserInputRemotePath_;
+    if (focusedField_ == FocusedField::FileBrowserNewDir) return &fileBrowserNewDirName_;
+    if (focusedField_ == FocusedField::FileBrowserRename) return &fileBrowserRenameName_;
     return nullptr;
 }
 
