@@ -70,4 +70,26 @@ std::span<const PaletteToken> paletteTokens();
 // WCAG 2.x contrast ratio (1..21) between two opaque colors; alpha is ignored.
 double contrastRatio(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b);
 
+// Layout, type and motion scales. Values are in DIPs. New screen work should use these instead of literals.
+namespace theme {
+
+namespace space { inline constexpr float xs = 4.0f, sm = 8.0f, md = 12.0f, lg = 16.0f, xl = 24.0f, xxl = 32.0f; }
+
+namespace radius { inline constexpr float sm = 6.0f, md = 12.0f, lg = 16.0f; }
+
+namespace type {
+struct Style { float size; int weight; };  // weight: DirectWrite numeric weight (400 normal, 600 semi-bold, 700 bold)
+inline constexpr Style hero{33.0f, 700}, heading{18.5f, 600}, subheading{14.5f, 600}, body{13.0f, 400},
+                       bodyBold{13.0f, 600}, caption{11.5f, 600}, mono{14.0f, 700}, tooltip{11.5f, 400};
+}
+
+namespace motion {
+struct Spring { float omega; float zeta; };  // damped spring: stiffness, damping ratio
+inline constexpr Spring themeBlend{20.0f, 0.92f}, hover{32.0f, 0.72f}, press{38.0f, 0.68f},
+                        standard{28.0f, 0.74f}, menu{32.0f, 0.76f}, panel{26.0f, 0.78f},
+                        drawer{26.0f, 0.80f}, scroll{32.0f, 0.88f};
+}
+
+} // namespace theme
+
 } // namespace cppdesk

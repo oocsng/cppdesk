@@ -316,24 +316,24 @@ bool CppDeskWindow::initGraphics() {
     );
     if (FAILED(hr) || !dwriteFactory_) return false;
 
-    auto createFmt = [&](const wchar_t* font, DWRITE_FONT_WEIGHT weight, float size, IDWriteTextFormat** outFmt) {
+    auto createFmt = [&](const wchar_t* font, const theme::type::Style& style, IDWriteTextFormat** outFmt) {
         dwriteFactory_->CreateTextFormat(
-            font, nullptr, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-            size, L"en-us", outFmt
+            font, nullptr, static_cast<DWRITE_FONT_WEIGHT>(style.weight), DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            style.size, L"en-us", outFmt
         );
         if (*outFmt) {
             (*outFmt)->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         }
     };
 
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_BOLD, 33.0f, &fmtHeroId_);
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 18.5f, &fmtHeading_);
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.5f, &fmtSubheading_);
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, 13.0f, &fmtBody_);
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 13.0f, &fmtBodyBold_);
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 11.5f, &fmtSmall_);
-    createFmt(L"Consolas", DWRITE_FONT_WEIGHT_BOLD, 14.0f, &fmtMono_);
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, 11.5f, &fmtTooltip_);
+    createFmt(L"Segoe UI", theme::type::hero, &fmtHeroId_);
+    createFmt(L"Segoe UI", theme::type::heading, &fmtHeading_);
+    createFmt(L"Segoe UI", theme::type::subheading, &fmtSubheading_);
+    createFmt(L"Segoe UI", theme::type::body, &fmtBody_);
+    createFmt(L"Segoe UI", theme::type::bodyBold, &fmtBodyBold_);
+    createFmt(L"Segoe UI", theme::type::caption, &fmtSmall_);
+    createFmt(L"Consolas", theme::type::mono, &fmtMono_);
+    createFmt(L"Segoe UI", theme::type::tooltip, &fmtTooltip_);
     if (fmtTooltip_) {
         fmtTooltip_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
     }
@@ -504,18 +504,18 @@ bool CppDeskWindow::stepAnimations(float dt) {
 
     // 3. Smooth Light <-> Dark Mode Transition
     float wantTheme = identity_.settings().darkTheme ? 1.0f : 0.0f;
-    if (stepSpring(themeAnimT_, themeAnimVel_, wantTheme, 20.0f, 0.92f, dt)) active = true;
+    if (stepSpring(themeAnimT_, themeAnimVel_, wantTheme, theme::motion::themeBlend.omega, theme::motion::themeBlend.zeta, dt)) active = true;
 
     // 4. Floating Side Sheet Drawer Spring
     float targetDrawer = showFileDrawer_ ? 1.0f : 0.0f;
-    if (stepSpring(drawerAnimT_, drawerAnimVel_, targetDrawer, 26.0f, 0.80f, dt)) active = true;
+    if (stepSpring(drawerAnimT_, drawerAnimVel_, targetDrawer, theme::motion::drawer.omega, theme::motion::drawer.zeta, dt)) active = true;
     float targetDrawerW = (drawerTab_ == DrawerTab::Sync) ? 440.0f : 395.0f;
     if (stepSpring(drawerWidth_, drawerWidthVel_, targetDrawerW, 26.0f, 0.82f, dt)) active = true;
 
     // 5. Sheet Modal Spring (with subtle macOS pop overshoot)
     bool modalNow = network_.pendingIncomingRequest().active;
     float targetModal = modalNow ? 1.0f : 0.0f;
-    if (stepSpring(modalAnimT_, modalAnimVel_, targetModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(modalAnimT_, modalAnimVel_, targetModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // Window dimensions for dynamic springs
     RECT rcCl{};
@@ -533,17 +533,17 @@ bool CppDeskWindow::stepAnimations(float dt) {
 
     // Floating Toolbar Dropdown Spring Menus
     float targetDisplayMenu = showDisplayMenu_ ? 1.0f : 0.0f;
-    if (stepSpring(displayMenuAnimT_, displayMenuAnimVel_, targetDisplayMenu, 32.0f, 0.76f, dt)) active = true;
+    if (stepSpring(displayMenuAnimT_, displayMenuAnimVel_, targetDisplayMenu, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
     float targetAdminMenu = showAdminMenu_ ? 1.0f : 0.0f;
-    if (stepSpring(adminMenuAnimT_, adminMenuAnimVel_, targetAdminMenu, 32.0f, 0.76f, dt)) active = true;
+    if (stepSpring(adminMenuAnimT_, adminMenuAnimVel_, targetAdminMenu, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
     float targetQualityMenu = showQualityMenu_ ? 1.0f : 0.0f;
-    if (stepSpring(qualityMenuAnimT_, qualityMenuAnimVel_, targetQualityMenu, 32.0f, 0.76f, dt)) active = true;
+    if (stepSpring(qualityMenuAnimT_, qualityMenuAnimVel_, targetQualityMenu, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
     float targetAudioPop = showAudioVolumePopup_ ? 1.0f : 0.0f;
-    if (stepSpring(audioPopAnimT_, audioPopAnimVel_, targetAudioPop, 32.0f, 0.76f, dt)) active = true;
+    if (stepSpring(audioPopAnimT_, audioPopAnimVel_, targetAudioPop, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
     float targetAudioInputMenu = showAudioInputMenu_ ? 1.0f : 0.0f;
-    if (stepSpring(audioInputMenuAnimT_, audioInputMenuAnimVel_, targetAudioInputMenu, 32.0f, 0.76f, dt)) active = true;
+    if (stepSpring(audioInputMenuAnimT_, audioInputMenuAnimVel_, targetAudioInputMenu, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
     float targetAudioOutputMenu = showAudioOutputMenu_ ? 1.0f : 0.0f;
-    if (stepSpring(audioOutputMenuAnimT_, audioOutputMenuAnimVel_, targetAudioOutputMenu, 32.0f, 0.76f, dt)) active = true;
+    if (stepSpring(audioOutputMenuAnimT_, audioOutputMenuAnimVel_, targetAudioOutputMenu, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
 
     // 7. Fullscreen macOS Dynamic Island Floating Top Bar Spring
     float pillHalfW = 665.0f;
@@ -555,43 +555,43 @@ bool CppDeskWindow::stepAnimations(float dt) {
     float targetToolbarY = (isFullscreen_ && activeTab_ == ActiveTab::RemoteSession)
         ? ((floatingToolbarPinned_ || islandHovered || islandDropdownOpen) ? 14.0f : -64.0f)
         : -64.0f;
-    if (stepSpring(floatingToolbarY_, floatingToolbarVel_, targetToolbarY, 26.0f, 0.78f, dt)) active = true;
+    if (stepSpring(floatingToolbarY_, floatingToolbarVel_, targetToolbarY, theme::motion::panel.omega, theme::motion::panel.zeta, dt)) active = true;
 
     // Rewind Scrubber Bar Spring
     float targetRewind = showRewindScrubber_ ? 1.0f : 0.0f;
-    if (stepSpring(rewindScrubberAnimT_, rewindScrubberAnimVel_, targetRewind, 26.0f, 0.78f, dt)) active = true;
+    if (stepSpring(rewindScrubberAnimT_, rewindScrubberAnimVel_, targetRewind, theme::motion::panel.omega, theme::motion::panel.zeta, dt)) active = true;
 
     // 8. Keyboard Shortcuts Modal Spring
     float targetShortcuts = showShortcutsModal_ ? 1.0f : 0.0f;
-    if (stepSpring(shortcutsModalAnimT_, shortcutsModalAnimVel_, targetShortcuts, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(shortcutsModalAnimT_, shortcutsModalAnimVel_, targetShortcuts, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 9. TCP Port Forwarding Manager Modal Spring
     float targetPortModal = showPortForwardModal_ ? 1.0f : 0.0f;
-    if (stepSpring(portForwardModalAnimT_, portForwardModalAnimVel_, targetPortModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(portForwardModalAnimT_, portForwardModalAnimVel_, targetPortModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 10. Address Book Edit Modal Spring
     float targetABModal = showAddressBookEditModal_ ? 1.0f : 0.0f;
-    if (stepSpring(addressBookModalAnimT_, addressBookModalAnimVel_, targetABModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(addressBookModalAnimT_, addressBookModalAnimVel_, targetABModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 11. Mandatory Update Modal Spring (v3.0.0)
     float targetUpdateModal = showUpdateRequiredModal_ ? 1.0f : 0.0f;
-    if (stepSpring(updateModalAnimT_, updateModalAnimVel_, targetUpdateModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(updateModalAnimT_, updateModalAnimVel_, targetUpdateModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 12. Real-Time Performance HUD Overlay Spring
     float targetHud = showPerformanceHud_ ? 1.0f : 0.0f;
-    if (stepSpring(hudAnimT_, hudAnimVel_, targetHud, 26.0f, 0.78f, dt)) active = true;
+    if (stepSpring(hudAnimT_, hudAnimVel_, targetHud, theme::motion::panel.omega, theme::motion::panel.zeta, dt)) active = true;
 
     // 13. Remote Reboot & Reconnect Modal Spring
     float targetRebootModal = showRebootConfirmModal_ ? 1.0f : 0.0f;
-    if (stepSpring(rebootModalAnimT_, rebootModalAnimVel_, targetRebootModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(rebootModalAnimT_, rebootModalAnimVel_, targetRebootModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 14. Hardware Acceleration Restart Modal Spring
     float targetHwAccelModal = showHwAccelRestartModal_ ? 1.0f : 0.0f;
-    if (stepSpring(hwAccelModalAnimT_, hwAccelModalAnimVel_, targetHwAccelModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(hwAccelModalAnimT_, hwAccelModalAnimVel_, targetHwAccelModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 15. Session Recording Player Modal Spring
     float targetPlayerModal = showRecordingPlayer_ ? 1.0f : 0.0f;
-    if (stepSpring(recordingPlayerModalAnimT_, recordingPlayerModalAnimVel_, targetPlayerModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(recordingPlayerModalAnimT_, recordingPlayerModalAnimVel_, targetPlayerModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 16. Viewer TOTP Challenge Modal Spring
     bool waitingTotp = network_.isWaitingForTotp();
@@ -609,16 +609,16 @@ bool CppDeskWindow::stepAnimations(float dt) {
         }
     }
     float targetTotpModal = showTotpModal_ ? 1.0f : 0.0f;
-    if (stepSpring(totpModalAnimT_, totpModalAnimVel_, targetTotpModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(totpModalAnimT_, totpModalAnimVel_, targetTotpModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 17. Spotlight Omnibar Command Palette Modal Spring
     float targetOmniModal = showOmnibarModal_ ? 1.0f : 0.0f;
-    if (stepSpring(omnibarModalAnimT_, omnibarModalAnimVel_, targetOmniModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(omnibarModalAnimT_, omnibarModalAnimVel_, targetOmniModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 18. Settings Tab Smooth Scroll Spring
     if (!draggingSettingsScrollbar_) {
         settingsScrollTarget_ = std::clamp(settingsScrollTarget_, 0.0f, settingsMaxScroll_);
-        if (stepSpring(settingsScrollOffset_, settingsScrollVel_, settingsScrollTarget_, 32.0f, 0.88f, dt, 0.15f)) {
+        if (stepSpring(settingsScrollOffset_, settingsScrollVel_, settingsScrollTarget_, theme::motion::scroll.omega, theme::motion::scroll.zeta, dt, 0.15f)) {
             settingsScrollOffset_ = std::clamp(settingsScrollOffset_, 0.0f, settingsMaxScroll_);
             active = true;
         }
@@ -626,14 +626,14 @@ bool CppDeskWindow::stepAnimations(float dt) {
 
     // Horizontal HUD Smooth Scroll Spring
     sessionHudScrollTarget_ = std::clamp(sessionHudScrollTarget_, 0.0f, sessionHudMaxScroll_);
-    if (stepSpring(sessionHudScrollOffset_, sessionHudScrollVel_, sessionHudScrollTarget_, 32.0f, 0.88f, dt, 0.15f)) {
+    if (stepSpring(sessionHudScrollOffset_, sessionHudScrollVel_, sessionHudScrollTarget_, theme::motion::scroll.omega, theme::motion::scroll.zeta, dt, 0.15f)) {
         sessionHudScrollOffset_ = std::clamp(sessionHudScrollOffset_, 0.0f, sessionHudMaxScroll_);
         active = true;
     }
 
     // Drawer Tabs Header Smooth Scroll Spring
     drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_, 0.0f, drawerTabsMaxScroll_);
-    if (stepSpring(drawerTabsScrollOffset_, drawerTabsScrollVel_, drawerTabsScrollTarget_, 32.0f, 0.88f, dt, 0.15f)) {
+    if (stepSpring(drawerTabsScrollOffset_, drawerTabsScrollVel_, drawerTabsScrollTarget_, theme::motion::scroll.omega, theme::motion::scroll.zeta, dt, 0.15f)) {
         drawerTabsScrollOffset_ = std::clamp(drawerTabsScrollOffset_, 0.0f, drawerTabsMaxScroll_);
         active = true;
     }
@@ -657,8 +657,8 @@ bool CppDeskWindow::stepAnimations(float dt) {
         float wantHover = (id == hoveredWidgetId_) ? 1.0f : 0.0f;
         float wantPress = (mouseLeftDown_ && id == pressedWidgetId_ && id == hoveredWidgetId_) ? 1.0f : 0.0f;
 
-        if (stepSpring(st.hoverT, st.hoverVel, wantHover, 32.0f, 0.72f, dt)) active = true;
-        if (stepSpring(st.pressT, st.pressVel, wantPress, 38.0f, 0.68f, dt)) active = true;
+        if (stepSpring(st.hoverT, st.hoverVel, wantHover, theme::motion::hover.omega, theme::motion::hover.zeta, dt)) active = true;
+        if (stepSpring(st.pressT, st.pressVel, wantPress, theme::motion::press.omega, theme::motion::press.zeta, dt)) active = true;
 
         if (st.rippleT < 1.0f) {
             st.rippleT = std::min(1.0f, st.rippleT + dt * 3.6f);
@@ -680,7 +680,7 @@ bool CppDeskWindow::stepAnimations(float dt) {
         }
     }
     float targetTooltip = hasTooltipHover ? 1.0f : 0.0f;
-    if (stepSpring(tooltipAnimT_, tooltipAnimVel_, targetTooltip, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(tooltipAnimT_, tooltipAnimVel_, targetTooltip, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
     if (!hasTooltipHover && tooltipAnimT_ <= 0.005f) {
         activeTooltipText_.clear();
     }

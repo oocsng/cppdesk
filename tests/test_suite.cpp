@@ -6830,6 +6830,38 @@ void testThemePaletteContrast() {
     }
 }
 #undef CONTRAST_CHECK
+
+void testThemeScales() {
+    std::cout << "[TEST 55] Theme Spacing, Radius, Type & Motion Scales..." << std::endl;
+    TEST_ASSERT(theme::space::xs == 4.0f && theme::space::sm == 8.0f && theme::space::md == 12.0f);
+    TEST_ASSERT(theme::space::lg == 16.0f && theme::space::xl == 24.0f && theme::space::xxl == 32.0f);
+    TEST_ASSERT(theme::radius::sm == 6.0f && theme::radius::md == 12.0f && theme::radius::lg == 16.0f);
+
+    // Type scale equals the text formats initGraphics() created before the scale existed.
+    TEST_ASSERT(theme::type::hero.size == 33.0f && theme::type::hero.weight == 700);
+    TEST_ASSERT(theme::type::heading.size == 18.5f && theme::type::heading.weight == 600);
+    TEST_ASSERT(theme::type::subheading.size == 14.5f && theme::type::subheading.weight == 600);
+    TEST_ASSERT(theme::type::body.size == 13.0f && theme::type::body.weight == 400);
+    TEST_ASSERT(theme::type::bodyBold.size == 13.0f && theme::type::bodyBold.weight == 600);
+    TEST_ASSERT(theme::type::caption.size == 11.5f && theme::type::caption.weight == 600);
+    TEST_ASSERT(theme::type::mono.size == 14.0f && theme::type::mono.weight == 700);
+    TEST_ASSERT(theme::type::tooltip.size == 11.5f && theme::type::tooltip.weight == 400);
+
+    // Motion scale equals the spring parameters the update loop used before the scale existed.
+    TEST_ASSERT(theme::motion::themeBlend.omega == 20.0f && theme::motion::themeBlend.zeta == 0.92f);
+    TEST_ASSERT(theme::motion::hover.omega == 32.0f && theme::motion::hover.zeta == 0.72f);
+    TEST_ASSERT(theme::motion::press.omega == 38.0f && theme::motion::press.zeta == 0.68f);
+    TEST_ASSERT(theme::motion::standard.omega == 28.0f && theme::motion::standard.zeta == 0.74f);
+    TEST_ASSERT(theme::motion::menu.omega == 32.0f && theme::motion::menu.zeta == 0.76f);
+    TEST_ASSERT(theme::motion::panel.omega == 26.0f && theme::motion::panel.zeta == 0.78f);
+    TEST_ASSERT(theme::motion::drawer.omega == 26.0f && theme::motion::drawer.zeta == 0.80f);
+    TEST_ASSERT(theme::motion::scroll.omega == 32.0f && theme::motion::scroll.zeta == 0.88f);
+    for (const auto& s : { theme::motion::themeBlend, theme::motion::hover, theme::motion::press,
+                           theme::motion::standard, theme::motion::menu, theme::motion::panel,
+                           theme::motion::drawer, theme::motion::scroll }) {
+        TEST_ASSERT(s.omega > 0.0f && s.zeta > 0.0f && s.zeta < 1.0f);
+    }
+}
 #endif
 
 } // namespace
@@ -6899,6 +6931,7 @@ int main() {
 #if defined(_WIN32)
         testThemeTableEndpoints(); std::cout << "Test 53 done\n" << std::flush;
         testThemePaletteContrast(); std::cout << "Test 54 done\n" << std::flush;
+        testThemeScales(); std::cout << "Test 55 done\n" << std::flush;
 #endif
 
         std::cout << "---------------------------------------------------------\n";
