@@ -40,6 +40,7 @@ if(WIN32)
     list(APPEND CORE_SOURCES
         src/simd/simd_kernels.S
         src/control/windows_service_manager.cpp
+        src/ui/theme.cpp
     )
 
     add_compile_definitions(

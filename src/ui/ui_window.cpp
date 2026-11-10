@@ -1,4 +1,5 @@
 #include "ui_window.hpp"
+#include "theme.hpp"
 #include "../control/windows_service_manager.hpp"
 #include "../capture/screen_capture.hpp"
 #include <gdiplus.h>
@@ -29,24 +30,6 @@ namespace cppdesk {
 
 namespace {
 
-D2D1_COLOR_F rgba(uint8_t r, uint8_t g, uint8_t b, float a = 1.0f) {
-    return D2D1::ColorF(r / 255.0f, g / 255.0f, b / 255.0f, a);
-}
-
-D2D1_COLOR_F withAlpha(D2D1_COLOR_F c, float aMultiplier) {
-    return D2D1::ColorF(c.r, c.g, c.b, std::clamp(c.a * aMultiplier, 0.0f, 1.0f));
-}
-
-D2D1_COLOR_F lerpColor(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b, float t) {
-    t = std::clamp(t, 0.0f, 1.0f);
-    return D2D1::ColorF(
-        a.r + (b.r - a.r) * t,
-        a.g + (b.g - a.g) * t,
-        a.b + (b.b - a.b) * t,
-        a.a + (b.a - a.a) * t
-    );
-}
-
 // Second-order damped harmonic oscillator (macOS CoreAnimation CASpringAnimation physics)
 bool stepSpring(float& pos, float& vel, float target, float omega, float zeta, float dt, float eps = 0.0012f) {
     return cppdesk::UiPlatform::stepSpring(pos, vel, target, omega, zeta, dt, eps);
@@ -69,67 +52,6 @@ bool stepExp(float& current, float target, float speed, float dt) {
 float smoothStepEase(float t) {
     t = std::clamp(t, 0.0f, 1.0f);
     return t * t * (3.0f - 2.0f * t);
-}
-
-// ---------------- Dynamic Minimalist Palette (Warm Claude Cream & Terracotta) ----------------
-D2D1_COLOR_F COL_BG_MAIN          = rgba(250, 248, 245); // #FAF8F5 Warm cream linen
-D2D1_COLOR_F COL_BG_NAV           = rgba(245, 240, 234); // #F5F0EA Warm parchment header
-D2D1_COLOR_F COL_BG_CARD          = rgba(255, 255, 255); // #FFFFFF Pure warm white card
-D2D1_COLOR_F COL_BG_SUBTLE        = rgba(243, 238, 230); // #F3EEE6 Warm stone container/input
-D2D1_COLOR_F COL_BG_CARD_ALT      = rgba(249, 243, 236); // #F9F3EC Warm clay tinted card
-D2D1_COLOR_F COL_BG_INPUT         = rgba(243, 238, 230);
-D2D1_COLOR_F COL_BG_INPUT_FOCUS   = rgba(255, 255, 255);
-D2D1_COLOR_F COL_BORDER           = rgba(228, 222, 212); // #E4DED4 Parchment border
-D2D1_COLOR_F COL_BORDER_ALT       = rgba(224, 198, 185); // #E0C6B9 Warm terracotta border
-D2D1_COLOR_F COL_BORDER_FOCUS     = rgba(217, 119, 87);  // #D97757 Claude terracotta accent
-
-D2D1_COLOR_F COL_PRIMARY_ACCENT      = rgba(217, 119, 87);  // #D97757 Claude terracotta clay
-D2D1_COLOR_F COL_PRIMARY_ACCENT_HV   = rgba(193, 95, 60);   // #C15F3C Warm clay hover
-D2D1_COLOR_F COL_SEC_BTN_BG       = rgba(240, 234, 225); // #F0EAE1 Warm secondary button
-D2D1_COLOR_F COL_SEC_BTN_HV       = rgba(230, 222, 210); // #E6DED2 Warm secondary button hover
-
-D2D1_COLOR_F COL_SUCCESS          = rgba(46, 125, 96);   // #2E7D60 Warm sage green
-D2D1_COLOR_F COL_WARNING          = rgba(217, 130, 43);  // #D9822B Warm amber
-D2D1_COLOR_F COL_DANGER           = rgba(199, 62, 58);   // #C73E3A Warm crimson
-D2D1_COLOR_F COL_DANGER_HV        = rgba(173, 50, 47);   // #AD322F
-
-D2D1_COLOR_F COL_TEXT_PRIMARY     = rgba(38, 35, 32);    // #262320 Deep warm espresso
-D2D1_COLOR_F COL_TEXT_SECONDARY   = rgba(105, 98, 89);   // #696259 Warm graphite
-D2D1_COLOR_F COL_TEXT_MUTED       = rgba(148, 140, 130); // #948C82 Warm stone grey
-D2D1_COLOR_F COL_TEXT_ACCENT      = rgba(193, 95, 60);   // #C15F3C Claude clay text
-D2D1_COLOR_F COL_TEXT_ON_ACCENT   = rgba(255, 255, 255);
-D2D1_COLOR_F COL_STAGE_BG         = rgba(235, 229, 219); // #EBE5DB Warm stage canvas
-
-void updateActivePalette(float darkT) {
-    darkT = std::clamp(darkT, 0.0f, 1.0f);
-
-    // 60% Dominant Surfaces: Cream Linen (#FAF8F5 / #FFFFFF) <-> Roasted Espresso (#1C1B19 / #262522)
-    COL_BG_MAIN        = lerpColor(rgba(250, 248, 245), rgba(28, 27, 25), darkT);
-    COL_BG_NAV         = lerpColor(rgba(245, 240, 234), rgba(34, 33, 30), darkT);
-    COL_BG_CARD        = lerpColor(rgba(255, 255, 255), rgba(38, 37, 34), darkT);
-    COL_BG_SUBTLE      = lerpColor(rgba(243, 238, 230), rgba(46, 44, 40), darkT);
-
-    // 30% Secondary Surfaces & Hairline Borders: Soft Warm Stone <-> Roasted Bronze Espresso
-    COL_BG_CARD_ALT    = lerpColor(rgba(249, 243, 236), rgba(51, 44, 38), darkT);
-    COL_BG_INPUT       = lerpColor(rgba(243, 238, 230), rgba(34, 32, 29), darkT);
-    COL_BG_INPUT_FOCUS = lerpColor(rgba(255, 255, 255), rgba(42, 40, 36), darkT);
-    COL_BORDER         = lerpColor(rgba(228, 222, 212), rgba(59, 56, 51), darkT);
-    COL_BORDER_ALT     = lerpColor(rgba(224, 198, 185), rgba(87, 68, 57), darkT);
-    COL_BORDER_FOCUS   = lerpColor(rgba(217, 119, 87),  rgba(217, 119, 87), darkT);
-
-    // 10% Signature Accent: Claude Terracotta Clay (#D97757) <-> Warm Terracotta Ember
-    COL_PRIMARY_ACCENT    = lerpColor(rgba(217, 119, 87), rgba(217, 119, 87), darkT);
-    COL_PRIMARY_ACCENT_HV = lerpColor(rgba(193, 95, 60),  rgba(228, 138, 108), darkT);
-    COL_SEC_BTN_BG     = lerpColor(rgba(240, 234, 225), rgba(44, 42, 38), darkT);
-    COL_SEC_BTN_HV     = lerpColor(rgba(230, 222, 210), rgba(58, 55, 49), darkT);
-
-    // Typography Hierarchy (>= 4.5:1 WCAG contrast in both modes)
-    COL_TEXT_PRIMARY   = lerpColor(rgba(38, 35, 32),    rgba(250, 247, 242), darkT);
-    COL_TEXT_SECONDARY = lerpColor(rgba(105, 98, 89),   rgba(184, 177, 166), darkT);
-    COL_TEXT_MUTED     = lerpColor(rgba(148, 140, 130), rgba(128, 121, 111), darkT);
-    COL_TEXT_ACCENT    = lerpColor(rgba(193, 95, 60),   rgba(228, 138, 108), darkT);
-    COL_TEXT_ON_ACCENT = rgba(255, 255, 255);
-    COL_STAGE_BG       = lerpColor(rgba(235, 229, 219), rgba(20, 19, 18), darkT);
 }
 
 std::wstring utf8ToWide(const std::string& str) {

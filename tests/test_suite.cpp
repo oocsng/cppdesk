@@ -34,6 +34,7 @@
 #ifdef DeleteFile
 #undef DeleteFile
 #endif
+#include "../src/ui/theme.hpp"
 #endif
 
 #include <iostream>
@@ -6747,6 +6748,44 @@ void testLinuxPlatformSupport() {
     }
 }
 
+#if defined(_WIN32)
+bool themeColorNear(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b) {
+    return std::fabs(a.r - b.r) < 1e-5f && std::fabs(a.g - b.g) < 1e-5f &&
+           std::fabs(a.b - b.b) < 1e-5f && std::fabs(a.a - b.a) < 1e-5f;
+}
+
+void testThemeTableEndpoints() {
+    std::cout << "[TEST 53] Theme Palette Table Endpoints & Clamping..." << std::endl;
+    auto tokens = paletteTokens();
+    TEST_ASSERT(!tokens.empty());
+
+    updateActivePalette(0.0f);
+    for (const auto& tok : tokens) TEST_ASSERT(themeColorNear(*tok.live, tok.light));
+    updateActivePalette(1.0f);
+    for (const auto& tok : tokens) TEST_ASSERT(themeColorNear(*tok.live, tok.dark));
+
+    // darkT outside 0..1 (spring overshoot) must equal the nearest endpoint.
+    updateActivePalette(-1.0f);
+    for (const auto& tok : tokens) TEST_ASSERT(themeColorNear(*tok.live, tok.light));
+    updateActivePalette(2.0f);
+    for (const auto& tok : tokens) TEST_ASSERT(themeColorNear(*tok.live, tok.dark));
+
+    // Values carried over unchanged from the pre-theme-module palette.
+    updateActivePalette(0.0f);
+    TEST_ASSERT(themeColorNear(COL_BG_MAIN, rgba(250, 248, 245)));
+    updateActivePalette(1.0f);
+    TEST_ASSERT(themeColorNear(COL_BG_MAIN, rgba(28, 27, 25)));
+    TEST_ASSERT(themeColorNear(COL_TEXT_PRIMARY, rgba(250, 247, 242)));
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        TEST_ASSERT(tokens[i].name != nullptr && tokens[i].name[0] != '\0');
+        for (size_t j = i + 1; j < tokens.size(); ++j) {
+            TEST_ASSERT(std::strcmp(tokens[i].name, tokens[j].name) != 0);
+        }
+    }
+}
+#endif
+
 } // namespace
 
 int main() {
@@ -6811,6 +6850,9 @@ int main() {
         testCrossPlatformMacOsAndWindowsFoundation(); std::cout << "Test 50 done\n" << std::flush;
         testCrossPlatformUiWindowingAndMacOsViewer(); std::cout << "Test 51 done\n" << std::flush;
         testLinuxPlatformSupport(); std::cout << "Test 52 done\n" << std::flush;
+#if defined(_WIN32)
+        testThemeTableEndpoints(); std::cout << "Test 53 done\n" << std::flush;
+#endif
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
