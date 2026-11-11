@@ -251,6 +251,9 @@ public:
         CursorState& outCursor,
         RECT* outDirtyBounds = nullptr) const;
     void markViewerCanvasFullDirty();
+    // Replaces the viewer canvas with this frame as if it had just been decoded; an empty frame clears it.
+    // Used by the UI snapshot harness.
+    void injectViewerFrameForTest(const std::vector<uint8_t>& bgra, int width, int height);
 
     // Frame notification callback for event-driven 60 FPS viewer rendering
     void setOnFrameDecodedCallback(std::function<void()> cb);

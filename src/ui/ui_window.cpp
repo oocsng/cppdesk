@@ -9,6 +9,7 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shobjidl.h>
+#include <wincodec.h>
 #ifdef DeleteFile
 #undef DeleteFile
 #endif
@@ -397,6 +398,7 @@ void CppDeskWindow::discardDeviceResources() {
     if (recordingPlayerBitmap_) { recordingPlayerBitmap_->Release(); recordingPlayerBitmap_ = nullptr; }
     if (solidBrush_) { solidBrush_->Release(); solidBrush_ = nullptr; }
     if (renderTarget_) { renderTarget_->Release(); renderTarget_ = nullptr; }
+    hwndTarget_ = nullptr;
     bitmapW_ = 0;
     bitmapH_ = 0;
     recordingPlayerBitmapW_ = 0;
@@ -545,7 +547,7 @@ bool CppDeskWindow::stepAnimations(float dt) {
     float winW = clientSizeDips().width;
 
     // 6. Dynamic Island / Capsule Toast Spring
-    bool toastVisible = (!toastText_.empty() && GetTickCount64() <= toastExpireTick_);
+    bool toastVisible = (!toastText_.empty() && uiNowMs() <= toastExpireTick_);
     float targetToast = toastVisible ? 1.0f : 0.0f;
     if (stepSpring(toastAnimT_, toastAnimVel_, targetToast, 28.0f, 0.72f, dt)) active = true;
     float estTextW = static_cast<float>(toastText_.size()) * 7.6f + 64.0f;
@@ -865,7 +867,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 GetClientRect(hwnd_, &rc);
                 D2D1_SIZE_U sz = D2D1::SizeU(std::max<UINT32>(1, rc.right - rc.left),
                                              std::max<UINT32>(1, rc.bottom - rc.top));
-                HRESULT hr = renderTarget_->Resize(sz);
+                HRESULT hr = hwndTarget_ ? hwndTarget_->Resize(sz) : S_OK;
                 if (hr == D2DERR_RECREATE_TARGET) {
                     discardDeviceResources();
                     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -1736,12 +1738,23 @@ void CppDeskWindow::onPaint() {
         rtProps.dpiX = static_cast<float>(dpi_);
         rtProps.dpiY = static_cast<float>(dpi_);
         D2D1_HWND_RENDER_TARGET_PROPERTIES hwndProps = D2D1::HwndRenderTargetProperties(hwnd_, clientSizePx());
-        if (FAILED(d2dFactory_->CreateHwndRenderTarget(rtProps, hwndProps, &renderTarget_)) || !renderTarget_) {
+        if (FAILED(d2dFactory_->CreateHwndRenderTarget(rtProps, hwndProps, &hwndTarget_)) || !hwndTarget_) {
             return;
         }
+        renderTarget_ = hwndTarget_;
         renderTarget_->CreateSolidColorBrush(toD2D(COL_TEXT_PRIMARY), &solidBrush_);
     }
 
+    HRESULT hr = drawFrame(width, height);
+    if (hr == D2DERR_RECREATE_TARGET) {
+        discardDeviceResources();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    } else if (animMoving || inlineAnimActive_) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+HRESULT CppDeskWindow::drawFrame(float width, float height) {
     clickRegions_.clear();
     renderTarget_->BeginDraw();
     renderTarget_->Clear(toD2D(COL_BG_MAIN));
@@ -2034,13 +2047,7 @@ void CppDeskWindow::onPaint() {
         }
     }
 
-    HRESULT hr = renderTarget_->EndDraw();
-    if (hr == D2DERR_RECREATE_TARGET) {
-        discardDeviceResources();
-        InvalidateRect(hwnd_, nullptr, FALSE);
-    } else if (animMoving || inlineAnimActive_) {
-        InvalidateRect(hwnd_, nullptr, FALSE);
-    }
+    return renderTarget_->EndDraw();
 }
 
 // ---------------- macOS Unified Top Toolbar ----------------
@@ -3224,7 +3231,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             if (sessionRecorder_.isRecording()) {
                 sessionRecorder_.pushFrame(frameBufferBgra_.data(), frameBufferW_, frameBufferH_);
             }
-            uint64_t nowTick = GetTickCount64();
+            uint64_t nowTick = uiNowMs();
             if (nowTick - lastRewindPushTickMs_ >= 500) {
                 lastRewindPushTickMs_ = nowTick;
                 rewindBuffer_.pushFrame(nowTick, frameBufferBgra_.data(), frameBufferW_, frameBufferH_);
@@ -3399,7 +3406,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
 
         // Direct Canvas Drag-and-Drop Confirmation Ripple Effect (Feature 2)
         if (canvasDropEffectActive_) {
-            uint64_t elapsed = GetTickCount64() - canvasDropTick_;
+            uint64_t elapsed = uiNowMs() - canvasDropTick_;
             if (elapsed < 1400) {
                 float t = static_cast<float>(elapsed) / 1400.0f;
                 float ripRadius = 16.0f + 64.0f * std::sin(t * 1.57079f);
@@ -3483,7 +3490,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             fillRoundRect(recPill, 16.0f, rgba(20, 20, 24, 0.94f));
             strokeRoundRect(recPill, 16.0f, withAlpha(COL_DANGER, 0.75f), 1.2f);
 
-            uint64_t tick = GetTickCount64();
+            uint64_t tick = uiNowMs();
             float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(tick % 1000) / 1000.0f * 6.28318f);
             ui::Color dotColor = ui::Color{0.95f, 0.2f, 0.2f, 0.5f + 0.5f * pulse};
             solidBrush_->SetColor(toD2D(dotColor));
@@ -7169,7 +7176,7 @@ void CppDeskWindow::activateFilePaneEntry(int pane, int index) {
     activeFilePane_ = pane;
     if (index < 0 || index >= static_cast<int>(st.entries.size())) return;
 
-    const uint64_t now = GetTickCount64();
+    const uint64_t now = uiNowMs();
     const bool doubleClick = (st.lastClickIndex == index && now - st.lastClickTick < 450);
     st.lastClickIndex = index;
     st.lastClickTick = now;
@@ -8911,7 +8918,13 @@ D2D1_SIZE_U CppDeskWindow::clientSizePx() const {
                        static_cast<UINT32>(std::max<LONG>(1, rc.bottom - rc.top)));
 }
 
+uint64_t CppDeskWindow::uiNowMs() const {
+    // Snapshots draw at a fixed instant so clock-driven pulses and timeouts are repeatable.
+    return snapshotMode_ ? 10000 : GetTickCount64();
+}
+
 D2D1_SIZE_F CppDeskWindow::clientSizeDips() const {
+    if (snapshotMode_) return D2D1::SizeF(kSnapshotWidth, kSnapshotHeight);
     D2D1_SIZE_U px = clientSizePx();
     return D2D1::SizeF(pxToDip(static_cast<float>(px.width), dpi_), pxToDip(static_cast<float>(px.height), dpi_));
 }
@@ -10422,6 +10435,216 @@ void CppDeskWindow::drawOmnibarModal(float width, float height, float modalProgr
     }
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+}
+
+// ---------------- Offscreen UI Snapshots (regression checks) ----------------
+
+namespace {
+
+struct SnapshotState {
+    const char* name;
+    std::function<void(CppDeskWindow&)> setup;      // once, before the first frame
+    std::function<void(CppDeskWindow&)> perFrame;   // after each animation step, before drawing
+};
+
+bool writeBmp32(const std::wstring& path, const uint8_t* bgra, UINT width, UINT height, UINT stride) {
+    BITMAPFILEHEADER bfh{};
+    BITMAPINFOHEADER bih{};
+    const DWORD imageBytes = width * height * 4;
+    bfh.bfType = 0x4D42;
+    bfh.bfOffBits = sizeof(bfh) + sizeof(bih);
+    bfh.bfSize = bfh.bfOffBits + imageBytes;
+    bih.biSize = sizeof(bih);
+    bih.biWidth = static_cast<LONG>(width);
+    bih.biHeight = -static_cast<LONG>(height);   // top-down
+    bih.biPlanes = 1;
+    bih.biBitCount = 32;
+    bih.biCompression = BI_RGB;
+    bih.biSizeImage = imageBytes;
+    std::ofstream out(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(&bfh), sizeof(bfh));
+    out.write(reinterpret_cast<const char*>(&bih), sizeof(bih));
+    for (UINT y = 0; y < height; ++y) {
+        out.write(reinterpret_cast<const char*>(bgra + static_cast<size_t>(y) * stride), width * 4);
+    }
+    return static_cast<bool>(out);
+}
+
+} // namespace
+
+int CppDeskWindow::runUiSnapshots(IdentityManager& identity, NetworkEngine& network, const std::wstring& outDir) {
+    std::error_code ec;
+    std::filesystem::create_directories(outDir, ec);
+
+    IWICImagingFactory* wic = nullptr;
+    CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+    if (!wic) return 0;
+
+    // A 1920x1080 gradient stands in for a remote desktop frame.
+    std::vector<uint8_t> remoteFrame(1920u * 1080u * 4u);
+    for (int y = 0; y < 1080; ++y) {
+        for (int x = 0; x < 1920; ++x) {
+            uint8_t* p = &remoteFrame[(static_cast<size_t>(y) * 1920 + x) * 4];
+            p[0] = static_cast<uint8_t>(x * 255 / 1919);
+            p[1] = static_cast<uint8_t>(y * 255 / 1079);
+            p[2] = 96;
+            p[3] = 255;
+        }
+    }
+
+    auto setTab = [](ActiveTab t) {
+        return [t](CppDeskWindow& w) { w.activeTab_ = t; };
+    };
+    auto settings = [](SettingsSection sec) {
+        return [sec](CppDeskWindow& w) {
+            w.activeTab_ = ActiveTab::Settings;
+            w.settingsSection_ = sec;
+        };
+    };
+    auto drawer = [](DrawerTab tab) {
+        return [tab](CppDeskWindow& w) {
+            w.showFileDrawer_ = true;
+            w.drawerTab_ = tab;
+        };
+    };
+    auto withDark = [&identity](bool dark) {
+        AppSettings s = identity.settings();
+        s.darkTheme = dark;
+        identity.updateSettings(s);
+    };
+
+    const std::vector<SnapshotState> states = {
+        { "dashboard_light", setTab(ActiveTab::Dashboard), nullptr },
+        { "dashboard_dark", [&](CppDeskWindow& w) { withDark(true); w.activeTab_ = ActiveTab::Dashboard; }, nullptr },
+        { "theme_mid_blend", [&](CppDeskWindow& w) { withDark(true); w.activeTab_ = ActiveTab::Dashboard; },
+          [](CppDeskWindow& w) { w.themeAnimT_ = 0.5f; w.themeAnimVel_ = 0.0f; } },
+        { "settings_appearance", settings(SettingsSection::Appearance), nullptr },
+        { "settings_display", settings(SettingsSection::DisplayQuality), nullptr },
+        { "settings_audio", settings(SettingsSection::AudioVoice), nullptr },
+        { "settings_permissions", settings(SettingsSection::Permissions), nullptr },
+        { "settings_2fa", settings(SettingsSection::TwoFactorAuth), nullptr },
+        { "settings_network", settings(SettingsSection::NetworkRelay), nullptr },
+        { "settings_privacy", settings(SettingsSection::CurtainPrivacy), nullptr },
+        { "settings_system", settings(SettingsSection::SystemService), nullptr },
+        { "settings_about", settings(SettingsSection::About), nullptr },
+        { "session_view", [&](CppDeskWindow& w) {
+              w.activeTab_ = ActiveTab::RemoteSession;
+              network.injectViewerFrameForTest(remoteFrame, 1920, 1080);
+          }, nullptr },
+        { "session_tabs_3", [&](CppDeskWindow& w) {
+              w.sessionTabs_.createTab(111222333, "111222333", "Office");
+              w.sessionTabs_.createTab(444555666, "444555666", "Build Server");
+              w.sessionTabs_.createTab(777888999, "777888999", "Home");
+              w.activeTab_ = ActiveTab::RemoteSession;
+              network.injectViewerFrameForTest(remoteFrame, 1920, 1080);
+          }, nullptr },
+        { "drawer_file_transfer", drawer(DrawerTab::FilesAndClip), nullptr },
+        { "drawer_file_manager", drawer(DrawerTab::FileManager), nullptr },
+        { "drawer_sync", drawer(DrawerTab::Sync), nullptr },
+        { "chat_long_text", [&](CppDeskWindow& w) {
+              drawer(DrawerTab::LiveChat)(w);
+              w.chatInput_ = "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E \xF0\x9F\x96\xA5 " + std::string(700, 'x');
+              w.focusedField_ = FocusedField::ChatInput;
+          }, nullptr },
+        { "modal_approval", setTab(ActiveTab::Dashboard),
+          [](CppDeskWindow& w) { w.modalAnimT_ = 1.0f; w.modalAnimVel_ = 0.0f; } },
+        { "modal_totp", [](CppDeskWindow& w) { w.showTotpModal_ = true; }, nullptr },
+        { "modal_run_task", [](CppDeskWindow& w) { w.showRunTaskModal_ = true; }, nullptr },
+        { "modal_address_book", [](CppDeskWindow& w) {
+              w.showAddressBookEditModal_ = true;
+              w.editingDeskId_ = 111222333;
+              w.editAliasInput_ = "Office Workstation";
+          }, nullptr },
+        { "modal_recording_player", [](CppDeskWindow& w) { w.showRecordingPlayer_ = true; }, nullptr },
+        { "modal_omnibar", [&](CppDeskWindow& w) {
+              w.showOmnibarModal_ = true;
+              w.omnibarFiltered_ = network.commandPaletteManager().getCatalog();
+          }, nullptr },
+        { "toast", [](CppDeskWindow& w) {
+              w.showToast("Saved desk details");
+              w.toastExpireTick_ = UINT64_MAX;
+          }, nullptr },
+        { "tooltip", settings(SettingsSection::Appearance),
+          [](CppDeskWindow& w) {
+              w.activeTooltipText_ = "Blend the interface between the light and dark palettes.";
+              w.activeTooltipTargetRect_ = { 600.0f, 300.0f, 640.0f, 320.0f };
+              w.tooltipAnimT_ = 1.0f;
+              w.tooltipAnimVel_ = 0.0f;
+          } },
+    };
+
+    int written = 0;
+    std::string timings;   // average drawFrame time per state, for before/after performance checks
+    LARGE_INTEGER qpcFreq{};
+    QueryPerformanceFrequency(&qpcFreq);
+    for (const auto& st : states) {
+        withDark(false);
+        CppDeskWindow w(identity, network, "");
+        w.snapshotMode_ = true;
+        w.dpi_ = 96;
+        // The audio settings page would open the microphone; snapshots must not, and a live level meter
+        // would make the output differ run to run.
+        w.voiceMonitorAttempted_ = true;
+        if (!w.initGraphics()) continue;
+
+        IWICBitmap* bitmap = nullptr;
+        wic->CreateBitmap(static_cast<UINT>(kSnapshotWidth), static_cast<UINT>(kSnapshotHeight),
+                          GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &bitmap);
+        if (!bitmap) continue;
+        D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
+        if (FAILED(w.d2dFactory_->CreateWicBitmapRenderTarget(bitmap, props, &w.renderTarget_)) || !w.renderTarget_) {
+            bitmap->Release();
+            continue;
+        }
+        w.renderTarget_->CreateSolidColorBrush(toD2D(COL_TEXT_PRIMARY), &w.solidBrush_);
+
+        if (st.setup) st.setup(w);
+        // Settle every spring at a fixed step, then hold animation time still so caret and pulse are fixed.
+        constexpr float kDt = 1.0f / 60.0f;
+        constexpr int kFrames = 150;
+        constexpr int kTimedFrom = 50;   // time only the settled frames
+        double drawSeconds = 0.0;
+        for (int frame = 0; frame < kFrames; ++frame) {
+            w.lastDt_ = kDt;
+            w.inlineAnimActive_ = false;
+            w.stepAnimations(kDt);
+            if (st.perFrame) st.perFrame(w);
+            w.animTimeSec_ = 10.0;
+            w.activeTooltips_.clear();
+            updateActivePalette(smoothStepEase(w.themeAnimT_));
+            LARGE_INTEGER t0{}, t1{};
+            QueryPerformanceCounter(&t0);
+            w.drawFrame(kSnapshotWidth, kSnapshotHeight);
+            QueryPerformanceCounter(&t1);
+            if (frame >= kTimedFrom && qpcFreq.QuadPart > 0) {
+                drawSeconds += static_cast<double>(t1.QuadPart - t0.QuadPart) / static_cast<double>(qpcFreq.QuadPart);
+            }
+        }
+        char line[96];
+        std::snprintf(line, sizeof(line), "%s %.3f ms\n", st.name, 1000.0 * drawSeconds / (kFrames - kTimedFrom));
+        timings += line;
+
+        WICRect rc{ 0, 0, static_cast<INT>(kSnapshotWidth), static_cast<INT>(kSnapshotHeight) };
+        IWICBitmapLock* lock = nullptr;
+        if (SUCCEEDED(bitmap->Lock(&rc, WICBitmapLockRead, &lock)) && lock) {
+            UINT stride = 0, size = 0;
+            BYTE* data = nullptr;
+            lock->GetStride(&stride);
+            lock->GetDataPointer(&size, &data);
+            std::wstring path = (std::filesystem::path(outDir) / (std::string(st.name) + ".bmp")).wstring();
+            if (data && writeBmp32(path, data, rc.Width, rc.Height, stride)) ++written;
+            lock->Release();
+        }
+        bitmap->Release();
+        network.injectViewerFrameForTest({}, 0, 0);
+    }
+    withDark(false);
+    wic->Release();
+    std::ofstream(std::filesystem::path(outDir) / "timings.txt", std::ios::trunc) << timings;
+    return written;
 }
 
 } // namespace cppdesk

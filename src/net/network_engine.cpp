@@ -3186,6 +3186,16 @@ bool NetworkEngine::copyLatestViewerFrame(
     return true;
 }
 
+void NetworkEngine::injectViewerFrameForTest(const std::vector<uint8_t>& bgra, int width, int height) {
+    std::lock_guard<std::mutex> lock(viewerFrameMutex_);
+    viewerCanvasBgra_ = bgra;
+    viewerCanvasW_ = width;
+    viewerCanvasH_ = height;
+    ++viewerFrameSeq_;
+    viewerFullCanvasDirty_ = true;
+    viewerDirtyBounds_ = RECT{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+}
+
 void NetworkEngine::markViewerCanvasFullDirty() {
     std::lock_guard<std::mutex> lock(viewerFrameMutex_);
     viewerFullCanvasDirty_ = true;

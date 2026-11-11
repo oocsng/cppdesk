@@ -153,6 +153,9 @@ public:
     ~CppDeskWindow();
 
     bool create(HINSTANCE hInstance = nullptr, int nCmdShow = 1);
+    // Renders every fixed UI state offscreen to <outDir>/<state>.bmp and returns how many were written.
+    // Used to check that UI refactors leave the pixels unchanged.
+    static int runUiSnapshots(IdentityManager& identity, NetworkEngine& network, const std::wstring& outDir);
     int messageLoop();
 
 private:
@@ -231,6 +234,10 @@ private:
                           const std::string& tooltip = "");
     void ensureAppIconBitmap();
     IDWriteTextFormat* formatFor(ui::FontRole font) const;
+    // Draws one complete frame into renderTarget_ (BeginDraw..EndDraw) and returns EndDraw's result.
+    HRESULT drawFrame(float width, float height);
+    // Milliseconds for UI timing; fixed while rendering snapshots.
+    uint64_t uiNowMs() const;
 
     // Two-Factor Authentication (TOTP) rendering
     void renderQrCodeDirect2D(
@@ -283,7 +290,11 @@ private:
 
     // Direct2D & DirectWrite resources
     ID2D1Factory*           d2dFactory_ = nullptr;
-    ID2D1HwndRenderTarget*  renderTarget_ = nullptr;
+    ID2D1RenderTarget*      renderTarget_ = nullptr;   // the window target, or an offscreen one for snapshots
+    ID2D1HwndRenderTarget*  hwndTarget_ = nullptr;     // same object as renderTarget_ when drawing to the window
+    bool                    snapshotMode_ = false;     // drawing offscreen at a fixed size, no window
+    static constexpr float  kSnapshotWidth = 1280.0f;
+    static constexpr float  kSnapshotHeight = 800.0f;
     ID2D1SolidColorBrush*   solidBrush_ = nullptr;
     ID2D1Bitmap*            remoteBitmap_ = nullptr;
     ID2D1Bitmap*            appIconBitmap_ = nullptr;

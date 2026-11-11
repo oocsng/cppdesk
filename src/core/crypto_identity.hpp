@@ -282,6 +282,8 @@ public:
     // Dynamic 6-character One-Time Session Password (in-memory only, regenerable anytime)
     const std::string& sessionCode() const { return sessionCode_; }
     std::string regenerateSessionCode();
+    // Sets the session code directly; used by the UI snapshot harness for repeatable output.
+    void setSessionCode(const std::string& code) { sessionCode_ = code; }
 
     // With boundSessionKey the client's digest must be bound to that key (see CryptoUtils::bindChallengeResponse);
     // without it the legacy unbound digest is expected.

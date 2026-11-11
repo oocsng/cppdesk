@@ -5,6 +5,9 @@
 #include "control/shortcut_manager.hpp"
 #include "net/updater.hpp"
 
+#include <filesystem>
+#include <fstream>
+
 #if defined(_WIN32)
 #include "control/windows_service_manager.hpp"
 #ifndef WIN32_LEAN_AND_MEAN
@@ -42,6 +45,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
     OleInitialize(nullptr);
 
     int instanceId = 1;
+    std::wstring uiSnapshotDir;
     bool headlessRelayOnly = false;
     uint16_t relayPort = cppdesk::DEFAULT_RELAY_PORT;
 
@@ -93,6 +97,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
                 try {
                     instanceId = std::stoi(argv[++i]);
                 } catch (...) {}
+            } else if (arg == L"--ui-snapshot" && i + 1 < argc) {
+                uiSnapshotDir = argv[++i];
             } else if (arg == L"--relay-server") {
                 headlessRelayOnly = true;
                 if (i + 1 < argc) {
@@ -107,6 +113,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
             }
         }
         LocalFree(argv);
+    }
+
+    if (!uiSnapshotDir.empty()) {
+        // Fixed identity so every run draws the same pixels: its own instance, a known desk ID and session code.
+        constexpr int kSnapshotInstance = 4243;
+        cppdesk::IdentityManager snapIdentity(kSnapshotInstance);
+        {
+            std::error_code ec;
+            std::filesystem::remove(snapIdentity.configFilePath(), ec);
+            std::ofstream cfg(snapIdentity.configFilePath(), std::ios::trunc);
+            cfg << "desk_id=482910375\n" << "totp_secret=JBSWY3DPEHPK3PXP\n";
+        }
+        snapIdentity.loadOrCreate();
+        snapIdentity.setSessionCode("k7m2qp");
+        cppdesk::NetworkEngine snapNetwork(snapIdentity);
+        int written = cppdesk::CppDeskWindow::runUiSnapshots(snapIdentity, snapNetwork, uiSnapshotDir);
+        std::error_code ec;
+        std::filesystem::remove(snapIdentity.configFilePath(), ec);
+        OleUninitialize();
+        return written > 0 ? 0 : 1;
     }
 
     if (headlessRelayOnly) {
