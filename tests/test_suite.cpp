@@ -44,8 +44,30 @@
 #include <chrono>
 #include <thread>
 #include <cassert>
+#include <functional>
+#include <random>
+#include <atomic>
+#include <new>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
+
+// Counts single allocations above 256 MB so the hostile-input sweep can see a parser that
+// would honor an attacker-supplied size (the oversized request itself is refused).
+namespace {
+std::atomic<int> g_oversizedAllocs{0};
+constexpr size_t kOversizedAlloc = 256u * 1024u * 1024u;
+}
+void* operator new(size_t size) {
+    if (size > kOversizedAlloc) {
+        ++g_oversizedAllocs;
+        throw std::bad_alloc();
+    }
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
 
 using namespace cppdesk;
 
@@ -7042,6 +7064,83 @@ void testUpdaterIntegrity() {
 #endif
 }
 
+void testDeserializersSurviveHostileInput() {
+    std::cout << "[TEST 60] Packet Deserializers Survive Hostile Input..." << std::endl;
+
+    using Target = std::function<void(const uint8_t*, size_t)>;
+#define FUZZ_TARGET(fn, T) Target([](const uint8_t* d, size_t n) { T out; (void)fn(d, n, out); })
+    std::vector<Target> targets = {
+        FUZZ_TARGET(deserializeSystemDiagnostics, SystemDiagnosticsPayload),
+        FUZZ_TARGET(deserializePerformanceHud, PerformanceHudPayload),
+        FUZZ_TARGET(deserializeChatMedia, ChatMediaPayload),
+        FUZZ_TARGET(deserializeRemoteRebootRequest, RemoteRebootRequestPayload),
+        FUZZ_TARGET(deserializeRemoteRebootConfirm, RemoteRebootConfirmPayload),
+        FUZZ_TARGET(deserializeRemoteRebootReconnect, RemoteRebootReconnectPayload),
+        FUZZ_TARGET(deserializeVirtualDisplayCmd, VirtualDisplayCmdPayload),
+        FUZZ_TARGET(deserializeVirtualDisplayStatus, VirtualDisplayStatusPayload),
+        FUZZ_TARGET(deserializePrivacyModeConfig, PrivacyModeConfigPayload),
+        FUZZ_TARGET(deserializeMonitorList, std::vector<MonitorDesc>),
+        FUZZ_TARGET(deserializeTotpVerify, TotpVerifyPacket),
+        FUZZ_TARGET(deserializeSyncScanReq, SyncScanReqPayload),
+        FUZZ_TARGET(deserializeSyncScanResp, SyncScanRespPayload),
+        FUZZ_TARGET(deserializeSyncHashReq, SyncHashReqPayload),
+        FUZZ_TARGET(deserializeSyncHashResp, SyncHashRespPayload),
+        FUZZ_TARGET(deserializeSyncDeltaBlock, SyncDeltaBlockPayload),
+        FUZZ_TARGET(deserializeSyncStatusUpdate, SyncStatusUpdatePayload),
+        FUZZ_TARGET(deserializeSyncActionReq, SyncActionReqPayload),
+        FUZZ_TARGET(deserializeSyncActionResp, SyncActionRespPayload),
+        FUZZ_TARGET(deserializeVersionUpgradeNotice, VersionUpgradeNoticePayload),
+        FUZZ_TARGET(deserializeScratchpadUpdate, ScratchpadUpdatePayload),
+        FUZZ_TARGET(deserializeCommandPaletteExec, CommandPaletteExecPayload),
+        FUZZ_TARGET(deserializeCommandPaletteOutput, CommandPaletteOutputPayload),
+        FUZZ_TARGET(deserializeProcessLaunchReq, ProcessLaunchReqPayload),
+        FUZZ_TARGET(deserializeProcessLaunchResp, ProcessLaunchRespPayload),
+        FUZZ_TARGET(deserializeFileBrowserListReq, FileBrowserListReqPayload),
+        FUZZ_TARGET(deserializeFileBrowserListResp, FileBrowserListRespPayload),
+        FUZZ_TARGET(deserializeFileBrowserActionReq, FileBrowserActionReqPayload),
+        FUZZ_TARGET(deserializeFileBrowserActionResp, FileBrowserActionRespPayload),
+        FUZZ_TARGET(deserializeFileBrowserDownloadReq, FileBrowserDownloadReqPayload),
+        Target([](const uint8_t* d, size_t n) {
+            uint32_t id = 0;
+            std::vector<VirtualFileEntry> files;
+            (void)deserializeClipboardFileList(d, n, id, files);
+        }),
+    };
+#undef FUZZ_TARGET
+
+    // Fixed seed keeps the sweep reproducible. A crash or hang here fails the whole run.
+    std::mt19937 rng(0xC0FFEE);
+    size_t inputs = 0;
+    g_oversizedAllocs = 0;
+    for (const Target& run : targets) {
+        // Empty and null input
+        run(nullptr, 0);
+        run(reinterpret_cast<const uint8_t*>(""), 0);
+
+        // Constant-filled buffers make every length/count field 0, 0xFF..FF or 0x80..80
+        for (uint8_t fill : { uint8_t(0x00), uint8_t(0xFF), uint8_t(0x80), uint8_t(0x7F) }) {
+            for (size_t n = 1; n <= 160; ++n) {
+                std::vector<uint8_t> buf(n, fill);
+                run(buf.data(), buf.size());
+                ++inputs;
+            }
+        }
+
+        // Random buffers of random length
+        for (int i = 0; i < 400; ++i) {
+            std::vector<uint8_t> buf(rng() % 256 + 1);
+            for (uint8_t& b : buf) b = static_cast<uint8_t>(rng());
+            run(buf.data(), buf.size());
+            ++inputs;
+        }
+    }
+
+    std::cout << "  (" << targets.size() << " deserializers, " << inputs << " hostile inputs)" << std::endl;
+    TEST_ASSERT(targets.size() == 31);
+    TEST_ASSERT(inputs > 20000);
+    TEST_ASSERT(g_oversizedAllocs == 0);
+}
+
 void testRemoteFileBrowserProtocol() {
     std::cout << "[TEST 58] Remote File Browser Protocol..." << std::endl;
 
@@ -7190,6 +7289,7 @@ int main() {
         testRemoteFileBrowserPaths(); std::cout << "Test 57 done\n" << std::flush;
         testRemoteFileBrowserProtocol(); std::cout << "Test 58 done\n" << std::flush;
         testUpdaterIntegrity(); std::cout << "Test 59 done\n" << std::flush;
+        testDeserializersSurviveHostileInput(); std::cout << "Test 60 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
