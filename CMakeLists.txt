@@ -34,6 +34,7 @@ set(CORE_SOURCES
     src/ui/notification_manager.cpp
     src/ui/ui_platform.cpp
     src/ui/recording_canvas.cpp
+    src/ui/app_ui.cpp
     src/ui/theme.cpp
 )
 

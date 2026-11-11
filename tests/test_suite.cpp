@@ -10,6 +10,8 @@
 #include "../src/net/relay_owner.hpp"
 #include "../src/core/win_compat.hpp"
 #include "../src/ui/recording_canvas.hpp"
+#include "../src/ui/app_ui.hpp"
+#include "../src/ui/platform_shell.hpp"
 #if defined(_WIN32)
 #include "../src/ui/canvas_d2d.hpp"
 #include <wincodec.h>
@@ -7864,6 +7866,110 @@ void testD2DCanvas() {
 }
 #endif
 
+// A PlatformShell for headless screen tests: no window, a fixed clock, and switchable capabilities.
+class FakeShell : public ui::PlatformShell {
+public:
+    bool service = true, elevation = true, shortcut = true, actionCenter = true, tray = true, notifications = true;
+
+    void invalidate() override {}
+    void setCursor(ui::CursorShape) override {}
+    float dpiScale() const override { return 1.0f; }
+    uint64_t nowMs() const override { return 10000; }
+    void setTextInputActive(bool) override {}
+    std::optional<std::string> chooseOpenFile(const std::string&, const std::string&, const std::string&) override { return std::nullopt; }
+    std::optional<std::string> chooseFolder(const std::string&) override { return std::nullopt; }
+    void openUrl(const std::string&) override {}
+    void revealPath(const std::string&) override {}
+    void relaunchApp() override {}
+    void showNotification(const std::string&, const std::string&) override {}
+    void setTrayStatus(const std::string&) override {}
+    void setFrameIntervalMs(unsigned) override {}
+    bool setFullscreen(bool) override { return true; }
+    void setDarkTitleBar(bool) override {}
+    void quitApp() override {}
+    bool relaunchElevated() override { return false; }
+    void playAlertSound() override {}
+    void setMouseCapture(bool) override {}
+    bool isKeyDown(uint16_t) const override { return false; }
+    void trackMouseLeave() override {}
+    bool loadAppIcon(std::vector<uint8_t>&, int&, int&) override { return false; }
+    void checkForUpdates(bool) override {}
+    void startUpdateDownload(const std::string&, uint64_t, const std::string&,
+                             std::function<void(bool, const std::string&)>) override {}
+    ui::ServiceState serviceState() const override { return ui::ServiceState::NotInstalled; }
+    bool runServiceAction(ui::ServiceAction) override { return false; }
+    bool has(ui::Capability c) const override {
+        switch (c) {
+            case ui::Capability::WindowsService: return service;
+            case ui::Capability::Elevation: return elevation;
+            case ui::Capability::DesktopShortcut: return shortcut;
+            case ui::Capability::ActionCenterToasts: return actionCenter;
+            case ui::Capability::TrayIcon: return tray;
+            case ui::Capability::NativeNotifications: return notifications;
+        }
+        return false;
+    }
+};
+
+// Renders one snapshot state into a recording canvas and returns the serialized draw calls.
+std::string renderAppState(IdentityManager& id, NetworkEngine& net, ui::PlatformShell& shell, const std::string& state) {
+    AppUi app(id, net, shell, "");
+    ui::RecordingCanvas rc;
+    app.applySnapshotState(state);
+    for (int i = 0; i < 60; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);
+    return rc.serialize();
+}
+
+void testShellCapabilityGating() {
+    std::cout << "[TEST 69] Windows-only controls hide when the shell lacks the capability..." << std::endl;
+    IdentityManager id(4244);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+
+    FakeShell all;
+    std::string sysAll = renderAppState(id, net, all, "settings_system");
+    std::string dashAll = renderAppState(id, net, all, "dashboard_light");
+    TEST_ASSERT(sysAll.find("|Uninstall") != std::string::npos);
+    TEST_ASSERT(sysAll.find("WINDOWS SYSTEM SERVICE") != std::string::npos);
+    TEST_ASSERT(sysAll.find("Windows Action Center push toasts") != std::string::npos);
+
+    FakeShell none;
+    none.service = none.elevation = none.shortcut = none.actionCenter = none.tray = false;
+    std::string sysNone = renderAppState(id, net, none, "settings_system");
+    std::string dashNone = renderAppState(id, net, none, "dashboard_light");
+    TEST_ASSERT(sysNone.find("|Uninstall") == std::string::npos);
+    TEST_ASSERT(sysNone.find("WINDOWS SYSTEM SERVICE") == std::string::npos);
+    TEST_ASSERT(sysNone.find("Windows Action Center push toasts") == std::string::npos);
+    TEST_ASSERT(sysNone.find("Minimize window to system tray") == std::string::npos);
+    TEST_ASSERT(dashNone.find("|Elevate Admin") == std::string::npos);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
+void testAppUiRendersEveryScreenHeadless() {
+    std::cout << "[TEST 70] Every screen renders headless through AppUi..." << std::endl;
+    IdentityManager id(4245);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    FakeShell shell;
+    auto names = AppUi::snapshotStateNames();
+    TEST_ASSERT(names.size() >= 26);
+    for (const auto& name : names) {
+        AppUi app(id, net, shell, "");
+        ui::RecordingCanvas rc;
+        app.applySnapshotState(name);
+        app.render(rc, 1280, 800, 0.0);
+        TEST_ASSERT(rc.frameBalanced());
+        TEST_ASSERT(rc.ops().size() > 20);
+    }
+    std::string approval = renderAppState(id, net, shell, "modal_approval");
+    TEST_ASSERT(approval.find("|Connection Request") != std::string::npos);
+    std::string dash = renderAppState(id, net, shell, "dashboard_light");
+    TEST_ASSERT(dash.find("|" + CryptoUtils::formatDeskId(id.deskId())) != std::string::npos);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
 } // namespace
 
 int main() {
@@ -7949,6 +8055,8 @@ int main() {
         testRelayDeskOwnership(); std::cout << "Test 65 done\n" << std::flush;
         testCanvasTypes(); std::cout << "Test 66 done\n" << std::flush;
         testRecordingCanvas(); std::cout << "Test 67 done\n" << std::flush;
+        testShellCapabilityGating(); std::cout << "Test 69 done\n" << std::flush;
+        testAppUiRendersEveryScreenHeadless(); std::cout << "Test 70 done\n" << std::flush;
 #if defined(_WIN32)
         testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;
 #endif
