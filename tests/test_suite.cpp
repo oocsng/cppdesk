@@ -5976,7 +5976,12 @@ void testNovelBreakthroughPowerFeatures() {
         // Synchronous non-blocking piped execution verification
         int32_t exitCode = -1;
         std::string syncOutput;
-        bool execOk = CommandPaletteManager::executeSync("cmd.exe /c echo CPPDESK_OMNIBAR_VERIFIED", exitCode, syncOutput, 5000);
+#if defined(_WIN32)
+        const char* echoCommand = "cmd.exe /c echo CPPDESK_OMNIBAR_VERIFIED";
+#else
+        const char* echoCommand = "echo CPPDESK_OMNIBAR_VERIFIED";
+#endif
+        bool execOk = CommandPaletteManager::executeSync(echoCommand, exitCode, syncOutput, 5000);
         TEST_ASSERT(execOk);
         TEST_ASSERT(exitCode == 0);
         TEST_ASSERT(syncOutput.find("CPPDESK_OMNIBAR_VERIFIED") != std::string::npos);
