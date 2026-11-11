@@ -52,8 +52,9 @@ public:
 
     void drawText(std::string_view utf8, Rect r, FontRole font, Color c, HAlign h, VAlign v) override;
     float measureTextWidth(std::string_view utf8, FontRole font) override;
+    Point measureTextBlock(std::string_view utf8, FontRole font, float maxWidth) override;
 
-    ImageId createImage(int width, int height) override;
+    ImageId createImage(int width, int height, bool opaque = false) override;
     void updateImage(ImageId id, const uint8_t* bgra, int pitch, Rect dirty) override;
     void drawImage(ImageId id, Rect dst, float opacity) override;
     void destroyImage(ImageId id) override;

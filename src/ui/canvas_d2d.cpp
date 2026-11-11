@@ -256,11 +256,27 @@ float D2DCanvas::measureTextWidth(std::string_view utf8, FontRole font) {
     return m.widthIncludingTrailingWhitespace;
 }
 
-ImageId D2DCanvas::createImage(int width, int height) {
+Point D2DCanvas::measureTextBlock(std::string_view utf8, FontRole font, float maxWidth) {
+    IDWriteTextFormat* fmt = format(font);
+    if (!dwrite_ || !fmt || utf8.empty()) return Point{};
+    std::wstring w = widen(utf8);
+    IDWriteTextLayout* layout = nullptr;
+    if (FAILED(dwrite_->CreateTextLayout(w.c_str(), static_cast<UINT32>(w.size()), fmt, maxWidth, 1000.0f, &layout)) ||
+        !layout) {
+        return Point{};
+    }
+    DWRITE_TEXT_METRICS m{};
+    layout->GetMetrics(&m);
+    layout->Release();
+    return Point{ m.width, m.height };
+}
+
+ImageId D2DCanvas::createImage(int width, int height, bool opaque) {
     if (!rt_ || width <= 0 || height <= 0) return {};
     ImageEntry e;
     D2D1_BITMAP_PROPERTIES props =
-        D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                                 opaque ? D2D1_ALPHA_MODE_IGNORE : D2D1_ALPHA_MODE_PREMULTIPLIED));
     if (FAILED(rt_->CreateBitmap(D2D1::SizeU(width, height), props, &e.bitmap)) || !e.bitmap) return {};
     e.width = width;
     e.height = height;

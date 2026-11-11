@@ -24,6 +24,9 @@
 #include <memory>
 
 #include "canvas.hpp"
+#if defined(_WIN32)
+#include "canvas_d2d.hpp"
+#endif
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -234,6 +237,8 @@ private:
                           const std::string& tooltip = "");
     void ensureAppIconBitmap();
     IDWriteTextFormat* formatFor(ui::FontRole font) const;
+    // Destroys the canvas image (if any) and clears the handle.
+    void releaseImage(ui::ImageId& id);
     // Draws one complete frame into renderTarget_ (BeginDraw..EndDraw) and returns EndDraw's result.
     HRESULT drawFrame(float width, float height);
     // Milliseconds for UI timing; fixed while rendering snapshots.
@@ -295,10 +300,11 @@ private:
     bool                    snapshotMode_ = false;     // drawing offscreen at a fixed size, no window
     static constexpr float  kSnapshotWidth = 1280.0f;
     static constexpr float  kSnapshotHeight = 800.0f;
-    ID2D1SolidColorBrush*   solidBrush_ = nullptr;
-    ID2D1Bitmap*            remoteBitmap_ = nullptr;
-    ID2D1Bitmap*            appIconBitmap_ = nullptr;
-    ID2D1PathGeometry*      geoUnitStar_ = nullptr;
+    ui::ImageId            remoteBitmap_{};
+    ui::ImageId            appIconBitmap_{};
+    ui::Path                unitStar_;                 // unit-radius star, drawn scaled
+    std::unique_ptr<ui::D2DCanvas> canvas_;            // every screen draws through this
+    ui::Color               brushColor_{};             // color for the next raw shape call
     int                     bitmapW_ = 0;
     int                     bitmapH_ = 0;
 
@@ -540,7 +546,7 @@ private:
     float                                   recordingPlayerModalAnimT_ = 0.0f;
     float                                   recordingPlayerModalAnimVel_ = 0.0f;
     std::unique_ptr<SessionRecordingPlayer> recordingPlayer_;
-    ID2D1Bitmap*                            recordingPlayerBitmap_ = nullptr;
+    ui::ImageId                            recordingPlayerBitmap_{};
     int                                     recordingPlayerBitmapW_ = 0;
     int                                     recordingPlayerBitmapH_ = 0;
     bool                                    draggingPlayerScrubber_ = false;

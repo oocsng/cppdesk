@@ -125,9 +125,17 @@ float RecordingCanvas::measureTextWidth(std::string_view utf8, FontRole font) {
     return advance * static_cast<float>(codePoints);
 }
 
-ImageId RecordingCanvas::createImage(int width, int height) {
+Point RecordingCanvas::measureTextBlock(std::string_view utf8, FontRole font, float maxWidth) {
+    float w = measureTextWidth(utf8, font);
+    if (maxWidth <= 0.0f || w <= maxWidth) return Point{ w, utf8.empty() ? 0.0f : 16.0f };
+    float lines = std::ceil(w / maxWidth);
+    return Point{ maxWidth, lines * 16.0f };
+}
+
+ImageId RecordingCanvas::createImage(int width, int height, bool opaque) {
     ImageId id{ nextImage_++ };
-    record("createImage " + std::to_string(id.value) + " " + std::to_string(width) + "x" + std::to_string(height));
+    record("createImage " + std::to_string(id.value) + " " + std::to_string(width) + "x" + std::to_string(height) +
+           (opaque ? " opaque" : ""));
     return id;
 }
 

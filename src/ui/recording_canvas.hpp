@@ -27,8 +27,10 @@ public:
     void drawText(std::string_view utf8, Rect r, FontRole font, Color c, HAlign h, VAlign v) override;
     // Deterministic stand-in: a fixed advance per code point, scaled by the font role.
     float measureTextWidth(std::string_view utf8, FontRole font) override;
+    // Deterministic stand-in: wraps the fixed-advance width into lines 16 DIPs tall.
+    Point measureTextBlock(std::string_view utf8, FontRole font, float maxWidth) override;
 
-    ImageId createImage(int width, int height) override;
+    ImageId createImage(int width, int height, bool opaque = false) override;
     void updateImage(ImageId id, const uint8_t* bgra, int pitch, Rect dirty) override;
     void drawImage(ImageId id, Rect dst, float opacity) override;
     void destroyImage(ImageId id) override;

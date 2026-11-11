@@ -140,10 +140,7 @@ void CppDeskWindow::hardResetViewerUiState() {
     frameBufferH_ = 0;
     displayedFrameSeq_ = 0;
 
-    if (remoteBitmap_) {
-        remoteBitmap_->Release();
-        remoteBitmap_ = nullptr;
-    }
+    releaseImage(remoteBitmap_);
     bitmapW_ = 0;
     bitmapH_ = 0;
 
@@ -363,40 +360,31 @@ bool CppDeskWindow::initGraphics() {
         fmtTooltip_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
     }
 
-    // Pre-cache unit star geometry for zero-allocation UI rendering
-    if (d2dFactory_) {
-        ID2D1PathGeometry* star = nullptr;
-        if (SUCCEEDED(d2dFactory_->CreatePathGeometry(&star)) && star) {
-            ID2D1GeometrySink* sink = nullptr;
-            if (SUCCEEDED(star->Open(&sink)) && sink) {
-                constexpr float PI = 3.14159265f;
-                float innerR = 0.42f;
-                D2D1_POINT_2F pts[10];
-                for (int i = 0; i < 10; ++i) {
-                    float angle = -PI * 0.5f + i * (PI / 5.0f);
-                    float r = (i % 2 == 0) ? 1.0f : innerR;
-                    pts[i] = D2D1::Point2F(r * std::cos(angle), r * std::sin(angle));
-                }
-                sink->BeginFigure(pts[0], D2D1_FIGURE_BEGIN_FILLED);
-                sink->AddLines(&pts[1], 9);
-                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-                sink->Close();
-                sink->Release();
-                geoUnitStar_ = star;
-            } else {
-                star->Release();
-            }
+    // Unit star (outer radius 1), scaled and translated when drawn.
+    {
+        constexpr float PI = 3.14159265f;
+        constexpr float innerR = 0.42f;
+        unitStar_ = ui::Path{};
+        for (int i = 0; i < 10; ++i) {
+            float angle = -PI * 0.5f + i * (PI / 5.0f);
+            float r = (i % 2 == 0) ? 1.0f : innerR;
+            if (i == 0) unitStar_.moveTo(r * std::cos(angle), r * std::sin(angle));
+            else unitStar_.lineTo(r * std::cos(angle), r * std::sin(angle));
         }
+        unitStar_.close();
     }
+
+    canvas_ = std::make_unique<ui::D2DCanvas>(d2dFactory_, dwriteFactory_);
 
     return true;
 }
 
 void CppDeskWindow::discardDeviceResources() {
-    if (appIconBitmap_) { appIconBitmap_->Release(); appIconBitmap_ = nullptr; }
-    if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; }
-    if (recordingPlayerBitmap_) { recordingPlayerBitmap_->Release(); recordingPlayerBitmap_ = nullptr; }
-    if (solidBrush_) { solidBrush_->Release(); solidBrush_ = nullptr; }
+    // Detaching drops every canvas image, so the handles are simply cleared.
+    if (canvas_) canvas_->detach();
+    appIconBitmap_ = {};
+    remoteBitmap_ = {};
+    recordingPlayerBitmap_ = {};
     if (renderTarget_) { renderTarget_->Release(); renderTarget_ = nullptr; }
     hwndTarget_ = nullptr;
     bitmapW_ = 0;
@@ -407,7 +395,6 @@ void CppDeskWindow::discardDeviceResources() {
 
 void CppDeskWindow::releaseGraphics() {
     discardDeviceResources();
-    if (geoUnitStar_) { geoUnitStar_->Release(); geoUnitStar_ = nullptr; }
     if (fmtHeroId_) { fmtHeroId_->Release(); fmtHeroId_ = nullptr; }
     if (fmtHeading_) { fmtHeading_->Release(); fmtHeading_ = nullptr; }
     if (fmtSubheading_) { fmtSubheading_->Release(); fmtSubheading_ = nullptr; }
@@ -421,7 +408,7 @@ void CppDeskWindow::releaseGraphics() {
 }
 
 void CppDeskWindow::ensureAppIconBitmap() {
-    if (appIconBitmap_ || !renderTarget_) return;
+    if (appIconBitmap_.valid() || !canvas_ || !renderTarget_) return;
 
     TileCodec::initGdiPlus();
 
@@ -488,16 +475,9 @@ void CppDeskWindow::ensureAppIconBitmap() {
         Gdiplus::Rect lockRect(0, 0, w, h);
         Gdiplus::BitmapData bdata;
         if (gdiBmp->LockBits(&lockRect, Gdiplus::ImageLockModeRead, PixelFormat32bppPARGB, &bdata) == Gdiplus::Ok) {
-            D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)
-            );
-            renderTarget_->CreateBitmap(
-                D2D1::SizeU(w, h),
-                bdata.Scan0,
-                bdata.Stride,
-                &props,
-                &appIconBitmap_
-            );
+            appIconBitmap_ = canvas_->createImage(static_cast<int>(w), static_cast<int>(h));
+            canvas_->updateImage(appIconBitmap_, static_cast<const uint8_t*>(bdata.Scan0), bdata.Stride,
+                                 ui::Rect{0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h)});
             gdiBmp->UnlockBits(&bdata);
         }
     }
@@ -1236,7 +1216,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 // ---------------- Primitive Drawing, Vector Icons & macOS Surface Helpers ----------------
 
 void CppDeskWindow::drawCardShadow(const UiRect& r, float radius, float intensity) {
-    if (!renderTarget_ || !solidBrush_ || intensity <= 0.01f) return;
+    if (!canvas_ || intensity <= 0.01f) return;
     float shadowScale = 1.0f + 2.4f * std::clamp(themeAnimT_, 0.0f, 1.0f);
     fillRoundRect(r.offset(0.0f, 5.0f).inflate(2.5f, 2.5f), radius + 2.5f, rgba(38, 30, 20, 0.022f * shadowScale * intensity));
     fillRoundRect(r.offset(0.0f, 2.5f).inflate(1.0f, 1.0f), radius + 1.0f, rgba(38, 30, 20, 0.032f * shadowScale * intensity));
@@ -1254,121 +1234,86 @@ void CppDeskWindow::drawCardSurface(const UiRect& r, float radius, float alpha, 
 }
 
 void CppDeskWindow::drawPulseDot(float cx, float cy, float baseRadius, ui::Color color, float alpha) {
-    if (!renderTarget_ || !solidBrush_ || alpha <= 0.01f) return;
+    if (!canvas_ || alpha <= 0.01f) return;
     float wave = 0.5f + 0.5f * std::sin(animTimeSec_ * 2.8f);
     float haloRadius = baseRadius + 1.2f + 3.0f * wave;
     float haloAlpha = (0.24f - 0.16f * wave) * alpha;
 
     // Dual-ring breathing glow
-    solidBrush_->SetColor(toD2D(withAlpha(color, haloAlpha * 0.5f)));
-    renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), haloRadius + 2.0f, haloRadius + 2.0f), solidBrush_);
+    brushColor_ = withAlpha(color, haloAlpha * 0.5f);
+    canvas_->fillEllipse((ui::Point{cx, cy}).x, (ui::Point{cx, cy}).y, haloRadius + 2.0f, haloRadius + 2.0f, brushColor_);
 
-    solidBrush_->SetColor(toD2D(withAlpha(color, haloAlpha)));
-    renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), haloRadius, haloRadius), solidBrush_);
+    brushColor_ = withAlpha(color, haloAlpha);
+    canvas_->fillEllipse((ui::Point{cx, cy}).x, (ui::Point{cx, cy}).y, haloRadius, haloRadius, brushColor_);
 
-    solidBrush_->SetColor(toD2D(withAlpha(color, alpha)));
-    renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), baseRadius, baseRadius), solidBrush_);
+    brushColor_ = withAlpha(color, alpha);
+    canvas_->fillEllipse((ui::Point{cx, cy}).x, (ui::Point{cx, cy}).y, baseRadius, baseRadius, brushColor_);
 }
 
 void CppDeskWindow::drawSparkline(const UiRect& r, const float* values, size_t count, float maxVal, ui::Color color, float alpha) {
-    if (!renderTarget_ || !solidBrush_ || count < 2 || maxVal <= 0.001f) return;
+    if (!canvas_ || count < 2 || maxVal <= 0.001f) return;
     fillRoundRect(r, 4.0f, withAlpha(COL_BG_SUBTLE, alpha * 0.85f));
     strokeRoundRect(r, 4.0f, withAlpha(COL_BORDER, alpha * 0.85f), 1.0f);
 
-    solidBrush_->SetColor(toD2D(withAlpha(color, alpha)));
+    brushColor_ = withAlpha(color, alpha);
     float stepX = (r.width() - 6.0f) / static_cast<float>(count - 1);
     float innerH = r.height() - 6.0f;
 
     for (size_t i = 0; i + 1 < count; ++i) {
         float n0 = std::clamp(values[i] / maxVal, 0.0f, 1.0f);
         float n1 = std::clamp(values[i + 1] / maxVal, 0.0f, 1.0f);
-        D2D1_POINT_2F p0 = D2D1::Point2F(r.left + 3.0f + i * stepX, r.bottom - 3.0f - n0 * innerH);
-        D2D1_POINT_2F p1 = D2D1::Point2F(r.left + 3.0f + (i + 1) * stepX, r.bottom - 3.0f - n1 * innerH);
-        renderTarget_->DrawLine(p0, p1, solidBrush_, 1.5f);
+        ui::Point p0 = ui::Point{r.left + 3.0f + i * stepX, r.bottom - 3.0f - n0 * innerH};
+        ui::Point p1 = ui::Point{r.left + 3.0f + (i + 1) * stepX, r.bottom - 3.0f - n1 * innerH};
+        canvas_->drawLine((p0).x, (p0).y, (p1).x, (p1).y, brushColor_, 1.5f);
     }
 }
 
 void CppDeskWindow::drawIconStar(float cx, float cy, float radius, bool filled, ui::Color color) {
-    if (!renderTarget_ || !solidBrush_) return;
-
-    if (geoUnitStar_) {
-        D2D1_MATRIX_3X2_F oldXform;
-        renderTarget_->GetTransform(&oldXform);
-        D2D1_MATRIX_3X2_F starXform = D2D1::Matrix3x2F::Scale(radius, radius) *
-                                      D2D1::Matrix3x2F::Translation(cx, cy) *
-                                      oldXform;
-        renderTarget_->SetTransform(starXform);
-
-        solidBrush_->SetColor(toD2D(color));
-        if (filled) {
-            renderTarget_->FillGeometry(geoUnitStar_, solidBrush_);
-        }
-        float strokeThick = (radius > 0.001f) ? (1.3f / radius) : 1.3f;
-        renderTarget_->DrawGeometry(geoUnitStar_, solidBrush_, strokeThick);
-        renderTarget_->SetTransform(oldXform);
-        return;
+    if (!canvas_) return;
+    ui::Transform2D oldXform = canvas_->transform();
+    canvas_->setTransform(ui::Transform2D::scale(radius, radius, 0.0f, 0.0f) *
+                          ui::Transform2D::translation(cx, cy) *
+                          oldXform);
+    if (filled) {
+        canvas_->fillPath(unitStar_, color);
     }
-
-    if (!d2dFactory_) return;
-    ID2D1PathGeometry* geo = nullptr;
-    if (FAILED(d2dFactory_->CreatePathGeometry(&geo)) || !geo) return;
-
-    ID2D1GeometrySink* sink = nullptr;
-    if (SUCCEEDED(geo->Open(&sink)) && sink) {
-        constexpr float PI = 3.14159265f;
-        float innerR = radius * 0.42f;
-        D2D1_POINT_2F pts[10];
-        for (int i = 0; i < 10; ++i) {
-            float angle = -PI * 0.5f + i * (PI / 5.0f);
-            float r = (i % 2 == 0) ? radius : innerR;
-            pts[i] = D2D1::Point2F(cx + r * std::cos(angle), cy + r * std::sin(angle));
-        }
-        sink->BeginFigure(pts[0], filled ? D2D1_FIGURE_BEGIN_FILLED : D2D1_FIGURE_BEGIN_HOLLOW);
-        sink->AddLines(&pts[1], 9);
-        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-        sink->Close();
-        sink->Release();
-
-        solidBrush_->SetColor(toD2D(color));
-        if (filled) {
-            renderTarget_->FillGeometry(geo, solidBrush_);
-        }
-        renderTarget_->DrawGeometry(geo, solidBrush_, 1.3f);
-    }
-    geo->Release();
+    float strokeThick = (radius > 0.001f) ? (1.3f / radius) : 1.3f;
+    canvas_->strokePath(unitStar_, color, strokeThick);
+    canvas_->setTransform(oldXform);
 }
 
 void CppDeskWindow::drawIconClose(float cx, float cy, float halfSize, ui::Color color, float strokeWidth) {
-    if (!renderTarget_ || !solidBrush_) return;
-    solidBrush_->SetColor(toD2D(color));
-    renderTarget_->DrawLine(D2D1::Point2F(cx - halfSize, cy - halfSize), D2D1::Point2F(cx + halfSize, cy + halfSize), solidBrush_, strokeWidth);
-    renderTarget_->DrawLine(D2D1::Point2F(cx + halfSize, cy - halfSize), D2D1::Point2F(cx - halfSize, cy + halfSize), solidBrush_, strokeWidth);
+    if (!canvas_) return;
+    brushColor_ = color;
+    canvas_->drawLine((ui::Point{cx - halfSize, cy - halfSize}).x, (ui::Point{cx - halfSize, cy - halfSize}).y, (ui::Point{cx + halfSize, cy + halfSize}).x, (ui::Point{cx + halfSize, cy + halfSize}).y, brushColor_, strokeWidth);
+    canvas_->drawLine((ui::Point{cx + halfSize, cy - halfSize}).x, (ui::Point{cx + halfSize, cy - halfSize}).y, (ui::Point{cx - halfSize, cy + halfSize}).x, (ui::Point{cx - halfSize, cy + halfSize}).y, brushColor_, strokeWidth);
 }
 
 void CppDeskWindow::drawIconTheme(float cx, float cy, float radius, bool isDark, ui::Color color) {
-    if (!renderTarget_ || !solidBrush_) return;
-    solidBrush_->SetColor(toD2D(color));
+    if (!canvas_) return;
+    brushColor_ = color;
     if (!isDark) {
         // Sun icon (circle + 8 rays)
         float coreR = radius * 0.52f;
-        renderTarget_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), coreR, coreR), solidBrush_, 1.5f);
+        canvas_->strokeEllipse((ui::Point{cx, cy}).x, (ui::Point{cx, cy}).y, coreR, coreR, brushColor_, 1.5f);
         constexpr float PI = 3.14159265f;
         for (int i = 0; i < 8; ++i) {
             float a = i * (PI * 0.25f);
             float r0 = radius * 0.74f;
             float r1 = radius * 1.02f;
-            renderTarget_->DrawLine(
-                D2D1::Point2F(cx + r0 * std::cos(a), cy + r0 * std::sin(a)),
-                D2D1::Point2F(cx + r1 * std::cos(a), cy + r1 * std::sin(a)),
-                solidBrush_, 1.4f
-            );
+            canvas_->drawLine((ui::Point{cx + r0 * std::cos(a), cy + r0 * std::sin(a)}).x, (ui::Point{cx + r0 * std::cos(a), cy + r0 * std::sin(a)}).y, (ui::Point{cx + r1 * std::cos(a), cy + r1 * std::sin(a)}).x, (ui::Point{cx + r1 * std::cos(a), cy + r1 * std::sin(a)}).y, brushColor_, 1.4f);
         }
     } else {
         // Crescent indicator (outer ring + inner offset circle)
-        renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), radius * 0.78f, radius * 0.78f), solidBrush_);
-        solidBrush_->SetColor(toD2D(COL_SEC_BTN_BG));
-        renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx + radius * 0.32f, cy - radius * 0.24f), radius * 0.62f, radius * 0.62f), solidBrush_);
+        canvas_->fillEllipse((ui::Point{cx, cy}).x, (ui::Point{cx, cy}).y, radius * 0.78f, radius * 0.78f, brushColor_);
+        brushColor_ = COL_SEC_BTN_BG;
+        canvas_->fillEllipse((ui::Point{cx + radius * 0.32f, cy - radius * 0.24f}).x, (ui::Point{cx + radius * 0.32f, cy - radius * 0.24f}).y, radius * 0.62f, radius * 0.62f, brushColor_);
     }
+}
+
+void CppDeskWindow::releaseImage(ui::ImageId& id) {
+    if (id.valid() && canvas_) canvas_->destroyImage(id);
+    id = {};
 }
 
 IDWriteTextFormat* CppDeskWindow::formatFor(ui::FontRole font) const {
@@ -1386,17 +1331,11 @@ IDWriteTextFormat* CppDeskWindow::formatFor(ui::FontRole font) const {
 }
 
 void CppDeskWindow::fillRoundRect(const UiRect& r, float radius, ui::Color color) {
-    if (!renderTarget_ || !solidBrush_) return;
-    solidBrush_->SetColor(toD2D(color));
-    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(r.left, r.top, r.right, r.bottom), radius, radius);
-    renderTarget_->FillRoundedRectangle(rr, solidBrush_);
+    if (canvas_) canvas_->fillRoundRect(r, radius, color);
 }
 
 void CppDeskWindow::strokeRoundRect(const UiRect& r, float radius, ui::Color color, float strokeWidth) {
-    if (!renderTarget_ || !solidBrush_) return;
-    solidBrush_->SetColor(toD2D(color));
-    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(r.left, r.top, r.right, r.bottom), radius, radius);
-    renderTarget_->DrawRoundedRectangle(rr, solidBrush_, strokeWidth);
+    if (canvas_) canvas_->strokeRoundRect(r, radius, color, strokeWidth);
 }
 
 void CppDeskWindow::drawText(
@@ -1407,27 +1346,7 @@ void CppDeskWindow::drawText(
     ui::HAlign hAlign,
     ui::VAlign vAlign)
 {
-    IDWriteTextFormat* fmt = formatFor(font);
-    if (!renderTarget_ || !solidBrush_ || !fmt || utf8.empty()) return;
-    fmt->SetTextAlignment(hAlign == ui::HAlign::Center ? DWRITE_TEXT_ALIGNMENT_CENTER
-                          : hAlign == ui::HAlign::Trailing ? DWRITE_TEXT_ALIGNMENT_TRAILING
-                          : DWRITE_TEXT_ALIGNMENT_LEADING);
-    fmt->SetParagraphAlignment(vAlign == ui::VAlign::Top ? DWRITE_PARAGRAPH_ALIGNMENT_NEAR
-                               : vAlign == ui::VAlign::Bottom ? DWRITE_PARAGRAPH_ALIGNMENT_FAR
-                               : DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    solidBrush_->SetColor(toD2D(color));
-    D2D1_RECT_F dr = D2D1::RectF(r.left, r.top, r.right, r.bottom);
-
-    if (utf8.size() < 512) {
-        wchar_t stackWide[512];
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), stackWide, 512);
-        if (wlen > 0) {
-            renderTarget_->DrawText(stackWide, static_cast<UINT32>(wlen), fmt, dr, solidBrush_, D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        }
-    } else {
-        std::wstring w = utf8ToWide(utf8);
-        renderTarget_->DrawText(w.c_str(), static_cast<UINT32>(w.size()), fmt, dr, solidBrush_, D2D1_DRAW_TEXT_OPTIONS_CLIP);
-    }
+    if (canvas_) canvas_->drawText(utf8, r, font, color, hAlign, vAlign);
 }
 
 void CppDeskWindow::drawButton(
@@ -1477,7 +1396,7 @@ void CppDeskWindow::drawButton(
     }
 
     // Tactile click feedback with 100% curved geometry (zero straight-edge clipping artifacts)
-    if (anim.rippleT < 1.0f && renderTarget_ && solidBrush_) {
+    if (anim.rippleT < 1.0f && canvas_) {
         float fade = 1.0f - anim.rippleT;
         if (bgColor.a <= 0.01f) {
             // Transparent segmented tabs (e.g. tab_dash, tab_settings, tab_session):
@@ -1742,7 +1661,7 @@ void CppDeskWindow::onPaint() {
             return;
         }
         renderTarget_ = hwndTarget_;
-        renderTarget_->CreateSolidColorBrush(toD2D(COL_TEXT_PRIMARY), &solidBrush_);
+        if (canvas_) canvas_->attach(renderTarget_, 1.0f);
     }
 
     HRESULT hr = drawFrame(width, height);
@@ -1756,8 +1675,7 @@ void CppDeskWindow::onPaint() {
 
 HRESULT CppDeskWindow::drawFrame(float width, float height) {
     clickRegions_.clear();
-    renderTarget_->BeginDraw();
-    renderTarget_->Clear(toD2D(COL_BG_MAIN));
+    canvas_->beginFrame(width, height, COL_BG_MAIN);
 
     float topOffset = 0.0f;
     if (!isFullscreen_) {
@@ -1774,11 +1692,8 @@ HRESULT CppDeskWindow::drawFrame(float width, float height) {
     float enterAlpha = std::clamp(0.30f + 0.70f * smoothStepEase(tabEnterStaggerT_), 0.0f, 1.0f);
 
     if (std::fabs(slideX) > 0.15f || std::fabs(viewScale - 1.0f) > 0.001f) {
-        D2D1_POINT_2F center = D2D1::Point2F(contentBounds.centerX(), contentBounds.centerY());
-        renderTarget_->SetTransform(
-            D2D1::Matrix3x2F::Scale(viewScale, viewScale, center) *
-            D2D1::Matrix3x2F::Translation(slideX, 0.0f)
-        );
+        ui::Point center = ui::Point{contentBounds.centerX(), contentBounds.centerY()};
+        canvas_->setTransform(ui::Transform2D::scale(viewScale, viewScale, (center).x, (center).y) * ui::Transform2D::translation(slideX, 0.0f));
     }
 
     if (activeTab_ == ActiveTab::Dashboard) {
@@ -1789,7 +1704,7 @@ HRESULT CppDeskWindow::drawFrame(float width, float height) {
         drawSettingsView(contentBounds, enterAlpha);
     }
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 
     // Floating macOS Side Sheet Drawer
     if (drawerAnimT_ > 0.004f) {
@@ -1902,39 +1817,20 @@ HRESULT CppDeskWindow::drawFrame(float width, float height) {
     hoveredIsTextInput_ = newIsText;
 
     // Floating Settings Hover Tooltip (Acrylic Glassmorphic Card)
-    if (activeTab_ == ActiveTab::Settings && tooltipAnimT_ > 0.005f && !activeTooltipText_.empty() && dwriteFactory_ && fmtTooltip_ && renderTarget_ && solidBrush_) {
+    if (activeTab_ == ActiveTab::Settings && tooltipAnimT_ > 0.005f && !activeTooltipText_.empty() && canvas_) {
         float alpha = std::clamp(tooltipAnimT_, 0.0f, 1.0f);
-        std::wstring wText = utf8ToWide(activeTooltipText_);
 
         float maxCardW = std::min(320.0f, width - 32.0f);
         float maxTextW = std::max(40.0f, maxCardW - 24.0f);
 
-        IDWriteTextLayout* textLayout = nullptr;
-        HRESULT hrLayout = dwriteFactory_->CreateTextLayout(
-            wText.c_str(),
-            static_cast<UINT32>(wText.size()),
-            fmtTooltip_,
-            maxTextW,
-            1000.0f,
-            &textLayout);
-
-        if (SUCCEEDED(hrLayout) && textLayout) {
-            textLayout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-            textLayout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-
-            DWRITE_TEXT_METRICS tm{};
-            float textW = 0.0f;
-            float textH = 0.0f;
-            if (SUCCEEDED(textLayout->GetMetrics(&tm))) {
-                textW = std::ceil(tm.width);
-                textH = std::ceil(tm.height);
-            }
+        {
+            ui::Point textSize = canvas_->measureTextBlock(activeTooltipText_, ui::FontRole::Tooltip, maxTextW);
+            float textW = std::ceil(textSize.x);
+            float textH = std::ceil(textSize.y);
 
             // Layout card dimensions with 12px horizontal and 8px vertical padding, clamped width (max 320px)
             float cardW = std::clamp(textW + 24.0f, 60.0f, maxCardW);
             float cardH = textH + 16.0f;
-
-            textLayout->SetMaxWidth(cardW - 24.0f);
 
             // Compute position anchored above badge center (or below if close to window top)
             float anchorX = activeTooltipTargetRect_.centerX();
@@ -1961,16 +1857,16 @@ HRESULT CppDeskWindow::drawFrame(float width, float height) {
             float floatY = (1.0f - alpha) * 6.0f;
             float translateY = placeBelow ? -floatY : floatY;
 
-            D2D1_POINT_2F transformOrigin = D2D1::Point2F(anchorX, placeBelow ? cardTop : cardBottom);
-            D2D1_MATRIX_3X2_F prevXform{};
-            renderTarget_->GetTransform(&prevXform);
+            ui::Point transformOrigin = ui::Point{anchorX, placeBelow ? cardTop : cardBottom};
+            ui::Transform2D prevXform{};
+            prevXform = canvas_->transform();
 
-            D2D1::Matrix3x2F tooltipXform =
-                D2D1::Matrix3x2F::Scale(scale, scale, transformOrigin) *
-                D2D1::Matrix3x2F::Translation(0.0f, translateY) *
-                static_cast<const D2D1::Matrix3x2F&>(prevXform);
+            ui::Transform2D tooltipXform =
+                ui::Transform2D::scale(scale, scale, (transformOrigin).x, (transformOrigin).y) *
+                ui::Transform2D::translation(0.0f, translateY) *
+                prevXform;
 
-            renderTarget_->SetTransform(tooltipXform);
+            canvas_->setTransform(tooltipXform);
 
             // Double-drop shadow
             // Shadow 1: Deep ambient soft spread
@@ -1981,32 +1877,25 @@ HRESULT CppDeskWindow::drawFrame(float width, float height) {
             // Dynamic triangle pointer beak pointing toward badge center
             float beakHalfW = 5.0f;
             float beakX = std::clamp(anchorX, cardLeft + 12.0f, cardRight - 12.0f);
-            D2D1_POINT_2F beakPts[3];
+            ui::Point beakPts[3];
             if (placeBelow) {
-                beakPts[0] = D2D1::Point2F(beakX - beakHalfW, cardTop + 0.5f);
-                beakPts[1] = D2D1::Point2F(beakX, cardTop - beakH);
-                beakPts[2] = D2D1::Point2F(beakX + beakHalfW, cardTop + 0.5f);
+                beakPts[0] = ui::Point{beakX - beakHalfW, cardTop + 0.5f};
+                beakPts[1] = ui::Point{beakX, cardTop - beakH};
+                beakPts[2] = ui::Point{beakX + beakHalfW, cardTop + 0.5f};
             } else {
-                beakPts[0] = D2D1::Point2F(beakX - beakHalfW, cardBottom - 0.5f);
-                beakPts[1] = D2D1::Point2F(beakX, cardBottom + beakH);
-                beakPts[2] = D2D1::Point2F(beakX + beakHalfW, cardBottom - 0.5f);
+                beakPts[0] = ui::Point{beakX - beakHalfW, cardBottom - 0.5f};
+                beakPts[1] = ui::Point{beakX, cardBottom + beakH};
+                beakPts[2] = ui::Point{beakX + beakHalfW, cardBottom - 0.5f};
             }
 
-            ID2D1PathGeometry* beakGeo = nullptr;
-            if (d2dFactory_ && SUCCEEDED(d2dFactory_->CreatePathGeometry(&beakGeo)) && beakGeo) {
-                ID2D1GeometrySink* sink = nullptr;
-                if (SUCCEEDED(beakGeo->Open(&sink)) && sink) {
-                    sink->BeginFigure(beakPts[0], D2D1_FIGURE_BEGIN_FILLED);
-                    sink->AddLines(&beakPts[1], 2);
-                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-                    sink->Close();
-                    sink->Release();
-
-                    // Fill beak with dark acrylic
-                    solidBrush_->SetColor(toD2D(rgba(18, 17, 16, 0.96f * alpha)));
-                    renderTarget_->FillGeometry(beakGeo, solidBrush_);
-                }
-                beakGeo->Release();
+            {
+                ui::Path beak;
+                beak.moveTo(beakPts[0].x, beakPts[0].y);
+                beak.lineTo(beakPts[1].x, beakPts[1].y);
+                beak.lineTo(beakPts[2].x, beakPts[2].y);
+                beak.close();
+                // Fill beak with dark acrylic
+                canvas_->fillPath(beak, rgba(18, 17, 16, 0.96f * alpha));
             }
 
             // Dark acrylic fill (rgba(18, 17, 16, 0.96 * alpha))
@@ -2020,34 +1909,34 @@ HRESULT CppDeskWindow::drawFrame(float width, float height) {
             ui::Color glassBorder = rgba(255, 255, 255, 0.13f * alpha);
             strokeRoundRect(cardRect, 7.0f, glassBorder, 1.0f);
 
-            // Seamless beak border strokes pointing toward badge
-            solidBrush_->SetColor(toD2D(glassBorder));
+            // Beak edge strokes. These have always drawn in the card fill color, not glassBorder: the shared
+            // brush was re-colored by the fillRoundRect calls below before the lines were drawn.
+            brushColor_ = rgba(18, 17, 16, 0.96f * alpha);
             if (placeBelow) {
                 fillRoundRect({ beakX - beakHalfW + 0.5f, cardTop - 0.5f, beakX + beakHalfW - 0.5f, cardTop + 1.5f },
                               0.0f, rgba(18, 17, 16, 0.96f * alpha));
-                renderTarget_->DrawLine(beakPts[0], beakPts[1], solidBrush_, 1.0f);
-                renderTarget_->DrawLine(beakPts[1], beakPts[2], solidBrush_, 1.0f);
+                canvas_->drawLine((beakPts[0]).x, (beakPts[0]).y, (beakPts[1]).x, (beakPts[1]).y, brushColor_, 1.0f);
+                canvas_->drawLine((beakPts[1]).x, (beakPts[1]).y, (beakPts[2]).x, (beakPts[2]).y, brushColor_, 1.0f);
             } else {
                 fillRoundRect({ beakX - beakHalfW + 0.5f, cardBottom - 1.5f, beakX + beakHalfW - 0.5f, cardBottom + 0.5f },
                               0.0f, rgba(18, 17, 16, 0.96f * alpha));
-                renderTarget_->DrawLine(beakPts[0], beakPts[1], solidBrush_, 1.0f);
-                renderTarget_->DrawLine(beakPts[1], beakPts[2], solidBrush_, 1.0f);
+                canvas_->drawLine((beakPts[0]).x, (beakPts[0]).y, (beakPts[1]).x, (beakPts[1]).y, brushColor_, 1.0f);
+                canvas_->drawLine((beakPts[1]).x, (beakPts[1]).y, (beakPts[2]).x, (beakPts[2]).y, brushColor_, 1.0f);
             }
 
             // Clean DirectWrite text rendering
-            solidBrush_->SetColor(toD2D(rgba(240, 243, 248, 0.96f * alpha)));
-            renderTarget_->DrawTextLayout(
-                D2D1::Point2F(cardRect.left + 12.0f, cardRect.top + 8.0f),
-                textLayout,
-                solidBrush_,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            // The layout box the tooltip always used: text width, 1000 DIPs tall, anchored top-left.
+            ui::Rect textBox = { cardRect.left + 12.0f, cardRect.top + 8.0f,
+                                 cardRect.left + 12.0f + (cardW - 24.0f), cardRect.top + 8.0f + 1000.0f };
+            canvas_->drawText(activeTooltipText_, textBox, ui::FontRole::Tooltip, rgba(240, 243, 248, 0.96f * alpha),
+                              ui::HAlign::Leading, ui::VAlign::Top);
 
-            renderTarget_->SetTransform(prevXform);
-            textLayout->Release();
+            canvas_->setTransform(prevXform);
         }
     }
 
-    return renderTarget_->EndDraw();
+    canvas_->endFrame();
+    return canvas_->consumeRecreateNeeded() ? D2DERR_RECREATE_TARGET : S_OK;
 }
 
 // ---------------- macOS Unified Top Toolbar ----------------
@@ -3097,7 +2986,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                     rewindFrozen_ = false;
                     rewindOffsetMs_ = 0;
                     displayedFrameSeq_ = 0;
-                    if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; bitmapW_ = 0; bitmapH_ = 0; }
+                    { releaseImage(remoteBitmap_); bitmapW_ = 0; bitmapH_ = 0; }
                 }
                 showToast(showRewindScrubber_ ? "Rewind Scrubber Active" : "Snapped to Live");
                 InvalidateRect(hwnd_, nullptr, FALSE);
@@ -3189,10 +3078,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             stripViewport.right -= 26.0f;
         }
 
-        renderTarget_->PushAxisAlignedClip(
-            D2D1::RectF(stripViewport.left, stripViewport.top, stripViewport.right, stripViewport.bottom),
-            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
-        );
+        canvas_->pushClip(ui::Rect{stripViewport.left, stripViewport.top, stripViewport.right, stripViewport.bottom});
 
         float curBtnX = stripViewport.left - sessionHudScrollOffset_;
         for (const auto& btn : hudButtons) {
@@ -3208,7 +3094,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             curBtnX += btn.width + 6.0f;
         }
 
-        renderTarget_->PopAxisAlignedClip();
+        canvas_->popClip();
 
         stageRect = { bounds.left, hudBar.bottom, bounds.right, bounds.bottom };
     }
@@ -3222,7 +3108,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
         rewindFrozen_ = false;
         rewindOffsetMs_ = 0;
         displayedFrameSeq_ = 0;
-        if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; bitmapW_ = 0; bitmapH_ = 0; }
+        { releaseImage(remoteBitmap_); bitmapW_ = 0; bitmapH_ = 0; }
     }
 
     RECT dirtyBounds{};
@@ -3237,18 +3123,11 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                 rewindBuffer_.pushFrame(nowTick, frameBufferBgra_.data(), frameBufferW_, frameBufferH_);
             }
             if (!rewindFrozen_) {
-                if (!remoteBitmap_ || bitmapW_ != frameBufferW_ || bitmapH_ != frameBufferH_) {
-                    if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; }
-                    D2D1_BITMAP_PROPERTIES bprops = D2D1::BitmapProperties(
-                        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)
-                    );
-                    renderTarget_->CreateBitmap(
-                        D2D1::SizeU(static_cast<UINT32>(frameBufferW_), static_cast<UINT32>(frameBufferH_)),
-                        frameBufferBgra_.data(),
-                        static_cast<UINT32>(frameBufferW_ * 4),
-                        &bprops,
-                        &remoteBitmap_
-                    );
+                if (!remoteBitmap_.valid() || bitmapW_ != frameBufferW_ || bitmapH_ != frameBufferH_) {
+                    releaseImage(remoteBitmap_);
+                    remoteBitmap_ = canvas_->createImage(frameBufferW_, frameBufferH_, true);
+                    canvas_->updateImage(remoteBitmap_, frameBufferBgra_.data(), frameBufferW_ * 4,
+                                         ui::Rect{0.0f, 0.0f, static_cast<float>(frameBufferW_), static_cast<float>(frameBufferH_)});
                     bitmapW_ = frameBufferW_;
                     bitmapH_ = frameBufferH_;
                 } else {
@@ -3257,15 +3136,9 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                     LONG clTop = std::clamp(dirtyBounds.top, 0L, static_cast<LONG>(frameBufferH_));
                     LONG clBottom = std::clamp(dirtyBounds.bottom, 0L, static_cast<LONG>(frameBufferH_));
                     if (clRight > clLeft && clBottom > clTop) {
-                        UINT32 pitch = static_cast<UINT32>(frameBufferW_ * 4);
-                        D2D1_RECT_U dstU = D2D1::RectU(
-                            static_cast<UINT32>(clLeft),
-                            static_cast<UINT32>(clTop),
-                            static_cast<UINT32>(clRight),
-                            static_cast<UINT32>(clBottom)
-                        );
-                        const uint8_t* pSubData = frameBufferBgra_.data() + static_cast<size_t>(clTop) * pitch + static_cast<size_t>(clLeft) * 4;
-                        remoteBitmap_->CopyFromMemory(&dstU, pSubData, pitch);
+                        canvas_->updateImage(remoteBitmap_, frameBufferBgra_.data(), frameBufferW_ * 4,
+                                             ui::Rect{static_cast<float>(clLeft), static_cast<float>(clTop),
+                                                      static_cast<float>(clRight), static_cast<float>(clBottom)});
                     }
                 }
             }
@@ -3273,27 +3146,17 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
     }
 
     if (showRewindScrubber_ && rewindFrozen_ && !rewindCachedFrameBgra_.empty() && rewindCachedW_ > 0 && rewindCachedH_ > 0 && renderTarget_) {
-        if (!remoteBitmap_ || bitmapW_ != rewindCachedW_ || bitmapH_ != rewindCachedH_) {
-            if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; }
-            D2D1_BITMAP_PROPERTIES bprops = D2D1::BitmapProperties(
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)
-            );
-            renderTarget_->CreateBitmap(
-                D2D1::SizeU(static_cast<UINT32>(rewindCachedW_), static_cast<UINT32>(rewindCachedH_)),
-                rewindCachedFrameBgra_.data(),
-                static_cast<UINT32>(rewindCachedW_ * 4),
-                &bprops,
-                &remoteBitmap_
-            );
+        if (!remoteBitmap_.valid() || bitmapW_ != rewindCachedW_ || bitmapH_ != rewindCachedH_) {
+            releaseImage(remoteBitmap_);
+            remoteBitmap_ = canvas_->createImage(rewindCachedW_, rewindCachedH_, true);
             bitmapW_ = rewindCachedW_;
             bitmapH_ = rewindCachedH_;
-        } else {
-            D2D1_RECT_U fullU = D2D1::RectU(0, 0, static_cast<UINT32>(rewindCachedW_), static_cast<UINT32>(rewindCachedH_));
-            remoteBitmap_->CopyFromMemory(&fullU, rewindCachedFrameBgra_.data(), static_cast<UINT32>(rewindCachedW_ * 4));
         }
+        canvas_->updateImage(remoteBitmap_, rewindCachedFrameBgra_.data(), rewindCachedW_ * 4,
+                             ui::Rect{0.0f, 0.0f, static_cast<float>(rewindCachedW_), static_cast<float>(rewindCachedH_)});
     }
 
-    if (remoteBitmap_ && bitmapW_ > 0 && bitmapH_ > 0) {
+    if (remoteBitmap_.valid() && bitmapW_ > 0 && bitmapH_ > 0) {
         float availW = isFullscreen_ ? stageRect.width() : (stageRect.width() - 24.0f);
         float availH = isFullscreen_ ? stageRect.height() : (stageRect.height() - 24.0f);
         float drawW = availW;
@@ -3328,25 +3191,24 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
         }
 
         if (scaleMode_ == ScaleMode::FillAspect) {
-            D2D1_RECT_F clipRect = D2D1::RectF(stageRect.left, stageRect.top, stageRect.right, stageRect.bottom);
-            renderTarget_->PushAxisAlignedClip(clipRect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            ui::Rect clipRect = ui::Rect{stageRect.left, stageRect.top, stageRect.right, stageRect.bottom};
+            canvas_->pushClip(clipRect);
         }
 
-        D2D1_RECT_F dRect = D2D1::RectF(renderedCanvasRect_.left, renderedCanvasRect_.top,
-                                        renderedCanvasRect_.right, renderedCanvasRect_.bottom);
-        renderTarget_->DrawBitmap(remoteBitmap_, dRect, alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        ui::Rect dRect = ui::Rect{renderedCanvasRect_.left, renderedCanvasRect_.top, renderedCanvasRect_.right, renderedCanvasRect_.bottom};
+        canvas_->drawImage(remoteBitmap_, dRect, alpha);
 
         if (scaleMode_ == ScaleMode::FillAspect) {
-            renderTarget_->PopAxisAlignedClip();
+            canvas_->popClip();
         }
 
         if (remoteCursor_.visible && appSett.showRemoteCursor) {
             float curX = renderedCanvasRect_.left + remoteCursor_.normX * renderedCanvasRect_.width();
             float curY = renderedCanvasRect_.top + remoteCursor_.normY * renderedCanvasRect_.height();
-            solidBrush_->SetColor(toD2D(withAlpha(COL_PRIMARY_ACCENT, 0.92f)));
-            renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(curX, curY), 5.0f, 5.0f), solidBrush_);
-            solidBrush_->SetColor(toD2D(rgba(255, 255, 255, 0.98f)));
-            renderTarget_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(curX, curY), 6.0f, 6.0f), solidBrush_, 1.6f);
+            brushColor_ = withAlpha(COL_PRIMARY_ACCENT, 0.92f);
+            canvas_->fillEllipse((ui::Point{curX, curY}).x, (ui::Point{curX, curY}).y, 5.0f, 5.0f, brushColor_);
+            brushColor_ = rgba(255, 255, 255, 0.98f);
+            canvas_->strokeEllipse((ui::Point{curX, curY}).x, (ui::Point{curX, curY}).y, 6.0f, 6.0f, brushColor_, 1.6f);
         }
 
         // Multi-Monitor Grid Partition Overlays & Badges
@@ -3412,11 +3274,11 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                 float ripRadius = 16.0f + 64.0f * std::sin(t * 1.57079f);
                 float ripAlpha = (1.0f - t) * alpha;
 
-                solidBrush_->SetColor(toD2D(withAlpha(COL_PRIMARY_ACCENT, ripAlpha * 0.7f)));
-                renderTarget_->DrawEllipse(D2D1::Ellipse(canvasDropPos_, ripRadius, ripRadius), solidBrush_, 2.4f);
+                brushColor_ = withAlpha(COL_PRIMARY_ACCENT, ripAlpha * 0.7f);
+                canvas_->strokeEllipse((canvasDropPos_).x, (canvasDropPos_).y, ripRadius, ripRadius, brushColor_, 2.4f);
 
-                solidBrush_->SetColor(toD2D(withAlpha(COL_PRIMARY_ACCENT, ripAlpha * 0.35f)));
-                renderTarget_->FillEllipse(D2D1::Ellipse(canvasDropPos_, 12.0f * (1.0f - t), 12.0f * (1.0f - t)), solidBrush_);
+                brushColor_ = withAlpha(COL_PRIMARY_ACCENT, ripAlpha * 0.35f);
+                canvas_->fillEllipse((canvasDropPos_).x, (canvasDropPos_).y, 12.0f * (1.0f - t), 12.0f * (1.0f - t), brushColor_);
 
                 UiRect badge = { canvasDropPos_.x - 85.0f, canvasDropPos_.y + ripRadius + 6.0f,
                                  canvasDropPos_.x + 85.0f, canvasDropPos_.y + ripRadius + 28.0f };
@@ -3493,8 +3355,8 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             uint64_t tick = uiNowMs();
             float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(tick % 1000) / 1000.0f * 6.28318f);
             ui::Color dotColor = ui::Color{0.95f, 0.2f, 0.2f, 0.5f + 0.5f * pulse};
-            solidBrush_->SetColor(toD2D(dotColor));
-            renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(recPill.left + 16.0f, recPill.centerY()), 5.0f, 5.0f), solidBrush_);
+            brushColor_ = dotColor;
+            canvas_->fillEllipse((ui::Point{recPill.left + 16.0f, recPill.centerY()}).x, (ui::Point{recPill.left + 16.0f, recPill.centerY()}).y, 5.0f, 5.0f, brushColor_);
 
             uint64_t durSec = sessionRecorder_.durationSeconds();
             char recTimeBuf[32];
@@ -3535,8 +3397,8 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             // Audio level indicator dot with size responding to RMS volume
             float lvl = network_.voiceIntercomInputLevel();
             float dotRadius = 4.0f + std::min(lvl * 12.0f, 4.0f);
-            solidBrush_->SetColor(toD2D(accentCol));
-            renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(icomPill.left + 16.0f, icomPill.centerY()), dotRadius, dotRadius), solidBrush_);
+            brushColor_ = accentCol;
+            canvas_->fillEllipse((ui::Point{icomPill.left + 16.0f, icomPill.centerY()}).x, (ui::Point{icomPill.left + 16.0f, icomPill.centerY()}).y, dotRadius, dotRadius, brushColor_);
 
             std::string icomText = isMuted ? "Mic: Muted" : "Voice: Live";
             UiRect icomTextRect = { icomPill.left + 28.0f, icomPill.top, icomPill.right - 30.0f, icomPill.bottom };
@@ -3693,10 +3555,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
     size_t rightPaneClickStart = clickRegions_.size();
     size_t rightPaneTooltipStart = activeTooltips_.size();
 
-    renderTarget_->PushAxisAlignedClip(
-        D2D1::RectF(contentPane.left, contentPane.top, contentPane.right, contentPane.bottom),
-        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
-    );
+    canvas_->pushClip(ui::Rect{contentPane.left, contentPane.top, contentPane.right, contentPane.bottom});
 
     const AppSettings s = identity_.settings();
     float cPad = 24.0f;
@@ -4146,10 +4005,10 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
             fillRoundRect({ volTrack.left, volTrack.top, volTrack.left + fillW, volTrack.bottom }, 4.0f, COL_PRIMARY_ACCENT);
         }
         float thumbX = volTrack.left + fillW;
-        solidBrush_->SetColor(toD2D(COL_PRIMARY_ACCENT));
-        renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(thumbX, volTrack.centerY()), 6.0f, 6.0f), solidBrush_);
-        solidBrush_->SetColor(toD2D(rgba(255, 255, 255, 0.85f)));
-        renderTarget_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(thumbX, volTrack.centerY()), 6.0f, 6.0f), solidBrush_, 1.5f);
+        brushColor_ = COL_PRIMARY_ACCENT;
+        canvas_->fillEllipse((ui::Point{thumbX, volTrack.centerY()}).x, (ui::Point{thumbX, volTrack.centerY()}).y, 6.0f, 6.0f, brushColor_);
+        brushColor_ = rgba(255, 255, 255, 0.85f);
+        canvas_->strokeEllipse((ui::Point{thumbX, volTrack.centerY()}).x, (ui::Point{thumbX, volTrack.centerY()}).y, 6.0f, 6.0f, brushColor_, 1.5f);
 
         UiRect volValRect = { volTrack.right + 10.0f, vy - 6.0f, defBox.right - 16.0f, vy + 14.0f };
         drawText(std::to_string(s.defaultAudioVolume) + "%", volValRect, ui::FontRole::Small, COL_TEXT_PRIMARY, ui::HAlign::Trailing);
@@ -4770,10 +4629,10 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         float bPad = 16.0f;
         UiRect iconBadge = { updateBanner.left + bPad, updateBanner.top + 13.0f, updateBanner.left + bPad + 40.0f, updateBanner.top + 53.0f };
         ensureAppIconBitmap();
-        if (appIconBitmap_) {
+        if (appIconBitmap_.valid()) {
             drawCardShadow(iconBadge, 10.0f, 0.5f * alpha);
-            D2D1_RECT_F dst = D2D1::RectF(iconBadge.left, iconBadge.top, iconBadge.right, iconBadge.bottom);
-            renderTarget_->DrawBitmap(appIconBitmap_, dst, alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            ui::Rect dst = ui::Rect{iconBadge.left, iconBadge.top, iconBadge.right, iconBadge.bottom};
+            canvas_->drawImage(appIconBitmap_, dst, alpha);
         } else {
             fillRoundRect(iconBadge, 10.0f, COL_PRIMARY_ACCENT);
             drawText("CD", iconBadge, ui::FontRole::Subheading, COL_TEXT_ON_ACCENT, ui::HAlign::Center);
@@ -4904,7 +4763,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         }
     }
 
-    renderTarget_->PopAxisAlignedClip();
+    canvas_->popClip();
 
     // Vertical Scrollbar for contentPane
     if (settingsMaxScroll_ > 0.5f) {
@@ -5206,10 +5065,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
             }
         }
 
-        renderTarget_->PushAxisAlignedClip(
-            D2D1::RectF(tabsViewport.left, tabsViewport.top, tabsViewport.right, tabsViewport.bottom),
-            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
-        );
+        canvas_->pushClip(ui::Rect{tabsViewport.left, tabsViewport.top, tabsViewport.right, tabsViewport.bottom});
 
         float curTabX = tabsViewport.left - drawerTabsScrollOffset_;
         for (const auto& t : drawerTabsList) {
@@ -5224,7 +5080,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
             curTabX += t.width + 5.0f;
         }
 
-        renderTarget_->PopAxisAlignedClip();
+        canvas_->popClip();
         y += 44.0f;
     }
 
@@ -6150,9 +6006,7 @@ void CppDeskWindow::drawIncomingApprovalModal(float width, float height, float m
     UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
 
     float scale = 0.88f + 0.12f * modalProgress;
-    renderTarget_->SetTransform(
-        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
-    );
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 20.0f, alpha);
 
@@ -6204,7 +6058,7 @@ void CppDeskWindow::drawIncomingApprovalModal(float width, float height, float m
                    showToast("Connection accepted");
                });
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 // ---------------- macOS Dynamic Island Floating Top Bar ----------------
@@ -6405,7 +6259,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                        rewindFrozen_ = false;
                        rewindOffsetMs_ = 0;
                        displayedFrameSeq_ = 0;
-                       if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; bitmapW_ = 0; bitmapH_ = 0; }
+                       { releaseImage(remoteBitmap_); bitmapW_ = 0; bitmapH_ = 0; }
                    }
                    showToast(showRewindScrubber_ ? "Rewind Scrubber Active" : "Snapped to Live");
                    InvalidateRect(hwnd_, nullptr, FALSE);
@@ -6823,9 +6677,7 @@ void CppDeskWindow::drawShortcutsModal(float width, float height, float modalPro
     clickRegions_.push_back({ modal, "modal_sc_absorb", []() {}, false });
 
     float scale = 0.90f + 0.10f * modalProgress;
-    renderTarget_->SetTransform(
-        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
-    );
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 20.0f, alpha);
 
@@ -6881,7 +6733,7 @@ void CppDeskWindow::drawShortcutsModal(float width, float height, float modalPro
     drawText("Tip: In Fullscreen, move your mouse to the top edge to reveal the Dynamic Island.",
              { mx, my, mrx, my + 20.0f }, ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 // ---------------- TCP Port Forwarding Manager Sheet Modal (v2.1.0) ----------------
@@ -6904,9 +6756,7 @@ void CppDeskWindow::drawPortForwardModal(float width, float height, float modalP
     clickRegions_.push_back({ modal, "modal_pf_absorb", []() {}, false });
 
     float scale = 0.90f + 0.10f * modalProgress;
-    renderTarget_->SetTransform(
-        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
-    );
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 20.0f, alpha);
 
@@ -7058,7 +6908,7 @@ void CppDeskWindow::drawPortForwardModal(float width, float height, float modalP
         }
     }
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 // ---------------- Address Book Edit Sheet Modal (v2.1.0) ----------------
@@ -7081,9 +6931,7 @@ void CppDeskWindow::drawAddressBookModal(float width, float height, float modalP
     clickRegions_.push_back({ modal, "modal_ab_absorb", []() {}, false });
 
     float scale = 0.90f + 0.10f * modalProgress;
-    renderTarget_->SetTransform(
-        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
-    );
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 20.0f, alpha);
 
@@ -7143,7 +6991,7 @@ void CppDeskWindow::drawAddressBookModal(float width, float height, float modalP
                    showToast("Saved desk details");
                }, ui::FontRole::Small);
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 // ---------------- Dual-Pane File Explorer, Run Task & File Action Modals ----------------
@@ -7456,9 +7304,7 @@ void CppDeskWindow::drawRunTaskModal(float width, float height, float modalProgr
     clickRegions_.push_back({ modal, "modal_runtask_absorb", []() {}, false });
 
     float scale = 0.90f + 0.10f * modalProgress;
-    renderTarget_->SetTransform(
-        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
-    );
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
     drawCardSurface(modal, 18.0f, alpha);
 
     float mx = modal.left + 26.0f;
@@ -7500,7 +7346,7 @@ void CppDeskWindow::drawRunTaskModal(float width, float height, float modalProgr
                COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f,
                [this]() { submitRunTask(); }, ui::FontRole::Small);
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 void CppDeskWindow::drawFileBrowserActionModal(float width, float height, float modalProgress) {
@@ -7524,9 +7370,7 @@ void CppDeskWindow::drawFileBrowserActionModal(float width, float height, float 
     clickRegions_.push_back({ modal, "modal_fileaction_absorb", []() {}, false });
 
     float scale = 0.90f + 0.10f * modalProgress;
-    renderTarget_->SetTransform(
-        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
-    );
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
     drawCardSurface(modal, 18.0f, alpha);
 
     float mx = modal.left + 26.0f;
@@ -7572,7 +7416,7 @@ void CppDeskWindow::drawFileBrowserActionModal(float width, float height, float 
                isDelete ? COL_DANGER : COL_PRIMARY_ACCENT, isDelete ? COL_DANGER_HV : COL_PRIMARY_ACCENT_HV,
                COL_TEXT_ON_ACCENT, 8.0f, [this]() { submitFileBrowserModal(); }, ui::FontRole::Small);
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 // ---------------- Mandatory Update Modal (v3.0.0) ----------------
@@ -7588,9 +7432,7 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
     UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
 
     float scale = 0.90f + 0.10f * modalProgress;
-    renderTarget_->SetTransform(
-        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
-    );
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardShadow(modal, 24.0f, 1.5f * alpha);
     drawCardSurface(modal, 20.0f, alpha);
@@ -7775,7 +7617,7 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
                    );
                }, ui::FontRole::Small);
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 // ---------------- Remote Reboot & Reconnect Sheet Modal ----------------
@@ -7798,9 +7640,7 @@ void CppDeskWindow::drawRebootConfirmModal(float width, float height, float moda
     clickRegions_.push_back({ modal, "modal_reboot_absorb", []() {}, false });
 
     float scale = 0.90f + 0.10f * modalProgress;
-    renderTarget_->SetTransform(
-        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
-    );
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 18.0f, alpha);
 
@@ -7849,7 +7689,7 @@ void CppDeskWindow::drawRebootConfirmModal(float width, float height, float moda
                    }
                }, ui::FontRole::Small);
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 void CppDeskWindow::drawHwAccelRestartModal(float width, float height, float modalProgress) {
@@ -7871,9 +7711,7 @@ void CppDeskWindow::drawHwAccelRestartModal(float width, float height, float mod
     clickRegions_.push_back({ modal, "modal_hwaccel_absorb", []() {}, false });
 
     float scale = 0.90f + 0.10f * modalProgress;
-    renderTarget_->SetTransform(
-        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
-    );
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 18.0f, alpha);
 
@@ -7924,7 +7762,7 @@ void CppDeskWindow::drawHwAccelRestartModal(float width, float height, float mod
                    DestroyWindow(hwnd_);
                }, ui::FontRole::Small);
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 // ---------------- In-Session Session Recording Player & Transcoder ----------------
@@ -7978,9 +7816,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
     clickRegions_.push_back({ modal, "player_absorb", []() {}, false });
 
     float scale = 0.90f + 0.10f * modalProgress;
-    renderTarget_->SetTransform(
-        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
-    );
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 18.0f, alpha);
 
@@ -8051,26 +7887,22 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
             recordingPlayer_->clearNewFrameFlag();
 
             if (!frameBgra.empty() && fw > 0 && fh > 0) {
-                if (!recordingPlayerBitmap_ || recordingPlayerBitmapW_ != fw || recordingPlayerBitmapH_ != fh) {
-                    if (recordingPlayerBitmap_) {
-                        recordingPlayerBitmap_->Release();
-                        recordingPlayerBitmap_ = nullptr;
-                    }
-                    D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
-                        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-                    HRESULT hr = renderTarget_->CreateBitmap(D2D1::SizeU(fw, fh), props, &recordingPlayerBitmap_);
-                    if (SUCCEEDED(hr)) {
+                if (!recordingPlayerBitmap_.valid() || recordingPlayerBitmapW_ != fw || recordingPlayerBitmapH_ != fh) {
+                    releaseImage(recordingPlayerBitmap_);
+                    recordingPlayerBitmap_ = canvas_->createImage(fw, fh);
+                    if (recordingPlayerBitmap_.valid()) {
                         recordingPlayerBitmapW_ = fw;
                         recordingPlayerBitmapH_ = fh;
                     }
                 }
-                if (recordingPlayerBitmap_) {
-                    recordingPlayerBitmap_->CopyFromMemory(nullptr, frameBgra.data(), fw * 4);
+                if (recordingPlayerBitmap_.valid()) {
+                    canvas_->updateImage(recordingPlayerBitmap_, frameBgra.data(), fw * 4,
+                                         ui::Rect{0.0f, 0.0f, static_cast<float>(fw), static_cast<float>(fh)});
                 }
             }
         }
 
-        if (recordingPlayerBitmap_ && recordingPlayerBitmapW_ > 0 && recordingPlayerBitmapH_ > 0) {
+        if (recordingPlayerBitmap_.valid() && recordingPlayerBitmapW_ > 0 && recordingPlayerBitmapH_ > 0) {
             float vW = viewport.width() - 8.0f;
             float vH = viewport.height() - 8.0f;
             float aspect = static_cast<float>(recordingPlayerBitmapW_) / static_cast<float>(recordingPlayerBitmapH_);
@@ -8086,8 +7918,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                 viewport.centerX() + fitW * 0.5f,
                 viewport.centerY() + fitH * 0.5f
             };
-            renderTarget_->DrawBitmap(recordingPlayerBitmap_,
-                D2D1::RectF(fitRect.left, fitRect.top, fitRect.right, fitRect.bottom));
+            canvas_->drawImage(recordingPlayerBitmap_, fitRect, 1.0f);
         }
     } else {
         drawText("Open an AVI recording to inspect frames, scrub timeline, and export clips",
@@ -8305,7 +8136,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                    }
                }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 // ---------------- Two-Factor Authentication (TOTP) UI & QR Rendering ----------------
@@ -8316,7 +8147,7 @@ void CppDeskWindow::renderQrCodeDirect2D(
     int matrixSize,
     float alpha)
 {
-    if (!renderTarget_ || !solidBrush_ || alpha <= 0.01f) return;
+    if (!canvas_ || alpha <= 0.01f) return;
 
     fillRoundRect(rect, 8.0f, withAlpha(rgba(255, 255, 255), alpha));
     strokeRoundRect(rect, 8.0f, withAlpha(COL_BORDER, alpha), 1.0f);
@@ -8335,18 +8166,13 @@ void CppDeskWindow::renderQrCodeDirect2D(
     float startX = rect.left + (rect.width() - qrTotal) * 0.5f;
     float startY = rect.top + (rect.height() - qrTotal) * 0.5f;
 
-    solidBrush_->SetColor(toD2D(withAlpha(rgba(18, 18, 18), alpha)));
+    brushColor_ = withAlpha(rgba(18, 18, 18), alpha);
 
     for (int y = 0; y < matrixSize; ++y) {
         for (int x = 0; x < matrixSize; ++x) {
             if (matrix[static_cast<size_t>(y * matrixSize + x)] != 0) {
-                D2D1_RECT_F modRect = D2D1::RectF(
-                    startX + static_cast<float>(x) * moduleSize,
-                    startY + static_cast<float>(y) * moduleSize,
-                    startX + static_cast<float>(x + 1) * moduleSize,
-                    startY + static_cast<float>(y + 1) * moduleSize
-                );
-                renderTarget_->FillRectangle(modRect, solidBrush_);
+                ui::Rect modRect = ui::Rect{startX + static_cast<float>(x) * moduleSize, startY + static_cast<float>(y) * moduleSize, startX + static_cast<float>(x + 1) * moduleSize, startY + static_cast<float>(y + 1) * moduleSize};
+                canvas_->fillRect(modRect, brushColor_);
             }
         }
     }
@@ -8392,9 +8218,7 @@ void CppDeskWindow::drawTotpChallengeModal(float clientW, float clientH) {
     clickRegions_.push_back({ modal, "modal_totp_absorb", []() {}, false });
 
     float scale = 0.90f + 0.10f * totpModalAnimT_;
-    renderTarget_->SetTransform(
-        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
-    );
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardShadow(modal, 24.0f, 1.4f * alpha);
     drawCardSurface(modal, 20.0f, alpha);
@@ -8453,7 +8277,7 @@ void CppDeskWindow::drawTotpChallengeModal(float clientW, float clientH) {
                    }
                }, ui::FontRole::Small);
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 void CppDeskWindow::triggerUpdateCheck(bool manual) {
@@ -8494,7 +8318,7 @@ void CppDeskWindow::drawWhiteboardOverlay(const UiRect& canvasRect) {
             s.argbColor & 0xFF,
             alpha
         );
-        solidBrush_->SetColor(toD2D(col));
+        brushColor_ = col;
 
         float strokeThick = (s.tool == WhiteboardTool::Highlighter) ? (s.thickness * 2.5f) : s.thickness;
 
@@ -8506,7 +8330,7 @@ void CppDeskWindow::drawWhiteboardOverlay(const UiRect& canvasRect) {
             float x1 = canvasRect.left + p1.x * canvasRect.width();
             float y1 = canvasRect.top + p1.y * canvasRect.height();
 
-            renderTarget_->DrawLine(D2D1::Point2F(x0, y0), D2D1::Point2F(x1, y1), solidBrush_, strokeThick);
+            canvas_->drawLine((ui::Point{x0, y0}).x, (ui::Point{x0, y0}).y, (ui::Point{x1, y1}).x, (ui::Point{x1, y1}).y, brushColor_, strokeThick);
 
             float dx = x1 - x0;
             float dy = y1 - y0;
@@ -8519,8 +8343,8 @@ void CppDeskWindow::drawWhiteboardOverlay(const UiRect& canvasRect) {
                 float a1y = y1 - headLen * std::sin(angle - headAngle);
                 float a2x = x1 - headLen * std::cos(angle + headAngle);
                 float a2y = y1 - headLen * std::sin(angle + headAngle);
-                renderTarget_->DrawLine(D2D1::Point2F(x1, y1), D2D1::Point2F(a1x, a1y), solidBrush_, strokeThick);
-                renderTarget_->DrawLine(D2D1::Point2F(x1, y1), D2D1::Point2F(a2x, a2y), solidBrush_, strokeThick);
+                canvas_->drawLine((ui::Point{x1, y1}).x, (ui::Point{x1, y1}).y, (ui::Point{a1x, a1y}).x, (ui::Point{a1x, a1y}).y, brushColor_, strokeThick);
+                canvas_->drawLine((ui::Point{x1, y1}).x, (ui::Point{x1, y1}).y, (ui::Point{a2x, a2y}).x, (ui::Point{a2x, a2y}).y, brushColor_, strokeThick);
             }
         } else if (s.points.size() >= 2) {
             for (size_t i = 1; i < s.points.size(); ++i) {
@@ -8530,7 +8354,7 @@ void CppDeskWindow::drawWhiteboardOverlay(const UiRect& canvasRect) {
                 float y0 = canvasRect.top + pt0.y * canvasRect.height();
                 float x1 = canvasRect.left + pt1.x * canvasRect.width();
                 float y1 = canvasRect.top + pt1.y * canvasRect.height();
-                renderTarget_->DrawLine(D2D1::Point2F(x0, y0), D2D1::Point2F(x1, y1), solidBrush_, strokeThick);
+                canvas_->drawLine((ui::Point{x0, y0}).x, (ui::Point{x0, y0}).y, (ui::Point{x1, y1}).x, (ui::Point{x1, y1}).y, brushColor_, strokeThick);
             }
         }
     }
@@ -8540,12 +8364,12 @@ void CppDeskWindow::drawWhiteboardOverlay(const UiRect& canvasRect) {
     if (network_.whiteboardManager().getLaserPointer(lx, ly, lalpha)) {
         float lpx = canvasRect.left + lx * canvasRect.width();
         float lpy = canvasRect.top + ly * canvasRect.height();
-        solidBrush_->SetColor(toD2D(rgba(255, 59, 48, 0.28f * lalpha)));
-        renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(lpx, lpy), 14.0f, 14.0f), solidBrush_);
-        solidBrush_->SetColor(toD2D(rgba(255, 59, 48, 0.95f * lalpha)));
-        renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(lpx, lpy), 5.5f, 5.5f), solidBrush_);
-        solidBrush_->SetColor(toD2D(rgba(255, 255, 255, 0.98f * lalpha)));
-        renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(lpx, lpy), 2.2f, 2.2f), solidBrush_);
+        brushColor_ = rgba(255, 59, 48, 0.28f * lalpha);
+        canvas_->fillEllipse((ui::Point{lpx, lpy}).x, (ui::Point{lpx, lpy}).y, 14.0f, 14.0f, brushColor_);
+        brushColor_ = rgba(255, 59, 48, 0.95f * lalpha);
+        canvas_->fillEllipse((ui::Point{lpx, lpy}).x, (ui::Point{lpx, lpy}).y, 5.5f, 5.5f, brushColor_);
+        brushColor_ = rgba(255, 255, 255, 0.98f * lalpha);
+        canvas_->fillEllipse((ui::Point{lpx, lpy}).x, (ui::Point{lpx, lpy}).y, 2.2f, 2.2f, brushColor_);
     }
 
     if (!whiteboardActive_) return;
@@ -8660,9 +8484,7 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
 
     // Apply spring slide & scale transform
     float scale = 0.94f + 0.06f * hudProgress;
-    renderTarget_->SetTransform(
-        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(hudCard.right, hudCard.top))
-    );
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{hudCard.right, hudCard.top}).x, (ui::Point{hudCard.right, hudCard.top}).y));
 
     // Frosted glass card surface with specular highlight (hud-sci-fi-fui)
     drawCardShadow(hudCard, 14.0f, 0.95f * hudProgress);
@@ -8761,7 +8583,7 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
              { hudCard.left + 14.0f, cy, hudCard.right - 14.0f, cy + 16.0f },
              ui::FontRole::Small, withAlpha(COL_HUD_TEXT_MUTED, hudProgress * 0.70f), ui::HAlign::Center);
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 // ---------------- macOS Dynamic Capsule Toast Banner ----------------
@@ -8847,10 +8669,10 @@ void CppDeskWindow::drawAudioVolumePopup(float anchorX, float anchorY) {
     }
     // Slider thumb
     float thumbX = isMuted ? trackRect.left : (trackRect.left + fillWidth);
-    solidBrush_->SetColor(toD2D(withAlpha(COL_PRIMARY_ACCENT, popAlpha)));
-    renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(thumbX, trackRect.centerY()), 6.0f, 6.0f), solidBrush_);
-    solidBrush_->SetColor(toD2D(withAlpha(rgba(255, 255, 255, 0.8f), popAlpha)));
-    renderTarget_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(thumbX, trackRect.centerY()), 6.0f, 6.0f), solidBrush_, 1.5f);
+    brushColor_ = withAlpha(COL_PRIMARY_ACCENT, popAlpha);
+    canvas_->fillEllipse((ui::Point{thumbX, trackRect.centerY()}).x, (ui::Point{thumbX, trackRect.centerY()}).y, 6.0f, 6.0f, brushColor_);
+    brushColor_ = withAlpha(rgba(255, 255, 255, 0.8f), popAlpha);
+    canvas_->strokeEllipse((ui::Point{thumbX, trackRect.centerY()}).x, (ui::Point{thumbX, trackRect.centerY()}).y, 6.0f, 6.0f, brushColor_, 1.5f);
 
     // Click anywhere on track to set volume
     if (showAudioVolumePopup_) {
@@ -9603,7 +9425,7 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
                 rewindFrozen_ = false;
                 rewindOffsetMs_ = 0;
                 displayedFrameSeq_ = 0;
-                if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; bitmapW_ = 0; bitmapH_ = 0; }
+                { releaseImage(remoteBitmap_); bitmapW_ = 0; bitmapH_ = 0; }
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 return;
             }
@@ -9854,21 +9676,11 @@ void CppDeskWindow::switchToSessionTab(uint32_t tabId, bool force) {
         displayedFrameSeq_ = newTab->lastFrameSeq;
         remoteCursor_ = newTab->cursor;
 
-        if (renderTarget_) {
-            if (remoteBitmap_) {
-                remoteBitmap_->Release();
-                remoteBitmap_ = nullptr;
-            }
-            D2D1_BITMAP_PROPERTIES bprops = D2D1::BitmapProperties(
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)
-            );
-            renderTarget_->CreateBitmap(
-                D2D1::SizeU(static_cast<UINT32>(frameBufferW_), static_cast<UINT32>(frameBufferH_)),
-                frameBufferBgra_.data(),
-                static_cast<UINT32>(frameBufferW_ * 4),
-                &bprops,
-                &remoteBitmap_
-            );
+        if (canvas_ && renderTarget_) {
+            releaseImage(remoteBitmap_);
+            remoteBitmap_ = canvas_->createImage(frameBufferW_, frameBufferH_, true);
+            canvas_->updateImage(remoteBitmap_, frameBufferBgra_.data(), frameBufferW_ * 4,
+                                 ui::Rect{0.0f, 0.0f, static_cast<float>(frameBufferW_), static_cast<float>(frameBufferH_)});
             bitmapW_ = frameBufferW_;
             bitmapH_ = frameBufferH_;
         }
@@ -9877,10 +9689,7 @@ void CppDeskWindow::switchToSessionTab(uint32_t tabId, bool force) {
         frameBufferW_ = 0;
         frameBufferH_ = 0;
         displayedFrameSeq_ = 0;
-        if (remoteBitmap_) {
-            remoteBitmap_->Release();
-            remoteBitmap_ = nullptr;
-        }
+        releaseImage(remoteBitmap_);
         bitmapW_ = 0;
         bitmapH_ = 0;
     }
@@ -9947,10 +9756,7 @@ void CppDeskWindow::closeSessionTab(uint32_t tabId) {
         frameBufferW_ = 0;
         frameBufferH_ = 0;
         displayedFrameSeq_ = 0;
-        if (remoteBitmap_) {
-            remoteBitmap_->Release();
-            remoteBitmap_ = nullptr;
-        }
+        releaseImage(remoteBitmap_);
         bitmapW_ = 0;
         bitmapH_ = 0;
         switchTab(ActiveTab::Dashboard);
@@ -10327,7 +10133,7 @@ void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
                    rewindFrozen_ = false;
                    showRewindScrubber_ = false;
                    displayedFrameSeq_ = 0;
-                   if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; bitmapW_ = 0; bitmapH_ = 0; }
+                   { releaseImage(remoteBitmap_); bitmapW_ = 0; bitmapH_ = 0; }
                    showToast("Snapped to live stream");
                    InvalidateRect(hwnd_, nullptr, FALSE);
                }, ui::FontRole::Small);
@@ -10350,9 +10156,7 @@ void CppDeskWindow::drawOmnibarModal(float width, float height, float modalProgr
     clickRegions_.push_back({ modal, "modal_omni_absorb", []() {}, false });
 
     float scale = 0.92f + 0.08f * modalProgress;
-    renderTarget_->SetTransform(
-        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
-    );
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 16.0f, alpha);
 
@@ -10434,7 +10238,7 @@ void CppDeskWindow::drawOmnibarModal(float width, float height, float modalProgr
                  ui::FontRole::Small, COL_TEXT_PRIMARY, ui::HAlign::Leading, ui::VAlign::Top);
     }
 
-    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 // ---------------- Offscreen UI Snapshots (regression checks) ----------------
@@ -10599,7 +10403,7 @@ int CppDeskWindow::runUiSnapshots(IdentityManager& identity, NetworkEngine& netw
             bitmap->Release();
             continue;
         }
-        w.renderTarget_->CreateSolidColorBrush(toD2D(COL_TEXT_PRIMARY), &w.solidBrush_);
+        w.canvas_->attach(w.renderTarget_, 1.0f);
 
         if (st.setup) st.setup(w);
         // Settle every spring at a fixed step, then hold animation time still so caret and pulse are fixed.

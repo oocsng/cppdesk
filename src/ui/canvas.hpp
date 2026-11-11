@@ -40,6 +40,11 @@ enum class VAlign { Top, Center, Bottom };
 
 using Rect = UiRect;
 
+struct Point {
+    float x = 0.0f;
+    float y = 0.0f;
+};
+
 // 2D affine transform in the Direct2D Matrix3x2F convention: row vectors, x' = x*m11 + y*m21 + dx,
 // y' = x*m12 + y*m22 + dy, and a*b applies a first.
 struct Transform2D {
@@ -145,9 +150,12 @@ public:
     // Text, clipped to the rect.
     virtual void drawText(std::string_view utf8, Rect r, FontRole font, Color c, HAlign h, VAlign v) = 0;
     virtual float measureTextWidth(std::string_view utf8, FontRole font) = 0;
+    // Size of the text laid out within maxWidth (wrapping where the font role wraps): {width, height}.
+    virtual Point measureTextBlock(std::string_view utf8, FontRole font, float maxWidth) = 0;
 
     // Images (BGRA, premultiplied like the decoded remote frames)
-    virtual ImageId createImage(int width, int height) = 0;
+    // opaque: the alpha byte is ignored (decoded remote frames); otherwise BGRA is premultiplied.
+    virtual ImageId createImage(int width, int height, bool opaque = false) = 0;
     virtual void updateImage(ImageId id, const uint8_t* bgra, int pitch, Rect dirty) = 0;
     virtual void drawImage(ImageId id, Rect dst, float opacity) = 0;
     virtual void destroyImage(ImageId id) = 0;
