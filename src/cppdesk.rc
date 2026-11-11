@@ -3,8 +3,8 @@
 1 24 "cppdesk.manifest"
 
 1 VERSIONINFO
-FILEVERSION 3,7,0,0
-PRODUCTVERSION 3,7,0,0
+FILEVERSION 3,8,0,0
+PRODUCTVERSION 3,8,0,0
 FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
 FILEFLAGS 0x1L
@@ -21,11 +21,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "CppDesk"
             VALUE "FileDescription", "CppDesk Ultra-Low-Latency Remote Desktop"
-            VALUE "FileVersion", "3.7.0.0"
+            VALUE "FileVersion", "3.8.0.0"
             VALUE "InternalName", "CppDesk"
             VALUE "OriginalFilename", "CppDesk.exe"
             VALUE "ProductName", "CppDesk"
-            VALUE "ProductVersion", "3.7.0.0"
+            VALUE "ProductVersion", "3.8.0.0"
         END
     END
     BLOCK "VarFileInfo"
