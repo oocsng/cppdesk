@@ -94,7 +94,8 @@ bool isValidEntryName(const std::string& name) {
 #if defined(_WIN32)
     const char* bad = "\\/:*?\"<>|";
 #else
-    const char* bad = "/";
+    // A backslash is a legal file name character here, but a Windows peer reads it as a separator.
+    const char* bad = "\\/";
 #endif
     for (char c : name) {
         if (c == '\0' || std::strchr(bad, c) != nullptr) return false;

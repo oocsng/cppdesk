@@ -1,4 +1,5 @@
 #include "file_sync_manager.hpp"
+#include "../core/win_compat.hpp"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1077,6 +1078,7 @@ bool FileSyncManager::handleDeltaBlock(const SyncDeltaBlockPayload& block) {
                       (block.blockOffset + block.blockData.size() >= in.totalSize);
 
     if (isComplete) {
+#if defined(_WIN32)
         std::wstring partW = utf8ToWide(in.partFullPath);
         std::wstring targetW = utf8ToWide(in.targetFullPath);
 
@@ -1084,6 +1086,12 @@ bool FileSyncManager::handleDeltaBlock(const SyncDeltaBlockPayload& block) {
             std::error_code ec;
             std::filesystem::rename(in.partFullPath, in.targetFullPath, ec);
         }
+#else
+        {
+            std::error_code ec;
+            std::filesystem::rename(in.partFullPath, in.targetFullPath, ec);
+        }
+#endif
 
 #if defined(_WIN32)
         if (in.mtimeSec > 0) {

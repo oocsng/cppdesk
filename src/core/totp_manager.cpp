@@ -10,6 +10,10 @@
 #include <bcrypt.h>
 #endif
 
+#if !defined(_WIN32) && !defined(__APPLE__)
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#endif
 #include <ctime>
 #include <cstdio>
 #include <cctype>
@@ -284,7 +288,12 @@ bool TotpManager::computeHmac(
     CCHmac(ccAlg, key, keyLen, data, dataLen, digestOut.data());
     return true;
 #else
-    return false;
+    unsigned int outLen = 0;
+    unsigned char mac[EVP_MAX_MD_SIZE];
+    const EVP_MD* md = (alg == TotpAlgorithm::Sha256) ? EVP_sha256() : EVP_sha1();
+    if (!HMAC(md, key, static_cast<int>(keyLen), data, dataLen, mac, &outLen)) return false;
+    digestOut.assign(mac, mac + outLen);
+    return true;
 #endif
 }
 

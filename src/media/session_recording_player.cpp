@@ -8,6 +8,8 @@
 #include <windows.h>
 #include <objidl.h>
 #include <gdiplus.h>
+#else
+#include "../core/win_compat.hpp"
 #endif
 #include <filesystem>
 #include <iostream>

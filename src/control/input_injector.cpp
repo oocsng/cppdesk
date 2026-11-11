@@ -647,6 +647,7 @@ bool InputInjector::executeSystemAction(SystemActionType) {
 #elif defined(__linux__) || defined(__unix__)
 
 #if __has_include(<X11/Xlib.h>)
+#include "../capture/xlib_threads.hpp"
 #include <X11/Xlib.h>
 #endif
 #if __has_include(<X11/extensions/XTest.h>)
@@ -661,7 +662,7 @@ Display* getCachedX11Display() {
     static bool s_inited = false;
     std::lock_guard<std::mutex> lk(s_x11InputMutex);
     if (!s_inited) {
-        XInitThreads();
+        ensureXlibThreads();
         s_inited = true;
     }
     if (!s_dpy) {

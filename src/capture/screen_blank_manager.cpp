@@ -455,10 +455,10 @@ ScreenBlankManager::ScreenBlankManager() = default;
 ScreenBlankManager::~ScreenBlankManager() = default;
 void ScreenBlankManager::powerDownDisplays() {}
 void ScreenBlankManager::wakeDisplays() {}
-bool ScreenBlankManager::startBlanking(ScreenBlankMode, const std::string&, const std::string&, bool, uint64_t) { return false; }
-void ScreenBlankManager::stopBlanking() {}
+bool ScreenBlankManager::engageBlanking(ScreenBlankMode, const std::string&, const std::string&, bool, uint64_t) { return false; }
+void ScreenBlankManager::disengageBlanking() {}
 bool ScreenBlankManager::isBlankActive() const { return false; }
-ScreenBlankMode ScreenBlankManager::currentMode() const { return ScreenBlankMode::CurtainOnly; }
+ScreenBlankMode ScreenBlankManager::currentBlankMode() const { return ScreenBlankMode::CurtainOnly; }
 void ScreenBlankManager::setEmergencyWakeCallback(std::function<void()>) {}
 void ScreenBlankManager::triggerEmergencyWake() {}
 void ScreenBlankManager::blankingThreadFunc() {}

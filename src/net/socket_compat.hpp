@@ -19,11 +19,17 @@
 #include <sys/uio.h>
 #include <netdb.h>
 #include <errno.h>
+#include <sys/ioctl.h>
+#include <csignal>
 #endif
 
 #include <cstdint>
 #include <cstddef>
 #include <mutex>
+
+#if !defined(_WIN32)
+#include "../core/win_compat.hpp"
+#endif
 
 namespace cppdesk {
 
@@ -66,6 +72,11 @@ inline void socket_set_nosigpipe(socket_t s) {
     (void)s;
 }
 
+// select() ignores its first argument on Winsock but needs the highest descriptor + 1 elsewhere.
+inline int socket_select_nfds(socket_t) {
+    return 0;
+}
+
 #else
 
 using socket_t = int;
@@ -95,7 +106,9 @@ inline bool socket_set_nonblocking(socket_t s, bool nonblock) {
 }
 
 inline bool socket_init_network() {
-    return true;
+    // A write to a peer that has gone away must fail with EPIPE, not kill the process.
+    static const bool ignored = (std::signal(SIGPIPE, SIG_IGN) != SIG_ERR);
+    return ignored;
 }
 
 inline void socket_set_nosigpipe(socket_t s) {
@@ -107,26 +120,27 @@ inline void socket_set_nosigpipe(socket_t s) {
 #endif
 }
 
-#endif
+inline int socket_select_nfds(socket_t s) {
+    return s + 1;
+}
 
-// Fallback geometry types for non-Windows platforms
-#if !defined(_WIN32)
-#ifndef _RECT_DEFINED
-#define _RECT_DEFINED
-struct RECT {
-    int32_t left = 0;
-    int32_t top = 0;
-    int32_t right = 0;
-    int32_t bottom = 0;
-};
-#endif
-#ifndef _POINT_DEFINED
-#define _POINT_DEFINED
-struct POINT {
-    int32_t x = 0;
-    int32_t y = 0;
-};
-#endif
+// The Winsock names the shared networking code is written against.
+using SOCKET = socket_t;
+constexpr SOCKET INVALID_SOCKET = INVALID_SOCKET_VAL;
+constexpr int SOCKET_ERROR = SOCKET_ERROR_VAL;
+constexpr int SD_SEND = SHUT_WR;
+constexpr int SD_BOTH = SHUT_RDWR;
+
+inline int closesocket(SOCKET s) {
+    return close(s);
+}
+
+// Only FIONBIO is used: a nonzero *argp makes the socket non-blocking.
+inline int ioctlsocket(SOCKET s, unsigned long cmd, unsigned long* argp) {
+    if (cmd != FIONBIO) return -1;
+    return socket_set_nonblocking(s, *argp != 0) ? 0 : -1;
+}
+
 #endif
 
 // Portable scatter-gather buffer structure

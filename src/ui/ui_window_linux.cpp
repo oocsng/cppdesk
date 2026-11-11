@@ -1,6 +1,7 @@
 #if defined(__linux__) || defined(__unix__)
 
 #include "ui_window.hpp"
+#include "../capture/xlib_threads.hpp"
 #include "ui_platform.hpp"
 #include "../net/network_engine.hpp"
 #include "../core/crypto_identity.hpp"
@@ -241,6 +242,7 @@ CppDeskWindow::~CppDeskWindow() {
 
 bool CppDeskWindow::create(void* displayContext, int showCommand) {
     (void)showCommand;
+    ensureXlibThreads();
     Display* dpy = displayContext ? static_cast<Display*>(displayContext) : XOpenDisplay(nullptr);
     if (!dpy) {
         std::cerr << "CppDesk: Could not open X11 display connection.\n";

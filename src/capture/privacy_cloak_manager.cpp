@@ -36,11 +36,35 @@ std::wstring utf8ToWide(const std::string& str) {
 
 std::string wideToUtf8(const std::wstring& wstr) {
     if (wstr.empty()) return "";
+#if !defined(_WIN32)
+    // wchar_t is UTF-32 here.
+    std::string out;
+    for (wchar_t wc : wstr) {
+        uint32_t cp = static_cast<uint32_t>(wc);
+        if (cp < 0x80) {
+            out += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += static_cast<char>(0xE0 | (cp >> 12));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (cp >> 18));
+            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+    return out;
+#else
     int len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.size()), nullptr, 0, nullptr, nullptr);
     if (len <= 0) return "";
     std::string str(static_cast<size_t>(len), '\0');
     WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.size()), str.data(), len, nullptr, nullptr);
     return str;
+#endif
 }
 
 std::string trim(const std::string& s) {

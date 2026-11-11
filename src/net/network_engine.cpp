@@ -35,6 +35,18 @@
 #include <algorithm>
 #include <deque>
 
+#if !defined(_WIN32)
+#include <csignal>
+#include <sys/statvfs.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
+#endif
+
+#include "../core/win_compat.hpp"
+
 namespace cppdesk {
 
 namespace {
@@ -49,11 +61,13 @@ namespace {
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
 #endif
 
+#if defined(_WIN32)
 static const CLSID CLSID_MMDeviceEnumerator_val = { 0xbcde0395, 0xe52f, 0x467c, { 0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e } };
 static const IID IID_IMMDeviceEnumerator_val = { 0xa95664d2, 0x9614, 0x4f35, { 0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6 } };
 static const IID IID_IAudioClient_val = { 0x1cb9ad4c, 0xdbfa, 0x4c32, { 0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2 } };
 static const IID IID_IAudioCaptureClient_val = { 0xc8adbd64, 0xe71e, 0x48a0, { 0xa4, 0xde, 0x18, 0x5c, 0x39, 0x5c, 0xd3, 0x17 } };
 static const GUID KSDATAFORMAT_SUBTYPE_IEEE_FLOAT_val = { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+#endif
 
 std::once_flag g_wsaInitFlag;
 
@@ -100,6 +114,7 @@ bool sendAllBytes(socket_t s, const void* buf, size_t len) {
     return true;
 }
 
+#if defined(_WIN32)
 struct CurtainWindowConfig {
     std::wstring brandName = L"CppDesk Enterprise Security";
     std::wstring noticeText = L"Screen output hidden and local physical inputs secured for authorized administration.";
@@ -269,6 +284,8 @@ static LRESULT CALLBACK PrivacyCurtainWndProc(HWND hwnd, UINT msg, WPARAM wParam
     }
 }
 
+#endif // _WIN32 curtain window
+
 bool recvAllBytes(socket_t s, void* buf, size_t len) {
     char* p = static_cast<char*>(buf);
     size_t gotTotal = 0;
@@ -325,7 +342,7 @@ socket_t connectTcpWithTimeout(const std::string& host, uint16_t port, int timeo
         tv.tv_usec = (timeoutMs % 1000) * 1000;
 
 #if defined(_WIN32)
-        int sel = select(0, nullptr, &wfds, &efds, &tv);
+        int sel = select(socket_select_nfds(s), nullptr, &wfds, &efds, &tv);
 #else
         int sel = select(s + 1, nullptr, &wfds, &efds, &tv);
 #endif
@@ -689,7 +706,7 @@ bool RelayServer::start(uint16_t port) {
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (ls == INVALID_SOCKET) return false;
 
-    BOOL reuse = TRUE;
+    int reuse = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
 
     sockaddr_in addr{};
@@ -744,7 +761,7 @@ void RelayServer::acceptLoop() {
         if (ls == INVALID_SOCKET) break;
 
         sockaddr_in clientAddr{};
-        int addrLen = sizeof(clientAddr);
+        socklen_t addrLen = sizeof(clientAddr);
         SOCKET cs = accept(ls, reinterpret_cast<sockaddr*>(&clientAddr), &addrLen);
         if (cs == INVALID_SOCKET) {
             if (!running_.load()) break;
@@ -1101,8 +1118,8 @@ bool NetworkEngine::start() {
 
     SOCKET us = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (us != INVALID_SOCKET) {
-        BOOL broadcast = TRUE;
-        BOOL reuse = TRUE;
+        int broadcast = 1;
+        int reuse = 1;
         setsockopt(us, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&broadcast), sizeof(broadcast));
         setsockopt(us, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
 
@@ -1166,8 +1183,13 @@ void NetworkEngine::stop() {
         try { if (viewerThread_.joinable()) viewerThread_.join(); } catch (...) {}
     }
     {
-        std::lock_guard<std::mutex> lk(netDiagMutex_);
-        try { if (netDiagThread_.joinable()) netDiagThread_.join(); } catch (...) {}
+        // Join outside the lock: the diagnostics thread takes it to publish its result.
+        std::thread diagThread;
+        {
+            std::lock_guard<std::mutex> lk(netDiagMutex_);
+            diagThread = std::move(netDiagThread_);
+        }
+        try { if (diagThread.joinable()) diagThread.join(); } catch (...) {}
     }
 }
 
@@ -1232,10 +1254,10 @@ void NetworkEngine::discoveryLoop() {
         FD_SET(us, &rfds);
         timeval tv{ 0, 150000 };
 
-        int sel = select(0, &rfds, nullptr, nullptr, &tv);
+        int sel = select(socket_select_nfds(us), &rfds, nullptr, nullptr, &tv);
         if (sel > 0 && FD_ISSET(us, &rfds)) {
             sockaddr_in fromAddr{};
-            int fromLen = sizeof(fromAddr);
+            socklen_t fromLen = sizeof(fromAddr);
             DiscoveryBeaconPacket pkt{};
             int n = recvfrom(us, reinterpret_cast<char*>(&pkt), sizeof(pkt), 0,
                              reinterpret_cast<sockaddr*>(&fromAddr), &fromLen);
@@ -1338,7 +1360,7 @@ void NetworkEngine::relayRegistrationLoop() {
             FD_ZERO(&rfds);
             FD_SET(s, &rfds);
             timeval tv{ 2, 0 };
-            int sel = select(0, &rfds, nullptr, nullptr, &tv);
+            int sel = select(socket_select_nfds(s), &rfds, nullptr, nullptr, &tv);
             if (sel == 0) {
                 if (!sendFrame(relayControlSock_, PacketType::PING, 0, nullptr, 0, regMutex)) {
                     break;
@@ -1470,8 +1492,10 @@ void NetworkEngine::disconnectHostClient() {
             shutdown(sock, SD_BOTH);
             closesocket(sock);
 #else
+            // The session thread owns the descriptor and closes it once the shutdown has woken it. Closing
+            // here as well would close it twice, and the second close can hit a descriptor that has since
+            // been reused for another connection.
             shutdown(sock, SHUT_RDWR);
-            close(sock);
 #endif
         }
     }
@@ -1495,7 +1519,7 @@ void NetworkEngine::hostAcceptLoop() {
         if (ls == INVALID_SOCKET) break;
 
         sockaddr_in clientAddr{};
-        int addrLen = sizeof(clientAddr);
+        socklen_t addrLen = sizeof(clientAddr);
         SOCKET cs = accept(ls, reinterpret_cast<sockaddr*>(&clientAddr), &addrLen);
         if (cs == INVALID_SOCKET) {
             if (!running_.load()) break;
@@ -2964,7 +2988,13 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
 
         sessionAlive.store(false);
         outboxCv.notify_all();
-        closeWinSock(clientSock);
+        // Close the socket exactly once: cleanup() below closes whatever is still registered, and a second
+        // close of the same descriptor would hit whatever has reused its number by then.
+        {
+            uintptr_t liveSock = activeHostClientSock_.exchange(~uintptr_t(0));
+            if (liveSock != ~uintptr_t(0)) closeWinSock(liveSock);
+            clientSock = ~uintptr_t(0);
+        }
         if (sendWorkerThread.joinable()) {
             try { sendWorkerThread.join(); } catch (...) {}
         }
@@ -2973,7 +3003,9 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         }
 
         if (identity_.settings().lockWorkstationOnDisconnect) {
+#if defined(_WIN32)
             LockWorkStation();
+#endif
         }
     } catch (...) {}
 
@@ -3034,8 +3066,10 @@ void NetworkEngine::disconnectViewer() {
             shutdown(sock, SD_BOTH);
             closesocket(sock);
 #else
+            // The session thread owns the descriptor and closes it once the shutdown has woken it. Closing
+            // here as well would close it twice, and the second close can hit a descriptor that has since
+            // been reused for another connection.
             shutdown(sock, SHUT_RDWR);
-            close(sock);
 #endif
         }
     }
@@ -3132,10 +3166,10 @@ bool NetworkEngine::copyLatestViewerFrame(
         viewerFullCanvasDirty_ = false;
     } else {
         RECT r = viewerDirtyBounds_;
-        r.left = std::clamp(r.left, 0L, static_cast<LONG>(outW));
-        r.right = std::clamp(r.right, 0L, static_cast<LONG>(outW));
-        r.top = std::clamp(r.top, 0L, static_cast<LONG>(outH));
-        r.bottom = std::clamp(r.bottom, 0L, static_cast<LONG>(outH));
+        r.left = std::clamp<LONG>(r.left, 0, static_cast<LONG>(outW));
+        r.right = std::clamp<LONG>(r.right, 0, static_cast<LONG>(outW));
+        r.top = std::clamp<LONG>(r.top, 0, static_cast<LONG>(outH));
+        r.bottom = std::clamp<LONG>(r.bottom, 0, static_cast<LONG>(outH));
         if (r.right > r.left && r.bottom > r.top) {
             int stride = outW * 4;
             int copyBytes = (r.right - r.left) * 4;
@@ -3755,7 +3789,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                 FD_SET(ws, &rfds);
                 timeval tv{ 0, 20000 }; // 20 ms
 
-                int sel = select(0, &rfds, nullptr, nullptr, &tv);
+                int sel = select(socket_select_nfds(ws), &rfds, nullptr, nullptr, &tv);
                 if (sel < 0) {
                     socketDropped = true;
                     break;
@@ -4915,6 +4949,7 @@ void NetworkEngine::setHostPrivacyMode(bool enable, const std::string& notice, c
     }
 }
 
+#if defined(_WIN32)
 void NetworkEngine::createPrivacyCurtainWindow() {
     if (hwndPrivacyCurtain_) return;
 
@@ -4972,7 +5007,11 @@ void NetworkEngine::createPrivacyCurtainWindow() {
     BlockInput(TRUE);
     hostPrivacyModeActive_.store(true);
 }
+#else
+void NetworkEngine::createPrivacyCurtainWindow() {}
+#endif
 
+#if defined(_WIN32)
 void NetworkEngine::destroyPrivacyCurtainWindow() {
     BlockInput(FALSE);
     if (hwndPrivacyCurtain_) {
@@ -4982,6 +5021,12 @@ void NetworkEngine::destroyPrivacyCurtainWindow() {
     ScreenBlankManager::instance().disengageBlanking();
     hostPrivacyModeActive_.store(false);
 }
+#else
+void NetworkEngine::destroyPrivacyCurtainWindow() {
+    ScreenBlankManager::instance().disengageBlanking();
+    hostPrivacyModeActive_.store(false);
+}
+#endif
 
 void NetworkEngine::startHostAudioCapture() {
     stopHostAudioCapture();
@@ -5584,6 +5629,17 @@ void NetworkEngine::hostTerminalReaderLoop() {
 #endif
 }
 
+#if !defined(_WIN32)
+// shortcut: no remote terminal off Windows; the request is ignored.
+void NetworkEngine::stopHostTerminal() {
+    hostTerminalActive_.store(false);
+}
+
+void NetworkEngine::injectHostTerminalStdin(const std::string&) {}
+
+void NetworkEngine::hostTerminalReaderLoop() {}
+#endif
+
 uint32_t NetworkEngine::addPortForwardRule(uint16_t localPort, uint16_t targetPort, const std::string& desc, bool startActive) {
     std::lock_guard<std::mutex> lk(tunnelMutex_);
     PortForwardRule r;
@@ -5683,14 +5739,22 @@ void NetworkEngine::stopPortForwarding() {
 void NetworkEngine::startViewerTunnelMultiplexer() {
     stopViewerTunnelMultiplexer();
     viewerTunnelActive_.store(true);
+    std::lock_guard<std::mutex> lk(viewerTunnelThreadMutex_);
     viewerTunnelThread_ = std::thread(&NetworkEngine::viewerTunnelMultiplexerLoop, this);
 }
 
 void NetworkEngine::stopViewerTunnelMultiplexer() {
     viewerTunnelActive_.store(false);
+    // The viewer session thread and disconnectViewer() both stop the multiplexer. Moving the thread out under
+    // a lock gives exactly one of them the join; two threads joining the same std::thread is undefined.
+    std::thread tunnelThread;
+    {
+        std::lock_guard<std::mutex> lk(viewerTunnelThreadMutex_);
+        tunnelThread = std::move(viewerTunnelThread_);
+    }
     try {
-        if (viewerTunnelThread_.joinable()) {
-            viewerTunnelThread_.join();
+        if (tunnelThread.joinable()) {
+            tunnelThread.join();
         }
     } catch (...) {}
     std::lock_guard<std::mutex> lk(tunnelMutex_);
@@ -5761,7 +5825,7 @@ void NetworkEngine::viewerTunnelMultiplexerLoop() {
         for (const auto& l : currentListeners) {
             if (FD_ISSET(l.listenSock, &readSet)) {
                 sockaddr_in clientAddr{};
-                int addrLen = sizeof(clientAddr);
+                socklen_t addrLen = sizeof(clientAddr);
                 SOCKET cs = accept(l.listenSock, reinterpret_cast<sockaddr*>(&clientAddr), &addrLen);
                 if (cs != INVALID_SOCKET) {
                     u_long nonblock = 1;
@@ -5916,6 +5980,114 @@ void NetworkEngine::hostTunnelProxyLoop() {
 }
 
 // ---------------- Remote Hardware Diagnostics & Live Process Telemetry ----------------
+
+#if !defined(_WIN32)
+namespace {
+
+// Reads the host's real numbers from /proc and statvfs. Anything that cannot be read stays zero or empty.
+void sampleLinuxDiagnostics(SystemDiagnosticsPayload& diag) {
+    // CPU: share of non-idle time since the previous sample (zero on the first call).
+    {
+        static std::mutex s_mutex;
+        static uint64_t s_prevTotal = 0, s_prevIdle = 0;
+        std::ifstream stat("/proc/stat");
+        std::string tag;
+        uint64_t user = 0, nice = 0, sys = 0, idle = 0, iowait = 0, irq = 0, softirq = 0, steal = 0;
+        if (stat >> tag >> user >> nice >> sys >> idle >> iowait >> irq >> softirq >> steal && tag == "cpu") {
+            uint64_t idleAll = idle + iowait;
+            uint64_t total = user + nice + sys + idleAll + irq + softirq + steal;
+            std::lock_guard<std::mutex> lock(s_mutex);
+            if (s_prevTotal != 0 && total > s_prevTotal) {
+                double busy = static_cast<double>((total - s_prevTotal) - (idleAll - s_prevIdle));
+                diag.cpuUsagePercent = static_cast<float>(std::clamp(100.0 * busy / static_cast<double>(total - s_prevTotal), 0.0, 100.0));
+            }
+            s_prevTotal = total;
+            s_prevIdle = idleAll;
+        }
+    }
+
+    // Memory
+    {
+        std::ifstream mem("/proc/meminfo");
+        std::string key;
+        uint64_t value = 0;
+        std::string unit;
+        uint64_t totalKb = 0, availKb = 0;
+        while (mem >> key >> value) {
+            std::getline(mem, unit);
+            if (key == "MemTotal:") totalKb = value;
+            else if (key == "MemAvailable:") availKb = value;
+        }
+        diag.ramTotalBytes = totalKb * 1024;
+        diag.ramUsedBytes = (totalKb >= availKb ? totalKb - availKb : 0) * 1024;
+    }
+
+    // Disk: the root filesystem
+    {
+        struct statvfs fs{};
+        if (statvfs("/", &fs) == 0) {
+            diag.diskTotalBytes = static_cast<uint64_t>(fs.f_blocks) * fs.f_frsize;
+            uint64_t freeBytes = static_cast<uint64_t>(fs.f_bfree) * fs.f_frsize;
+            diag.diskUsedBytes = diag.diskTotalBytes >= freeBytes ? diag.diskTotalBytes - freeBytes : 0;
+        }
+    }
+
+    // Processes by resident memory
+    {
+        const uint64_t pageSize = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+        std::vector<ProcessTelemetryItem> candidates;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
+            const std::string pidText = entry.path().filename().string();
+            if (pidText.empty() || !std::all_of(pidText.begin(), pidText.end(), [](unsigned char c) { return std::isdigit(c); })) continue;
+            ProcessTelemetryItem item;
+            item.pid = static_cast<uint32_t>(std::stoul(pidText));
+            std::ifstream comm(entry.path() / "comm");
+            std::getline(comm, item.name);
+            if (item.name.empty()) item.name = "Unknown";
+            std::ifstream statm(entry.path() / "statm");
+            uint64_t sizePages = 0, residentPages = 0;
+            if (statm >> sizePages >> residentPages) item.workingSetBytes = residentPages * pageSize;
+            candidates.push_back(std::move(item));
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const ProcessTelemetryItem& a, const ProcessTelemetryItem& b) {
+            return a.workingSetBytes > b.workingSetBytes;
+        });
+        diag.processes.assign(candidates.begin(), candidates.begin() + std::min<size_t>(candidates.size(), 60));
+    }
+
+    // Hardware and OS
+    {
+        std::ifstream cpuinfo("/proc/cpuinfo");
+        std::string line;
+        uint32_t cores = 0;
+        while (std::getline(cpuinfo, line)) {
+            if (line.rfind("model name", 0) == 0 && diag.cpuModel.empty()) {
+                auto colon = line.find(':');
+                if (colon != std::string::npos) diag.cpuModel = line.substr(colon + 2);
+            }
+            if (line.rfind("processor", 0) == 0) ++cores;
+        }
+        diag.cpuCores = cores != 0 ? cores : static_cast<uint32_t>(std::max(1u, std::thread::hardware_concurrency()));
+
+        std::ifstream osRelease("/etc/os-release");
+        while (std::getline(osRelease, line)) {
+            if (line.rfind("PRETTY_NAME=", 0) == 0) {
+                diag.osVersion = line.substr(12);
+                diag.osVersion.erase(std::remove(diag.osVersion.begin(), diag.osVersion.end(), '"'), diag.osVersion.end());
+            }
+        }
+        // shortcut: no GPU probe off Windows, so the sheet says so instead of guessing.
+        diag.gpuModel = "Not detected";
+
+        std::ifstream up("/proc/uptime");
+        double seconds = 0;
+        if (up >> seconds) diag.uptimeSeconds = static_cast<uint64_t>(seconds);
+    }
+}
+
+} // namespace
+#endif
 
 SystemDiagnosticsPayload NetworkEngine::sampleHostDiagnostics() {
     SystemDiagnosticsPayload diag{};
@@ -6130,16 +6302,7 @@ SystemDiagnosticsPayload NetworkEngine::sampleHostDiagnostics() {
 
     diag.uptimeSeconds = GetTickCount64() / 1000;
 #else
-    diag.cpuUsagePercent = 5.0f;
-    diag.ramTotalBytes = 16ULL * 1024 * 1024 * 1024;
-    diag.ramUsedBytes = 4ULL * 1024 * 1024 * 1024;
-    diag.diskTotalBytes = 512ULL * 1024 * 1024 * 1024;
-    diag.diskUsedBytes = 128ULL * 1024 * 1024 * 1024;
-    diag.cpuModel = "Linux CPU";
-    diag.cpuCores = 4;
-    diag.gpuModel = "Linux Display Adapter";
-    diag.osVersion = "Linux 6.x";
-    diag.uptimeSeconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    sampleLinuxDiagnostics(diag);
 #endif
 
     return diag;
@@ -6152,7 +6315,12 @@ bool NetworkEngine::executeProcessKill(uint32_t pid, uint8_t callerPermissions) 
     if (pid == 0 || pid == 4) {
         return false;
     }
-    if (pid == GetCurrentProcessId()) {
+#if defined(_WIN32)
+    const uint32_t selfPid = GetCurrentProcessId();
+#else
+    const uint32_t selfPid = static_cast<uint32_t>(getpid());
+#endif
+    if (pid == selfPid) {
         return false;
     }
 
@@ -6414,7 +6582,15 @@ StunNatResult NetworkEngine::queryStunServer(const std::string& hostPort, uint32
     CryptoUtils::randomBytes(req.transId, 12);
 
     uint64_t t0 = nowTickMs();
+#if defined(_WIN32)
     int sent = sendto(s, reinterpret_cast<const char*>(&req), sizeof(req), 0, res->ai_addr, static_cast<int>(res->ai_addrlen));
+#else
+    // A connected UDP socket reports "port unreachable" at once, as Winsock does for an unconnected one,
+    // instead of leaving the caller to wait out the whole timeout.
+    int sent = (connect(s, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen)) == 0)
+        ? static_cast<int>(send(s, reinterpret_cast<const char*>(&req), sizeof(req), 0))
+        : -1;
+#endif
     freeaddrinfo(res);
 
     if (sent != sizeof(req)) {
@@ -6431,7 +6607,7 @@ StunNatResult NetworkEngine::queryStunServer(const std::string& hostPort, uint32
     tv.tv_sec = timeoutMs / 1000;
     tv.tv_usec = (timeoutMs % 1000) * 1000;
 
-    int sel = select(0, &rfds, nullptr, nullptr, &tv);
+    int sel = select(socket_select_nfds(s), &rfds, nullptr, nullptr, &tv);
     if (sel <= 0 || !FD_ISSET(s, &rfds)) {
         closesocket(s);
         result.natTypeDescription = "STUN query timed out";
@@ -6440,7 +6616,7 @@ StunNatResult NetworkEngine::queryStunServer(const std::string& hostPort, uint32
 
     uint8_t recvBuf[1024] = {};
     sockaddr_in fromAddr{};
-    int fromLen = sizeof(fromAddr);
+    socklen_t fromLen = sizeof(fromAddr);
     int nRecv = recvfrom(s, reinterpret_cast<char*>(recvBuf), sizeof(recvBuf), 0, reinterpret_cast<sockaddr*>(&fromAddr), &fromLen);
     uint64_t t1 = nowTickMs();
     closesocket(s);
@@ -6574,14 +6750,26 @@ void NetworkEngine::setRelayAddressAndReconnect(const std::string& newAddr) {
 }
 
 void NetworkEngine::startNetworkDiagnostics(const std::string& relayAddr, const std::string& stunAddr) {
+    {
+        std::lock_guard<std::mutex> lock(netDiagMutex_);
+        if (netDiagResult_.running) {
+            return;
+        }
+    }
+    // A finished thread is joined with the lock released: it takes the lock to publish its result.
+    std::thread finished;
+    {
+        std::lock_guard<std::mutex> lock(netDiagMutex_);
+        finished = std::move(netDiagThread_);
+    }
+    if (finished.joinable()) {
+        try { finished.join(); } catch (...) {}
+    }
+
     std::lock_guard<std::mutex> lock(netDiagMutex_);
     if (netDiagResult_.running) {
         return;
     }
-    if (netDiagThread_.joinable()) {
-        try { netDiagThread_.join(); } catch (...) {}
-    }
-
     netDiagResult_.running = true;
     netDiagResult_.completed = false;
     netDiagResult_.relay = RelayProbeResult{};
