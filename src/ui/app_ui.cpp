@@ -9037,6 +9037,416 @@ void AppUi::applyWindowThemeAttribute() {
     shell_->setDarkTitleBar(identity_.settings().darkTheme);
 }
 
+// ---------------- Shell-facing input and window events ----------------
+
+void AppUi::onWheel(float /*dx*/, float dy, float x, float y) {
+    mouseX_ = x;
+    mouseY_ = y;
+    onMouseWheel(static_cast<int>(std::lround(dy)));
+}
+
+void AppUi::onKey(const KeyEvent& e) {
+    onKeyEvent(e.vk, e.scan, e.down, e.extended);
+}
+
+void AppUi::onText(const std::string& utf8) {
+    // The text handler takes UTF-16 units (it joins surrogate pairs itself), so decode and re-split.
+    const auto* s = reinterpret_cast<const unsigned char*>(utf8.data());
+    const size_t n = utf8.size();
+    for (size_t i = 0; i < n;) {
+        unsigned char b = s[i];
+        int len = (b < 0x80) ? 1 : ((b >> 5) == 0x6) ? 2 : ((b >> 4) == 0xE) ? 3 : ((b >> 3) == 0x1E) ? 4 : 0;
+        if (len == 0 || i + len > n) { ++i; continue; }   // invalid lead byte or truncated sequence
+        char32_t cp = (len == 1) ? b : (b & (0x7F >> len));
+        bool ok = true;
+        for (int k = 1; k < len; ++k) {
+            if ((s[i + k] & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (s[i + k] & 0x3F);
+        }
+        if (!ok) { ++i; continue; }
+        i += len;
+        if (cp >= 0x10000) {
+            cp -= 0x10000;
+            onCharInput(static_cast<char16_t>(0xD800 + (cp >> 10)));
+            onCharInput(static_cast<char16_t>(0xDC00 + (cp & 0x3FF)));
+        } else {
+            onCharInput(static_cast<char16_t>(cp));
+        }
+    }
+}
+
+void AppUi::onFocusChanged(bool focused) {
+    if (!focused) {
+        mouseLeftDown_ = false;
+        draggingSettingsScrollbar_ = false;
+        pressedWidgetId_.clear();
+        network_.sendReleaseAllModifiers();
+        shell_->invalidate();
+        return;
+    }
+    if (notificationMgr_) {
+        notificationMgr_->stopFlash();
+    }
+    if (activeTab_ == ActiveTab::RemoteSession) {
+        network_.markViewerCanvasFullDirty();
+        displayedFrameSeq_ = 0;
+        shell_->invalidate();
+    }
+}
+
+void AppUi::onMouseLeave() {
+    mouseInsideClient_ = false;
+    trackingMouseLeave_ = false;
+    hoveredWidgetId_.clear();
+    hoveredIsTextInput_ = false;
+    shell_->invalidate();
+}
+
+void AppUi::onCaptureLost() {
+    draggingRewindScrubber_ = false;
+    draggingSettingsScrollbar_ = false;
+    pressedWidgetId_.clear();
+    shell_->invalidate();
+}
+
+ui::CursorShape AppUi::cursorShape() const {
+    if (hoveredIsTextInput_) return ui::CursorShape::IBeam;
+    if (!hoveredWidgetId_.empty()) return ui::CursorShape::Hand;
+    return ui::CursorShape::Arrow;
+}
+
+void AppUi::onResized() {
+    sessionHudScrollOffset_ = std::clamp(sessionHudScrollOffset_, 0.0f, sessionHudMaxScroll_);
+    navPillInit_ = false;
+    activeTooltipText_.clear();
+    tooltipAnimT_ = 0.0f;
+    tooltipAnimVel_ = 0.0f;
+    shell_->invalidate();
+}
+
+void AppUi::onTick() {
+    uint64_t tickNow = shell_->nowMs();
+    if (remoteFilePane_.expireLoading(tickNow)) {
+        showToast(remoteFilePane_.statusMessage, true);
+        shell_->invalidate();
+    }
+    auto vStats = network_.viewerStats();
+    if (vStats.state == ViewerConnectionState::Connected &&
+        prevViewerState_ != ViewerConnectionState::Connected) {
+        switchTab(ActiveTab::RemoteSession);
+        scaleMode_ = static_cast<ScaleMode>(std::clamp<int>(identity_.settings().defaultScaleMode, 0, 3));
+        if (vStats.remoteAddress.find("127.0.0.1") != std::string::npos ||
+            vStats.remoteDeskId == identity_.deskId()) {
+            remoteInputEnabled_ = false;
+            showToast("Connected on same PC. View-Only enabled (F8 to toggle).");
+        } else {
+            remoteInputEnabled_ = true;
+            showToast("Connected to " + vStats.remoteHostname);
+        }
+
+        SessionTab* activeTab = sessionTabs_.activeTab();
+        if (activeTab) {
+            activeTab->state = ViewerConnectionState::Connected;
+            activeTab->deskId = vStats.remoteDeskId;
+            activeTab->remoteHostname = vStats.remoteHostname;
+            if (!vStats.remoteHostname.empty()) {
+                activeTab->title = vStats.remoteHostname;
+            }
+            activeTab->connectedSinceTickMs = tickNow;
+        }
+    } else if (vStats.state == ViewerConnectionState::Error &&
+               prevViewerState_ != ViewerConnectionState::Error) {
+        SessionTab* activeTab = sessionTabs_.activeTab();
+        if (activeTab) {
+            activeTab->state = ViewerConnectionState::Error;
+            activeTab->statusMessage = vStats.statusMessage;
+        }
+        showToast(vStats.statusMessage, true);
+        if (sessionTabs_.tabCount() <= 1) {
+            switchTab(ActiveTab::Dashboard);
+        }
+    } else if (prevViewerState_ == ViewerConnectionState::Connected &&
+               vStats.state == ViewerConnectionState::Disconnected) {
+        if (sessionRecorder_.isRecording()) {
+            sessionRecorder_.stopRecording();
+        }
+        if (network_.isVoiceIntercomActive()) {
+            network_.stopVoiceIntercom();
+        }
+        rewindBuffer_.clear();
+        showRewindScrubber_ = false;
+        rewindFrozen_ = false;
+        rewindOffsetMs_ = 0;
+        if (notificationMgr_) {
+            std::string hName = prevViewerHostname_.empty() ? "Remote Desktop" : prevViewerHostname_;
+            notificationMgr_->notify(NotificationType::SessionDropped, "Session Disconnected",
+                                     "Remote session with " + hName + " ended.", identity_.settings());
+        }
+        SessionTab* activeTab = sessionTabs_.activeTab();
+        if (activeTab) {
+            activeTab->state = ViewerConnectionState::Disconnected;
+        }
+        if (sessionTabs_.tabCount() <= 1) {
+            sessionTabs_.closeAllTabs();
+            switchTab(ActiveTab::Dashboard);
+        }
+    }
+    if (vStats.state == ViewerConnectionState::Connected) {
+        prevViewerHostname_ = vStats.remoteHostname;
+        SessionTab* curTab = sessionTabs_.activeTab();
+        if (curTab) {
+            curTab->fps = vStats.fps;
+            curTab->rttMs = vStats.rttMs;
+            curTab->activeMonitorIndex = vStats.activeMonitorIndex;
+            curTab->monitorCount = vStats.monitorCount;
+            curTab->qualityPreset = vStats.qualityPreset;
+            curTab->privacyModeEngaged = vStats.privacyModeEngaged;
+            if (!vStats.remoteHostname.empty() && curTab->remoteHostname != vStats.remoteHostname) {
+                curTab->remoteHostname = vStats.remoteHostname;
+                curTab->title = vStats.remoteHostname;
+            }
+        }
+    }
+    prevViewerState_ = vStats.state;
+
+    // Host session disconnect detection
+    auto hostStatus = network_.hostSessionStatus();
+    if (prevHostActive_ && !hostStatus.active) {
+        if (notificationMgr_) {
+            std::string cName = prevHostClientName_.empty() ? "Remote Client" : prevHostClientName_;
+            notificationMgr_->notify(NotificationType::SessionDropped, "Client Disconnected",
+                                     cName + " disconnected from your desktop.", identity_.settings());
+        }
+    }
+    if (hostStatus.active) {
+        prevHostClientName_ = hostStatus.viewerHostname;
+    }
+    prevHostActive_ = hostStatus.active;
+
+    // Chat message notifications
+    uint32_t unreadChat = network_.unreadChatCount();
+    if (showFileDrawer_ && drawerTab_ == DrawerTab::LiveChat && unreadChat > 0) {
+        network_.markChatRead();
+        unreadChat = 0;
+    }
+    if (unreadChat > lastSeenUnreadChat_) {
+        auto msgs = network_.chatMessages();
+        if (!msgs.empty() && !msgs.back().fromLocal) {
+            showToast(msgs.back().senderName + ": " + msgs.back().text);
+            bool isUnfocused = !shell_->isWindowForeground();
+            bool drawerClosed = (!showFileDrawer_ || drawerTab_ != DrawerTab::LiveChat);
+            if ((isUnfocused || drawerClosed) && notificationMgr_) {
+                notificationMgr_->notify(
+                    NotificationType::ChatMessage,
+                    msgs.back().senderName.empty() ? "New Chat Message" : msgs.back().senderName,
+                    msgs.back().text,
+                    identity_.settings()
+                );
+            }
+        }
+    }
+    lastSeenUnreadChat_ = unreadChat;
+
+    // Completed file transfer notifications
+    auto transfers = network_.fileTransferManager().snapshotTransfers();
+    size_t completedCount = 0;
+    std::string newlyCompletedName;
+    for (const auto& item : transfers) {
+        if (item.status == TransferStatus::Completed) {
+            completedCount++;
+            if (!item.isOutgoing && completedCount > prevCompletedTransfersCount_) {
+                newlyCompletedName = item.fileName;
+            }
+        }
+    }
+    if (completedCount > prevCompletedTransfersCount_) {
+        if (!newlyCompletedName.empty() && notificationMgr_) {
+            notificationMgr_->notify(
+                NotificationType::FileTransferDone,
+                "File Transfer Complete",
+                "File '" + newlyCompletedName + "' received successfully.",
+                identity_.settings()
+            );
+        }
+    }
+    prevCompletedTransfersCount_ = completedCount;
+
+    // Incoming connection request notification
+    auto pending = network_.pendingIncomingRequest();
+    if (pending.active && !prevHasPendingIncoming_) {
+        modalPermissions_ = identity_.settings().defaultPermissions;
+        shell_->bringToFront();
+        if (notificationMgr_) {
+            std::string title = "Incoming Connection Request";
+            std::string caller = pending.callerHostname.empty() ? "Remote User" : pending.callerHostname;
+            std::string msg = caller + " (" + CryptoUtils::formatDeskId(pending.callerDeskId) + ") is requesting remote control.";
+            notificationMgr_->notify(NotificationType::IncomingConnection, title, msg, identity_.settings());
+        }
+        shell_->invalidate();
+    }
+    prevHasPendingIncoming_ = pending.active;
+    modalWasActive_ = pending.active;
+
+    bool toastActive = (!toastText_.empty() && tickNow <= toastExpireTick_ + 500);
+    bool inLiveSession = (vStats.state != ViewerConnectionState::Disconnected) ||
+                         network_.hostSessionStatus().active ||
+                         pending.active;
+
+    if (hasPendingMouseMove_) {
+        flushPendingMouseMove();
+    }
+
+    ++idleTickCounter_;
+    bool micMonitoringActive = (activeTab_ == ActiveTab::Settings && settingsSection_ == SettingsSection::AudioVoice && network_.isVoiceMonitoring());
+    if (inLiveSession || toastActive || micMonitoringActive || (idleTickCounter_ % 4 == 0)) {
+        shell_->invalidate();
+    }
+}
+
+void AppUi::onFrameReady() {
+    frameRedrawPending_.store(false);
+    if (hasPendingMouseMove_) {
+        flushPendingMouseMove();
+    }
+    shell_->invalidate();
+}
+
+void AppUi::onGraphicsLost() {
+    appIconBitmap_ = {};
+    remoteBitmap_ = {};
+    recordingPlayerBitmap_ = {};
+    bitmapW_ = 0;
+    bitmapH_ = 0;
+    recordingPlayerBitmapW_ = 0;
+    recordingPlayerBitmapH_ = 0;
+}
+
+void AppUi::onCloseRequested() {
+    network_.disconnectViewer();
+    hardResetViewerUiState();
+}
+
+void AppUi::onWindowDestroyed() {
+    if (sessionRecorder_.isRecording()) {
+        sessionRecorder_.stopRecording();
+    }
+    if (notificationMgr_) {
+        notificationMgr_->shutdown();
+    }
+    network_.disconnectViewer();
+    hardResetViewerUiState();
+}
+
+void AppUi::startAutoConnect() {
+    if (!autoConnectTarget_.empty()) {
+        remoteIdInput_ = autoConnectTarget_;
+        initiateConnection();
+    }
+}
+
+void AppUi::restoreFromTray(NotificationType contextType) {
+    if (notificationMgr_) {
+        notificationMgr_->stopFlash();
+    }
+    if (contextType == NotificationType::ChatMessage) {
+        showFileDrawer_ = true;
+        drawerTab_ = DrawerTab::LiveChat;
+        network_.markChatRead();
+        focusedField_ = FocusedField::ChatInput;
+    } else if (contextType == NotificationType::FileTransferDone) {
+        showFileDrawer_ = true;
+        drawerTab_ = DrawerTab::FilesAndClip;
+    } else if (contextType == NotificationType::IncomingConnection) {
+        auto pending = network_.pendingIncomingRequest();
+        if (pending.active) {
+            shell_->bringToFront();
+        }
+    }
+    shell_->invalidate();
+}
+
+void AppUi::toggleNotificationsMuted() {
+    if (notificationMgr_) {
+        notificationMgr_->setMuted(!notificationMgr_->isMuted());
+        showToast(notificationMgr_->isMuted() ? "Notifications muted" : "Notifications unmuted");
+    }
+}
+
+std::string AppUi::trayStatusText() const {
+    auto vStats = network_.viewerStats();
+    if (vStats.state == ViewerConnectionState::Connected) {
+        return "Controlling " + vStats.remoteHostname;
+    }
+    if (network_.hostSessionStatus().active) {
+        return "Host Active";
+    }
+    return "Online";
+}
+
+void AppUi::onUpdateCheckDone(const UpdateInfo& info, bool manual) {
+    latestUpdateInfo_ = info;
+    isCheckingUpdates_ = false;
+    if (!info.success) {
+        updateStatusText_ = "Check failed (Offline or rate-limited)";
+        if (manual) showToast("Could not check for updates", true);
+    } else if (info.updateRequired) {
+        std::string cleanVer = info.latestVersion;
+        if (!cleanVer.empty() && (cleanVer[0] == 'v' || cleanVer[0] == 'V')) {
+            cleanVer = cleanVer.substr(1);
+        }
+        updateStatusText_ = "Mandatory Update: v" + cleanVer;
+        showUpdateRequiredModal_ = true;
+        if (manual) showToast("Mandatory update v" + cleanVer + " available!", true);
+    } else {
+        updateStatusText_ = "CppDesk is up to date (v" + std::string(CPP_DESK_VERSION) + ")";
+        if (manual) showToast("You have the latest version (v" + std::string(CPP_DESK_VERSION) + ")");
+    }
+    shell_->invalidate();
+}
+
+void AppUi::onScratchpadUpdate(const ScratchpadUpdatePayload& p) {
+    if (focusedField_ != FocusedField::ScratchpadText) {
+        scratchpadTextEdit_ = p.text;
+    }
+    lastSeenScratchpadRev_ = p.revision;
+    shell_->invalidate();
+}
+
+void AppUi::onCommandPaletteOutput(const CommandPaletteOutputPayload& p) {
+    omnibarLastOutput_ = p.stdoutData.empty() ? p.errorMessage : p.stdoutData;
+    omnibarLastExitCode_ = p.exitCode;
+    omnibarHasOutput_ = true;
+    shell_->invalidate();
+}
+
+void AppUi::onUpdateProgress(const UpdateProgressData& p) {
+    updateDownloadedBytes_ = p.downloaded;
+    updateTotalBytes_ = p.total;
+    updateSpeedBps_ = p.speed;
+    if (p.total > 0) {
+        updateDownloadProgress_ = static_cast<float>(p.downloaded) / static_cast<float>(p.total);
+    }
+    shell_->invalidate();
+}
+
+void AppUi::onPeerVersionMismatch(const std::string& hostVer, const std::string& viewerVer) {
+    peerMismatchHostVer_ = hostVer;
+    peerMismatchViewerVer_ = viewerVer;
+    showPeerMismatchModal_ = true;
+    showUpdateRequiredModal_ = true;
+    std::string cleanVer = hostVer;
+    if (!cleanVer.empty() && (cleanVer[0] == 'v' || cleanVer[0] == 'V')) {
+        cleanVer = cleanVer.substr(1);
+    }
+    latestUpdateInfo_.latestVersion = cleanVer;
+    triggerUpdateCheck(false);
+    shell_->invalidate();
+}
+
+void AppUi::onVersionUpgradeNotice(const std::string& senderVersion) {
+    showToast("Notice from Viewer: Upgrade to CppDesk v" + senderVersion + " recommended.");
+}
+
 // ---------------- Construction & frame loop ----------------
 
 AppUi::AppUi(IdentityManager& identity, NetworkEngine& network, ui::PlatformShell& shell, const std::string& autoConnectTarget)

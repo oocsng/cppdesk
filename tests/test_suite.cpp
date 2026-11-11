@@ -11,6 +11,7 @@
 #include "../src/core/win_compat.hpp"
 #include "../src/ui/recording_canvas.hpp"
 #include "../src/ui/app_ui.hpp"
+#include "../src/ui/vk_codes.hpp"
 #include "../src/ui/platform_shell.hpp"
 #if defined(_WIN32)
 #include "../src/ui/canvas_d2d.hpp"
@@ -7889,6 +7890,8 @@ public:
     void quitApp() override {}
     bool relaunchElevated() override { return false; }
     void playAlertSound() override {}
+    bool isWindowForeground() const override { return true; }
+    void bringToFront() override {}
     void setMouseCapture(bool) override {}
     bool isKeyDown(uint16_t) const override { return false; }
     void trackMouseLeave() override {}
@@ -7966,6 +7969,39 @@ void testAppUiRendersEveryScreenHeadless() {
     TEST_ASSERT(approval.find("|Connection Request") != std::string::npos);
     std::string dash = renderAppState(id, net, shell, "dashboard_light");
     TEST_ASSERT(dash.find("|" + CryptoUtils::formatDeskId(id.deskId())) != std::string::npos);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
+// Drives AppUi only through its public input API, the way a non-Windows shell will.
+void testAppUiPublicInputApi() {
+    std::cout << "[TEST 71] AppUi takes input through its public API..." << std::endl;
+    IdentityManager id(4246);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    FakeShell shell;
+    AppUi app(id, net, shell, "");
+    ui::RecordingCanvas rc;
+    auto settle = [&] { for (int i = 0; i < 150; ++i) app.render(rc, 1280, 800, 1.0 / 60.0); };   // let the drawer slide in
+    app.applySnapshotState("chat_long_text");   // chat input focused
+    app.onText("\x01");                          // Ctrl+A clears the field
+    app.onText("Z\xC3\xA9\xF0\x9F\x98\x80");     // "Zé😀": 2-byte and 4-byte UTF-8 (a surrogate pair)
+    settle();
+    TEST_ASSERT(rc.serialize().find("|Z\xC3\xA9\xF0\x9F\x98\x80|") != std::string::npos);
+    app.onText("\b");                            // Backspace drops the whole emoji
+    settle();
+    TEST_ASSERT(rc.serialize().find("|Z\xC3\xA9|") != std::string::npos);
+
+    app.onMouseMove(640, 400);
+    app.onWheel(0, -120, 640, 400);
+    app.onKey(KeyEvent{ VK_ESCAPE, 0x01, true, false });
+    app.onKey(KeyEvent{ VK_ESCAPE, 0x01, false, false });
+    app.onFocusChanged(false);
+    app.onMouseLeave();
+    TEST_ASSERT(app.cursorShape() == ui::CursorShape::Arrow);
+    app.onTick();
+    settle();
+    TEST_ASSERT(rc.frameBalanced());
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
 }
@@ -8057,6 +8093,7 @@ int main() {
         testRecordingCanvas(); std::cout << "Test 67 done\n" << std::flush;
         testShellCapabilityGating(); std::cout << "Test 69 done\n" << std::flush;
         testAppUiRendersEveryScreenHeadless(); std::cout << "Test 70 done\n" << std::flush;
+        testAppUiPublicInputApi(); std::cout << "Test 71 done\n" << std::flush;
 #if defined(_WIN32)
         testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;
 #endif

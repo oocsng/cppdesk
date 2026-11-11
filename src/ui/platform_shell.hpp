@@ -60,6 +60,10 @@ public:
     // Relaunch with administrator rights; true if the new instance started (this one should then quit).
     virtual bool relaunchElevated() = 0;
     virtual void playAlertSound() = 0;
+    // True when the app window is the active, non-minimized window.
+    virtual bool isWindowForeground() const = 0;
+    // Raise the app window and give it focus.
+    virtual void bringToFront() = 0;
 
     // Keep receiving mouse events while a button is held outside the window (scrubber drags).
     virtual void setMouseCapture(bool capture) = 0;

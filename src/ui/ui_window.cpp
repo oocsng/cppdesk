@@ -182,6 +182,10 @@ public:
     }
     bool relaunchElevated() override { return InputInjector::relaunchAsAdmin(w_.hwnd_); }
     void playAlertSound() override { MessageBeep(MB_OK); }
+    bool isWindowForeground() const override {
+        return w_.hwnd_ && GetForegroundWindow() == w_.hwnd_ && !IsIconic(w_.hwnd_);
+    }
+    void bringToFront() override { if (w_.hwnd_) SetForegroundWindow(w_.hwnd_); }
     void setMouseCapture(bool capture) override {
         if (capture) {
             if (w_.hwnd_) SetCapture(w_.hwnd_);
@@ -395,35 +399,24 @@ bool CppDeskWindow::create(HINSTANCE hInstance, int nCmdShow) {
     applyWindowThemeAttribute();
     DragAcceptFiles(hwnd_, TRUE);
 
-    app_->notificationMgr_ = std::make_unique<NotificationManager>();
-    app_->notificationMgr_->init(hwnd_, hInstance, title);
+    {
+        auto notif = std::make_unique<NotificationManager>();
+        notif->init(hwnd_, hInstance, title);
+        app_->setNotificationManager(std::move(notif));
+    }
 
     network_.setOnFrameDecodedCallback([this]() {
-        if (!app_->frameRedrawPending_.exchange(true)) {
-            if (hwnd_) {
-                PostMessageW(hwnd_, WM_APP_FRAME_READY, 0, 0);
-            }
+        if (app_->claimFrameRedraw() && hwnd_) {
+            PostMessageW(hwnd_, WM_APP_FRAME_READY, 0, 0);
         }
     });
 
     network_.setOnVersionMismatchCallback([this](const std::string& hostVer, const std::string& viewerVer) {
-        app_->peerMismatchHostVer_ = hostVer;
-        app_->peerMismatchViewerVer_ = viewerVer;
-        app_->showPeerMismatchModal_ = true;
-        app_->showUpdateRequiredModal_ = true;
-        std::string cleanVer = hostVer;
-        if (!cleanVer.empty() && (cleanVer[0] == 'v' || cleanVer[0] == 'V')) {
-            cleanVer = cleanVer.substr(1);
-        }
-        app_->latestUpdateInfo_.latestVersion = cleanVer;
-        app_->triggerUpdateCheck(false);
-        if (hwnd_) {
-            shell_->invalidate();
-        }
+        app_->onPeerVersionMismatch(hostVer, viewerVer);
     });
 
     network_.setOnVersionUpgradeNoticeCallback([this](const VersionUpgradeNoticePayload& notice) {
-        app_->showToast("Notice from Viewer: Upgrade to CppDesk v" + notice.senderVersion + " recommended.");
+        app_->onVersionUpgradeNotice(notice.senderVersion);
     });
 
     ShowWindow(hwnd_, nCmdShow);
@@ -431,10 +424,7 @@ bool CppDeskWindow::create(HINSTANCE hInstance, int nCmdShow) {
 
     SetTimer(hwnd_, 1, 32, nullptr);
 
-    if (!app_->autoConnectTarget_.empty()) {
-        app_->remoteIdInput_ = app_->autoConnectTarget_;
-        app_->initiateConnection();
-    }
+    app_->startAutoConnect();
     return true;
 }
 
@@ -467,14 +457,7 @@ void CppDeskWindow::discardDeviceResources() {
     if (d2dCanvas_) d2dCanvas_->detach();
     if (renderTarget_) { renderTarget_->Release(); renderTarget_ = nullptr; }
     hwndTarget_ = nullptr;
-    if (!app_) return;   // teardown: the screens are already gone
-    app_->appIconBitmap_ = {};
-    app_->remoteBitmap_ = {};
-    app_->recordingPlayerBitmap_ = {};
-    app_->bitmapW_ = 0;
-    app_->bitmapH_ = 0;
-    app_->recordingPlayerBitmapW_ = 0;
-    app_->recordingPlayerBitmapH_ = 0;
+    if (app_) app_->onGraphicsLost();   // app_ is already gone during teardown
 }
 
 void CppDeskWindow::releaseGraphics() {
@@ -595,45 +578,23 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_SETCURSOR: {
             if (LOWORD(lParam) == HTCLIENT) {
-                if (app_->hoveredIsTextInput_) {
-                    SetCursor(LoadCursor(nullptr, IDC_IBEAM));
-                } else if (!app_->hoveredWidgetId_.empty()) {
-                    SetCursor(LoadCursor(nullptr, IDC_HAND));
-                } else {
-                    SetCursor(LoadCursor(nullptr, IDC_ARROW));
-                }
+                const ui::CursorShape shape = app_->cursorShape();
+                SetCursor(LoadCursor(nullptr, shape == ui::CursorShape::IBeam ? IDC_IBEAM
+                                             : shape == ui::CursorShape::Hand ? IDC_HAND : IDC_ARROW));
                 return TRUE;
             }
             break;
         }
-        case WM_MOUSELEAVE: {
-            app_->mouseInsideClient_ = false;
-            app_->trackingMouseLeave_ = false;
-            app_->hoveredWidgetId_.clear();
-            app_->hoveredIsTextInput_ = false;
-            shell_->invalidate();
+        case WM_MOUSELEAVE:
+            app_->onMouseLeave();
             return 0;
-        }
-        case WM_KILLFOCUS: {
-            app_->mouseLeftDown_ = false;
-            app_->draggingSettingsScrollbar_ = false;
-            app_->pressedWidgetId_.clear();
-            network_.sendReleaseAllModifiers();
-            shell_->invalidate();
+        case WM_KILLFOCUS:
+            app_->onFocusChanged(false);
             return 0;
-        }
-        case WM_ACTIVATE:
-        case WM_SETFOCUS: {
-            if (app_->notificationMgr_) {
-                app_->notificationMgr_->stopFlash();
-            }
-            if (app_->activeTab_ == ActiveTab::RemoteSession) {
-                network_.markViewerCanvasFullDirty();
-                app_->displayedFrameSeq_ = 0;
-                shell_->invalidate();
-            }
+        case WM_ACTIVATE:   // as before the split, any activation change refreshes like a focus gain
+        case WM_SETFOCUS:
+            app_->onFocusChanged(true);
             break;
-        }
         case WM_SYSCOMMAND: {
             if ((wParam & 0xFFF0) == SC_MINIMIZE && identity_.settings().minimizeToTray) {
                 ShowWindow(hwnd_, SW_HIDE);
@@ -646,8 +607,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 ShowWindow(hwnd_, SW_HIDE);
                 return 0;
             }
-            network_.disconnectViewer();
-            app_->hardResetViewerUiState();
+            app_->onCloseRequested();
             DestroyWindow(hwnd_);
             return 0;
         }
@@ -657,10 +617,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 restoreFromTray();
                 return 0;
             } else if (cmdId == IDM_TRAY_MUTE) {
-                if (app_->notificationMgr_) {
-                    app_->notificationMgr_->setMuted(!app_->notificationMgr_->isMuted());
-                    app_->showToast(app_->notificationMgr_->isMuted() ? "Notifications muted" : "Notifications unmuted");
-                }
+                app_->toggleNotificationsMuted();
                 return 0;
             } else if (cmdId == IDM_TRAY_EXIT) {
                 DestroyWindow(hwnd_);
@@ -676,9 +633,10 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 case NIN_SELECT:
                 case NIN_KEYSELECT:
                 case NIN_BALLOONUSERCLICK: {
-                    NotificationType nType = app_->notificationMgr_ ? app_->notificationMgr_->lastNotificationType() : NotificationType::GeneralInfo;
+                    NotificationManager* notif = app_->notifications();
+                    NotificationType nType = notif ? notif->lastNotificationType() : NotificationType::GeneralInfo;
                     restoreFromTray(nType);
-                    if (app_->notificationMgr_) app_->notificationMgr_->clearLastNotificationType();
+                    if (notif) notif->clearLastNotificationType();
                     return 0;
                 }
                 case WM_RBUTTONUP:
@@ -688,15 +646,8 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         pt.x = static_cast<short>(LOWORD(wParam));
                         pt.y = static_cast<short>(HIWORD(wParam));
                     }
-                    std::string status = "Online";
-                    auto vStats = network_.viewerStats();
-                    if (vStats.state == ViewerConnectionState::Connected) {
-                        status = "Controlling " + vStats.remoteHostname;
-                    } else if (network_.hostSessionStatus().active) {
-                        status = "Host Active";
-                    }
-                    if (app_->notificationMgr_) {
-                        app_->notificationMgr_->showContextMenu(pt.x, pt.y, status);
+                    if (NotificationManager* notif = app_->notifications()) {
+                        notif->showContextMenu(pt.x, pt.y, app_->trayStatusText());
                     }
                     return 0;
                 }
@@ -726,203 +677,15 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     shell_->invalidate();
                 }
             }
-            app_->sessionHudScrollOffset_ = std::clamp(app_->sessionHudScrollOffset_, 0.0f, app_->sessionHudMaxScroll_);
-            app_->navPillInit_ = false;
-            app_->activeTooltipText_.clear();
-            app_->tooltipAnimT_ = 0.0f;
-            app_->tooltipAnimVel_ = 0.0f;
-            shell_->invalidate();
+            app_->onResized();
             return 0;
         }
-        case WM_CAPTURECHANGED: {
-            if (app_->draggingRewindScrubber_) {
-                app_->draggingRewindScrubber_ = false;
-            }
-            app_->draggingSettingsScrollbar_ = false;
-            app_->pressedWidgetId_.clear();
-            shell_->invalidate();
+        case WM_CAPTURECHANGED:
+            app_->onCaptureLost();
             return 0;
-        }
-        case WM_TIMER: {
-            uint64_t tickNow = shell_->nowMs();
-            if (app_->remoteFilePane_.expireLoading(tickNow)) {
-                app_->showToast(app_->remoteFilePane_.statusMessage, true);
-                shell_->invalidate();
-            }
-            auto vStats = network_.viewerStats();
-            if (vStats.state == ViewerConnectionState::Connected &&
-                app_->prevViewerState_ != ViewerConnectionState::Connected) {
-                app_->switchTab(ActiveTab::RemoteSession);
-                app_->scaleMode_ = static_cast<ScaleMode>(std::clamp<int>(identity_.settings().defaultScaleMode, 0, 3));
-                if (vStats.remoteAddress.find("127.0.0.1") != std::string::npos ||
-                    vStats.remoteDeskId == identity_.deskId()) {
-                    app_->remoteInputEnabled_ = false;
-                    app_->showToast("Connected on same PC. View-Only enabled (F8 to toggle).");
-                } else {
-                    app_->remoteInputEnabled_ = true;
-                    app_->showToast("Connected to " + vStats.remoteHostname);
-                }
-
-                SessionTab* activeTab = app_->sessionTabs_.activeTab();
-                if (activeTab) {
-                    activeTab->state = ViewerConnectionState::Connected;
-                    activeTab->deskId = vStats.remoteDeskId;
-                    activeTab->remoteHostname = vStats.remoteHostname;
-                    if (!vStats.remoteHostname.empty()) {
-                        activeTab->title = vStats.remoteHostname;
-                    }
-                    activeTab->connectedSinceTickMs = tickNow;
-                }
-            } else if (vStats.state == ViewerConnectionState::Error &&
-                       app_->prevViewerState_ != ViewerConnectionState::Error) {
-                SessionTab* activeTab = app_->sessionTabs_.activeTab();
-                if (activeTab) {
-                    activeTab->state = ViewerConnectionState::Error;
-                    activeTab->statusMessage = vStats.statusMessage;
-                }
-                app_->showToast(vStats.statusMessage, true);
-                if (app_->sessionTabs_.tabCount() <= 1) {
-                    app_->switchTab(ActiveTab::Dashboard);
-                }
-            } else if (app_->prevViewerState_ == ViewerConnectionState::Connected &&
-                       vStats.state == ViewerConnectionState::Disconnected) {
-                if (app_->sessionRecorder_.isRecording()) {
-                    app_->sessionRecorder_.stopRecording();
-                }
-                if (network_.isVoiceIntercomActive()) {
-                    network_.stopVoiceIntercom();
-                }
-                app_->rewindBuffer_.clear();
-                app_->showRewindScrubber_ = false;
-                app_->rewindFrozen_ = false;
-                app_->rewindOffsetMs_ = 0;
-                if (app_->notificationMgr_) {
-                    std::string hName = app_->prevViewerHostname_.empty() ? "Remote Desktop" : app_->prevViewerHostname_;
-                    app_->notificationMgr_->notify(NotificationType::SessionDropped, "Session Disconnected",
-                                             "Remote session with " + hName + " ended.", identity_.settings());
-                }
-                SessionTab* activeTab = app_->sessionTabs_.activeTab();
-                if (activeTab) {
-                    activeTab->state = ViewerConnectionState::Disconnected;
-                }
-                if (app_->sessionTabs_.tabCount() <= 1) {
-                    app_->sessionTabs_.closeAllTabs();
-                    app_->switchTab(ActiveTab::Dashboard);
-                }
-            }
-            if (vStats.state == ViewerConnectionState::Connected) {
-                app_->prevViewerHostname_ = vStats.remoteHostname;
-                SessionTab* curTab = app_->sessionTabs_.activeTab();
-                if (curTab) {
-                    curTab->fps = vStats.fps;
-                    curTab->rttMs = vStats.rttMs;
-                    curTab->activeMonitorIndex = vStats.activeMonitorIndex;
-                    curTab->monitorCount = vStats.monitorCount;
-                    curTab->qualityPreset = vStats.qualityPreset;
-                    curTab->privacyModeEngaged = vStats.privacyModeEngaged;
-                    if (!vStats.remoteHostname.empty() && curTab->remoteHostname != vStats.remoteHostname) {
-                        curTab->remoteHostname = vStats.remoteHostname;
-                        curTab->title = vStats.remoteHostname;
-                    }
-                }
-            }
-            app_->prevViewerState_ = vStats.state;
-
-            // Host session disconnect detection
-            auto hostStatus = network_.hostSessionStatus();
-            if (app_->prevHostActive_ && !hostStatus.active) {
-                if (app_->notificationMgr_) {
-                    std::string cName = app_->prevHostClientName_.empty() ? "Remote Client" : app_->prevHostClientName_;
-                    app_->notificationMgr_->notify(NotificationType::SessionDropped, "Client Disconnected",
-                                             cName + " disconnected from your desktop.", identity_.settings());
-                }
-            }
-            if (hostStatus.active) {
-                app_->prevHostClientName_ = hostStatus.viewerHostname;
-            }
-            app_->prevHostActive_ = hostStatus.active;
-
-            // Chat message notifications
-            uint32_t unreadChat = network_.unreadChatCount();
-            if (app_->showFileDrawer_ && app_->drawerTab_ == DrawerTab::LiveChat && unreadChat > 0) {
-                network_.markChatRead();
-                unreadChat = 0;
-            }
-            if (unreadChat > app_->lastSeenUnreadChat_) {
-                auto msgs = network_.chatMessages();
-                if (!msgs.empty() && !msgs.back().fromLocal) {
-                    app_->showToast(msgs.back().senderName + ": " + msgs.back().text);
-                    bool isUnfocused = (GetForegroundWindow() != hwnd_ || IsIconic(hwnd_));
-                    bool drawerClosed = (!app_->showFileDrawer_ || app_->drawerTab_ != DrawerTab::LiveChat);
-                    if ((isUnfocused || drawerClosed) && app_->notificationMgr_) {
-                        app_->notificationMgr_->notify(
-                            NotificationType::ChatMessage,
-                            msgs.back().senderName.empty() ? "New Chat Message" : msgs.back().senderName,
-                            msgs.back().text,
-                            identity_.settings()
-                        );
-                    }
-                }
-            }
-            app_->lastSeenUnreadChat_ = unreadChat;
-
-            // Completed file transfer notifications
-            auto transfers = network_.fileTransferManager().snapshotTransfers();
-            size_t completedCount = 0;
-            std::string newlyCompletedName;
-            for (const auto& item : transfers) {
-                if (item.status == TransferStatus::Completed) {
-                    completedCount++;
-                    if (!item.isOutgoing && completedCount > app_->prevCompletedTransfersCount_) {
-                        newlyCompletedName = item.fileName;
-                    }
-                }
-            }
-            if (completedCount > app_->prevCompletedTransfersCount_) {
-                if (!newlyCompletedName.empty() && app_->notificationMgr_) {
-                    app_->notificationMgr_->notify(
-                        NotificationType::FileTransferDone,
-                        "File Transfer Complete",
-                        "File '" + newlyCompletedName + "' received successfully.",
-                        identity_.settings()
-                    );
-                }
-            }
-            app_->prevCompletedTransfersCount_ = completedCount;
-
-            // Incoming connection request notification
-            auto pending = network_.pendingIncomingRequest();
-            if (pending.active && !app_->prevHasPendingIncoming_) {
-                app_->modalPermissions_ = identity_.settings().defaultPermissions;
-                SetForegroundWindow(hwnd_);
-                if (app_->notificationMgr_) {
-                    std::string title = "Incoming Connection Request";
-                    std::string caller = pending.callerHostname.empty() ? "Remote User" : pending.callerHostname;
-                    std::string msg = caller + " (" + CryptoUtils::formatDeskId(pending.callerDeskId) + ") is requesting remote control.";
-                    app_->notificationMgr_->notify(NotificationType::IncomingConnection, title, msg, identity_.settings());
-                }
-                shell_->invalidate();
-            }
-            app_->prevHasPendingIncoming_ = pending.active;
-            app_->modalWasActive_ = pending.active;
-
-            bool toastActive = (!app_->toastText_.empty() && tickNow <= app_->toastExpireTick_ + 500);
-            bool inLiveSession = (vStats.state != ViewerConnectionState::Disconnected) ||
-                                 network_.hostSessionStatus().active ||
-                                 pending.active;
-
-            if (app_->hasPendingMouseMove_) {
-                app_->flushPendingMouseMove();
-            }
-
-            static uint32_t idleTickCounter = 0;
-            ++idleTickCounter;
-            bool micMonitoringActive = (app_->activeTab_ == ActiveTab::Settings && app_->settingsSection_ == SettingsSection::AudioVoice && network_.isVoiceMonitoring());
-            if (inLiveSession || toastActive || micMonitoringActive || (idleTickCounter % 4 == 0)) {
-                shell_->invalidate();
-            }
+        case WM_TIMER:
+            app_->onTick();
             return 0;
-        }
         case WM_PAINT: {
             PAINTSTRUCT ps{};
             BeginPaint(hwnd_, &ps);
@@ -962,28 +725,32 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             app_->onMouseButton(MouseButtonId::Middle, false, toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
-        case WM_MOUSEWHEEL:
-            app_->onMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam));
-            return 0;
-
-        case WM_CHAR:
-            app_->onCharInput(static_cast<wchar_t>(wParam));
-            return 0;
-
-        case WM_KEYDOWN:
-        case WM_SYSKEYDOWN: {
-            uint16_t vk = static_cast<uint16_t>(wParam);
-            uint16_t scan = static_cast<uint16_t>((lParam >> 16) & 0xFF);
-            bool isExt = (lParam & (1 << 24)) != 0;
-            app_->onKeyEvent(vk, scan, true, isExt);
+        case WM_MOUSEWHEEL: {
+            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };   // screen coordinates
+            ScreenToClient(hwnd_, &pt);
+            app_->onWheel(0.0f, static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)), toDip(pt.x), toDip(pt.y));
             return 0;
         }
+
+        case WM_CHAR: {
+            // WM_CHAR sends UTF-16 units one at a time; join surrogate pairs before handing over UTF-8.
+            char32_t cp = 0;
+            if (charAssembler_.push(static_cast<char16_t>(wParam), cp)) {
+                app_->onText(textinput::encodeUtf8(cp));
+            }
+            return 0;
+        }
+
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN:
         case WM_KEYUP:
         case WM_SYSKEYUP: {
-            uint16_t vk = static_cast<uint16_t>(wParam);
-            uint16_t scan = static_cast<uint16_t>((lParam >> 16) & 0xFF);
-            bool isExt = (lParam & (1 << 24)) != 0;
-            app_->onKeyEvent(vk, scan, false, isExt);
+            KeyEvent e{};
+            e.vk = static_cast<uint16_t>(wParam);
+            e.scan = static_cast<uint16_t>((lParam >> 16) & 0xFF);
+            e.down = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
+            e.extended = (lParam & (1 << 24)) != 0;
+            app_->onKey(e);
             return 0;
         }
         case WM_DROPFILES:
@@ -991,28 +758,8 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_DESK_UPDATE_CHECK_DONE: {
-            auto* info = reinterpret_cast<UpdateInfo*>(wParam);
-            bool manual = (lParam != 0);
-            if (info) {
-                app_->latestUpdateInfo_ = *info;
-                app_->isCheckingUpdates_ = false;
-                if (!info->success) {
-                    app_->updateStatusText_ = "Check failed (Offline or rate-limited)";
-                    if (manual) app_->showToast("Could not check for updates", true);
-                } else if (info->updateRequired) {
-                    std::string cleanVer = info->latestVersion;
-                    if (!cleanVer.empty() && (cleanVer[0] == 'v' || cleanVer[0] == 'V')) {
-                        cleanVer = cleanVer.substr(1);
-                    }
-                    app_->updateStatusText_ = "Mandatory Update: v" + cleanVer;
-                    app_->showUpdateRequiredModal_ = true;
-                    if (manual) app_->showToast("Mandatory update v" + cleanVer + " available!", true);
-                } else {
-                    app_->updateStatusText_ = "CppDesk is up to date (v" + std::string(CPP_DESK_VERSION) + ")";
-                    if (manual) app_->showToast("You have the latest version (v" + std::string(CPP_DESK_VERSION) + ")");
-                }
-                delete info;
-            }
+            std::unique_ptr<UpdateInfo> info(reinterpret_cast<UpdateInfo*>(wParam));
+            if (info) app_->onUpdateCheckDone(*info, lParam != 0);
             shell_->invalidate();
             return 0;
         }
@@ -1026,60 +773,29 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_APP_SCRATCHPAD_UPDATE: {
             std::unique_ptr<ScratchpadUpdatePayload> own(reinterpret_cast<ScratchpadUpdatePayload*>(wParam));
-            if (own) {
-                if (app_->focusedField_ != FocusedField::ScratchpadText) {
-                    app_->scratchpadTextEdit_ = own->text;
-                }
-                app_->lastSeenScratchpadRev_ = own->revision;
-                shell_->invalidate();
-            }
+            if (own) app_->onScratchpadUpdate(*own);
             return 0;
         }
 
         case WM_APP_COMMAND_PALETTE: {
             std::unique_ptr<CommandPaletteOutputPayload> own(reinterpret_cast<CommandPaletteOutputPayload*>(wParam));
-            if (own) {
-                app_->omnibarLastOutput_ = own->stdoutData.empty() ? own->errorMessage : own->stdoutData;
-                app_->omnibarLastExitCode_ = own->exitCode;
-                app_->omnibarHasOutput_ = true;
-                shell_->invalidate();
-            }
+            if (own) app_->onCommandPaletteOutput(*own);
             return 0;
         }
 
         case WM_APP_UPDATE_PROGRESS: {
             std::unique_ptr<UpdateProgressData> own(reinterpret_cast<UpdateProgressData*>(wParam));
-            if (own) {
-                app_->updateDownloadedBytes_ = own->downloaded;
-                app_->updateTotalBytes_ = own->total;
-                app_->updateSpeedBps_ = own->speed;
-                if (own->total > 0) {
-                    app_->updateDownloadProgress_ = static_cast<float>(own->downloaded) / static_cast<float>(own->total);
-                }
-                shell_->invalidate();
-            }
+            if (own) app_->onUpdateProgress(*own);
             return 0;
         }
 
-        case WM_APP_FRAME_READY: {
-            app_->frameRedrawPending_.store(false);
-            if (app_->hasPendingMouseMove_) {
-                app_->flushPendingMouseMove();
-            }
-            shell_->invalidate();
+        case WM_APP_FRAME_READY:
+            app_->onFrameReady();
             return 0;
-        }
 
         case WM_DESTROY:
             KillTimer(hwnd_, 1);
-            if (app_->sessionRecorder_.isRecording()) {
-                app_->sessionRecorder_.stopRecording();
-            }
-            if (app_->notificationMgr_) {
-                app_->notificationMgr_->shutdown();
-            }
-            network_.disconnectViewer();
-            app_->hardResetViewerUiState();
+            app_->onWindowDestroyed();
             PostQuitMessage(0);
             return 0;
     }
@@ -1311,24 +1027,7 @@ void CppDeskWindow::restoreFromTray(NotificationType contextType) {
     }
     SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     SetForegroundWindow(hwnd_);
-    if (app_->notificationMgr_) {
-        app_->notificationMgr_->stopFlash();
-    }
-    if (contextType == NotificationType::ChatMessage) {
-        app_->showFileDrawer_ = true;
-        app_->drawerTab_ = DrawerTab::LiveChat;
-        network_.markChatRead();
-        app_->focusedField_ = FocusedField::ChatInput;
-    } else if (contextType == NotificationType::FileTransferDone) {
-        app_->showFileDrawer_ = true;
-        app_->drawerTab_ = DrawerTab::FilesAndClip;
-    } else if (contextType == NotificationType::IncomingConnection) {
-        auto pending = network_.pendingIncomingRequest();
-        if (pending.active) {
-            SetForegroundWindow(hwnd_);
-        }
-    }
-    shell_->invalidate();
+    app_->restoreFromTray(contextType);
 }
 
 

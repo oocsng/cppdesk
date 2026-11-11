@@ -29,17 +29,16 @@
 #include "canvas.hpp"
 #include "platform_shell.hpp"
 
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <shellapi.h>
-#include <d2d1.h>
-#include <dwrite.h>
-#endif
-
 namespace cppdesk {
+
+// One key press or release. vk is a Windows virtual-key code (see vk_codes.hpp); scan and extended are
+// forwarded to the remote host. Modifier state is read through PlatformShell::isKeyDown.
+struct KeyEvent {
+    uint16_t vk;
+    uint16_t scan;
+    bool down;
+    bool extended;
+};
 
 struct UpdateProgressData {
     uint64_t downloaded;
@@ -156,12 +155,46 @@ public:
     void applySnapshotState(const std::string& name);
 
     // Input, already translated by the shell. Coordinates are DIPs.
+    void onMouseMove(float x, float y);
+    void onMouseButton(MouseButtonId btn, bool down, float x, float y);
+    void onWheel(float dx, float dy, float x, float y);   // dy in wheel-delta units, 120 per notch
+    void onKey(const KeyEvent& e);
+    void onText(const std::string& utf8);                 // typed text, including control chars (\b, \r, Ctrl+A = \x01)
     void onFilesDropped(const std::vector<std::string>& paths, float x, float y);
+    void onFocusChanged(bool focused);
+    void onMouseLeave();
+    void onCaptureLost();
     bool isTextInputFocused() const { return hoveredIsTextInput_; }
+    ui::CursorShape cursorShape() const;
+
+    // Window events.
+    void onResized();
+    void onTick();                    // every ~32 ms: connection state, notifications, idle repaint
+    void onFrameReady();              // a decoded remote frame is waiting
+    bool claimFrameRedraw() { return !frameRedrawPending_.exchange(true); }   // any thread; true = post onFrameReady
+    void onGraphicsLost();            // the canvas dropped every image
+    void onCloseRequested();          // the window is about to close (not minimize to tray)
+    void onWindowDestroyed();
+    void startAutoConnect();          // once the window is up
+
+    // Tray and notifications.
+    void setNotificationManager(std::unique_ptr<NotificationManager> mgr) { notificationMgr_ = std::move(mgr); }
+    NotificationManager* notifications() const { return notificationMgr_.get(); }
+    void restoreFromTray(NotificationType contextType = NotificationType::GeneralInfo);
+    void toggleNotificationsMuted();
+    std::string trayStatusText() const;
+
+    // Results from background work, delivered on the UI thread.
+    void onUpdateCheckDone(const UpdateInfo& info, bool manual);
+    void onScratchpadUpdate(const ScratchpadUpdatePayload& p);
+    void onCommandPaletteOutput(const CommandPaletteOutputPayload& p);
+    void onUpdateProgress(const UpdateProgressData& p);
+    // From network threads (as before the split).
+    void onPeerVersionMismatch(const std::string& hostVer, const std::string& viewerVer);
+    void onVersionUpgradeNotice(const std::string& senderVersion);
 
 private:
-    // The Windows window still reaches into the UI state from its message handler.
-    friend class CppDeskWindow;
+    // WinShell implements services that need the UI state (update download, service actions).
     friend class WinShell;
 
     void drawFrame(float width, float height);
@@ -172,6 +205,7 @@ private:
     unsigned uiDpi() const;
 
     bool                    lastAnimMoving_ = false;
+    uint32_t                idleTickCounter_ = 0;      // onTick repaints every 4th tick when idle
     float                   frameWidth_ = 1280.0f;      // size of the last rendered frame, in DIPs
     float                   frameHeight_ = 800.0f;
     bool                    snapshotFrozen_ = false;    // a snapshot state holds animation time still
@@ -260,8 +294,6 @@ private:
     void drawTotpChallengeModal(float clientW, float clientH);
 
     // Input & interaction handlers
-    void onMouseMove(float x, float y);
-    void onMouseButton(MouseButtonId btn, bool isDown, float x, float y);
     void onMouseWheel(int delta);
     void onCharInput(char16_t ch);
     void onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended);
@@ -282,7 +314,6 @@ private:
     void closeSessionTab(uint32_t tabId);
     void hardResetViewerUiState();
     void showToast(const std::string& message, bool isError = false, uint32_t durationMs = 3000);
-    void restoreFromTray(NotificationType contextType = NotificationType::GeneralInfo);
     bool anyModalActive() const;
     bool mapCanvasPointToNormalized(float x, float y, float& outNormX, float& outNormY) const;
     std::string* activeFocusedTextBuffer();

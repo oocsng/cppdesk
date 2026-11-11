@@ -97,6 +97,7 @@ private:
     WINDOWPLACEMENT         savedWindowPlacement_{};
     int64_t                 qpcFreq_ = 0;
     int64_t                 lastQpcCounter_ = 0;
+    textinput::Utf16Assembler charAssembler_;           // joins WM_CHAR surrogate pairs
 
     ID2D1Factory*           d2dFactory_ = nullptr;
     IDWriteFactory*         dwriteFactory_ = nullptr;
