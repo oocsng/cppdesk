@@ -43,6 +43,7 @@ $CoreSources = @(
     "src/simd/simd_fallback.cpp",
     "src/ui/ui_platform.cpp",
     "src/ui/recording_canvas.cpp",
+    "src/ui/canvas_d2d.cpp",
     "src/ui/theme.cpp"
 )
 

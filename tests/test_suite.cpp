@@ -10,6 +10,10 @@
 #include "../src/net/relay_owner.hpp"
 #include "../src/core/win_compat.hpp"
 #include "../src/ui/recording_canvas.hpp"
+#if defined(_WIN32)
+#include "../src/ui/canvas_d2d.hpp"
+#include <wincodec.h>
+#endif
 #include "../src/ui/notification_manager.hpp"
 #include "../src/media/session_recorder.hpp"
 #include "../src/media/session_recording_player.hpp"
@@ -7732,6 +7736,134 @@ void testRecordingCanvas() {
     }
 }
 
+#if defined(_WIN32)
+// Offscreen Direct2D target over a WIC bitmap, so the canvas can be drawn and read back without a window.
+struct WicTarget {
+    IWICImagingFactory* wic = nullptr;
+    IWICBitmap* bitmap = nullptr;
+    ID2D1RenderTarget* rt = nullptr;
+    int w = 0, h = 0;
+
+    WicTarget(ID2D1Factory* d2d, int width, int height) : w(width), h(height) {
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+        if (!wic) return;
+        wic->CreateBitmap(w, h, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &bitmap);
+        D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
+        if (bitmap) d2d->CreateWicBitmapRenderTarget(bitmap, props, &rt);
+    }
+    ~WicTarget() {
+        if (rt) rt->Release();
+        if (bitmap) bitmap->Release();
+        if (wic) wic->Release();
+    }
+    // Returns {b, g, r, a} at (x, y).
+    std::array<uint8_t, 4> pixel(int x, int y) const {
+        std::array<uint8_t, 4> out{};
+        WICRect rc{ 0, 0, w, h };
+        IWICBitmapLock* lock = nullptr;
+        if (FAILED(bitmap->Lock(&rc, WICBitmapLockRead, &lock)) || !lock) return out;
+        UINT stride = 0, size = 0;
+        BYTE* data = nullptr;
+        lock->GetStride(&stride);
+        lock->GetDataPointer(&size, &data);
+        if (data) std::memcpy(out.data(), data + y * stride + x * 4, 4);
+        lock->Release();
+        return out;
+    }
+    bool anyBrighter(int l, int t, int r, int b, int threshold) const {
+        for (int y = t; y < b; ++y)
+            for (int x = l; x < r; ++x)
+                if (pixel(x, y)[2] > threshold) return true;
+        return false;
+    }
+};
+
+void testD2DCanvas() {
+    std::cout << "[TEST 68] Direct2D canvas backend (scene, image resize, recreate)..." << std::endl;
+    ID2D1Factory* d2d = nullptr;
+    IDWriteFactory* dw = nullptr;
+    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &d2d);
+    DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(&dw));
+    TEST_ASSERT(d2d && dw);
+    if (!d2d || !dw) return;
+
+    // testD2DCanvasScene: shapes, text and image land where expected.
+    {
+        WicTarget target(d2d, 200, 100);
+        TEST_ASSERT(target.rt != nullptr);
+        ui::D2DCanvas canvas(d2d, dw);
+        canvas.attach(target.rt, 1.0f);
+        canvas.beginFrame(200, 100, ui::rgba(0, 0, 0));
+        canvas.fillRoundRect({10, 10, 60, 60}, 4, ui::rgba(255, 0, 0));
+        canvas.drawText("Hi", {100, 10, 190, 40}, ui::FontRole::Heading, ui::rgba(255, 255, 255), ui::HAlign::Leading, ui::VAlign::Center);
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(35, 35)[2] > 200 && target.pixel(35, 35)[1] < 40);   // red square
+        TEST_ASSERT(target.anyBrighter(100, 10, 190, 40, 128));                       // the text drew
+        TEST_ASSERT(target.pixel(150, 80)[2] < 10);                                   // background untouched
+        TEST_ASSERT(canvas.frameBalanced());
+        canvas.detach();
+    }
+
+    // testD2DCanvasImageResize: an image recreated at a new size draws without overflow.
+    {
+        WicTarget target(d2d, 64, 64);
+        ui::D2DCanvas canvas(d2d, dw);
+        canvas.attach(target.rt, 1.0f);
+        std::vector<uint8_t> red(16 * 16 * 4), green(32 * 8 * 4);
+        for (size_t i = 0; i < red.size(); i += 4) { red[i] = 0; red[i + 1] = 0; red[i + 2] = 255; red[i + 3] = 255; }
+        for (size_t i = 0; i < green.size(); i += 4) { green[i] = 0; green[i + 1] = 255; green[i + 2] = 0; green[i + 3] = 255; }
+        canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
+        ui::ImageId id = canvas.createImage(16, 16);
+        canvas.updateImage(id, red.data(), 16 * 4, {0, 0, 16, 16});
+        canvas.drawImage(id, {0, 0, 16, 16}, 1.0f);
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(8, 8)[2] > 200);
+        canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
+        canvas.destroyImage(id);
+        id = canvas.createImage(32, 8);
+        canvas.updateImage(id, green.data(), 32 * 4, {0, 0, 32, 8});
+        canvas.drawImage(id, {0, 0, 32, 8}, 1.0f);
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(20, 4)[1] > 200 && target.pixel(20, 4)[2] < 40);
+        // A dirty-rectangle update only touches that region.
+        std::vector<uint8_t> blue(32 * 8 * 4);
+        for (size_t i = 0; i < blue.size(); i += 4) { blue[i] = 255; blue[i + 1] = 0; blue[i + 2] = 0; blue[i + 3] = 255; }
+        canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
+        canvas.updateImage(id, blue.data(), 32 * 4, {0, 0, 8, 8});
+        canvas.drawImage(id, {0, 0, 32, 8}, 1.0f);
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(4, 4)[0] > 200 && target.pixel(20, 4)[1] > 200);
+        canvas.detach();
+    }
+
+    // testD2DCanvasRecreate: after detach() and attach() to a new target the next frame draws normally,
+    // and state left pushed by the previous frame does not leak into it.
+    {
+        WicTarget first(d2d, 32, 32), second(d2d, 32, 32);
+        ui::D2DCanvas canvas(d2d, dw);
+        canvas.attach(first.rt, 1.0f);
+        ui::ImageId stale = canvas.createImage(4, 4);
+        canvas.beginFrame(32, 32, ui::rgba(0, 0, 0));
+        canvas.pushClip({0, 0, 4, 4});
+        canvas.setTransform(ui::Transform2D::scale(4, 4, 0, 0));
+        canvas.endFrame();                                   // unbalanced on purpose
+        canvas.detach();
+        canvas.attach(second.rt, 1.0f);
+        canvas.beginFrame(32, 32, ui::rgba(0, 0, 0));
+        canvas.drawImage(stale, {0, 0, 32, 32}, 1.0f);       // invalidated by detach: draws nothing, no crash
+        canvas.fillRect({0, 0, 32, 32}, ui::rgba(255, 0, 0));
+        canvas.endFrame();
+        TEST_ASSERT(second.pixel(30, 30)[2] > 200);          // not clipped, not scaled
+        TEST_ASSERT(canvas.frameBalanced());
+        canvas.detach();
+    }
+
+    dw->Release();
+    d2d->Release();
+}
+#endif
+
 } // namespace
 
 int main() {
@@ -7817,6 +7949,9 @@ int main() {
         testRelayDeskOwnership(); std::cout << "Test 65 done\n" << std::flush;
         testCanvasTypes(); std::cout << "Test 66 done\n" << std::flush;
         testRecordingCanvas(); std::cout << "Test 67 done\n" << std::flush;
+#if defined(_WIN32)
+        testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;
+#endif
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
