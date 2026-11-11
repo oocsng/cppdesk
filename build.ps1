@@ -41,7 +41,8 @@ $CoreSources = @(
     "src/control/scratchpad_manager.cpp",
     "src/control/command_palette.cpp",
     "src/simd/simd_fallback.cpp",
-    "src/ui/ui_platform.cpp"
+    "src/ui/ui_platform.cpp",
+    "src/ui/theme.cpp"
 )
 
 $AppSources = $CoreSources + @(

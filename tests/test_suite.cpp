@@ -24,6 +24,7 @@
 #include "../src/control/scratchpad_manager.hpp"
 #include "../src/control/command_palette.hpp"
 #include "../src/ui/ui_platform.hpp"
+#include "../src/ui/dpi.hpp"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -34,6 +35,7 @@
 #ifdef DeleteFile
 #undef DeleteFile
 #endif
+#include "../src/ui/theme.hpp"
 #endif
 
 #include <iostream>
@@ -6747,6 +6749,167 @@ void testLinuxPlatformSupport() {
     }
 }
 
+#if defined(_WIN32)
+bool themeColorNear(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b) {
+    return std::fabs(a.r - b.r) < 1e-5f && std::fabs(a.g - b.g) < 1e-5f &&
+           std::fabs(a.b - b.b) < 1e-5f && std::fabs(a.a - b.a) < 1e-5f;
+}
+
+void testThemeTableEndpoints() {
+    std::cout << "[TEST 53] Theme Palette Table Endpoints & Clamping..." << std::endl;
+    auto tokens = paletteTokens();
+    TEST_ASSERT(!tokens.empty());
+
+    updateActivePalette(0.0f);
+    for (const auto& tok : tokens) TEST_ASSERT(themeColorNear(*tok.live, tok.light));
+    updateActivePalette(1.0f);
+    for (const auto& tok : tokens) TEST_ASSERT(themeColorNear(*tok.live, tok.dark));
+
+    // darkT outside 0..1 (spring overshoot) must equal the nearest endpoint.
+    updateActivePalette(-1.0f);
+    for (const auto& tok : tokens) TEST_ASSERT(themeColorNear(*tok.live, tok.light));
+    updateActivePalette(2.0f);
+    for (const auto& tok : tokens) TEST_ASSERT(themeColorNear(*tok.live, tok.dark));
+
+    // Values carried over unchanged from the pre-theme-module palette.
+    updateActivePalette(0.0f);
+    TEST_ASSERT(themeColorNear(COL_BG_MAIN, rgba(250, 248, 245)));
+    updateActivePalette(1.0f);
+    TEST_ASSERT(themeColorNear(COL_BG_MAIN, rgba(28, 27, 25)));
+    TEST_ASSERT(themeColorNear(COL_TEXT_PRIMARY, rgba(250, 247, 242)));
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        TEST_ASSERT(tokens[i].name != nullptr && tokens[i].name[0] != '\0');
+        for (size_t j = i + 1; j < tokens.size(); ++j) {
+            TEST_ASSERT(std::strcmp(tokens[i].name, tokens[j].name) != 0);
+        }
+    }
+}
+
+void contrastCheck(const char* fgName, const D2D1_COLOR_F& fg, const char* bgName,
+                   const D2D1_COLOR_F& bg, double minRatio, float darkT) {
+    double ratio = contrastRatio(fg, bg);
+    if (ratio < minRatio) {
+        std::cerr << "[CONTRAST] " << fgName << " on " << bgName << " at darkT=" << darkT
+                  << " is " << ratio << ", need " << minRatio << "\n";
+    }
+    TEST_ASSERT(ratio >= minRatio);
+}
+#define CONTRAST_CHECK(fg, bg, minRatio) contrastCheck(#fg, fg, #bg, bg, minRatio, darkT)
+
+void testThemePaletteContrast() {
+    std::cout << "[TEST 54] Theme Palette WCAG Contrast..." << std::endl;
+    TEST_ASSERT(std::fabs(contrastRatio(rgba(255, 255, 255), rgba(0, 0, 0)) - 21.0) < 0.01);
+    TEST_ASSERT(std::fabs(contrastRatio(rgba(120, 80, 40), rgba(120, 80, 40)) - 1.0) < 1e-9);
+
+    for (float darkT : { 0.0f, 1.0f }) {
+        updateActivePalette(darkT);
+        const D2D1_COLOR_F surfaces[] = { COL_BG_MAIN, COL_BG_NAV, COL_BG_CARD, COL_BG_SUBTLE, COL_BG_CARD_ALT,
+                                          COL_BG_INPUT, COL_BG_INPUT_FOCUS, COL_SEC_BTN_BG, COL_SEC_BTN_HV };
+        for (const auto& bg : surfaces) {
+            CONTRAST_CHECK(COL_TEXT_PRIMARY, bg, 4.5);
+            CONTRAST_CHECK(COL_TEXT_SECONDARY, bg, 4.5);
+            CONTRAST_CHECK(COL_TEXT_MUTED, bg, 4.5);
+            CONTRAST_CHECK(COL_TEXT_ACCENT, bg, 4.5);
+        }
+
+        // Status colors drawn as text on page and card surfaces.
+        CONTRAST_CHECK(COL_WARNING, COL_BG_MAIN, 4.5);
+        CONTRAST_CHECK(COL_WARNING, COL_BG_CARD, 4.5);
+        double statusMin = (darkT == 0.0f) ? 4.5 : 3.0;  // Exemption: dark COL_DANGER/COL_SUCCESS also fill buttons under
+                                                          // white labels; raise them with the screen sub-projects.
+        CONTRAST_CHECK(COL_DANGER, COL_BG_MAIN, statusMin);
+        CONTRAST_CHECK(COL_DANGER, COL_BG_CARD, statusMin);
+        CONTRAST_CHECK(COL_SUCCESS, COL_BG_MAIN, statusMin);
+        CONTRAST_CHECK(COL_SUCCESS, COL_BG_CARD, statusMin);
+
+        // Exemption: white label on the terracotta fill is about 3.1:1; the Connect-screen sub-project owns the button design.
+        CONTRAST_CHECK(COL_TEXT_ON_ACCENT, COL_PRIMARY_ACCENT, 3.0);
+
+        // Not covered: COL_STAGE_BG (sits behind the remote canvas, no text) and the rewind-bar label (drawn over video).
+        TEST_ASSERT(std::fabs(COL_HUD_BG.a - 0.94f) < 1e-5f);
+
+        // Text on always-dark overlays (transfer pill, performance HUD, reconnect banner) uses fixed light
+        // tokens: theme text tokens turn dark in light mode and would be unreadable on those fills.
+        CONTRAST_CHECK(COL_HUD_TEXT, COL_HUD_BG, 4.5);
+        CONTRAST_CHECK(COL_HUD_TEXT_SECONDARY, COL_HUD_BG, 4.5);
+        CONTRAST_CHECK(COL_HUD_TEXT_MUTED, COL_HUD_BG, 4.5);
+        CONTRAST_CHECK(COL_HUD_TEXT_ACCENT, COL_HUD_BG, 4.5);
+    }
+}
+#undef CONTRAST_CHECK
+
+void testThemeScales() {
+    std::cout << "[TEST 55] Theme Spacing, Radius, Type & Motion Scales..." << std::endl;
+    TEST_ASSERT(theme::space::xs == 4.0f && theme::space::sm == 8.0f && theme::space::md == 12.0f);
+    TEST_ASSERT(theme::space::lg == 16.0f && theme::space::xl == 24.0f && theme::space::xxl == 32.0f);
+    TEST_ASSERT(theme::radius::sm == 6.0f && theme::radius::md == 12.0f && theme::radius::lg == 16.0f);
+
+    // Type scale equals the text formats initGraphics() created before the scale existed.
+    TEST_ASSERT(theme::type::hero.size == 33.0f && theme::type::hero.weight == 700);
+    TEST_ASSERT(theme::type::heading.size == 18.5f && theme::type::heading.weight == 600);
+    TEST_ASSERT(theme::type::subheading.size == 14.5f && theme::type::subheading.weight == 600);
+    TEST_ASSERT(theme::type::body.size == 13.0f && theme::type::body.weight == 400);
+    TEST_ASSERT(theme::type::bodyBold.size == 13.0f && theme::type::bodyBold.weight == 600);
+    TEST_ASSERT(theme::type::caption.size == 11.5f && theme::type::caption.weight == 600);
+    TEST_ASSERT(theme::type::mono.size == 14.0f && theme::type::mono.weight == 700);
+    TEST_ASSERT(theme::type::tooltip.size == 11.5f && theme::type::tooltip.weight == 400);
+
+    // Motion scale equals the spring parameters the update loop used before the scale existed.
+    TEST_ASSERT(theme::motion::themeBlend.omega == 20.0f && theme::motion::themeBlend.zeta == 0.92f);
+    TEST_ASSERT(theme::motion::hover.omega == 32.0f && theme::motion::hover.zeta == 0.72f);
+    TEST_ASSERT(theme::motion::press.omega == 38.0f && theme::motion::press.zeta == 0.68f);
+    TEST_ASSERT(theme::motion::standard.omega == 28.0f && theme::motion::standard.zeta == 0.74f);
+    TEST_ASSERT(theme::motion::menu.omega == 32.0f && theme::motion::menu.zeta == 0.76f);
+    TEST_ASSERT(theme::motion::panel.omega == 26.0f && theme::motion::panel.zeta == 0.78f);
+    TEST_ASSERT(theme::motion::drawer.omega == 26.0f && theme::motion::drawer.zeta == 0.80f);
+    TEST_ASSERT(theme::motion::scroll.omega == 32.0f && theme::motion::scroll.zeta == 0.88f);
+    for (const auto& s : { theme::motion::themeBlend, theme::motion::hover, theme::motion::press,
+                           theme::motion::standard, theme::motion::menu, theme::motion::panel,
+                           theme::motion::drawer, theme::motion::scroll }) {
+        TEST_ASSERT(s.omega > 0.0f && s.zeta > 0.0f && s.zeta < 1.0f);
+    }
+}
+#endif
+
+void testDpiConversion() {
+    std::cout << "[TEST 56] DPI Pixel/DIP Conversion..." << std::endl;
+    TEST_ASSERT(dipToPx(1220.0f, 96) == 1220);
+    TEST_ASSERT(dipToPx(1220.0f, 120) == 1525);   // 125%
+    TEST_ASSERT(dipToPx(760.0f, 144) == 1140);    // 150%
+    TEST_ASSERT(dipToPx(760.0f, 168) == 1330);    // 175%
+    TEST_ASSERT(dipToPx(760.0f, 192) == 1520);    // 200%
+    TEST_ASSERT(std::fabs(pxToDip(1525.0f, 120) - 1220.0f) < 1e-3f);
+    TEST_ASSERT(std::fabs(pxToDip(150.0f, 120) - 120.0f) < 1e-3f);
+
+    // A failed DPI query (0) must behave as 96, never divide by zero.
+    TEST_ASSERT(dpiScale(0) == 1.0f);
+    TEST_ASSERT(pxToDip(100.0f, 0) == 100.0f);
+    TEST_ASSERT(dipToPx(100.0f, 0) == 100);
+
+    // Fractional scales: a whole-pixel size survives a round trip without drifting.
+    for (unsigned dpi : { 96u, 120u, 144u, 168u, 192u }) {
+        TEST_ASSERT(dipToPx(pxToDip(1331.0f, dpi), dpi) == 1331);
+        TEST_ASSERT(dipToPx(pxToDip(777.0f, dpi), dpi) == 777);
+    }
+
+    // The initial window must fit the monitor work area: 1220x760 DIPs at 150% is taller than a 1080p screen.
+    SpanFit h = fitSpanToWork(70, dipToPx(760.0f, 144), 0, 1040);
+    TEST_ASSERT(h.size == 1040 && h.pos == 0);
+    SpanFit w = fitSpanToWork(100, dipToPx(1220.0f, 144), 0, 1920);
+    TEST_ASSERT(w.size == 1830 && w.pos == 90);
+    SpanFit fits = fitSpanToWork(100, 1220, 0, 1920);
+    TEST_ASSERT(fits.size == 1220 && fits.pos == 100);
+    SpanFit secondMonitor = fitSpanToWork(50, 800, 1920, 3840);
+    TEST_ASSERT(secondMonitor.size == 800 && secondMonitor.pos == 1920);
+
+    // 1:1 mode: the canvas origin must land on a whole physical pixel, or the image is resampled and soft.
+    float snapped = snapToPx(10.4f, 144);
+    TEST_ASSERT(dipToPx(snapped, 144) == 16);
+    TEST_ASSERT(std::fabs(snapToPx(snapped, 144) - snapped) < 1e-4f);
+    TEST_ASSERT(snapToPx(10.4f, 0) == 10.0f);
+}
+
 } // namespace
 
 int main() {
@@ -6811,6 +6974,12 @@ int main() {
         testCrossPlatformMacOsAndWindowsFoundation(); std::cout << "Test 50 done\n" << std::flush;
         testCrossPlatformUiWindowingAndMacOsViewer(); std::cout << "Test 51 done\n" << std::flush;
         testLinuxPlatformSupport(); std::cout << "Test 52 done\n" << std::flush;
+#if defined(_WIN32)
+        testThemeTableEndpoints(); std::cout << "Test 53 done\n" << std::flush;
+        testThemePaletteContrast(); std::cout << "Test 54 done\n" << std::flush;
+        testThemeScales(); std::cout << "Test 55 done\n" << std::flush;
+#endif
+        testDpiConversion(); std::cout << "Test 56 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";

@@ -1,4 +1,5 @@
 #include "ui_window.hpp"
+#include "theme.hpp"
 #include "../control/windows_service_manager.hpp"
 #include "../capture/screen_capture.hpp"
 #include <gdiplus.h>
@@ -29,24 +30,6 @@ namespace cppdesk {
 
 namespace {
 
-D2D1_COLOR_F rgba(uint8_t r, uint8_t g, uint8_t b, float a = 1.0f) {
-    return D2D1::ColorF(r / 255.0f, g / 255.0f, b / 255.0f, a);
-}
-
-D2D1_COLOR_F withAlpha(D2D1_COLOR_F c, float aMultiplier) {
-    return D2D1::ColorF(c.r, c.g, c.b, std::clamp(c.a * aMultiplier, 0.0f, 1.0f));
-}
-
-D2D1_COLOR_F lerpColor(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b, float t) {
-    t = std::clamp(t, 0.0f, 1.0f);
-    return D2D1::ColorF(
-        a.r + (b.r - a.r) * t,
-        a.g + (b.g - a.g) * t,
-        a.b + (b.b - a.b) * t,
-        a.a + (b.a - a.a) * t
-    );
-}
-
 // Second-order damped harmonic oscillator (macOS CoreAnimation CASpringAnimation physics)
 bool stepSpring(float& pos, float& vel, float target, float omega, float zeta, float dt, float eps = 0.0012f) {
     return cppdesk::UiPlatform::stepSpring(pos, vel, target, omega, zeta, dt, eps);
@@ -69,67 +52,6 @@ bool stepExp(float& current, float target, float speed, float dt) {
 float smoothStepEase(float t) {
     t = std::clamp(t, 0.0f, 1.0f);
     return t * t * (3.0f - 2.0f * t);
-}
-
-// ---------------- Dynamic Minimalist Palette (Warm Claude Cream & Terracotta) ----------------
-D2D1_COLOR_F COL_BG_MAIN          = rgba(250, 248, 245); // #FAF8F5 Warm cream linen
-D2D1_COLOR_F COL_BG_NAV           = rgba(245, 240, 234); // #F5F0EA Warm parchment header
-D2D1_COLOR_F COL_BG_CARD          = rgba(255, 255, 255); // #FFFFFF Pure warm white card
-D2D1_COLOR_F COL_BG_SUBTLE        = rgba(243, 238, 230); // #F3EEE6 Warm stone container/input
-D2D1_COLOR_F COL_BG_CARD_ALT      = rgba(249, 243, 236); // #F9F3EC Warm clay tinted card
-D2D1_COLOR_F COL_BG_INPUT         = rgba(243, 238, 230);
-D2D1_COLOR_F COL_BG_INPUT_FOCUS   = rgba(255, 255, 255);
-D2D1_COLOR_F COL_BORDER           = rgba(228, 222, 212); // #E4DED4 Parchment border
-D2D1_COLOR_F COL_BORDER_ALT       = rgba(224, 198, 185); // #E0C6B9 Warm terracotta border
-D2D1_COLOR_F COL_BORDER_FOCUS     = rgba(217, 119, 87);  // #D97757 Claude terracotta accent
-
-D2D1_COLOR_F COL_PRIMARY_ACCENT      = rgba(217, 119, 87);  // #D97757 Claude terracotta clay
-D2D1_COLOR_F COL_PRIMARY_ACCENT_HV   = rgba(193, 95, 60);   // #C15F3C Warm clay hover
-D2D1_COLOR_F COL_SEC_BTN_BG       = rgba(240, 234, 225); // #F0EAE1 Warm secondary button
-D2D1_COLOR_F COL_SEC_BTN_HV       = rgba(230, 222, 210); // #E6DED2 Warm secondary button hover
-
-D2D1_COLOR_F COL_SUCCESS          = rgba(46, 125, 96);   // #2E7D60 Warm sage green
-D2D1_COLOR_F COL_WARNING          = rgba(217, 130, 43);  // #D9822B Warm amber
-D2D1_COLOR_F COL_DANGER           = rgba(199, 62, 58);   // #C73E3A Warm crimson
-D2D1_COLOR_F COL_DANGER_HV        = rgba(173, 50, 47);   // #AD322F
-
-D2D1_COLOR_F COL_TEXT_PRIMARY     = rgba(38, 35, 32);    // #262320 Deep warm espresso
-D2D1_COLOR_F COL_TEXT_SECONDARY   = rgba(105, 98, 89);   // #696259 Warm graphite
-D2D1_COLOR_F COL_TEXT_MUTED       = rgba(148, 140, 130); // #948C82 Warm stone grey
-D2D1_COLOR_F COL_TEXT_ACCENT      = rgba(193, 95, 60);   // #C15F3C Claude clay text
-D2D1_COLOR_F COL_TEXT_ON_ACCENT   = rgba(255, 255, 255);
-D2D1_COLOR_F COL_STAGE_BG         = rgba(235, 229, 219); // #EBE5DB Warm stage canvas
-
-void updateActivePalette(float darkT) {
-    darkT = std::clamp(darkT, 0.0f, 1.0f);
-
-    // 60% Dominant Surfaces: Cream Linen (#FAF8F5 / #FFFFFF) <-> Roasted Espresso (#1C1B19 / #262522)
-    COL_BG_MAIN        = lerpColor(rgba(250, 248, 245), rgba(28, 27, 25), darkT);
-    COL_BG_NAV         = lerpColor(rgba(245, 240, 234), rgba(34, 33, 30), darkT);
-    COL_BG_CARD        = lerpColor(rgba(255, 255, 255), rgba(38, 37, 34), darkT);
-    COL_BG_SUBTLE      = lerpColor(rgba(243, 238, 230), rgba(46, 44, 40), darkT);
-
-    // 30% Secondary Surfaces & Hairline Borders: Soft Warm Stone <-> Roasted Bronze Espresso
-    COL_BG_CARD_ALT    = lerpColor(rgba(249, 243, 236), rgba(51, 44, 38), darkT);
-    COL_BG_INPUT       = lerpColor(rgba(243, 238, 230), rgba(34, 32, 29), darkT);
-    COL_BG_INPUT_FOCUS = lerpColor(rgba(255, 255, 255), rgba(42, 40, 36), darkT);
-    COL_BORDER         = lerpColor(rgba(228, 222, 212), rgba(59, 56, 51), darkT);
-    COL_BORDER_ALT     = lerpColor(rgba(224, 198, 185), rgba(87, 68, 57), darkT);
-    COL_BORDER_FOCUS   = lerpColor(rgba(217, 119, 87),  rgba(217, 119, 87), darkT);
-
-    // 10% Signature Accent: Claude Terracotta Clay (#D97757) <-> Warm Terracotta Ember
-    COL_PRIMARY_ACCENT    = lerpColor(rgba(217, 119, 87), rgba(217, 119, 87), darkT);
-    COL_PRIMARY_ACCENT_HV = lerpColor(rgba(193, 95, 60),  rgba(228, 138, 108), darkT);
-    COL_SEC_BTN_BG     = lerpColor(rgba(240, 234, 225), rgba(44, 42, 38), darkT);
-    COL_SEC_BTN_HV     = lerpColor(rgba(230, 222, 210), rgba(58, 55, 49), darkT);
-
-    // Typography Hierarchy (>= 4.5:1 WCAG contrast in both modes)
-    COL_TEXT_PRIMARY   = lerpColor(rgba(38, 35, 32),    rgba(250, 247, 242), darkT);
-    COL_TEXT_SECONDARY = lerpColor(rgba(105, 98, 89),   rgba(184, 177, 166), darkT);
-    COL_TEXT_MUTED     = lerpColor(rgba(148, 140, 130), rgba(128, 121, 111), darkT);
-    COL_TEXT_ACCENT    = lerpColor(rgba(193, 95, 60),   rgba(228, 138, 108), darkT);
-    COL_TEXT_ON_ACCENT = rgba(255, 255, 255);
-    COL_STAGE_BG       = lerpColor(rgba(235, 229, 219), rgba(20, 19, 18), darkT);
 }
 
 std::wstring utf8ToWide(const std::string& str) {
@@ -309,6 +231,9 @@ bool CppDeskWindow::create(HINSTANCE hInstance, int nCmdShow) {
     std::wstring wTitle = utf8ToWide(title);
 
     int offset = (identity_.instanceId() - 1) * 44;
+    constexpr float kInitialWidthDips = 1220.0f;
+    constexpr float kInitialHeightDips = 760.0f;
+    const unsigned systemDpi = GetDpiForSystem();
     hwnd_ = CreateWindowExW(
         WS_EX_ACCEPTFILES,
         wc.lpszClassName,
@@ -316,8 +241,8 @@ bool CppDeskWindow::create(HINSTANCE hInstance, int nCmdShow) {
         WS_OVERLAPPEDWINDOW,
         100 + offset,
         70 + offset,
-        1220,
-        760,
+        dipToPx(kInitialWidthDips, systemDpi),
+        dipToPx(kInitialHeightDips, systemDpi),
         nullptr,
         nullptr,
         hInstance,
@@ -326,6 +251,27 @@ bool CppDeskWindow::create(HINSTANCE hInstance, int nCmdShow) {
 
     if (!hwnd_) {
         return false;
+    }
+
+    // The window may have opened on a monitor whose DPI differs from the system DPI. Size it for that monitor
+    // and keep it inside the work area: 1220x760 DIPs at 150% is taller than a 1080p screen.
+    dpi_ = GetDpiForWindow(hwnd_);
+    if (dpi_ == 0) dpi_ = 96;
+    {
+        const int widthPx = dipToPx(kInitialWidthDips, dpi_);
+        const int heightPx = dipToPx(kInitialHeightDips, dpi_);
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        RECT placed{};
+        GetWindowRect(hwnd_, &placed);
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
+            const RECT& work = monitorInfo.rcWork;
+            const SpanFit x = fitSpanToWork(placed.left, widthPx, work.left, work.right);
+            const SpanFit y = fitSpanToWork(placed.top, heightPx, work.top, work.bottom);
+            SetWindowPos(hwnd_, nullptr, x.pos, y.pos, x.size, y.size, SWP_NOZORDER | SWP_NOACTIVATE);
+        } else if (dpi_ != systemDpi) {
+            SetWindowPos(hwnd_, nullptr, 0, 0, widthPx, heightPx, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
     }
 
     applyWindowThemeAttribute();
@@ -394,24 +340,24 @@ bool CppDeskWindow::initGraphics() {
     );
     if (FAILED(hr) || !dwriteFactory_) return false;
 
-    auto createFmt = [&](const wchar_t* font, DWRITE_FONT_WEIGHT weight, float size, IDWriteTextFormat** outFmt) {
+    auto createFmt = [&](const wchar_t* font, const theme::type::Style& style, IDWriteTextFormat** outFmt) {
         dwriteFactory_->CreateTextFormat(
-            font, nullptr, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-            size, L"en-us", outFmt
+            font, nullptr, static_cast<DWRITE_FONT_WEIGHT>(style.weight), DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            style.size, L"en-us", outFmt
         );
         if (*outFmt) {
             (*outFmt)->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         }
     };
 
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_BOLD, 33.0f, &fmtHeroId_);
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 18.5f, &fmtHeading_);
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.5f, &fmtSubheading_);
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, 13.0f, &fmtBody_);
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 13.0f, &fmtBodyBold_);
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 11.5f, &fmtSmall_);
-    createFmt(L"Consolas", DWRITE_FONT_WEIGHT_BOLD, 14.0f, &fmtMono_);
-    createFmt(L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, 11.5f, &fmtTooltip_);
+    createFmt(L"Segoe UI", theme::type::hero, &fmtHeroId_);
+    createFmt(L"Segoe UI", theme::type::heading, &fmtHeading_);
+    createFmt(L"Segoe UI", theme::type::subheading, &fmtSubheading_);
+    createFmt(L"Segoe UI", theme::type::body, &fmtBody_);
+    createFmt(L"Segoe UI", theme::type::bodyBold, &fmtBodyBold_);
+    createFmt(L"Segoe UI", theme::type::caption, &fmtSmall_);
+    createFmt(L"Consolas", theme::type::mono, &fmtMono_);
+    createFmt(L"Segoe UI", theme::type::tooltip, &fmtTooltip_);
     if (fmtTooltip_) {
         fmtTooltip_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
     }
@@ -582,23 +528,21 @@ bool CppDeskWindow::stepAnimations(float dt) {
 
     // 3. Smooth Light <-> Dark Mode Transition
     float wantTheme = identity_.settings().darkTheme ? 1.0f : 0.0f;
-    if (stepSpring(themeAnimT_, themeAnimVel_, wantTheme, 20.0f, 0.92f, dt)) active = true;
+    if (stepSpring(themeAnimT_, themeAnimVel_, wantTheme, theme::motion::themeBlend.omega, theme::motion::themeBlend.zeta, dt)) active = true;
 
     // 4. Floating Side Sheet Drawer Spring
     float targetDrawer = showFileDrawer_ ? 1.0f : 0.0f;
-    if (stepSpring(drawerAnimT_, drawerAnimVel_, targetDrawer, 26.0f, 0.80f, dt)) active = true;
+    if (stepSpring(drawerAnimT_, drawerAnimVel_, targetDrawer, theme::motion::drawer.omega, theme::motion::drawer.zeta, dt)) active = true;
     float targetDrawerW = (drawerTab_ == DrawerTab::FileManager) ? 580.0f : ((drawerTab_ == DrawerTab::Sync) ? 440.0f : 395.0f);
     if (stepSpring(drawerWidth_, drawerWidthVel_, targetDrawerW, 26.0f, 0.82f, dt)) active = true;
 
     // 5. Sheet Modal Spring (with subtle macOS pop overshoot)
     bool modalNow = network_.pendingIncomingRequest().active;
     float targetModal = modalNow ? 1.0f : 0.0f;
-    if (stepSpring(modalAnimT_, modalAnimVel_, targetModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(modalAnimT_, modalAnimVel_, targetModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // Window dimensions for dynamic springs
-    RECT rcCl{};
-    GetClientRect(hwnd_, &rcCl);
-    float winW = static_cast<float>(std::max<LONG>(1, rcCl.right - rcCl.left));
+    float winW = clientSizeDips().width;
 
     // 6. Dynamic Island / Capsule Toast Spring
     bool toastVisible = (!toastText_.empty() && GetTickCount64() <= toastExpireTick_);
@@ -611,17 +555,17 @@ bool CppDeskWindow::stepAnimations(float dt) {
 
     // Floating Toolbar Dropdown Spring Menus
     float targetDisplayMenu = showDisplayMenu_ ? 1.0f : 0.0f;
-    if (stepSpring(displayMenuAnimT_, displayMenuAnimVel_, targetDisplayMenu, 32.0f, 0.76f, dt)) active = true;
+    if (stepSpring(displayMenuAnimT_, displayMenuAnimVel_, targetDisplayMenu, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
     float targetAdminMenu = showAdminMenu_ ? 1.0f : 0.0f;
-    if (stepSpring(adminMenuAnimT_, adminMenuAnimVel_, targetAdminMenu, 32.0f, 0.76f, dt)) active = true;
+    if (stepSpring(adminMenuAnimT_, adminMenuAnimVel_, targetAdminMenu, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
     float targetQualityMenu = showQualityMenu_ ? 1.0f : 0.0f;
-    if (stepSpring(qualityMenuAnimT_, qualityMenuAnimVel_, targetQualityMenu, 32.0f, 0.76f, dt)) active = true;
+    if (stepSpring(qualityMenuAnimT_, qualityMenuAnimVel_, targetQualityMenu, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
     float targetAudioPop = showAudioVolumePopup_ ? 1.0f : 0.0f;
-    if (stepSpring(audioPopAnimT_, audioPopAnimVel_, targetAudioPop, 32.0f, 0.76f, dt)) active = true;
+    if (stepSpring(audioPopAnimT_, audioPopAnimVel_, targetAudioPop, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
     float targetAudioInputMenu = showAudioInputMenu_ ? 1.0f : 0.0f;
-    if (stepSpring(audioInputMenuAnimT_, audioInputMenuAnimVel_, targetAudioInputMenu, 32.0f, 0.76f, dt)) active = true;
+    if (stepSpring(audioInputMenuAnimT_, audioInputMenuAnimVel_, targetAudioInputMenu, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
     float targetAudioOutputMenu = showAudioOutputMenu_ ? 1.0f : 0.0f;
-    if (stepSpring(audioOutputMenuAnimT_, audioOutputMenuAnimVel_, targetAudioOutputMenu, 32.0f, 0.76f, dt)) active = true;
+    if (stepSpring(audioOutputMenuAnimT_, audioOutputMenuAnimVel_, targetAudioOutputMenu, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
 
     // 7. Fullscreen macOS Dynamic Island Floating Top Bar Spring
     float pillHalfW = 665.0f;
@@ -633,43 +577,43 @@ bool CppDeskWindow::stepAnimations(float dt) {
     float targetToolbarY = (isFullscreen_ && activeTab_ == ActiveTab::RemoteSession)
         ? ((floatingToolbarPinned_ || islandHovered || islandDropdownOpen) ? 14.0f : -64.0f)
         : -64.0f;
-    if (stepSpring(floatingToolbarY_, floatingToolbarVel_, targetToolbarY, 26.0f, 0.78f, dt)) active = true;
+    if (stepSpring(floatingToolbarY_, floatingToolbarVel_, targetToolbarY, theme::motion::panel.omega, theme::motion::panel.zeta, dt)) active = true;
 
     // Rewind Scrubber Bar Spring
     float targetRewind = showRewindScrubber_ ? 1.0f : 0.0f;
-    if (stepSpring(rewindScrubberAnimT_, rewindScrubberAnimVel_, targetRewind, 26.0f, 0.78f, dt)) active = true;
+    if (stepSpring(rewindScrubberAnimT_, rewindScrubberAnimVel_, targetRewind, theme::motion::panel.omega, theme::motion::panel.zeta, dt)) active = true;
 
     // 8. Keyboard Shortcuts Modal Spring
     float targetShortcuts = showShortcutsModal_ ? 1.0f : 0.0f;
-    if (stepSpring(shortcutsModalAnimT_, shortcutsModalAnimVel_, targetShortcuts, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(shortcutsModalAnimT_, shortcutsModalAnimVel_, targetShortcuts, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 9. TCP Port Forwarding Manager Modal Spring
     float targetPortModal = showPortForwardModal_ ? 1.0f : 0.0f;
-    if (stepSpring(portForwardModalAnimT_, portForwardModalAnimVel_, targetPortModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(portForwardModalAnimT_, portForwardModalAnimVel_, targetPortModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 10. Address Book Edit Modal Spring
     float targetABModal = showAddressBookEditModal_ ? 1.0f : 0.0f;
-    if (stepSpring(addressBookModalAnimT_, addressBookModalAnimVel_, targetABModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(addressBookModalAnimT_, addressBookModalAnimVel_, targetABModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 11. Mandatory Update Modal Spring (v3.0.0)
     float targetUpdateModal = showUpdateRequiredModal_ ? 1.0f : 0.0f;
-    if (stepSpring(updateModalAnimT_, updateModalAnimVel_, targetUpdateModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(updateModalAnimT_, updateModalAnimVel_, targetUpdateModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 12. Real-Time Performance HUD Overlay Spring
     float targetHud = showPerformanceHud_ ? 1.0f : 0.0f;
-    if (stepSpring(hudAnimT_, hudAnimVel_, targetHud, 26.0f, 0.78f, dt)) active = true;
+    if (stepSpring(hudAnimT_, hudAnimVel_, targetHud, theme::motion::panel.omega, theme::motion::panel.zeta, dt)) active = true;
 
     // 13. Remote Reboot & Reconnect Modal Spring
     float targetRebootModal = showRebootConfirmModal_ ? 1.0f : 0.0f;
-    if (stepSpring(rebootModalAnimT_, rebootModalAnimVel_, targetRebootModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(rebootModalAnimT_, rebootModalAnimVel_, targetRebootModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 14. Hardware Acceleration Restart Modal Spring
     float targetHwAccelModal = showHwAccelRestartModal_ ? 1.0f : 0.0f;
-    if (stepSpring(hwAccelModalAnimT_, hwAccelModalAnimVel_, targetHwAccelModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(hwAccelModalAnimT_, hwAccelModalAnimVel_, targetHwAccelModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 15. Session Recording Player Modal Spring
     float targetPlayerModal = showRecordingPlayer_ ? 1.0f : 0.0f;
-    if (stepSpring(recordingPlayerModalAnimT_, recordingPlayerModalAnimVel_, targetPlayerModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(recordingPlayerModalAnimT_, recordingPlayerModalAnimVel_, targetPlayerModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 16. Viewer TOTP Challenge Modal Spring
     bool waitingTotp = network_.isWaitingForTotp();
@@ -687,11 +631,11 @@ bool CppDeskWindow::stepAnimations(float dt) {
         }
     }
     float targetTotpModal = showTotpModal_ ? 1.0f : 0.0f;
-    if (stepSpring(totpModalAnimT_, totpModalAnimVel_, targetTotpModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(totpModalAnimT_, totpModalAnimVel_, targetTotpModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 17. Spotlight Omnibar Command Palette Modal Spring
     float targetOmniModal = showOmnibarModal_ ? 1.0f : 0.0f;
-    if (stepSpring(omnibarModalAnimT_, omnibarModalAnimVel_, targetOmniModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(omnibarModalAnimT_, omnibarModalAnimVel_, targetOmniModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 18. Run Task Modal Spring
     float targetRunTaskModal = showRunTaskModal_ ? 1.0f : 0.0f;
@@ -707,7 +651,7 @@ bool CppDeskWindow::stepAnimations(float dt) {
     // 20. Settings Tab Smooth Scroll Spring
     if (!draggingSettingsScrollbar_) {
         settingsScrollTarget_ = std::clamp(settingsScrollTarget_, 0.0f, settingsMaxScroll_);
-        if (stepSpring(settingsScrollOffset_, settingsScrollVel_, settingsScrollTarget_, 32.0f, 0.88f, dt, 0.15f)) {
+        if (stepSpring(settingsScrollOffset_, settingsScrollVel_, settingsScrollTarget_, theme::motion::scroll.omega, theme::motion::scroll.zeta, dt, 0.15f)) {
             settingsScrollOffset_ = std::clamp(settingsScrollOffset_, 0.0f, settingsMaxScroll_);
             active = true;
         }
@@ -715,14 +659,14 @@ bool CppDeskWindow::stepAnimations(float dt) {
 
     // Horizontal HUD Smooth Scroll Spring
     sessionHudScrollTarget_ = std::clamp(sessionHudScrollTarget_, 0.0f, sessionHudMaxScroll_);
-    if (stepSpring(sessionHudScrollOffset_, sessionHudScrollVel_, sessionHudScrollTarget_, 32.0f, 0.88f, dt, 0.15f)) {
+    if (stepSpring(sessionHudScrollOffset_, sessionHudScrollVel_, sessionHudScrollTarget_, theme::motion::scroll.omega, theme::motion::scroll.zeta, dt, 0.15f)) {
         sessionHudScrollOffset_ = std::clamp(sessionHudScrollOffset_, 0.0f, sessionHudMaxScroll_);
         active = true;
     }
 
     // Drawer Tabs Header Smooth Scroll Spring
     drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_, 0.0f, drawerTabsMaxScroll_);
-    if (stepSpring(drawerTabsScrollOffset_, drawerTabsScrollVel_, drawerTabsScrollTarget_, 32.0f, 0.88f, dt, 0.15f)) {
+    if (stepSpring(drawerTabsScrollOffset_, drawerTabsScrollVel_, drawerTabsScrollTarget_, theme::motion::scroll.omega, theme::motion::scroll.zeta, dt, 0.15f)) {
         drawerTabsScrollOffset_ = std::clamp(drawerTabsScrollOffset_, 0.0f, drawerTabsMaxScroll_);
         active = true;
     }
@@ -746,8 +690,8 @@ bool CppDeskWindow::stepAnimations(float dt) {
         float wantHover = (id == hoveredWidgetId_) ? 1.0f : 0.0f;
         float wantPress = (mouseLeftDown_ && id == pressedWidgetId_ && id == hoveredWidgetId_) ? 1.0f : 0.0f;
 
-        if (stepSpring(st.hoverT, st.hoverVel, wantHover, 32.0f, 0.72f, dt)) active = true;
-        if (stepSpring(st.pressT, st.pressVel, wantPress, 38.0f, 0.68f, dt)) active = true;
+        if (stepSpring(st.hoverT, st.hoverVel, wantHover, theme::motion::hover.omega, theme::motion::hover.zeta, dt)) active = true;
+        if (stepSpring(st.pressT, st.pressVel, wantPress, theme::motion::press.omega, theme::motion::press.zeta, dt)) active = true;
 
         if (st.rippleT < 1.0f) {
             st.rippleT = std::min(1.0f, st.rippleT + dt * 3.6f);
@@ -769,7 +713,7 @@ bool CppDeskWindow::stepAnimations(float dt) {
         }
     }
     float targetTooltip = hasTooltipHover ? 1.0f : 0.0f;
-    if (stepSpring(tooltipAnimT_, tooltipAnimVel_, targetTooltip, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(tooltipAnimT_, tooltipAnimVel_, targetTooltip, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
     if (!hasTooltipHover && tooltipAnimT_ <= 0.005f) {
         activeTooltipText_.clear();
     }
@@ -904,6 +848,17 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     return 0;
                 }
             }
+            return 0;
+        }
+        case WM_DPICHANGED: {
+            dpi_ = HIWORD(wParam);
+            if (dpi_ == 0) dpi_ = 96;
+            const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
+            SetWindowPos(hwnd_, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left, suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            if (renderTarget_) renderTarget_->SetDpi(static_cast<float>(dpi_), static_cast<float>(dpi_));
+            InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         }
         case WM_SIZE: {
@@ -1122,32 +1077,32 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 1;
 
         case WM_MOUSEMOVE:
-            onMouseMove(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseMove(toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_LBUTTONDOWN:
             SetFocus(hwnd_);
-            onMouseButton(MouseButtonId::Left, true, static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseButton(MouseButtonId::Left, true, toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_LBUTTONUP:
-            onMouseButton(MouseButtonId::Left, false, static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseButton(MouseButtonId::Left, false, toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_RBUTTONDOWN:
-            onMouseButton(MouseButtonId::Right, true, static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseButton(MouseButtonId::Right, true, toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_RBUTTONUP:
-            onMouseButton(MouseButtonId::Right, false, static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseButton(MouseButtonId::Right, false, toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_MBUTTONDOWN:
-            onMouseButton(MouseButtonId::Middle, true, static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseButton(MouseButtonId::Middle, true, toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_MBUTTONUP:
-            onMouseButton(MouseButtonId::Middle, false, static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+            onMouseButton(MouseButtonId::Middle, false, toDip(GET_X_LPARAM(lParam)), toDip(GET_Y_LPARAM(lParam)));
             return 0;
 
         case WM_MOUSEWHEEL:
@@ -1207,8 +1162,8 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_GETMINMAXINFO: {
             auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
-            mmi->ptMinTrackSize.x = 900;
-            mmi->ptMinTrackSize.y = 600;
+            mmi->ptMinTrackSize.x = dipToPx(900.0f, dpi_);
+            mmi->ptMinTrackSize.y = dipToPx(600.0f, dpi_);
             return 0;
         }
 
@@ -1747,21 +1702,19 @@ void CppDeskWindow::onPaint() {
 
     updateActivePalette(smoothStepEase(themeAnimT_));
 
-    RECT rc{};
-    GetClientRect(hwnd_, &rc);
-    float width = static_cast<float>(std::max<LONG>(1, rc.right - rc.left));
-    float height = static_cast<float>(std::max<LONG>(1, rc.bottom - rc.top));
+    const D2D1_SIZE_F clientDips = clientSizeDips();
+    float width = clientDips.width;
+    float height = clientDips.height;
 
     if (!renderTarget_) {
         D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties();
         rtProps.type = identity_.settings().hardwareAcceleration
             ? D2D1_RENDER_TARGET_TYPE_DEFAULT
             : D2D1_RENDER_TARGET_TYPE_SOFTWARE;
-        rtProps.dpiX = 96.0f;
-        rtProps.dpiY = 96.0f;
-        D2D1_HWND_RENDER_TARGET_PROPERTIES hwndProps = D2D1::HwndRenderTargetProperties(
-            hwnd_, D2D1::SizeU(static_cast<UINT32>(width), static_cast<UINT32>(height))
-        );
+        // Target DPI = window DPI, so every layout number below is a DIP and Direct2D scales it to pixels.
+        rtProps.dpiX = static_cast<float>(dpi_);
+        rtProps.dpiY = static_cast<float>(dpi_);
+        D2D1_HWND_RENDER_TARGET_PROPERTIES hwndProps = D2D1::HwndRenderTargetProperties(hwnd_, clientSizePx());
         if (FAILED(d2dFactory_->CreateHwndRenderTarget(rtProps, hwndProps, &renderTarget_)) || !renderTarget_) {
             return;
         }
@@ -3327,12 +3280,18 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             drawW = bitmapW_ * scale;
             drawH = bitmapH_ * scale;
         } else if (scaleMode_ == ScaleMode::Original) {
-            drawW = std::min(availW, static_cast<float>(bitmapW_));
-            drawH = std::min(availH, static_cast<float>(bitmapH_));
+            // 1:1 means one remote pixel per physical pixel, which is 96/dpi DIPs.
+            drawW = std::min(availW, pxToDip(static_cast<float>(bitmapW_), dpi_));
+            drawH = std::min(availH, pxToDip(static_cast<float>(bitmapH_), dpi_));
         }
 
         float left = stageRect.left + (stageRect.width() - drawW) * 0.5f;
         float top  = stageRect.top + (stageRect.height() - drawH) * 0.5f;
+        if (scaleMode_ == ScaleMode::Original) {
+            // Whole physical pixels, or the 1:1 image is resampled and soft at fractional scales.
+            left = snapToPx(left, dpi_);
+            top = snapToPx(top, dpi_);
+        }
         renderedCanvasRect_ = { left, top, left + drawW, top + drawH };
 
         if (!isFullscreen_) {
@@ -3460,7 +3419,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                                renderedCanvasRect_.right - 16.0f,
                                renderedCanvasRect_.bottom - 16.0f };
 
-            fillRoundRect(hudPill, 9.0f, rgba(28, 27, 25, 0.94f));
+            fillRoundRect(hudPill, 9.0f, COL_HUD_BG);
             strokeRoundRect(hudPill, 9.0f, COL_BORDER_ALT);
 
             float pct = (activeItem->totalBytes > 0)
@@ -3475,10 +3434,10 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                      fmtBodyBold_, COL_PRIMARY_ACCENT);
 
             drawText(activeItem->fileName, { hudPill.left + 26.0f, hudPill.top + 6.0f, hudPill.right - 50.0f, hudPill.top + 22.0f },
-                     fmtSmall_, COL_TEXT_PRIMARY);
+                     fmtSmall_, COL_HUD_TEXT);
 
             drawText(pctBuf, { hudPill.right - 48.0f, hudPill.top + 6.0f, hudPill.right - 10.0f, hudPill.top + 22.0f },
-                     fmtSmall_, COL_TEXT_ACCENT, DWRITE_TEXT_ALIGNMENT_TRAILING);
+                     fmtSmall_, COL_HUD_TEXT_ACCENT, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
             UiRect barBg = { hudPill.left + 10.0f, hudPill.bottom - 14.0f, hudPill.right - 10.0f, hudPill.bottom - 8.0f };
             fillRoundRect(barBg, 3.0f, rgba(255, 255, 255, 0.08f));
@@ -3580,11 +3539,11 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
 
             drawPulseDot(bannerRect.centerX(), bannerRect.top + 28.0f, 5.0f, COL_PRIMARY_ACCENT);
             drawText("Host Restarting...", { bannerRect.left + 20.0f, bannerRect.top + 42.0f, bannerRect.right - 20.0f, bannerRect.top + 68.0f },
-                     fmtHeading_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_CENTER);
+                     fmtHeading_, COL_HUD_TEXT, DWRITE_TEXT_ALIGNMENT_CENTER);
 
             std::string subText = "Auto-reconnecting with security token...\nWaiting for remote system to come back online.";
             drawText(subText, { bannerRect.left + 20.0f, bannerRect.top + 70.0f, bannerRect.right - 20.0f, bannerRect.bottom - 46.0f },
-                     fmtSmall_, COL_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_CENTER);
+                     fmtSmall_, COL_HUD_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_CENTER);
 
             UiRect cancelBtn = { bannerRect.centerX() - 70.0f, bannerRect.bottom - 38.0f, bannerRect.centerX() + 70.0f, bannerRect.bottom - 10.0f };
             drawButton("btn_cancel_reboot_rec", cancelBtn, "Cancel Reconnect",
@@ -8255,7 +8214,7 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
     drawPulseDot(curX + 4.0f, hudCard.top + 16.0f, 3.6f, rgba(16, 185, 129, hudProgress), hudProgress);
     curX += 16.0f;
     drawText("DIAGNOSTICS & TELEMETRY", { curX, hudCard.top + 8.0f, hudCard.right - 36.0f, hudCard.top + 26.0f },
-             fmtSmall_, withAlpha(COL_TEXT_PRIMARY, hudProgress));
+             fmtSmall_, withAlpha(COL_HUD_TEXT, hudProgress));
 
     UiRect closeBtn = { hudCard.right - 28.0f, hudCard.top + 7.0f, hudCard.right - 8.0f, hudCard.top + 27.0f };
     drawButton("hud_close_btn", closeBtn, "×",
@@ -8287,20 +8246,20 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
                              (stats.qualityPreset == QualityPreset::Balanced) ? "Balanced" : "Low";
     std::snprintf(resBuf, sizeof(resBuf), "%dx%d • %s", stats.frameWidth, stats.frameHeight, presetName);
     drawText(resBuf, { hudCard.left + 160.0f, cy, hudCard.right - 14.0f, cy + 18.0f },
-             fmtSmall_, withAlpha(COL_TEXT_SECONDARY, hudProgress), DWRITE_TEXT_ALIGNMENT_TRAILING);
+             fmtSmall_, withAlpha(COL_HUD_TEXT_SECONDARY, hudProgress), DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     cy += 24.0f;
 
     // Row 2: Latency Pipeline (Capture | Encode | Decode)
     drawText("LATENCY PIPELINE", { hudCard.left + 14.0f, cy, hudCard.right - 14.0f, cy + 14.0f },
-             fmtSmall_, withAlpha(COL_TEXT_MUTED, hudProgress * 0.85f));
+             fmtSmall_, withAlpha(COL_HUD_TEXT_MUTED, hudProgress * 0.85f));
     cy += 16.0f;
 
     char pipeBuf[80];
     std::snprintf(pipeBuf, sizeof(pipeBuf), "Cap: %.1f ms   Enc: %.1f ms   Dec: %.1f ms",
                   stats.captureLatencyMs, stats.encodeLatencyMs, stats.decodeLatencyMs);
     drawText(pipeBuf, { hudCard.left + 14.0f, cy, hudCard.right - 14.0f, cy + 18.0f },
-             fmtMono_ ? fmtMono_ : fmtSmall_, withAlpha(COL_TEXT_PRIMARY, hudProgress));
+             fmtMono_ ? fmtMono_ : fmtSmall_, withAlpha(COL_HUD_TEXT, hudProgress));
 
     cy += 24.0f;
 
@@ -8318,7 +8277,7 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
                   ((std::isfinite(stats.compressionRatio) && stats.compressionRatio > 0.1f) ? stats.compressionRatio : 1.0f),
                   stats.deltaTilesCount);
     drawText(compBuf, { hudCard.left + 160.0f, cy, hudCard.right - 14.0f, cy + 18.0f },
-             fmtSmall_, withAlpha(COL_TEXT_SECONDARY, hudProgress), DWRITE_TEXT_ALIGNMENT_TRAILING);
+             fmtSmall_, withAlpha(COL_HUD_TEXT_SECONDARY, hudProgress), DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     cy += 20.0f;
 
@@ -8330,7 +8289,7 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
         UiRect sparkRect = { hudCard.left + 14.0f, cy, hudCard.right - 14.0f, cy + 28.0f };
         fillRoundRect(sparkRect, 4.0f, withAlpha(COL_BG_SUBTLE, hudProgress * 0.5f));
         drawText("Sampling network latency...", sparkRect, fmtSmall_,
-                 withAlpha(COL_TEXT_MUTED, hudProgress), DWRITE_TEXT_ALIGNMENT_CENTER);
+                 withAlpha(COL_HUD_TEXT_MUTED, hudProgress), DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
     cy += 34.0f;
@@ -8338,7 +8297,7 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
     // Row 5: Hotkey helper
     drawText("Press Ctrl + Shift + O to toggle overlay",
              { hudCard.left + 14.0f, cy, hudCard.right - 14.0f, cy + 16.0f },
-             fmtSmall_, withAlpha(COL_TEXT_MUTED, hudProgress * 0.70f), DWRITE_TEXT_ALIGNMENT_CENTER);
+             fmtSmall_, withAlpha(COL_HUD_TEXT_MUTED, hudProgress * 0.70f), DWRITE_TEXT_ALIGNMENT_CENTER);
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -8371,10 +8330,9 @@ void CppDeskWindow::drawAudioVolumePopup(float anchorX, float anchorY) {
     if (audioPopAnimT_ <= 0.005f) return;
     float popAlpha = std::clamp(audioPopAnimT_, 0.0f, 1.0f);
 
-    RECT rcCl{};
-    GetClientRect(hwnd_, &rcCl);
-    float winW = static_cast<float>(std::max<LONG>(1, rcCl.right - rcCl.left));
-    float winH = static_cast<float>(std::max<LONG>(1, rcCl.bottom - rcCl.top));
+    const D2D1_SIZE_F clientDips = clientSizeDips();
+    float winW = clientDips.width;
+    float winH = clientDips.height;
 
     bool isMuted = network_.isAudioMuted();
     int curVol = network_.audioVolume();
@@ -8490,6 +8448,18 @@ bool CppDeskWindow::anyModalActive() const {
            showUpdateRequiredModal_;
 }
 
+D2D1_SIZE_U CppDeskWindow::clientSizePx() const {
+    RECT rc{};
+    if (hwnd_) GetClientRect(hwnd_, &rc);
+    return D2D1::SizeU(static_cast<UINT32>(std::max<LONG>(1, rc.right - rc.left)),
+                       static_cast<UINT32>(std::max<LONG>(1, rc.bottom - rc.top)));
+}
+
+D2D1_SIZE_F CppDeskWindow::clientSizeDips() const {
+    D2D1_SIZE_U px = clientSizePx();
+    return D2D1::SizeF(pxToDip(static_cast<float>(px.width), dpi_), pxToDip(static_cast<float>(px.height), dpi_));
+}
+
 bool CppDeskWindow::mapCanvasPointToNormalized(float x, float y, float& outNormX, float& outNormY) const {
     if (renderedCanvasRect_.width() <= 1.0f || renderedCanvasRect_.height() <= 1.0f) {
         return false;
@@ -8507,9 +8477,7 @@ bool CppDeskWindow::mapCanvasPointToNormalized(float x, float y, float& outNormX
         return false;
     }
     if (isFullscreen_ && floatingToolbarY_ > -50.0f && hwnd_) {
-        RECT rc{};
-        GetClientRect(hwnd_, &rc);
-        float winW = static_cast<float>(rc.right - rc.left);
+        float winW = clientSizeDips().width;
         float pillHalfW = 665.0f;
         float pillLeft = (winW * 0.5f) - pillHalfW;
         float pillRight = (winW * 0.5f) + pillHalfW;
@@ -8523,9 +8491,7 @@ bool CppDeskWindow::mapCanvasPointToNormalized(float x, float y, float& outNormX
     }
 
     if (drawerAnimT_ > 0.004f && hwnd_) {
-        RECT rc{};
-        GetClientRect(hwnd_, &rc);
-        float w = static_cast<float>(rc.right - rc.left);
+        float w = clientSizeDips().width;
         float drawerW = std::min(drawerWidth_, w * 0.48f);
         if (x >= (w - drawerW - 14.0f)) {
             return false;
@@ -8754,9 +8720,7 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
 
     bool insideDrawer = false;
     if (drawerAnimT_ > 0.004f && hwnd_) {
-        RECT rc{};
-        GetClientRect(hwnd_, &rc);
-        float w = static_cast<float>(rc.right - rc.left);
+        float w = clientSizeDips().width;
         float drawerW = std::min(drawerWidth_, w * 0.48f);
         if (x >= (w - drawerW - 14.0f)) {
             insideDrawer = true;
@@ -8864,9 +8828,7 @@ void CppDeskWindow::onMouseWheel(int delta) {
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
     if (drawerAnimT_ > 0.004f && hwnd_) {
-        RECT rc{};
-        GetClientRect(hwnd_, &rc);
-        float w = static_cast<float>(rc.right - rc.left);
+        float w = clientSizeDips().width;
         float drawerW = std::min(drawerWidth_, w * 0.48f);
         if (mouseX_ >= (w - drawerW - 14.0f)) {
             // Horizontal scroll for drawer tabs header if mouse is at the top
@@ -9316,9 +9278,12 @@ void CppDeskWindow::onDropFiles(HDROP hDrop) {
     DragQueryPoint(hDrop, &pt);
 
     float nx = 0.0f, ny = 0.0f;
+    // DragQueryPoint returns physical client pixels; hit-testing uses DIPs.
+    const float dropX = toDip(pt.x);
+    const float dropY = toDip(pt.y);
     bool droppedOnCanvas = (activeTab_ == ActiveTab::RemoteSession &&
-                            renderedCanvasRect_.contains(static_cast<float>(pt.x), static_cast<float>(pt.y)) &&
-                            mapCanvasPointToNormalized(static_cast<float>(pt.x), static_cast<float>(pt.y), nx, ny));
+                            renderedCanvasRect_.contains(dropX, dropY) &&
+                            mapCanvasPointToNormalized(dropX, dropY, nx, ny));
 
     FileOfferTarget targetHint = droppedOnCanvas ? FileOfferTarget::Desktop : FileOfferTarget::DefaultDownloads;
 
