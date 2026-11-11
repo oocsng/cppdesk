@@ -7141,6 +7141,31 @@ void testDeserializersSurviveHostileInput() {
     TEST_ASSERT(g_oversizedAllocs == 0);
 }
 
+void testFileBrowserLoadTimeout() {
+    std::cout << "[TEST 61] File Browser Pane Load Timeout..." << std::endl;
+
+    FileBrowserPaneState pane;
+    pane.statusMessage = "stale error";
+    pane.beginLoading(1000);
+    TEST_ASSERT(pane.isLoading);
+    TEST_ASSERT(pane.statusMessage.empty());
+
+    // Still waiting just before the deadline
+    TEST_ASSERT(!pane.expireLoading(1000 + 9999, 10000));
+    TEST_ASSERT(pane.isLoading);
+
+    // Gives up at the deadline with a readable message, once
+    TEST_ASSERT(pane.expireLoading(1000 + 10000, 10000));
+    TEST_ASSERT(!pane.isLoading);
+    TEST_ASSERT(pane.statusMessage.find("No response") != std::string::npos);
+    TEST_ASSERT(!pane.expireLoading(1000 + 20000, 10000));
+
+    // A pane that is not loading never expires
+    FileBrowserPaneState idle;
+    TEST_ASSERT(!idle.expireLoading(1ULL << 40, 10000));
+    TEST_ASSERT(idle.statusMessage.empty());
+}
+
 void testRemoteFileBrowserProtocol() {
     std::cout << "[TEST 58] Remote File Browser Protocol..." << std::endl;
 
@@ -7290,6 +7315,7 @@ int main() {
         testRemoteFileBrowserProtocol(); std::cout << "Test 58 done\n" << std::flush;
         testUpdaterIntegrity(); std::cout << "Test 59 done\n" << std::flush;
         testDeserializersSurviveHostileInput(); std::cout << "Test 60 done\n" << std::flush;
+        testFileBrowserLoadTimeout(); std::cout << "Test 61 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";

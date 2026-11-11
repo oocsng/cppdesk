@@ -890,6 +890,10 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_TIMER: {
             uint64_t tickNow = GetTickCount64();
+            if (remoteFilePane_.expireLoading(tickNow)) {
+                showToast(remoteFilePane_.statusMessage, true);
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
             auto vStats = network_.viewerStats();
             if (vStats.state == ViewerConnectionState::Connected &&
                 prevViewerState_ != ViewerConnectionState::Connected) {
@@ -5108,7 +5112,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                 }
                 if (remoteFilePane_.entries.empty()) {
                     network_.requestRemoteFileList("$DRIVES$");
-                    remoteFilePane_.isLoading = true;
+                    remoteFilePane_.beginLoading(GetTickCount64());
                 }
             }},
             { DrawerTab::LiveChat, "drawer_tab_chat", chatTabLbl, (unread > 0 ? 76.0f : 56.0f), (drawerTab_ == DrawerTab::LiveChat), [this]() {
@@ -7135,7 +7139,7 @@ void CppDeskWindow::navigateFilePane(int pane, const std::string& path) {
         localFilePane_.statusMessage.clear();
         fileBrowserInputLocalPath_ = (canon == "$DRIVES$") ? std::string() : canon;
     } else {
-        remoteFilePane_.isLoading = true;
+        remoteFilePane_.beginLoading(GetTickCount64());
         network_.requestRemoteFileList(path.empty() ? "$DRIVES$" : path);
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
