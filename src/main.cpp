@@ -46,6 +46,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
 
     int instanceId = 1;
     std::wstring uiSnapshotDir;
+    bool uiSnapshotRecord = false;
     bool headlessRelayOnly = false;
     uint16_t relayPort = cppdesk::DEFAULT_RELAY_PORT;
 
@@ -99,6 +100,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
                 } catch (...) {}
             } else if (arg == L"--ui-snapshot" && i + 1 < argc) {
                 uiSnapshotDir = argv[++i];
+            } else if (arg == L"--record") {
+                uiSnapshotRecord = true;
             } else if (arg == L"--relay-server") {
                 headlessRelayOnly = true;
                 if (i + 1 < argc) {
@@ -128,7 +131,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
         snapIdentity.loadOrCreate();
         snapIdentity.setSessionCode("k7m2qp");
         cppdesk::NetworkEngine snapNetwork(snapIdentity);
-        int written = cppdesk::CppDeskWindow::runUiSnapshots(snapIdentity, snapNetwork, uiSnapshotDir);
+        int written = cppdesk::CppDeskWindow::runUiSnapshots(snapIdentity, snapNetwork, uiSnapshotDir, uiSnapshotRecord);
         std::error_code ec;
         std::filesystem::remove(snapIdentity.configFilePath(), ec);
         OleUninitialize();

@@ -24,6 +24,7 @@
 #include <memory>
 
 #include "canvas.hpp"
+#include "platform_shell.hpp"
 #if defined(_WIN32)
 #include "canvas_d2d.hpp"
 #endif
@@ -158,7 +159,9 @@ public:
     bool create(HINSTANCE hInstance = nullptr, int nCmdShow = 1);
     // Renders every fixed UI state offscreen to <outDir>/<state>.bmp and returns how many were written.
     // Used to check that UI refactors leave the pixels unchanged.
-    static int runUiSnapshots(IdentityManager& identity, NetworkEngine& network, const std::wstring& outDir);
+    // With record set, each state is drawn through a RecordingCanvas and saved as <state>.ops.txt instead.
+    static int runUiSnapshots(IdentityManager& identity, NetworkEngine& network, const std::wstring& outDir,
+                              bool record = false);
     int messageLoop();
 
 private:
@@ -241,8 +244,6 @@ private:
     void releaseImage(ui::ImageId& id);
     // Draws one complete frame into renderTarget_ (BeginDraw..EndDraw) and returns EndDraw's result.
     HRESULT drawFrame(float width, float height);
-    // Milliseconds for UI timing; fixed while rendering snapshots.
-    uint64_t uiNowMs() const;
 
     // Two-Factor Authentication (TOTP) rendering
     void renderQrCodeDirect2D(
@@ -303,7 +304,11 @@ private:
     ui::ImageId            remoteBitmap_{};
     ui::ImageId            appIconBitmap_{};
     ui::Path                unitStar_;                 // unit-radius star, drawn scaled
-    std::unique_ptr<ui::D2DCanvas> canvas_;            // every screen draws through this
+    std::unique_ptr<ui::D2DCanvas> d2dCanvas_;         // the window's Direct2D canvas
+    ui::Canvas*             canvas_ = nullptr;         // every screen draws through this (d2dCanvas_, or a recorder)
+    std::unique_ptr<ui::PlatformShell> ownedShell_;    // WinShell for this window
+    ui::PlatformShell*      shell_ = nullptr;          // platform services the screens use
+    friend class WinShell;
     ui::Color               brushColor_{};             // color for the next raw shape call
     int                     bitmapW_ = 0;
     int                     bitmapH_ = 0;

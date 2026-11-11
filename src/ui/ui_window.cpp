@@ -1,5 +1,6 @@
 #include "ui_window.hpp"
 #include "theme.hpp"
+#include "recording_canvas.hpp"
 #include "../control/windows_service_manager.hpp"
 #include "../capture/screen_capture.hpp"
 #include <gdiplus.h>
@@ -64,13 +65,129 @@ std::wstring utf8ToWide(const std::string& str) {
     return w;
 }
 
+std::string wideToUtf8(const wchar_t* w) {
+    if (!w || !*w) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 1) return {};
+    std::string out(static_cast<size_t>(len - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), len, nullptr, nullptr);
+    return out;
+}
+
 } // namespace
+
+// ---------------- Windows Platform Shell ----------------
+
+class WinShell : public ui::PlatformShell {
+public:
+    explicit WinShell(CppDeskWindow& w) : w_(w) {}
+
+    void invalidate() override {
+        if (w_.hwnd_) InvalidateRect(w_.hwnd_, nullptr, FALSE);
+    }
+
+    void setCursor(ui::CursorShape shape) override {
+        LPCTSTR id = IDC_ARROW;
+        switch (shape) {
+            case ui::CursorShape::Hand: id = IDC_HAND; break;
+            case ui::CursorShape::IBeam: id = IDC_IBEAM; break;
+            case ui::CursorShape::ResizeH: id = IDC_SIZEWE; break;
+            case ui::CursorShape::ResizeV: id = IDC_SIZENS; break;
+            default: break;
+        }
+        SetCursor(LoadCursor(nullptr, id));
+    }
+
+    float dpiScale() const override { return static_cast<float>(w_.dpi_) / 96.0f; }
+
+    // Snapshots draw at a fixed instant so clock-driven pulses and timeouts are repeatable.
+    uint64_t nowMs() const override { return w_.snapshotMode_ ? 10000 : GetTickCount64(); }
+
+    void setTextInputActive(bool) override {}
+
+    std::optional<std::string> chooseOpenFile(const std::string& title, const std::string& filterName,
+                                              const std::string& filterPattern) override {
+        std::wstring wTitle = utf8ToWide(title);
+        std::wstring filter = utf8ToWide(filterName + " (" + filterPattern + ")");
+        filter.push_back(L'\0');
+        filter += utf8ToWide(filterPattern);
+        filter.push_back(L'\0');
+        filter += L"All Files (*.*)";
+        filter.push_back(L'\0');
+        filter += L"*.*";
+        filter.push_back(L'\0');
+        wchar_t file[MAX_PATH] = L"";
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = w_.hwnd_;
+        ofn.lpstrFile = file;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrFilter = filter.c_str();
+        ofn.nFilterIndex = 1;
+        ofn.lpstrTitle = wTitle.c_str();
+        ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetOpenFileNameW(&ofn)) return std::nullopt;
+        return wideToUtf8(file);
+    }
+
+    std::optional<std::string> chooseFolder(const std::string& title) override {
+        std::optional<std::string> result;
+        IFileDialog* pfd = nullptr;
+        if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd))) || !pfd) {
+            return result;
+        }
+        DWORD options = 0;
+        if (SUCCEEDED(pfd->GetOptions(&options))) pfd->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        std::wstring wTitle = utf8ToWide(title);
+        pfd->SetTitle(wTitle.c_str());
+        if (SUCCEEDED(pfd->Show(w_.hwnd_))) {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(pfd->GetResult(&item)) && item) {
+                PWSTR path = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+                    result = wideToUtf8(path);
+                    CoTaskMemFree(path);
+                }
+                item->Release();
+            }
+        }
+        pfd->Release();
+        return result;
+    }
+
+    void openUrl(const std::string& url) override {
+        ShellExecuteW(nullptr, L"open", utf8ToWide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+
+    void revealPath(const std::string& path) override {
+        std::wstring args = L"/select,\"" + utf8ToWide(path) + L"\"";
+        ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+    }
+
+    void relaunchApp() override {
+        wchar_t exePath[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
+            ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        if (w_.hwnd_) DestroyWindow(w_.hwnd_);
+    }
+
+    void showNotification(const std::string&, const std::string&) override {}
+    void setTrayStatus(const std::string&) override {}
+
+    bool has(ui::Capability) const override { return true; }
+
+private:
+    CppDeskWindow& w_;
+};
 
 CppDeskWindow::CppDeskWindow(IdentityManager& identity, NetworkEngine& network, const std::string& autoConnectTarget)
     : identity_(identity)
     , network_(network)
     , autoConnectTarget_(autoConnectTarget)
 {
+    ownedShell_ = std::make_unique<WinShell>(*this);
+    shell_ = ownedShell_.get();
     const auto& s = identity_.settings();
     relayServerEdit_ = s.relayServer.empty() ? identity_.relayServerAddress() : s.relayServer;
     relayAuthKeyEdit_ = s.relayAuthKey;
@@ -201,7 +318,7 @@ void CppDeskWindow::switchTab(ActiveTab newTab) {
             focusedField_ = FocusedField::RemoteId;
         }
     }
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    shell_->invalidate();
 }
 
 bool CppDeskWindow::create(HINSTANCE hInstance, int nCmdShow) {
@@ -298,7 +415,7 @@ bool CppDeskWindow::create(HINSTANCE hInstance, int nCmdShow) {
         latestUpdateInfo_.latestVersion = cleanVer;
         triggerUpdateCheck(false);
         if (hwnd_) {
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
         }
     });
 
@@ -374,14 +491,15 @@ bool CppDeskWindow::initGraphics() {
         unitStar_.close();
     }
 
-    canvas_ = std::make_unique<ui::D2DCanvas>(d2dFactory_, dwriteFactory_);
+    d2dCanvas_ = std::make_unique<ui::D2DCanvas>(d2dFactory_, dwriteFactory_);
+    canvas_ = d2dCanvas_.get();
 
     return true;
 }
 
 void CppDeskWindow::discardDeviceResources() {
     // Detaching drops every canvas image, so the handles are simply cleared.
-    if (canvas_) canvas_->detach();
+    if (d2dCanvas_) d2dCanvas_->detach();
     appIconBitmap_ = {};
     remoteBitmap_ = {};
     recordingPlayerBitmap_ = {};
@@ -527,7 +645,7 @@ bool CppDeskWindow::stepAnimations(float dt) {
     float winW = clientSizeDips().width;
 
     // 6. Dynamic Island / Capsule Toast Spring
-    bool toastVisible = (!toastText_.empty() && uiNowMs() <= toastExpireTick_);
+    bool toastVisible = (!toastText_.empty() && shell_->nowMs() <= toastExpireTick_);
     float targetToast = toastVisible ? 1.0f : 0.0f;
     if (stepSpring(toastAnimT_, toastAnimVel_, targetToast, 28.0f, 0.72f, dt)) active = true;
     float estTextW = static_cast<float>(toastText_.size()) * 7.6f + 64.0f;
@@ -738,7 +856,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             trackingMouseLeave_ = false;
             hoveredWidgetId_.clear();
             hoveredIsTextInput_ = false;
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
             return 0;
         }
         case WM_KILLFOCUS: {
@@ -746,7 +864,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             draggingSettingsScrollbar_ = false;
             pressedWidgetId_.clear();
             network_.sendReleaseAllModifiers();
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
             return 0;
         }
         case WM_ACTIVATE:
@@ -757,7 +875,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             if (activeTab_ == ActiveTab::RemoteSession) {
                 network_.markViewerCanvasFullDirty();
                 displayedFrameSeq_ = 0;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
             break;
         }
@@ -838,7 +956,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                          suggested->right - suggested->left, suggested->bottom - suggested->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
             if (renderTarget_) renderTarget_->SetDpi(static_cast<float>(dpi_), static_cast<float>(dpi_));
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
             return 0;
         }
         case WM_SIZE: {
@@ -850,7 +968,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 HRESULT hr = hwndTarget_ ? hwndTarget_->Resize(sz) : S_OK;
                 if (hr == D2DERR_RECREATE_TARGET) {
                     discardDeviceResources();
-                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    shell_->invalidate();
                 }
             }
             sessionHudScrollOffset_ = std::clamp(sessionHudScrollOffset_, 0.0f, sessionHudMaxScroll_);
@@ -858,7 +976,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             activeTooltipText_.clear();
             tooltipAnimT_ = 0.0f;
             tooltipAnimVel_ = 0.0f;
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
             return 0;
         }
         case WM_CAPTURECHANGED: {
@@ -867,14 +985,14 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             draggingSettingsScrollbar_ = false;
             pressedWidgetId_.clear();
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
             return 0;
         }
         case WM_TIMER: {
-            uint64_t tickNow = GetTickCount64();
+            uint64_t tickNow = shell_->nowMs();
             if (remoteFilePane_.expireLoading(tickNow)) {
                 showToast(remoteFilePane_.statusMessage, true);
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
             auto vStats = network_.viewerStats();
             if (vStats.state == ViewerConnectionState::Connected &&
@@ -1028,7 +1146,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     std::string msg = caller + " (" + CryptoUtils::formatDeskId(pending.callerDeskId) + ") is requesting remote control.";
                     notificationMgr_->notify(NotificationType::IncomingConnection, title, msg, identity_.settings());
                 }
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
             prevHasPendingIncoming_ = pending.active;
             modalWasActive_ = pending.active;
@@ -1046,7 +1164,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             ++idleTickCounter;
             bool micMonitoringActive = (activeTab_ == ActiveTab::Settings && settingsSection_ == SettingsSection::AudioVoice && network_.isVoiceMonitoring());
             if (inLiveSession || toastActive || micMonitoringActive || (idleTickCounter % 4 == 0)) {
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
             return 0;
         }
@@ -1140,7 +1258,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 delete info;
             }
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
             return 0;
         }
 
@@ -1158,7 +1276,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     scratchpadTextEdit_ = own->text;
                 }
                 lastSeenScratchpadRev_ = own->revision;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
             return 0;
         }
@@ -1169,7 +1287,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 omnibarLastOutput_ = own->stdoutData.empty() ? own->errorMessage : own->stdoutData;
                 omnibarLastExitCode_ = own->exitCode;
                 omnibarHasOutput_ = true;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
             return 0;
         }
@@ -1183,7 +1301,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (own->total > 0) {
                     updateDownloadProgress_ = static_cast<float>(own->downloaded) / static_cast<float>(own->total);
                 }
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
             return 0;
         }
@@ -1193,7 +1311,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             if (hasPendingMouseMove_) {
                 flushPendingMouseMove();
             }
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
             return 0;
         }
 
@@ -1661,15 +1779,15 @@ void CppDeskWindow::onPaint() {
             return;
         }
         renderTarget_ = hwndTarget_;
-        if (canvas_) canvas_->attach(renderTarget_, 1.0f);
+        if (d2dCanvas_) d2dCanvas_->attach(renderTarget_, 1.0f);
     }
 
     HRESULT hr = drawFrame(width, height);
     if (hr == D2DERR_RECREATE_TARGET) {
         discardDeviceResources();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        shell_->invalidate();
     } else if (animMoving || inlineAnimActive_) {
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        shell_->invalidate();
     }
 }
 
@@ -1936,7 +2054,8 @@ HRESULT CppDeskWindow::drawFrame(float width, float height) {
     }
 
     canvas_->endFrame();
-    return canvas_->consumeRecreateNeeded() ? D2DERR_RECREATE_TARGET : S_OK;
+    bool lost = d2dCanvas_ && canvas_ == d2dCanvas_.get() && d2dCanvas_->consumeRecreateNeeded();
+    return lost ? D2DERR_RECREATE_TARGET : S_OK;
 }
 
 // ---------------- macOS Unified Top Toolbar ----------------
@@ -2085,7 +2204,7 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
     float rx = leftCol.right - 24.0f;
     float curY = leftCol.top + 22.0f;
 
-    bool elevated = InputInjector::isElevated();
+    bool elevated = InputInjector::isElevated() || !shell_->has(ui::Capability::Elevation);
     drawText("This Desk", { lx, curY, rx - (elevated ? 0.0f : 110.0f), curY + 26.0f }, ui::FontRole::Heading, withAlpha(COL_TEXT_PRIMARY, alpha));
     if (!elevated) {
         UiRect elevBtn = { rx - 108.0f, curY, rx, curY + 26.0f };
@@ -2461,7 +2580,7 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
             std::string peerEp = cardItems[i].endpoint;
 
             // Desktop Shortcut (.lnk) Button
-            if (peerId > 0) {
+            if (peerId > 0 && shell_->has(ui::Capability::DesktopShortcut)) {
                 UiRect lnkBtn = { cardR.right - 120.0f, cardR.top + 7.0f, cardR.right - 96.0f, cardR.top + 27.0f };
                 drawButton("peer_lnk_" + std::to_string(i), lnkBtn, "↗",
                            COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_SECONDARY,
@@ -2910,7 +3029,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                     network_.stopVoiceIntercom();
                     showToast("Voice Intercom stopped");
                 }
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
         });
 
@@ -2989,7 +3108,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                     { releaseImage(remoteBitmap_); bitmapW_ = 0; bitmapH_ = 0; }
                 }
                 showToast(showRewindScrubber_ ? "Rewind Scrubber Active" : "Snapped to Live");
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
         });
 
@@ -3012,7 +3131,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                 } else {
                     focusedField_ = FocusedField::None;
                 }
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
         });
 
@@ -3057,7 +3176,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                        6.0f, [this, hasLeft]() {
                            if (hasLeft) {
                                sessionHudScrollTarget_ = std::clamp(sessionHudScrollTarget_ - 110.0f, 0.0f, sessionHudMaxScroll_);
-                               InvalidateRect(hwnd_, nullptr, FALSE);
+                               shell_->invalidate();
                            }
                        }, ui::FontRole::Small, true, COL_BORDER, hasLeft ? COL_TEXT_ACCENT : rgba(255, 255, 255, 0.25f));
 
@@ -3070,7 +3189,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                        6.0f, [this, hasRight]() {
                            if (hasRight) {
                                sessionHudScrollTarget_ = std::clamp(sessionHudScrollTarget_ + 110.0f, 0.0f, sessionHudMaxScroll_);
-                               InvalidateRect(hwnd_, nullptr, FALSE);
+                               shell_->invalidate();
                            }
                        }, ui::FontRole::Small, true, COL_BORDER, hasRight ? COL_TEXT_ACCENT : rgba(255, 255, 255, 0.25f));
 
@@ -3117,7 +3236,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             if (sessionRecorder_.isRecording()) {
                 sessionRecorder_.pushFrame(frameBufferBgra_.data(), frameBufferW_, frameBufferH_);
             }
-            uint64_t nowTick = uiNowMs();
+            uint64_t nowTick = shell_->nowMs();
             if (nowTick - lastRewindPushTickMs_ >= 500) {
                 lastRewindPushTickMs_ = nowTick;
                 rewindBuffer_.pushFrame(nowTick, frameBufferBgra_.data(), frameBufferW_, frameBufferH_);
@@ -3268,7 +3387,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
 
         // Direct Canvas Drag-and-Drop Confirmation Ripple Effect (Feature 2)
         if (canvasDropEffectActive_) {
-            uint64_t elapsed = uiNowMs() - canvasDropTick_;
+            uint64_t elapsed = shell_->nowMs() - canvasDropTick_;
             if (elapsed < 1400) {
                 float t = static_cast<float>(elapsed) / 1400.0f;
                 float ripRadius = 16.0f + 64.0f * std::sin(t * 1.57079f);
@@ -3352,7 +3471,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             fillRoundRect(recPill, 16.0f, rgba(20, 20, 24, 0.94f));
             strokeRoundRect(recPill, 16.0f, withAlpha(COL_DANGER, 0.75f), 1.2f);
 
-            uint64_t tick = uiNowMs();
+            uint64_t tick = shell_->nowMs();
             float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(tick % 1000) / 1000.0f * 6.28318f);
             ui::Color dotColor = ui::Color{0.95f, 0.2f, 0.2f, 0.5f + 0.5f * pulse};
             brushColor_ = dotColor;
@@ -3372,7 +3491,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                        rgba(255, 255, 255, 0.08f), rgba(239, 68, 68, 0.85f), rgba(255, 255, 255, 0.90f),
                        10.0f, [this]() {
                            toggleScreenRecording();
-                           InvalidateRect(hwnd_, nullptr, FALSE);
+                           shell_->invalidate();
                        }, ui::FontRole::Small);
         }
 
@@ -3411,7 +3530,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                        10.0f, [this]() {
                            network_.stopVoiceIntercom();
                            showToast("Voice Intercom stopped");
-                           InvalidateRect(hwnd_, nullptr, FALSE);
+                           shell_->invalidate();
                        }, ui::FontRole::Small);
         }
     } else {
@@ -4469,99 +4588,101 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
-        // 1. Windows System Service
-        UiRect svcBox = { cx, cy, crx, cy + 78.0f };
-        fillRoundRect(svcBox, 12.0f, COL_BG_SUBTLE);
-        strokeRoundRect(svcBox, 12.0f, COL_BORDER);
+        if (shell_->has(ui::Capability::WindowsService)) {
+            // 1. Windows System Service
+            UiRect svcBox = { cx, cy, crx, cy + 78.0f };
+            fillRoundRect(svcBox, 12.0f, COL_BG_SUBTLE);
+            strokeRoundRect(svcBox, 12.0f, COL_BORDER);
 
-        drawText("WINDOWS SYSTEM SERVICE",
-                 { svcBox.left + 16.0f, svcBox.top + 8.0f, svcBox.left + 240.0f, svcBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+            drawText("WINDOWS SYSTEM SERVICE",
+                     { svcBox.left + 16.0f, svcBox.top + 8.0f, svcBox.left + 240.0f, svcBox.top + 22.0f },
+                     ui::FontRole::Small, COL_TEXT_ACCENT);
 
-        ServiceStatusState svcState = WindowsServiceManager::getServiceState();
-        std::string svcStateLabel = (svcState == ServiceStatusState::Running) ? "Running" :
-                                    (svcState == ServiceStatusState::Stopped) ? "Stopped" : "Not Installed";
-        ui::Color svcStateCol = (svcState == ServiceStatusState::Running) ? COL_SUCCESS :
-                                   (svcState == ServiceStatusState::Stopped) ? COL_WARNING : COL_TEXT_MUTED;
+            ServiceStatusState svcState = WindowsServiceManager::getServiceState();
+            std::string svcStateLabel = (svcState == ServiceStatusState::Running) ? "Running" :
+                                        (svcState == ServiceStatusState::Stopped) ? "Stopped" : "Not Installed";
+            ui::Color svcStateCol = (svcState == ServiceStatusState::Running) ? COL_SUCCESS :
+                                       (svcState == ServiceStatusState::Stopped) ? COL_WARNING : COL_TEXT_MUTED;
 
-        drawPulseDot(svcBox.right - 100.0f, svcBox.top + 15.0f, 3.8f, svcStateCol, alpha);
-        drawText(svcStateLabel, { svcBox.right - 90.0f, svcBox.top + 7.0f, svcBox.right - 16.0f, svcBox.top + 23.0f },
-                 ui::FontRole::Small, svcStateCol, ui::HAlign::Leading);
+            drawPulseDot(svcBox.right - 100.0f, svcBox.top + 15.0f, 3.8f, svcStateCol, alpha);
+            drawText(svcStateLabel, { svcBox.right - 90.0f, svcBox.top + 7.0f, svcBox.right - 16.0f, svcBox.top + 23.0f },
+                     ui::FontRole::Small, svcStateCol, ui::HAlign::Leading);
 
-        float sBtnTop = svcBox.top + 28.0f;
-        float sBtnBot = svcBox.top + 64.0f;
-        float sQuarterW = (innerW - 32.0f - 24.0f) / 4.0f;
+            float sBtnTop = svcBox.top + 28.0f;
+            float sBtnBot = svcBox.top + 64.0f;
+            float sQuarterW = (innerW - 32.0f - 24.0f) / 4.0f;
 
-        UiRect installBtn   = { svcBox.left + 16.0f, sBtnTop, svcBox.left + 16.0f + sQuarterW, sBtnBot };
-        UiRect uninstallBtn = { installBtn.right + 8.0f, sBtnTop, installBtn.right + 8.0f + sQuarterW, sBtnBot };
-        UiRect startBtn     = { uninstallBtn.right + 8.0f, sBtnTop, uninstallBtn.right + 8.0f + sQuarterW, sBtnBot };
-        UiRect stopBtn      = { startBtn.right + 8.0f, sBtnTop, svcBox.right - 16.0f, sBtnBot };
+            UiRect installBtn   = { svcBox.left + 16.0f, sBtnTop, svcBox.left + 16.0f + sQuarterW, sBtnBot };
+            UiRect uninstallBtn = { installBtn.right + 8.0f, sBtnTop, installBtn.right + 8.0f + sQuarterW, sBtnBot };
+            UiRect startBtn     = { uninstallBtn.right + 8.0f, sBtnTop, uninstallBtn.right + 8.0f + sQuarterW, sBtnBot };
+            UiRect stopBtn      = { startBtn.right + 8.0f, sBtnTop, svcBox.right - 16.0f, sBtnBot };
 
-        bool isInstalled = (svcState != ServiceStatusState::NotInstalled);
-        bool isRunning = (svcState == ServiceStatusState::Running);
+            bool isInstalled = (svcState != ServiceStatusState::NotInstalled);
+            bool isRunning = (svcState == ServiceStatusState::Running);
 
-        drawButton("sett_svc_install", installBtn, "Install",
-                   !isInstalled ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   !isInstalled ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   !isInstalled ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   7.0f, [this, isInstalled]() {
-                       if (!isInstalled) {
-                           if (WindowsServiceManager::installService()) {
-                               showToast("Service installed successfully");
+            drawButton("sett_svc_install", installBtn, "Install",
+                       !isInstalled ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+                       !isInstalled ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                       !isInstalled ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                       7.0f, [this, isInstalled]() {
+                           if (!isInstalled) {
+                               if (WindowsServiceManager::installService()) {
+                                   showToast("Service installed successfully");
+                               } else {
+                                   showToast("Failed to install service (Admin required)", true);
+                               }
                            } else {
-                               showToast("Failed to install service (Admin required)", true);
+                               showToast("Service already installed");
                            }
-                       } else {
-                           showToast("Service already installed");
-                       }
-                   }, ui::FontRole::Small, isInstalled, COL_BORDER, !isInstalled ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+                       }, ui::FontRole::Small, isInstalled, COL_BORDER, !isInstalled ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
-        drawButton("sett_svc_uninstall", uninstallBtn, "Uninstall",
-                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
-                   7.0f, [this, isInstalled]() {
-                       if (isInstalled) {
-                           if (WindowsServiceManager::uninstallService()) {
-                               showToast("Service uninstalled");
+            drawButton("sett_svc_uninstall", uninstallBtn, "Uninstall",
+                       COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
+                       7.0f, [this, isInstalled]() {
+                           if (isInstalled) {
+                               if (WindowsServiceManager::uninstallService()) {
+                                   showToast("Service uninstalled");
+                               } else {
+                                   showToast("Failed to uninstall service (Admin required)", true);
+                               }
                            } else {
-                               showToast("Failed to uninstall service (Admin required)", true);
+                               showToast("Service not installed");
                            }
-                       } else {
-                           showToast("Service not installed");
-                       }
-                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+                       }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
-        drawButton("sett_svc_start", startBtn, "Start",
-                   (isInstalled && !isRunning) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (isInstalled && !isRunning) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (isInstalled && !isRunning) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   7.0f, [this, isInstalled, isRunning]() {
-                       if (isInstalled && !isRunning) {
-                           if (WindowsServiceManager::startService()) {
-                               showToast("Service started");
-                           } else {
-                               showToast("Failed to start service (Admin required)", true);
+            drawButton("sett_svc_start", startBtn, "Start",
+                       (isInstalled && !isRunning) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+                       (isInstalled && !isRunning) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                       (isInstalled && !isRunning) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                       7.0f, [this, isInstalled, isRunning]() {
+                           if (isInstalled && !isRunning) {
+                               if (WindowsServiceManager::startService()) {
+                                   showToast("Service started");
+                               } else {
+                                   showToast("Failed to start service (Admin required)", true);
+                               }
+                           } else if (!isInstalled) {
+                               showToast("Install service first", true);
                            }
-                       } else if (!isInstalled) {
-                           showToast("Install service first", true);
-                       }
-                   }, ui::FontRole::Small, !(isInstalled && !isRunning), COL_BORDER,
-                   (isInstalled && !isRunning) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+                       }, ui::FontRole::Small, !(isInstalled && !isRunning), COL_BORDER,
+                       (isInstalled && !isRunning) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
-        drawButton("sett_svc_stop", stopBtn, "Stop",
-                   isRunning ? COL_DANGER : COL_SEC_BTN_BG,
-                   isRunning ? COL_DANGER_HV : COL_SEC_BTN_HV,
-                   isRunning ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   7.0f, [this, isRunning]() {
-                       if (isRunning) {
-                           if (WindowsServiceManager::stopService()) {
-                               showToast("Service stopped");
-                           } else {
-                               showToast("Failed to stop service", true);
+            drawButton("sett_svc_stop", stopBtn, "Stop",
+                       isRunning ? COL_DANGER : COL_SEC_BTN_BG,
+                       isRunning ? COL_DANGER_HV : COL_SEC_BTN_HV,
+                       isRunning ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                       7.0f, [this, isRunning]() {
+                           if (isRunning) {
+                               if (WindowsServiceManager::stopService()) {
+                                   showToast("Service stopped");
+                               } else {
+                                   showToast("Failed to stop service", true);
+                               }
                            }
-                       }
-                   }, ui::FontRole::Small, !isRunning, COL_BORDER, isRunning ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+                       }, ui::FontRole::Small, !isRunning, COL_BORDER, isRunning ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
-        cy = svcBox.bottom + 12.0f;
+            cy = svcBox.bottom + 12.0f;
+        }
 
         // 2. Notifications & System Integration
         UiRect notifBox = { cx, cy, crx, cy + 158.0f };
@@ -4573,13 +4694,15 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                  ui::FontRole::Small, COL_TEXT_ACCENT);
 
         float ny = notifBox.top + 26.0f;
-        drawToggleSwitch("sett_push_notif", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
-                         s.enablePushNotifications, "Windows Action Center push toasts", [this]() {
-                             AppSettings ns = identity_.settings();
-                             ns.enablePushNotifications = !ns.enablePushNotifications;
-                             identity_.updateSettings(ns);
-                         }, "Deliver native Windows Action Center banner notifications for session events.");
-        ny += 25.0f;
+        if (shell_->has(ui::Capability::ActionCenterToasts)) {
+            drawToggleSwitch("sett_push_notif", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
+                             s.enablePushNotifications, "Windows Action Center push toasts", [this]() {
+                                 AppSettings ns = identity_.settings();
+                                 ns.enablePushNotifications = !ns.enablePushNotifications;
+                                 identity_.updateSettings(ns);
+                             }, "Deliver native Windows Action Center banner notifications for session events.");
+            ny += 25.0f;
+        }
 
         drawToggleSwitch("sett_taskbar_flash", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
                          s.enableTaskbarFlash, "Flash taskbar orange when unfocused", [this]() {
@@ -4597,13 +4720,15 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                          }, "Play an audio notification chime when incoming session alerts occur.");
         ny += 25.0f;
 
-        drawToggleSwitch("sett_min_to_tray", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
-                         s.minimizeToTray, "Minimize window to system tray", [this]() {
-                             AppSettings ns = identity_.settings();
-                             ns.minimizeToTray = !ns.minimizeToTray;
-                             identity_.updateSettings(ns);
-                         }, "Minimize application window to the Windows system notification tray area.");
-        ny += 25.0f;
+        if (shell_->has(ui::Capability::TrayIcon)) {
+            drawToggleSwitch("sett_min_to_tray", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
+                             s.minimizeToTray, "Minimize window to system tray", [this]() {
+                                 AppSettings ns = identity_.settings();
+                                 ns.minimizeToTray = !ns.minimizeToTray;
+                                 identity_.updateSettings(ns);
+                             }, "Minimize application window to the Windows system notification tray area.");
+            ny += 25.0f;
+        }
 
         bool isUriReg = ShortcutManager::isUriProtocolRegistered();
         drawToggleSwitch("sett_reg_uri", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
@@ -4668,7 +4793,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         drawButton("sett_view_release_top", relBtn, "Release Notes",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
                    8.0f, [this]() {
-                       ShellExecuteA(nullptr, "open", "https://github.com/oocsng/cppdesk/releases/latest", nullptr, nullptr, SW_SHOWNORMAL);
+                       shell_->openUrl("https://github.com/oocsng/cppdesk/releases/latest");
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         cy = updateBanner.bottom + 14.0f;
@@ -4690,14 +4815,14 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         UiRect licBtn = { aBtnRight - aBtnW, aBtnY, aBtnRight, aBtnY + aBtnH };
         drawButton("sett_about_license", licBtn, "License",
-                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, []() {
-                       ShellExecuteA(nullptr, "open", "https://github.com/oocsng/cppdesk/blob/main/LICENSE", nullptr, nullptr, SW_SHOWNORMAL);
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
+                       shell_->openUrl("https://github.com/oocsng/cppdesk/blob/main/LICENSE");
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         UiRect ghBtn = { licBtn.left - 8.0f - aBtnW, aBtnY, licBtn.left - 8.0f, aBtnY + aBtnH };
         drawButton("sett_about_github", ghBtn, "GitHub",
-                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, []() {
-                       ShellExecuteA(nullptr, "open", "https://github.com/oocsng/cppdesk", nullptr, nullptr, SW_SHOWNORMAL);
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
+                       shell_->openUrl("https://github.com/oocsng/cppdesk");
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         UiRect aTextRect = { aboutBox.left + aPad, aboutBox.top + 28.0f, ghBtn.left - 12.0f, aboutBox.top + 48.0f };
@@ -4997,7 +5122,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                 }
                 if (remoteFilePane_.entries.empty()) {
                     network_.requestRemoteFileList("$DRIVES$");
-                    remoteFilePane_.beginLoading(GetTickCount64());
+                    remoteFilePane_.beginLoading(shell_->nowMs());
                 }
             }},
             { DrawerTab::LiveChat, "drawer_tab_chat", chatTabLbl, (unread > 0 ? 76.0f : 56.0f), (drawerTab_ == DrawerTab::LiveChat), [this]() {
@@ -5051,7 +5176,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                 UiRect lBtn = { tabsViewport.left, tabsViewport.top + 2.0f, tabsViewport.left + 18.0f, tabsViewport.bottom - 2.0f };
                 drawButton("drawer_tab_scroll_l", lBtn, "◀", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
                     drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_ - 60.0f, 0.0f, drawerTabsMaxScroll_);
-                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    shell_->invalidate();
                 }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
                 tabsViewport.left += 22.0f;
             }
@@ -5059,7 +5184,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                 UiRect rBtn = { tabsViewport.right - 18.0f, tabsViewport.top + 2.0f, tabsViewport.right, tabsViewport.bottom - 2.0f };
                 drawButton("drawer_tab_scroll_r", rBtn, "▶", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
                     drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_ + 60.0f, 0.0f, drawerTabsMaxScroll_);
-                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    shell_->invalidate();
                 }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
                 tabsViewport.right -= 22.0f;
             }
@@ -6262,7 +6387,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                        { releaseImage(remoteBitmap_); bitmapW_ = 0; bitmapH_ = 0; }
                    }
                    showToast(showRewindScrubber_ ? "Rewind Scrubber Active" : "Snapped to Live");
-                   InvalidateRect(hwnd_, nullptr, FALSE);
+                   shell_->invalidate();
                }, ui::FontRole::Small, !showRewindScrubber_, COL_BORDER);
     curX = islandRewindBtn.right + 6.0f;
 
@@ -6283,7 +6408,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                    } else {
                        focusedField_ = FocusedField::None;
                    }
-                   InvalidateRect(hwnd_, nullptr, FALSE);
+                   shell_->invalidate();
                }, ui::FontRole::Small, !showOmnibarModal_, COL_BORDER);
     curX = islandPaletteBtn.right + 6.0f;
 
@@ -7013,10 +7138,10 @@ void CppDeskWindow::navigateFilePane(int pane, const std::string& path) {
         localFilePane_.statusMessage.clear();
         fileBrowserInputLocalPath_ = (canon == "$DRIVES$") ? std::string() : canon;
     } else {
-        remoteFilePane_.beginLoading(GetTickCount64());
+        remoteFilePane_.beginLoading(shell_->nowMs());
         network_.requestRemoteFileList(path.empty() ? "$DRIVES$" : path);
     }
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    shell_->invalidate();
 }
 
 void CppDeskWindow::activateFilePaneEntry(int pane, int index) {
@@ -7024,7 +7149,7 @@ void CppDeskWindow::activateFilePaneEntry(int pane, int index) {
     activeFilePane_ = pane;
     if (index < 0 || index >= static_cast<int>(st.entries.size())) return;
 
-    const uint64_t now = uiNowMs();
+    const uint64_t now = shell_->nowMs();
     const bool doubleClick = (st.lastClickIndex == index && now - st.lastClickTick < 450);
     st.lastClickIndex = index;
     st.lastClickTick = now;
@@ -7070,7 +7195,7 @@ void CppDeskWindow::openFileBrowserModal(int pane, int action) {
     } else {
         focusedField_ = FocusedField::None;
     }
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    shell_->invalidate();
 }
 
 void CppDeskWindow::closeFileBrowserModal() {
@@ -7078,7 +7203,7 @@ void CppDeskWindow::closeFileBrowserModal() {
     showFileBrowserRenameModal_ = false;
     showFileBrowserDeleteModal_ = false;
     focusedField_ = FocusedField::None;
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    shell_->invalidate();
 }
 
 void CppDeskWindow::submitFileBrowserModal() {
@@ -7136,7 +7261,7 @@ void CppDeskWindow::submitRunTask() {
     showRunTaskModal_ = false;
     focusedField_ = FocusedField::None;
     showToast("Launch requested...");
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    shell_->invalidate();
 }
 
 void CppDeskWindow::drawFileManagerDrawer(const UiRect& contentRect) {
@@ -7525,7 +7650,7 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 9.0f, [this]() {
                        showUpdateRequiredModal_ = false;
                        showPeerMismatchModal_ = false;
-                       InvalidateRect(hwnd_, nullptr, FALSE);
+                       shell_->invalidate();
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
     } else {
         drawButton("update_modal_exit", leftBtn, "Exit CppDesk",
@@ -7551,7 +7676,7 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
                        std::string targetUrl = latestUpdateInfo_.releaseUrl.empty()
                            ? "https://github.com/oocsng/cppdesk/releases/latest"
                            : latestUpdateInfo_.releaseUrl;
-                       ShellExecuteA(nullptr, "open", targetUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                       shell_->openUrl(targetUrl);
                        return;
                    }
 
@@ -7561,7 +7686,7 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
                    updateTotalBytes_ = latestUpdateInfo_.assetSizeBytes;
                    updateSpeedBps_ = 0.0;
                    updateStatusMsg_ = "Connecting to download server...";
-                   InvalidateRect(hwnd_, nullptr, FALSE);
+                   shell_->invalidate();
 
                    wchar_t tempDir[MAX_PATH]{};
                    GetTempPathW(MAX_PATH, tempDir);
@@ -7755,11 +7880,7 @@ void CppDeskWindow::drawHwAccelRestartModal(float width, float height, float mod
                COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f,
                [this]() {
                    showHwAccelRestartModal_ = false;
-                   wchar_t exePath[MAX_PATH]{};
-                   if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
-                       ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
-                   }
-                   DestroyWindow(hwnd_);
+                   shell_->relaunchApp();
                }, ui::FontRole::Small);
 
     canvas_->setTransform(ui::Transform2D::identity());
@@ -7773,7 +7894,7 @@ void CppDeskWindow::openRecordingPlayer(const std::string& filePath) {
     }
     recordingPlayer_->setOnFrameReady([this]() {
         if (hwnd_) {
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
         }
     });
 
@@ -7787,7 +7908,7 @@ void CppDeskWindow::openRecordingPlayer(const std::string& filePath) {
     hasTrimIn_ = false;
     hasTrimOut_ = false;
     showRecordingPlayer_ = true;
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    shell_->invalidate();
 }
 
 void CppDeskWindow::closeRecordingPlayer() {
@@ -7795,7 +7916,7 @@ void CppDeskWindow::closeRecordingPlayer() {
     if (recordingPlayer_) {
         recordingPlayer_->pause();
     }
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    shell_->invalidate();
 }
 
 void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float modalProgress) {
@@ -7832,22 +7953,8 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
     drawButton("player_open_btn", openBtnRect, "Open...",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f,
                [this]() {
-                   OPENFILENAMEW ofn{};
-                   wchar_t szFile[MAX_PATH] = L"";
-                   ofn.lStructSize = sizeof(ofn);
-                   ofn.hwndOwner = hwnd_;
-                   ofn.lpstrFile = szFile;
-                   ofn.nMaxFile = sizeof(szFile) / sizeof(wchar_t);
-                   ofn.lpstrFilter = L"AVI Session Recordings (*.avi)\0*.avi\0All Files (*.*)\0*.*\0";
-                   ofn.nFilterIndex = 1;
-                   ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
-                   if (GetOpenFileNameW(&ofn)) {
-                       int len = WideCharToMultiByte(CP_UTF8, 0, ofn.lpstrFile, -1, nullptr, 0, nullptr, nullptr);
-                       if (len > 1) {
-                           std::string path(len - 1, '\0');
-                           WideCharToMultiByte(CP_UTF8, 0, ofn.lpstrFile, -1, path.data(), len, nullptr, nullptr);
-                           openRecordingPlayer(path);
-                       }
+                   if (auto path = shell_->chooseOpenFile("Open Session Recording", "AVI Session Recordings", "*.avi")) {
+                       openRecordingPlayer(*path);
                    }
                }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
@@ -7972,7 +8079,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                     float frac = std::clamp((mouseX_ - playerScrubberTrackRect_.left) / trackW, 0.0f, 1.0f);
                     uint32_t targetFrame = static_cast<uint32_t>(frac * (recordingPlayer_->totalFrames() - 1));
                     recordingPlayer_->seekToFrame(targetFrame);
-                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    shell_->invalidate();
                 }
             }
         },
@@ -8106,7 +8213,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                        return;
                    }
                    std::string dir = network_.fileTransferManager().receiveDirectory();
-                   std::string outPath = (std::filesystem::path(dir) / ("Trimmed_" + std::to_string(GetTickCount64()) + ".avi")).string();
+                   std::string outPath = (std::filesystem::path(dir) / ("Trimmed_" + std::to_string(shell_->nowMs()) + ".avi")).string();
                    uint32_t sF = hasTrimIn_ ? trimInFrame_ : 0;
                    uint32_t eF = hasTrimOut_ ? trimOutFrame_ : (recordingPlayer_->totalFrames() - 1);
                    if (recordingPlayer_->trimClip(outPath, sF, eF)) {
@@ -8127,7 +8234,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                        return;
                    }
                    std::string dir = network_.fileTransferManager().receiveDirectory();
-                   std::string outPath = (std::filesystem::path(dir) / ("Snapshot_" + std::to_string(GetTickCount64()) + ".png")).string();
+                   std::string outPath = (std::filesystem::path(dir) / ("Snapshot_" + std::to_string(shell_->nowMs()) + ".png")).string();
                    if (recordingPlayer_->exportSnapshot(outPath)) {
                        std::string fname = std::filesystem::path(outPath).filename().string();
                        showToast("Snapshot saved: " + fname);
@@ -8740,10 +8847,6 @@ D2D1_SIZE_U CppDeskWindow::clientSizePx() const {
                        static_cast<UINT32>(std::max<LONG>(1, rc.bottom - rc.top)));
 }
 
-uint64_t CppDeskWindow::uiNowMs() const {
-    // Snapshots draw at a fixed instant so clock-driven pulses and timeouts are repeatable.
-    return snapshotMode_ ? 10000 : GetTickCount64();
-}
 
 D2D1_SIZE_F CppDeskWindow::clientSizeDips() const {
     if (snapshotMode_) return D2D1::SizeF(kSnapshotWidth, kSnapshotHeight);
@@ -8833,7 +8936,7 @@ std::string* CppDeskWindow::activeFocusedTextBuffer() {
 void CppDeskWindow::flushPendingMouseMove() {
     if (hasPendingMouseMove_) {
         hasPendingMouseMove_ = false;
-        lastMouseSendTick_ = GetTickCount64();
+        lastMouseSendTick_ = shell_->nowMs();
         if (remoteInputEnabled_ && activeTab_ == ActiveTab::RemoteSession) {
             network_.sendMouseMove(coalescedMouseNormX_, coalescedMouseNormY_);
         }
@@ -8859,7 +8962,7 @@ void CppDeskWindow::onMouseMove(float x, float y) {
         if (!mouseLeftDown_ || !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
             draggingSettingsScrollbar_ = false;
             ReleaseCapture();
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
         } else if (activeTab_ == ActiveTab::Settings && settingsMaxScroll_ > 0.5f) {
             float thumbH = settingsScrollThumbRect_.height();
             float availTrack = std::max(1.0f, settingsScrollTrackRect_.height() - thumbH);
@@ -8868,7 +8971,7 @@ void CppDeskWindow::onMouseMove(float x, float y) {
             settingsScrollTarget_ = frac * settingsMaxScroll_;
             settingsScrollOffset_ = settingsScrollTarget_;
             settingsScrollVel_ = 0.0f;
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
             return;
         }
     }
@@ -8877,14 +8980,14 @@ void CppDeskWindow::onMouseMove(float x, float y) {
         if (!mouseLeftDown_ || !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
             draggingPlayerScrubber_ = false;
             ReleaseCapture();
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
         } else if (recordingPlayer_ && recordingPlayer_->isOpen() && recordingPlayer_->totalFrames() > 1) {
             float trackW = playerScrubberTrackRect_.width();
             if (trackW > 1.0f) {
                 float frac = std::clamp((x - playerScrubberTrackRect_.left) / trackW, 0.0f, 1.0f);
                 uint32_t targetFrame = static_cast<uint32_t>(frac * (recordingPlayer_->totalFrames() - 1));
                 recordingPlayer_->seekToFrame(targetFrame);
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
         }
@@ -8894,7 +8997,7 @@ void CppDeskWindow::onMouseMove(float x, float y) {
         if (!mouseLeftDown_ || !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
             draggingRewindScrubber_ = false;
             ReleaseCapture();
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
         } else {
             float trackW = rewindScrubberTrackRect_.width();
             if (trackW > 1.0f) {
@@ -8905,7 +9008,7 @@ void CppDeskWindow::onMouseMove(float x, float y) {
                     uint64_t actualTs = 0;
                     rewindBuffer_.getFrameAtOffset(rewindOffsetMs_, rewindCachedFrameBgra_, rewindCachedW_, rewindCachedH_, actualTs);
                 }
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
         }
@@ -8935,13 +9038,13 @@ void CppDeskWindow::onMouseMove(float x, float y) {
                     if (whiteboardTool_ == WhiteboardTool::LaserPointer) {
                         network_.sendWhiteboardLaser(nx, ny);
                     }
-                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    shell_->invalidate();
                 }
             } else if (remoteInputEnabled_) {
                 coalescedMouseNormX_ = nx;
                 coalescedMouseNormY_ = ny;
                 hasPendingMouseMove_ = true;
-                uint64_t now = GetTickCount64();
+                uint64_t now = shell_->nowMs();
                 if (now - lastMouseSendTick_ >= 8) {
                     flushPendingMouseMove();
                 }
@@ -8950,7 +9053,7 @@ void CppDeskWindow::onMouseMove(float x, float y) {
     }
 
     if (hoverChanged) {
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        shell_->invalidate();
     }
 }
 
@@ -8963,7 +9066,7 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
         mouseLeftDown_ = false;
         draggingSettingsScrollbar_ = false;
         ReleaseCapture();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        shell_->invalidate();
         return;
     }
 
@@ -8971,7 +9074,7 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
         mouseLeftDown_ = false;
         draggingPlayerScrubber_ = false;
         ReleaseCapture();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        shell_->invalidate();
         return;
     }
 
@@ -8979,7 +9082,7 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
         mouseLeftDown_ = false;
         draggingRewindScrubber_ = false;
         ReleaseCapture();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        shell_->invalidate();
         return;
     }
 
@@ -8997,13 +9100,13 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
                         anim.rippleX = x;
                         anim.rippleY = y;
                         if (cb) cb();
-                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        shell_->invalidate();
                         return;
                     }
                 }
             } else {
                 pressedWidgetId_.clear();
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
         }
         return; // Block all other interaction while mandatory update is pending
@@ -9037,7 +9140,7 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
                 }
                 draggingSettingsScrollbar_ = true;
                 SetCapture(hwnd_);
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
 
@@ -9050,19 +9153,19 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
                     anim.rippleX = x;
                     anim.rippleY = y;
                     if (cb) cb();
-                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    shell_->invalidate();
                     return;
                 }
             }
             pressedWidgetId_.clear();
             if (insideDrawer) {
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
         } else {
             if (!pressedWidgetId_.empty()) {
                 pressedWidgetId_.clear();
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
             if (insideDrawer) {
                 return;
@@ -9099,7 +9202,7 @@ void CppDeskWindow::onMouseButton(MouseButtonId btn, bool isDown, float x, float
                             network_.sendWhiteboardStroke(finished);
                         }
                     }
-                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    shell_->invalidate();
                 }
                 return;
             }
@@ -9116,7 +9219,7 @@ void CppDeskWindow::onMouseWheel(int delta) {
     if (showAudioInputMenu_ || showAudioOutputMenu_) {
         showAudioInputMenu_ = false;
         showAudioOutputMenu_ = false;
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        shell_->invalidate();
     }
     if (drawerAnimT_ > 0.004f && hwnd_) {
         float w = clientSizeDips().width;
@@ -9126,34 +9229,34 @@ void CppDeskWindow::onMouseWheel(int delta) {
             if (mouseY_ >= 10.0f && mouseY_ <= 56.0f && drawerTabsMaxScroll_ > 0.5f) {
                 float step = (static_cast<float>(delta) / 120.0f) * 60.0f;
                 drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_ - step, 0.0f, drawerTabsMaxScroll_);
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (drawerTab_ == DrawerTab::LiveChat) {
                 chatScrollOffset_ += (delta > 0 ? 1 : -1);
                 if (chatScrollOffset_ < 0) chatScrollOffset_ = 0;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             } else if (drawerTab_ == DrawerTab::RemoteTerminal) {
                 terminalScrollOffset_ += (delta > 0 ? -1.0f : 1.0f);
                 if (terminalScrollOffset_ < 0.0f) terminalScrollOffset_ = 0.0f;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             } else if (drawerTab_ == DrawerTab::Diagnostics) {
                 diagnosticsScrollOffset_ += (delta > 0 ? -1.0f : 1.0f);
                 if (diagnosticsScrollOffset_ < 0.0f) diagnosticsScrollOffset_ = 0.0f;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             } else if (drawerTab_ == DrawerTab::ClipboardHistory) {
                 clipHistoryScrollOffset_ += (delta > 0 ? -1 : 1);
                 if (clipHistoryScrollOffset_ < 0) clipHistoryScrollOffset_ = 0;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             } else if (drawerTab_ == DrawerTab::Sync) {
                 syncDiffScrollOffset_ += (delta > 0 ? -1.0f : 1.0f);
                 if (syncDiffScrollOffset_ < 0.0f) syncDiffScrollOffset_ = 0.0f;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             } else if (drawerTab_ == DrawerTab::FileManager) {
                 // The upper bound is clamped while drawing, when the visible row count is known.
                 FileBrowserPaneState& pane = (mouseX_ < filePaneSplitX_) ? localFilePane_ : remoteFilePane_;
                 pane.scrollOffset = std::max(0.0f, pane.scrollOffset + (delta > 0 ? -3.0f : 3.0f));
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
             return;
         }
@@ -9166,7 +9269,7 @@ void CppDeskWindow::onMouseWheel(int delta) {
             sessionHudMaxScroll_ > 0.5f) {
             float step = (static_cast<float>(delta) / 120.0f) * 90.0f;
             sessionHudScrollTarget_ = std::clamp(sessionHudScrollTarget_ - step, 0.0f, sessionHudMaxScroll_);
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
             return;
         }
     }
@@ -9174,7 +9277,7 @@ void CppDeskWindow::onMouseWheel(int delta) {
     if (activeTab_ == ActiveTab::Settings && settingsMaxScroll_ > 0.5f) {
         float step = (static_cast<float>(delta) / 120.0f) * 84.0f;
         settingsScrollTarget_ = std::clamp(settingsScrollTarget_ - step, 0.0f, settingsMaxScroll_);
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        shell_->invalidate();
         return;
     }
 
@@ -9314,7 +9417,7 @@ void CppDeskWindow::onCharInput(wchar_t ch) {
                 network_.sendChatImage(jpeg, w, h, chatInput_);
                 chatInput_.clear();
                 showToast("Sent image from clipboard");
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
         }
@@ -9342,7 +9445,7 @@ void CppDeskWindow::onCharInput(wchar_t ch) {
         omnibarSelectedIndex_ = 0;
     }
 
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    shell_->invalidate();
 }
 
 void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended) {
@@ -9357,7 +9460,7 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
             }
             if (scrollDelta != 0.0f) {
                 settingsScrollTarget_ = std::clamp(settingsScrollTarget_ + scrollDelta, 0.0f, settingsMaxScroll_);
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
         }
@@ -9372,20 +9475,20 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
             } else {
                 focusedField_ = FocusedField::None;
             }
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
             return;
         }
 
         if (showOmnibarModal_) {
             if (vk == VK_UP) {
                 if (omnibarSelectedIndex_ > 0) omnibarSelectedIndex_--;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             } else if (vk == VK_DOWN) {
                 if (!omnibarFiltered_.empty() && omnibarSelectedIndex_ < (int)omnibarFiltered_.size() - 1) {
                     omnibarSelectedIndex_++;
                 }
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             } else if (vk == VK_RETURN) {
                 if (!omnibarFiltered_.empty() && omnibarSelectedIndex_ >= 0 && omnibarSelectedIndex_ < (int)omnibarFiltered_.size()) {
@@ -9393,7 +9496,7 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
                     network_.sendCommandPaletteExec(cmd.commandLine);
                     omnibarLastOutput_ = "Executing: " + cmd.commandLine + "...";
                     omnibarHasOutput_ = true;
-                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    shell_->invalidate();
                     return;
                 }
             }
@@ -9411,13 +9514,13 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
             if (showAudioInputMenu_ || showAudioOutputMenu_) {
                 showAudioInputMenu_ = false;
                 showAudioOutputMenu_ = false;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showOmnibarModal_) {
                 showOmnibarModal_ = false;
                 focusedField_ = FocusedField::None;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showRewindScrubber_) {
@@ -9426,39 +9529,39 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
                 rewindOffsetMs_ = 0;
                 displayedFrameSeq_ = 0;
                 { releaseImage(remoteBitmap_); bitmapW_ = 0; bitmapH_ = 0; }
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showTotpModal_) {
                 showTotpModal_ = false;
                 network_.cancelViewerTotp();
                 showToast("2FA challenge cancelled", true);
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showPerformanceHud_) {
                 showPerformanceHud_ = false;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showAudioVolumePopup_) {
                 showAudioVolumePopup_ = false;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showPortForwardModal_) {
                 showPortForwardModal_ = false;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showShortcutsModal_) {
                 showShortcutsModal_ = false;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showAddressBookEditModal_) {
                 showAddressBookEditModal_ = false;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showFileBrowserNewDirModal_ || showFileBrowserRenameModal_ || showFileBrowserDeleteModal_) {
@@ -9468,39 +9571,39 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
             if (showRunTaskModal_) {
                 showRunTaskModal_ = false;
                 focusedField_ = FocusedField::None;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showRebootConfirmModal_) {
                 showRebootConfirmModal_ = false;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showHwAccelRestartModal_) {
                 showHwAccelRestartModal_ = false;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showRecordingPlayer_) {
                 closeRecordingPlayer();
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showDisplayMenu_ || showAdminMenu_ || showQualityMenu_) {
                 showDisplayMenu_ = false;
                 showAdminMenu_ = false;
                 showQualityMenu_ = false;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (focusedField_ == FocusedField::ChatInput) {
                 focusedField_ = FocusedField::None;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (showFileDrawer_) {
                 showFileDrawer_ = false;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
             if (isFullscreen_) {
@@ -9509,7 +9612,7 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
             }
             if (focusedField_ != FocusedField::None && focusedField_ != FocusedField::RemoteCanvas) {
                 focusedField_ = FocusedField::None;
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
                 return;
             }
         }
@@ -9517,7 +9620,7 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
         if ((GetKeyState(VK_CONTROL) & 0x8000) && (GetKeyState(VK_SHIFT) & 0x8000) && (vk == 'O' || vk == 'o')) {
             showPerformanceHud_ = !showPerformanceHud_;
             showToast(showPerformanceHud_ ? "Performance HUD: ON" : "Performance HUD: OFF");
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
             return;
         }
         // Ctrl+Shift+M: In-Session Audio Mute Hotkey
@@ -9525,7 +9628,7 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
             bool nowMuted = !network_.isAudioMuted();
             network_.setAudioMuted(nowMuted);
             showToast(nowMuted ? "Audio: Muted (Ctrl+Shift+M)" : "Audio: Unmuted (Ctrl+Shift+M)");
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
             return;
         }
         // Remote Hotkeys: Ctrl+Alt+[1-9], Ctrl+Alt+0, Ctrl+Alt+G, Ctrl+Alt+L, Ctrl+Alt+D, Ctrl+Alt+Del
@@ -9627,11 +9730,11 @@ void CppDeskWindow::onDropFiles(HDROP hDrop) {
         if (droppedOnCanvas) {
             canvasDropEffectActive_ = true;
             canvasDropPos_ = { static_cast<float>(pt.x), static_cast<float>(pt.y) };
-            canvasDropTick_ = GetTickCount64();
+            canvasDropTick_ = shell_->nowMs();
             canvasDropCount_ = sentCount;
             showToast("Dropped " + std::to_string(sentCount) + " file(s) onto Remote Desktop");
             if (hwnd_) {
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                shell_->invalidate();
             }
         } else {
             drawerTab_ = DrawerTab::FilesAndClip;
@@ -9717,7 +9820,7 @@ void CppDeskWindow::switchToSessionTab(uint32_t tabId, bool force) {
     std::string toastTitle = newTab->title.empty() ? (newTab->targetInput.empty() ? ("Desk " + std::to_string(newTab->deskId)) : newTab->targetInput) : newTab->title;
     showToast("Switched to tab: " + toastTitle);
     if (hwnd_) {
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        shell_->invalidate();
     }
 }
 
@@ -9764,7 +9867,7 @@ void CppDeskWindow::closeSessionTab(uint32_t tabId) {
     }
 
     if (hwnd_) {
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        shell_->invalidate();
     }
 }
 
@@ -9799,18 +9902,8 @@ void CppDeskWindow::initiateConnection() {
 }
 
 void CppDeskWindow::openSendFileDialog() {
-    char fileBuf[MAX_PATH] = {};
-    OPENFILENAMEA ofn{};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = hwnd_;
-    ofn.lpstrFile = fileBuf;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = "All Files (*.*)\0*.*\0";
-    ofn.nFilterIndex = 1;
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-
-    if (GetOpenFileNameA(&ofn)) {
-        if (network_.sendFile(fileBuf) > 0) {
+    if (auto path = shell_->chooseOpenFile("Send File", "All Files", "*.*")) {
+        if (network_.sendFile(*path) > 0) {
             drawerTab_ = DrawerTab::FilesAndClip;
             showFileDrawer_ = true;
             showToast("Sending file...");
@@ -9821,31 +9914,8 @@ void CppDeskWindow::openSendFileDialog() {
 }
 
 void CppDeskWindow::openPickFolderDialog(std::string& outPath) {
-    IFileDialog* pfd = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd));
-    if (SUCCEEDED(hr)) {
-        DWORD dwOptions = 0;
-        if (SUCCEEDED(pfd->GetOptions(&dwOptions))) {
-            pfd->SetOptions(dwOptions | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-        }
-        pfd->SetTitle(L"Select Folder to Synchronize");
-        if (SUCCEEDED(pfd->Show(hwnd_))) {
-            IShellItem* psi = nullptr;
-            if (SUCCEEDED(pfd->GetResult(&psi))) {
-                PWSTR pszPath = nullptr;
-                if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pszPath))) {
-                    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, pszPath, -1, nullptr, 0, nullptr, nullptr);
-                    if (utf8Len > 0) {
-                        std::string res(utf8Len - 1, '\0');
-                        WideCharToMultiByte(CP_UTF8, 0, pszPath, -1, res.data(), utf8Len, nullptr, nullptr);
-                        outPath = res;
-                    }
-                    CoTaskMemFree(pszPath);
-                }
-                psi->Release();
-            }
-        }
-        pfd->Release();
+    if (auto path = shell_->chooseFolder("Select Folder to Synchronize")) {
+        outPath = *path;
     }
 }
 
@@ -9859,7 +9929,7 @@ void CppDeskWindow::saveRemoteScreenshot() {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
 
-    std::string fileName = "Screenshot_" + std::to_string(GetTickCount64()) + ".bmp";
+    std::string fileName = "Screenshot_" + std::to_string(shell_->nowMs()) + ".bmp";
     std::filesystem::path fullPath = std::filesystem::path(dir) / fileName;
 
     uint32_t rowStride = static_cast<uint32_t>(frameBufferW_ * 4);
@@ -9907,7 +9977,7 @@ void CppDeskWindow::toggleScreenRecording() {
 
         std::string fname = std::filesystem::path(path).filename().string();
         showToast("Recording saved: " + fname + " (" + szBuf + ") • Review in Player");
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        shell_->invalidate();
     } else {
         if (frameBufferBgra_.empty() || frameBufferW_ <= 0 || frameBufferH_ <= 0) {
             showToast("No active remote video stream to record", true);
@@ -9929,7 +9999,7 @@ void CppDeskWindow::toggleScreenRecording() {
         if (sessionRecorder_.startRecording(fullPath.string(), frameBufferW_, frameBufferH_, 30)) {
             sessionRecorder_.pushFrame(frameBufferBgra_.data(), frameBufferW_, frameBufferH_);
             showToast("Screen recording started");
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
         } else {
             showToast("Failed to start screen recording", true);
         }
@@ -9940,7 +10010,7 @@ void CppDeskWindow::sendChatFromInput() {
     if (chatInput_.empty()) return;
     if (network_.sendChatMessage(chatInput_)) {
         chatInput_.clear();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        shell_->invalidate();
     } else {
         showToast("Connect to a remote desk first", true);
     }
@@ -9951,7 +10021,7 @@ void CppDeskWindow::sendTerminalFromInput() {
     network_.sendTerminalCommand(terminalInputText_);
     terminalInputText_.clear();
     terminalHistoryIndex_ = -1;
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    shell_->invalidate();
 }
 
 void CppDeskWindow::toggleFullscreen() {
@@ -9981,14 +10051,14 @@ void CppDeskWindow::toggleFullscreen() {
 
 void CppDeskWindow::toggleShortcutsModal() {
     showShortcutsModal_ = !showShortcutsModal_;
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    shell_->invalidate();
 }
 
 void CppDeskWindow::showToast(const std::string& message, bool isError, uint32_t durationMs) {
     toastText_ = message;
     toastIsError_ = isError;
-    toastExpireTick_ = GetTickCount64() + durationMs;
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    toastExpireTick_ = shell_->nowMs() + durationMs;
+    shell_->invalidate();
 }
 
 void CppDeskWindow::restoreFromTray(NotificationType contextType) {
@@ -10015,7 +10085,7 @@ void CppDeskWindow::restoreFromTray(NotificationType contextType) {
             SetForegroundWindow(hwnd_);
         }
     }
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    shell_->invalidate();
 }
 
 void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
@@ -10080,7 +10150,7 @@ void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
                 uint64_t actualTs = 0;
                 rewindBuffer_.getFrameAtOffset(rewindOffsetMs_, rewindCachedFrameBgra_, rewindCachedW_, rewindCachedH_, actualTs);
             }
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            shell_->invalidate();
         }});
     }
 
@@ -10096,7 +10166,7 @@ void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
                    rewindFrozen_ = true;
                    uint64_t actualTs = 0;
                    rewindBuffer_.getFrameAtOffset(rewindOffsetMs_, rewindCachedFrameBgra_, rewindCachedW_, rewindCachedH_, actualTs);
-                   InvalidateRect(hwnd_, nullptr, FALSE);
+                   shell_->invalidate();
                }, ui::FontRole::Small, true, withAlpha(COL_BORDER, animAlpha));
 
     UiRect stepNextBtn = { stepPrevBtn.right + 4.0f, btnY, stepPrevBtn.right + 36.0f, btnY + btnH };
@@ -10109,7 +10179,7 @@ void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
                        uint64_t actualTs = 0;
                        rewindBuffer_.getFrameAtOffset(rewindOffsetMs_, rewindCachedFrameBgra_, rewindCachedW_, rewindCachedH_, actualTs);
                    }
-                   InvalidateRect(hwnd_, nullptr, FALSE);
+                   shell_->invalidate();
                }, ui::FontRole::Small, true, withAlpha(COL_BORDER, animAlpha));
 
     UiRect copyBtn = { stepNextBtn.right + 6.0f, btnY, stepNextBtn.right + 76.0f, btnY + btnH };
@@ -10135,7 +10205,7 @@ void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
                    displayedFrameSeq_ = 0;
                    { releaseImage(remoteBitmap_); bitmapW_ = 0; bitmapH_ = 0; }
                    showToast("Snapped to live stream");
-                   InvalidateRect(hwnd_, nullptr, FALSE);
+                   shell_->invalidate();
                }, ui::FontRole::Small);
 }
 
@@ -10277,7 +10347,8 @@ bool writeBmp32(const std::wstring& path, const uint8_t* bgra, UINT width, UINT 
 
 } // namespace
 
-int CppDeskWindow::runUiSnapshots(IdentityManager& identity, NetworkEngine& network, const std::wstring& outDir) {
+int CppDeskWindow::runUiSnapshots(IdentityManager& identity, NetworkEngine& network, const std::wstring& outDir,
+                                  bool record) {
     std::error_code ec;
     std::filesystem::create_directories(outDir, ec);
 
@@ -10403,7 +10474,9 @@ int CppDeskWindow::runUiSnapshots(IdentityManager& identity, NetworkEngine& netw
             bitmap->Release();
             continue;
         }
-        w.canvas_->attach(w.renderTarget_, 1.0f);
+        w.d2dCanvas_->attach(w.renderTarget_, 1.0f);
+        ui::RecordingCanvas recorder;
+        if (record) w.canvas_ = &recorder;
 
         if (st.setup) st.setup(w);
         // Settle every spring at a fixed step, then hold animation time still so caret and pulse are fixed.
@@ -10431,6 +10504,16 @@ int CppDeskWindow::runUiSnapshots(IdentityManager& identity, NetworkEngine& netw
         std::snprintf(line, sizeof(line), "%s %.3f ms\n", st.name, 1000.0 * drawSeconds / (kFrames - kTimedFrom));
         timings += line;
 
+        if (record) {
+            std::ofstream ops(std::filesystem::path(outDir) / (std::string(st.name) + ".ops.txt"),
+                              std::ios::binary | std::ios::trunc);
+            ops << recorder.serialize();
+            if (ops) ++written;
+            w.canvas_ = w.d2dCanvas_.get();
+            bitmap->Release();
+            network.injectViewerFrameForTest({}, 0, 0);
+            continue;
+        }
         WICRect rc{ 0, 0, static_cast<INT>(kSnapshotWidth), static_cast<INT>(kSnapshotHeight) };
         IWICBitmapLock* lock = nullptr;
         if (SUCCEEDED(bitmap->Lock(&rc, WICBitmapLockRead, &lock)) && lock) {
