@@ -328,6 +328,15 @@ enum class AuthResultCode : uint8_t {
     TotpInvalid      = 0x21  // 33: Submitted TOTP code was incorrect or replayed
 };
 
+// First byte of AUTH_RESPONSE
+constexpr uint8_t AUTH_MODE_NONE           = 0;
+constexpr uint8_t AUTH_MODE_PASSWORD       = 1; // legacy: digest computable from public values, testable offline by an eavesdropper
+constexpr uint8_t AUTH_MODE_REBOOT_TOKEN   = 2;
+constexpr uint8_t AUTH_MODE_PASSWORD_BOUND = 3; // digest bound to the ECDH session key (CryptoUtils::bindChallengeResponse)
+
+// Optional trailing byte of AUTH_CHALLENGE; older viewers stop reading before it
+constexpr uint8_t AUTH_CAP_BOUND_RESPONSE  = 0x01;
+
 #pragma pack(push, 1)
 struct FrameHeader {
     uint32_t magic;       // PROTOCOL_MAGIC

@@ -7249,6 +7249,50 @@ void testUnicodeTextInput() {
     }
 }
 
+void testBoundAuthResponse() {
+    std::cout << "[TEST 63] Password Response Bound To The ECDH Session Key..." << std::endl;
+
+    IdentityManager host(105);
+    host.loadOrCreate();
+    host.setUnattendedEnabled(true);
+    host.setUnattendedPassword("Bound#Pass1");
+    const uint64_t hostId = host.deskId();
+    const uint64_t viewerId = 123456789ULL;
+
+    std::array<uint8_t, 32> nonce{};
+    CryptoUtils::randomBytes(nonce.data(), nonce.size());
+    std::array<uint8_t, 32> keyA{}, keyB{};
+    keyA.fill(0x11);
+    keyB.fill(0x22);
+
+    auto legacy = CryptoUtils::computeChallengeResponse("Bound#Pass1", hostId, viewerId, nonce);
+    auto bound = CryptoUtils::bindChallengeResponse(keyA, legacy);
+
+    TEST_ASSERT(bound != legacy);
+    TEST_ASSERT(bound == CryptoUtils::bindChallengeResponse(keyA, legacy));   // deterministic
+    TEST_ASSERT(bound != CryptoUtils::bindChallengeResponse(keyB, legacy));   // depends on the key
+
+    // Without a session key the old exchange still verifies (pre-3.9 viewers)
+    TEST_ASSERT(host.verifyChallengeResponse(viewerId, nonce, legacy));
+    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, bound));
+
+    // With a session key only the bound digest verifies; an observer who saw the legacy digest gets nothing
+    TEST_ASSERT(host.verifyChallengeResponse(viewerId, nonce, bound, &keyA));
+    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, legacy, &keyA));
+    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, bound, &keyB));
+
+    // A wrong password never verifies, bound or not
+    auto wrongLegacy = CryptoUtils::computeChallengeResponse("Wrong#Pass1", hostId, viewerId, nonce);
+    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, CryptoUtils::bindChallengeResponse(keyA, wrongLegacy), &keyA));
+
+    // The one-time session code takes the same bound path
+    const std::string code = host.sessionCode();
+    TEST_ASSERT(!code.empty());
+    auto codeLegacy = CryptoUtils::computeChallengeResponse(code, hostId, viewerId, nonce);
+    TEST_ASSERT(host.verifyChallengeResponse(viewerId, nonce, CryptoUtils::bindChallengeResponse(keyA, codeLegacy), &keyA));
+    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, codeLegacy, &keyA));
+}
+
 void testRemoteFileBrowserProtocol() {
     std::cout << "[TEST 58] Remote File Browser Protocol..." << std::endl;
 
@@ -7400,6 +7444,7 @@ int main() {
         testDeserializersSurviveHostileInput(); std::cout << "Test 60 done\n" << std::flush;
         testFileBrowserLoadTimeout(); std::cout << "Test 61 done\n" << std::flush;
         testUnicodeTextInput(); std::cout << "Test 62 done\n" << std::flush;
+        testBoundAuthResponse(); std::cout << "Test 63 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";

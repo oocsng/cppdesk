@@ -1584,6 +1584,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                 w.writeBytes(hostEcdh.localPublicKey().data(), hostEcdh.localPublicKey().size());
             }
             w.writeString(CPP_DESK_VERSION);
+            w.writeU8(AUTH_CAP_BOUND_RESPONSE);
             if (!sendFrame(clientSock, PacketType::AUTH_CHALLENGE, 0, w.buffer().data(), w.buffer().size(), hostSendMutex_)) {
                 cleanup();
                 return;
@@ -1629,7 +1630,18 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                 resultMsg = "Invalid or expired reboot resume token";
             }
         } else if (hasPassword != 0) {
-            if (identity_.verifyChallengeResponse(viewerId, nonce, clientDigest)) {
+            // Mode 3 binds the digest to the ECDH key so a passive observer cannot test password guesses offline.
+            std::array<uint8_t, 32> boundKey{};
+            const bool bound = (hasPassword == AUTH_MODE_PASSWORD_BOUND);
+            const bool boundKeyOk = !bound ||
+                (!viewerPubBlob.empty() &&
+                 hostEcdh.computeSharedSessionKey(viewerPubBlob.data(), viewerPubBlob.size(),
+                                                  identity_.deskId(), viewerId, nonce, boundKey) &&
+                 CryptoUtils::isUsableKey(boundKey));
+            const bool digestOk = boundKeyOk &&
+                identity_.verifyChallengeResponse(viewerId, nonce, clientDigest, bound ? &boundKey : nullptr);
+            CryptoUtils::secureZero(boundKey.data(), boundKey.size());
+            if (digestOk) {
                 // Unattended password verified successfully!
                 if (identity_.settings().totpEnabled && identity_.totpManager().isConfigured()) {
                     // Host requires Two-Factor Authentication!
@@ -3332,6 +3344,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                 std::lock_guard<std::mutex> lk(peerVersionMutex_);
                 remotePeerAppVersion_ = hostAppVersion;
             }
+            const uint8_t hostAuthCaps = chalReader.hasRemaining(1) ? chalReader.readU8() : 0;
 
             // 3. Compute & send AUTH_RESPONSE
             {
@@ -3354,8 +3367,27 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         w.writeBytes(tb.data(), 32);
                     }
                 } else if (!password.empty()) {
-                    w.writeU8(1);
                     auto digest = CryptoUtils::computeChallengeResponse(password, remoteId, identity_.deskId(), nonce);
+                    if (hostAuthCaps & AUTH_CAP_BOUND_RESPONSE) {
+                        // Never fall back to the unbound digest once the host offered the bound one.
+                        std::array<uint8_t, 32> boundKey{};
+                        if (hostPubBlob.empty() ||
+                            !viewerEcdh.computeSharedSessionKey(hostPubBlob.data(), hostPubBlob.size(),
+                                                                remoteId, identity_.deskId(), nonce, boundKey) ||
+                            !CryptoUtils::isUsableKey(boundKey)) {
+                            if (!isReconnecting) {
+                                setStatus(ViewerConnectionState::Error, "Failed to establish secure session.");
+                            }
+                            closeWinSock(vSock);
+                            viewerSock_.store(~uintptr_t(0));
+                            return false;
+                        }
+                        w.writeU8(AUTH_MODE_PASSWORD_BOUND);
+                        digest = CryptoUtils::bindChallengeResponse(boundKey, digest);
+                        CryptoUtils::secureZero(boundKey.data(), boundKey.size());
+                    } else {
+                        w.writeU8(AUTH_MODE_PASSWORD);
+                    }
                     w.writeBytes(digest.data(), digest.size());
                 } else {
                     w.writeU8(0);

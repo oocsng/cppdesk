@@ -241,6 +241,16 @@ std::array<uint8_t, 32> CryptoUtils::computeChallengeResponse(
     return computeChallengeResponseFromToken(passToken, hostId, clientId, nonce);
 }
 
+std::array<uint8_t, 32> CryptoUtils::bindChallengeResponse(
+    const std::array<uint8_t, 32>& sessionKey,
+    const std::array<uint8_t, 32>& digest)
+{
+    static const char kLabel[] = "CppDesk-auth-bound-v1";
+    std::vector<uint8_t> msg(kLabel, kLabel + sizeof(kLabel) - 1);
+    msg.insert(msg.end(), digest.begin(), digest.end());
+    return hmacSha256(sessionKey.data(), sessionKey.size(), msg.data(), msg.size());
+}
+
 void CryptoUtils::secureZero(void* ptr, size_t len) {
     crypto_secure_zero(ptr, len);
 }
@@ -786,13 +796,15 @@ std::string IdentityManager::regenerateSessionCode() {
 bool IdentityManager::verifyChallengeResponse(
     uint64_t clientId,
     const std::array<uint8_t, 32>& nonce,
-    const std::array<uint8_t, 32>& clientDigest) const
+    const std::array<uint8_t, 32>& clientDigest,
+    const std::array<uint8_t, 32>* boundSessionKey) const
 {
     // 1. Check against active One-Time Session Code
     if (!sessionCode_.empty()) {
         auto expectedCode = CryptoUtils::computeChallengeResponse(
             sessionCode_, deskId_, clientId, nonce
         );
+        if (boundSessionKey) expectedCode = CryptoUtils::bindChallengeResponse(*boundSessionKey, expectedCode);
         if (constantTimeEquals32(expectedCode, clientDigest)) {
             return true;
         }
@@ -803,6 +815,7 @@ bool IdentityManager::verifyChallengeResponse(
         auto expected = CryptoUtils::computeChallengeResponseFromToken(
             unattendedVerifier_, deskId_, clientId, nonce
         );
+        if (boundSessionKey) expected = CryptoUtils::bindChallengeResponse(*boundSessionKey, expected);
         if (constantTimeEquals32(expected, clientDigest)) {
             return true;
         }

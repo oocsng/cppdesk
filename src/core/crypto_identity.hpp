@@ -115,6 +115,13 @@ public:
         uint64_t clientId,
         const std::array<uint8_t, 32>& nonce);
 
+    // Binds a challenge-response digest to the ECDH session key (HMAC-SHA256 keyed by it). The plain digest is
+    // computable from public values, so anyone who sees it can test password guesses offline; the bound one
+    // can only be tested by a party that holds an ephemeral ECDH private key.
+    static std::array<uint8_t, 32> bindChallengeResponse(
+        const std::array<uint8_t, 32>& sessionKey,
+        const std::array<uint8_t, 32>& digest);
+
     // Derive a 256-bit session key from handshake parameters (supports ECDH shared secret)
     static std::array<uint8_t, 32> deriveSessionKey(
         uint64_t hostId,
@@ -273,10 +280,13 @@ public:
     const std::string& sessionCode() const { return sessionCode_; }
     std::string regenerateSessionCode();
 
+    // With boundSessionKey the client's digest must be bound to that key (see CryptoUtils::bindChallengeResponse);
+    // without it the legacy unbound digest is expected.
     bool verifyChallengeResponse(
         uint64_t clientId,
         const std::array<uint8_t, 32>& nonce,
-        const std::array<uint8_t, 32>& clientDigest) const;
+        const std::array<uint8_t, 32>& clientDigest,
+        const std::array<uint8_t, 32>* boundSessionKey = nullptr) const;
 
     const std::string& relayServerAddress() const { return relayServerAddr_; }
     void setRelayServerAddress(const std::string& addr);
