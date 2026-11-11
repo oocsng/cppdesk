@@ -23,6 +23,8 @@
 #include <functional>
 #include <memory>
 
+#include "canvas.hpp"
+
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -41,6 +43,10 @@ static constexpr UINT WM_APP_FRAME_READY        = WM_APP + 101;
 static constexpr UINT WM_APP_SCRATCHPAD_UPDATE  = WM_APP + 102;
 static constexpr UINT WM_APP_COMMAND_PALETTE    = WM_APP + 103;
 static constexpr UINT WM_APP_UPDATE_PROGRESS    = WM_APP + 104;
+
+inline D2D1_COLOR_F toD2D(const ui::Color& c) {
+    return D2D1::ColorF(c.r, c.g, c.b, c.a);
+}
 #endif
 
 struct UpdateProgressData {
@@ -202,21 +208,21 @@ private:
     // Primitive drawing & vector icon helpers
     void drawCardShadow(const UiRect& r, float radius, float intensity = 1.0f);
     void drawCardSurface(const UiRect& r, float radius, float alpha, bool accentHeader = false);
-    void drawPulseDot(float cx, float cy, float baseRadius, D2D1_COLOR_F color, float alpha = 1.0f);
-    void drawSparkline(const UiRect& r, const float* values, size_t count, float maxVal, D2D1_COLOR_F color, float alpha = 1.0f);
-    void drawIconStar(float cx, float cy, float radius, bool filled, D2D1_COLOR_F color);
-    void drawIconClose(float cx, float cy, float halfSize, D2D1_COLOR_F color, float strokeWidth = 1.6f);
-    void drawIconTheme(float cx, float cy, float radius, bool isDark, D2D1_COLOR_F color);
-    void fillRoundRect(const UiRect& r, float radius, D2D1_COLOR_F color);
-    void strokeRoundRect(const UiRect& r, float radius, D2D1_COLOR_F color, float strokeWidth = 1.0f);
-    void drawText(const std::string& utf8, const UiRect& r, IDWriteTextFormat* fmt, D2D1_COLOR_F color,
-                  DWRITE_TEXT_ALIGNMENT hAlign = DWRITE_TEXT_ALIGNMENT_LEADING,
-                  DWRITE_PARAGRAPH_ALIGNMENT vAlign = DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    void drawPulseDot(float cx, float cy, float baseRadius, ui::Color color, float alpha = 1.0f);
+    void drawSparkline(const UiRect& r, const float* values, size_t count, float maxVal, ui::Color color, float alpha = 1.0f);
+    void drawIconStar(float cx, float cy, float radius, bool filled, ui::Color color);
+    void drawIconClose(float cx, float cy, float halfSize, ui::Color color, float strokeWidth = 1.6f);
+    void drawIconTheme(float cx, float cy, float radius, bool isDark, ui::Color color);
+    void fillRoundRect(const UiRect& r, float radius, ui::Color color);
+    void strokeRoundRect(const UiRect& r, float radius, ui::Color color, float strokeWidth = 1.0f);
+    void drawText(const std::string& utf8, const UiRect& r, ui::FontRole font, ui::Color color,
+                  ui::HAlign hAlign = ui::HAlign::Leading,
+                  ui::VAlign vAlign = ui::VAlign::Center);
     void drawButton(const std::string& id, const UiRect& r, const std::string& label,
-                    D2D1_COLOR_F bgColor, D2D1_COLOR_F hoverColor, D2D1_COLOR_F textColor,
-                    float radius, std::function<void()> onClick, IDWriteTextFormat* fmt = nullptr,
-                    bool hasBorder = false, D2D1_COLOR_F borderColor = D2D1::ColorF(0, 0, 0, 0),
-                    D2D1_COLOR_F hoverTextColor = D2D1::ColorF(0, 0, 0, -1.0f));
+                    ui::Color bgColor, ui::Color hoverColor, ui::Color textColor,
+                    float radius, std::function<void()> onClick, ui::FontRole font = ui::FontRole::BodyBold,
+                    bool hasBorder = false, ui::Color borderColor = ui::Color{0, 0, 0, 0},
+                    ui::Color hoverTextColor = ui::Color{0, 0, 0, -1.0f});
     UiRect getWidgetAnimRect(const std::string& id, const UiRect& r) const;
     void drawTextField(const std::string& id, FocusedField fieldType, const UiRect& r,
                        const std::string& value, const std::string& placeholder, bool maskPassword);
@@ -224,6 +230,7 @@ private:
                           const std::string& label, std::function<void()> onToggle,
                           const std::string& tooltip = "");
     void ensureAppIconBitmap();
+    IDWriteTextFormat* formatFor(ui::FontRole font) const;
 
     // Two-Factor Authentication (TOTP) rendering
     void renderQrCodeDirect2D(

@@ -5,35 +5,35 @@
 
 namespace cppdesk {
 
-D2D1_COLOR_F COL_BG_MAIN{};
-D2D1_COLOR_F COL_BG_NAV{};
-D2D1_COLOR_F COL_BG_CARD{};
-D2D1_COLOR_F COL_BG_SUBTLE{};
-D2D1_COLOR_F COL_BG_CARD_ALT{};
-D2D1_COLOR_F COL_BG_INPUT{};
-D2D1_COLOR_F COL_BG_INPUT_FOCUS{};
-D2D1_COLOR_F COL_BORDER{};
-D2D1_COLOR_F COL_BORDER_ALT{};
-D2D1_COLOR_F COL_BORDER_FOCUS{};
-D2D1_COLOR_F COL_PRIMARY_ACCENT{};
-D2D1_COLOR_F COL_PRIMARY_ACCENT_HV{};
-D2D1_COLOR_F COL_SEC_BTN_BG{};
-D2D1_COLOR_F COL_SEC_BTN_HV{};
-D2D1_COLOR_F COL_SUCCESS{};
-D2D1_COLOR_F COL_WARNING{};
-D2D1_COLOR_F COL_DANGER{};
-D2D1_COLOR_F COL_DANGER_HV{};
-D2D1_COLOR_F COL_TEXT_PRIMARY{};
-D2D1_COLOR_F COL_TEXT_SECONDARY{};
-D2D1_COLOR_F COL_TEXT_MUTED{};
-D2D1_COLOR_F COL_TEXT_ACCENT{};
-D2D1_COLOR_F COL_TEXT_ON_ACCENT{};
-D2D1_COLOR_F COL_STAGE_BG{};
-D2D1_COLOR_F COL_HUD_BG{};
-D2D1_COLOR_F COL_HUD_TEXT{};
-D2D1_COLOR_F COL_HUD_TEXT_SECONDARY{};
-D2D1_COLOR_F COL_HUD_TEXT_MUTED{};
-D2D1_COLOR_F COL_HUD_TEXT_ACCENT{};
+ui::Color COL_BG_MAIN{};
+ui::Color COL_BG_NAV{};
+ui::Color COL_BG_CARD{};
+ui::Color COL_BG_SUBTLE{};
+ui::Color COL_BG_CARD_ALT{};
+ui::Color COL_BG_INPUT{};
+ui::Color COL_BG_INPUT_FOCUS{};
+ui::Color COL_BORDER{};
+ui::Color COL_BORDER_ALT{};
+ui::Color COL_BORDER_FOCUS{};
+ui::Color COL_PRIMARY_ACCENT{};
+ui::Color COL_PRIMARY_ACCENT_HV{};
+ui::Color COL_SEC_BTN_BG{};
+ui::Color COL_SEC_BTN_HV{};
+ui::Color COL_SUCCESS{};
+ui::Color COL_WARNING{};
+ui::Color COL_DANGER{};
+ui::Color COL_DANGER_HV{};
+ui::Color COL_TEXT_PRIMARY{};
+ui::Color COL_TEXT_SECONDARY{};
+ui::Color COL_TEXT_MUTED{};
+ui::Color COL_TEXT_ACCENT{};
+ui::Color COL_TEXT_ON_ACCENT{};
+ui::Color COL_STAGE_BG{};
+ui::Color COL_HUD_BG{};
+ui::Color COL_HUD_TEXT{};
+ui::Color COL_HUD_TEXT_SECONDARY{};
+ui::Color COL_HUD_TEXT_MUTED{};
+ui::Color COL_HUD_TEXT_ACCENT{};
 
 namespace {
 
@@ -89,7 +89,7 @@ std::span<const PaletteToken> paletteTokens() {
 }
 
 namespace {
-double relativeLuminance(const D2D1_COLOR_F& c) {
+double relativeLuminance(const ui::Color& c) {
     auto lin = [](float v) {
         return v <= 0.03928f ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4);
     };
@@ -97,7 +97,7 @@ double relativeLuminance(const D2D1_COLOR_F& c) {
 }
 } // namespace
 
-double contrastRatio(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b) {
+double contrastRatio(const ui::Color& a, const ui::Color& b) {
     double la = relativeLuminance(a);
     double lb = relativeLuminance(b);
     if (la < lb) std::swap(la, lb);

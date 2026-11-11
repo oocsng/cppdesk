@@ -1251,29 +1251,29 @@ void CppDeskWindow::drawCardSurface(const UiRect& r, float radius, float alpha, 
     fillRoundRect({ r.left + 14.0f, r.top + 0.8f, r.right - 14.0f, r.top + 1.8f }, 0.5f, rgba(255, 255, 255, specAlpha));
 }
 
-void CppDeskWindow::drawPulseDot(float cx, float cy, float baseRadius, D2D1_COLOR_F color, float alpha) {
+void CppDeskWindow::drawPulseDot(float cx, float cy, float baseRadius, ui::Color color, float alpha) {
     if (!renderTarget_ || !solidBrush_ || alpha <= 0.01f) return;
     float wave = 0.5f + 0.5f * std::sin(animTimeSec_ * 2.8f);
     float haloRadius = baseRadius + 1.2f + 3.0f * wave;
     float haloAlpha = (0.24f - 0.16f * wave) * alpha;
 
     // Dual-ring breathing glow
-    solidBrush_->SetColor(withAlpha(color, haloAlpha * 0.5f));
+    solidBrush_->SetColor(toD2D(withAlpha(color, haloAlpha * 0.5f)));
     renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), haloRadius + 2.0f, haloRadius + 2.0f), solidBrush_);
 
-    solidBrush_->SetColor(withAlpha(color, haloAlpha));
+    solidBrush_->SetColor(toD2D(withAlpha(color, haloAlpha)));
     renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), haloRadius, haloRadius), solidBrush_);
 
-    solidBrush_->SetColor(withAlpha(color, alpha));
+    solidBrush_->SetColor(toD2D(withAlpha(color, alpha)));
     renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), baseRadius, baseRadius), solidBrush_);
 }
 
-void CppDeskWindow::drawSparkline(const UiRect& r, const float* values, size_t count, float maxVal, D2D1_COLOR_F color, float alpha) {
+void CppDeskWindow::drawSparkline(const UiRect& r, const float* values, size_t count, float maxVal, ui::Color color, float alpha) {
     if (!renderTarget_ || !solidBrush_ || count < 2 || maxVal <= 0.001f) return;
     fillRoundRect(r, 4.0f, withAlpha(COL_BG_SUBTLE, alpha * 0.85f));
     strokeRoundRect(r, 4.0f, withAlpha(COL_BORDER, alpha * 0.85f), 1.0f);
 
-    solidBrush_->SetColor(withAlpha(color, alpha));
+    solidBrush_->SetColor(toD2D(withAlpha(color, alpha)));
     float stepX = (r.width() - 6.0f) / static_cast<float>(count - 1);
     float innerH = r.height() - 6.0f;
 
@@ -1286,7 +1286,7 @@ void CppDeskWindow::drawSparkline(const UiRect& r, const float* values, size_t c
     }
 }
 
-void CppDeskWindow::drawIconStar(float cx, float cy, float radius, bool filled, D2D1_COLOR_F color) {
+void CppDeskWindow::drawIconStar(float cx, float cy, float radius, bool filled, ui::Color color) {
     if (!renderTarget_ || !solidBrush_) return;
 
     if (geoUnitStar_) {
@@ -1297,7 +1297,7 @@ void CppDeskWindow::drawIconStar(float cx, float cy, float radius, bool filled, 
                                       oldXform;
         renderTarget_->SetTransform(starXform);
 
-        solidBrush_->SetColor(color);
+        solidBrush_->SetColor(toD2D(color));
         if (filled) {
             renderTarget_->FillGeometry(geoUnitStar_, solidBrush_);
         }
@@ -1327,7 +1327,7 @@ void CppDeskWindow::drawIconStar(float cx, float cy, float radius, bool filled, 
         sink->Close();
         sink->Release();
 
-        solidBrush_->SetColor(color);
+        solidBrush_->SetColor(toD2D(color));
         if (filled) {
             renderTarget_->FillGeometry(geo, solidBrush_);
         }
@@ -1336,16 +1336,16 @@ void CppDeskWindow::drawIconStar(float cx, float cy, float radius, bool filled, 
     geo->Release();
 }
 
-void CppDeskWindow::drawIconClose(float cx, float cy, float halfSize, D2D1_COLOR_F color, float strokeWidth) {
+void CppDeskWindow::drawIconClose(float cx, float cy, float halfSize, ui::Color color, float strokeWidth) {
     if (!renderTarget_ || !solidBrush_) return;
-    solidBrush_->SetColor(color);
+    solidBrush_->SetColor(toD2D(color));
     renderTarget_->DrawLine(D2D1::Point2F(cx - halfSize, cy - halfSize), D2D1::Point2F(cx + halfSize, cy + halfSize), solidBrush_, strokeWidth);
     renderTarget_->DrawLine(D2D1::Point2F(cx + halfSize, cy - halfSize), D2D1::Point2F(cx - halfSize, cy + halfSize), solidBrush_, strokeWidth);
 }
 
-void CppDeskWindow::drawIconTheme(float cx, float cy, float radius, bool isDark, D2D1_COLOR_F color) {
+void CppDeskWindow::drawIconTheme(float cx, float cy, float radius, bool isDark, ui::Color color) {
     if (!renderTarget_ || !solidBrush_) return;
-    solidBrush_->SetColor(color);
+    solidBrush_->SetColor(toD2D(color));
     if (!isDark) {
         // Sun icon (circle + 8 rays)
         float coreR = radius * 0.52f;
@@ -1364,21 +1364,35 @@ void CppDeskWindow::drawIconTheme(float cx, float cy, float radius, bool isDark,
     } else {
         // Crescent indicator (outer ring + inner offset circle)
         renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), radius * 0.78f, radius * 0.78f), solidBrush_);
-        solidBrush_->SetColor(COL_SEC_BTN_BG);
+        solidBrush_->SetColor(toD2D(COL_SEC_BTN_BG));
         renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx + radius * 0.32f, cy - radius * 0.24f), radius * 0.62f, radius * 0.62f), solidBrush_);
     }
 }
 
-void CppDeskWindow::fillRoundRect(const UiRect& r, float radius, D2D1_COLOR_F color) {
+IDWriteTextFormat* CppDeskWindow::formatFor(ui::FontRole font) const {
+    switch (font) {
+        case ui::FontRole::HeroId: return fmtHeroId_;
+        case ui::FontRole::Heading: return fmtHeading_;
+        case ui::FontRole::Subheading: return fmtSubheading_;
+        case ui::FontRole::Body: return fmtBody_;
+        case ui::FontRole::BodyBold: return fmtBodyBold_;
+        case ui::FontRole::Small: return fmtSmall_;
+        case ui::FontRole::Mono: return fmtMono_;
+        case ui::FontRole::Tooltip: return fmtTooltip_;
+    }
+    return fmtBody_;
+}
+
+void CppDeskWindow::fillRoundRect(const UiRect& r, float radius, ui::Color color) {
     if (!renderTarget_ || !solidBrush_) return;
-    solidBrush_->SetColor(color);
+    solidBrush_->SetColor(toD2D(color));
     D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(r.left, r.top, r.right, r.bottom), radius, radius);
     renderTarget_->FillRoundedRectangle(rr, solidBrush_);
 }
 
-void CppDeskWindow::strokeRoundRect(const UiRect& r, float radius, D2D1_COLOR_F color, float strokeWidth) {
+void CppDeskWindow::strokeRoundRect(const UiRect& r, float radius, ui::Color color, float strokeWidth) {
     if (!renderTarget_ || !solidBrush_) return;
-    solidBrush_->SetColor(color);
+    solidBrush_->SetColor(toD2D(color));
     D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(r.left, r.top, r.right, r.bottom), radius, radius);
     renderTarget_->DrawRoundedRectangle(rr, solidBrush_, strokeWidth);
 }
@@ -1386,15 +1400,20 @@ void CppDeskWindow::strokeRoundRect(const UiRect& r, float radius, D2D1_COLOR_F 
 void CppDeskWindow::drawText(
     const std::string& utf8,
     const UiRect& r,
-    IDWriteTextFormat* fmt,
-    D2D1_COLOR_F color,
-    DWRITE_TEXT_ALIGNMENT hAlign,
-    DWRITE_PARAGRAPH_ALIGNMENT vAlign)
+    ui::FontRole font,
+    ui::Color color,
+    ui::HAlign hAlign,
+    ui::VAlign vAlign)
 {
+    IDWriteTextFormat* fmt = formatFor(font);
     if (!renderTarget_ || !solidBrush_ || !fmt || utf8.empty()) return;
-    fmt->SetTextAlignment(hAlign);
-    fmt->SetParagraphAlignment(vAlign);
-    solidBrush_->SetColor(color);
+    fmt->SetTextAlignment(hAlign == ui::HAlign::Center ? DWRITE_TEXT_ALIGNMENT_CENTER
+                          : hAlign == ui::HAlign::Trailing ? DWRITE_TEXT_ALIGNMENT_TRAILING
+                          : DWRITE_TEXT_ALIGNMENT_LEADING);
+    fmt->SetParagraphAlignment(vAlign == ui::VAlign::Top ? DWRITE_PARAGRAPH_ALIGNMENT_NEAR
+                               : vAlign == ui::VAlign::Bottom ? DWRITE_PARAGRAPH_ALIGNMENT_FAR
+                               : DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    solidBrush_->SetColor(toD2D(color));
     D2D1_RECT_F dr = D2D1::RectF(r.left, r.top, r.right, r.bottom);
 
     if (utf8.size() < 512) {
@@ -1413,15 +1432,15 @@ void CppDeskWindow::drawButton(
     const std::string& id,
     const UiRect& r,
     const std::string& label,
-    D2D1_COLOR_F bgColor,
-    D2D1_COLOR_F hoverColor,
-    D2D1_COLOR_F textColor,
+    ui::Color bgColor,
+    ui::Color hoverColor,
+    ui::Color textColor,
     float radius,
     std::function<void()> onClick,
-    IDWriteTextFormat* fmt,
+    ui::FontRole font,
     bool hasBorder,
-    D2D1_COLOR_F borderColor,
-    D2D1_COLOR_F hoverTextColor)
+    ui::Color borderColor,
+    ui::Color hoverTextColor)
 {
     WidgetAnimState& anim = widgetAnims_[id];
 
@@ -1435,12 +1454,12 @@ void CppDeskWindow::drawButton(
         float shadowAlpha = 0.16f * hT * std::max(0.0f, 1.0f - pT);
         float shadowSpread = 1.2f * hT;
         float shadowY = 2.0f + 1.8f * hT;
-        D2D1_COLOR_F shadowCol = (bgColor.a > 0.05f) ? COL_PRIMARY_ACCENT : rgba(38, 30, 20);
+        ui::Color shadowCol = (bgColor.a > 0.05f) ? COL_PRIMARY_ACCENT : rgba(38, 30, 20);
         fillRoundRect(animRect.offset(0.0f, shadowY).inflate(shadowSpread, shadowSpread),
                       radius + shadowSpread, withAlpha(shadowCol, shadowAlpha));
     }
 
-    D2D1_COLOR_F curBg = lerpColor(bgColor, hoverColor, std::clamp(hT, 0.0f, 1.0f));
+    ui::Color curBg = lerpColor(bgColor, hoverColor, std::clamp(hT, 0.0f, 1.0f));
     if (pT > 0.01f) {
         curBg = lerpColor(curBg, rgba(20, 18, 16, curBg.a), 0.15f * std::clamp(pT, 0.0f, 1.0f));
     }
@@ -1472,16 +1491,16 @@ void CppDeskWindow::drawButton(
     }
 
     if (hasBorder) {
-        D2D1_COLOR_F bCol = lerpColor(borderColor, COL_BORDER_FOCUS, std::clamp(hT, 0.0f, 1.0f) * 0.65f);
+        ui::Color bCol = lerpColor(borderColor, COL_BORDER_FOCUS, std::clamp(hT, 0.0f, 1.0f) * 0.65f);
         strokeRoundRect(animRect, radius, bCol, 1.0f + 0.35f * std::clamp(hT, 0.0f, 1.0f));
     }
 
-    D2D1_COLOR_F targetTxtCol = (hoverTextColor.a >= 0.0f) ? hoverTextColor : textColor;
-    D2D1_COLOR_F curTxtCol = lerpColor(textColor, targetTxtCol, std::clamp(hT, 0.0f, 1.0f));
+    ui::Color targetTxtCol = (hoverTextColor.a >= 0.0f) ? hoverTextColor : textColor;
+    ui::Color curTxtCol = lerpColor(textColor, targetTxtCol, std::clamp(hT, 0.0f, 1.0f));
 
     if (!label.empty()) {
-        drawText(label, animRect, fmt ? fmt : fmtBodyBold_, curTxtCol,
-                 DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        drawText(label, animRect, font, curTxtCol,
+                 ui::HAlign::Center, ui::VAlign::Center);
     }
 
     if (onClick) {
@@ -1527,10 +1546,10 @@ void CppDeskWindow::drawTextField(
         fillRoundRect(animField.offset(0.0f, 1.5f).inflate(1.0f, 1.0f), 10.0f, rgba(38, 30, 20, 0.04f * hT));
     }
 
-    D2D1_COLOR_F bg = lerpColor(COL_BG_INPUT, COL_BG_INPUT_FOCUS, std::max(fT, hT * 0.4f));
+    ui::Color bg = lerpColor(COL_BG_INPUT, COL_BG_INPUT_FOCUS, std::max(fT, hT * 0.4f));
     fillRoundRect(animField, 9.0f, bg);
 
-    D2D1_COLOR_F bdr = lerpColor(
+    ui::Color bdr = lerpColor(
         lerpColor(COL_BORDER, COL_BORDER_ALT, hT * 0.75f),
         COL_BORDER_FOCUS,
         fT
@@ -1539,7 +1558,7 @@ void CppDeskWindow::drawTextField(
 
     UiRect textR = { animField.left + 13.0f, animField.top + 2.0f, animField.right - 13.0f, animField.bottom - 2.0f };
     if (value.empty() && !focused) {
-        drawText(placeholder, textR, fmtBody_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_LEADING);
+        drawText(placeholder, textR, ui::FontRole::Body, COL_TEXT_MUTED, ui::HAlign::Leading);
     } else {
         std::string display = maskPassword ? std::string(value.size(), '*') : value;
         if (focused) {
@@ -1548,7 +1567,7 @@ void CppDeskWindow::drawTextField(
                 display.push_back('|');
             }
         }
-        drawText(display, textR, fmtMono_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_LEADING);
+        drawText(display, textR, ui::FontRole::Mono, COL_TEXT_PRIMARY, ui::HAlign::Leading);
     }
 
     clickRegions_.push_back({ r, id, [this, fieldType]() {
@@ -1625,33 +1644,33 @@ void CppDeskWindow::drawToggleSwitch(
         UiRect animBadgeRect = baseBadgeRect.inflate(1.2f * bHoverT, 1.2f * bHoverT);
         float badgeRadius = animBadgeRect.height() * 0.5f;
 
-        D2D1_COLOR_F restBg = lerpColor(rgba(215, 210, 202, 0.45f), rgba(52, 49, 44, 0.50f), themeAnimT_);
-        D2D1_COLOR_F hoverBg = lerpColor(rgba(240, 235, 228, 0.88f), rgba(68, 64, 58, 0.90f), themeAnimT_);
+        ui::Color restBg = lerpColor(rgba(215, 210, 202, 0.45f), rgba(52, 49, 44, 0.50f), themeAnimT_);
+        ui::Color hoverBg = lerpColor(rgba(240, 235, 228, 0.88f), rgba(68, 64, 58, 0.90f), themeAnimT_);
         hoverBg = lerpColor(hoverBg, withAlpha(COL_PRIMARY_ACCENT, 0.22f), 0.5f);
-        D2D1_COLOR_F badgeBg = lerpColor(restBg, hoverBg, bHoverT);
+        ui::Color badgeBg = lerpColor(restBg, hoverBg, bHoverT);
 
-        D2D1_COLOR_F restBorder = withAlpha(COL_BORDER, 0.65f);
-        D2D1_COLOR_F hoverBorder = COL_PRIMARY_ACCENT;
-        D2D1_COLOR_F badgeBorder = lerpColor(restBorder, hoverBorder, bHoverT);
+        ui::Color restBorder = withAlpha(COL_BORDER, 0.65f);
+        ui::Color hoverBorder = COL_PRIMARY_ACCENT;
+        ui::Color badgeBorder = lerpColor(restBorder, hoverBorder, bHoverT);
 
-        D2D1_COLOR_F restGlyph = lerpColor(COL_TEXT_MUTED, COL_TEXT_PRIMARY, 0.35f);
-        D2D1_COLOR_F hoverGlyph = lerpColor(COL_TEXT_PRIMARY, COL_PRIMARY_ACCENT, 0.55f);
-        D2D1_COLOR_F badgeGlyph = lerpColor(restGlyph, hoverGlyph, bHoverT);
+        ui::Color restGlyph = lerpColor(COL_TEXT_MUTED, COL_TEXT_PRIMARY, 0.35f);
+        ui::Color hoverGlyph = lerpColor(COL_TEXT_PRIMARY, COL_PRIMARY_ACCENT, 0.55f);
+        ui::Color badgeGlyph = lerpColor(restGlyph, hoverGlyph, bHoverT);
 
         fillRoundRect(animBadgeRect, badgeRadius, badgeBg);
         strokeRoundRect(animBadgeRect, badgeRadius, badgeBorder, 1.0f);
-        drawText("?", animBadgeRect, fmtSmall_, badgeGlyph, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        drawText("?", animBadgeRect, ui::FontRole::Small, badgeGlyph, ui::HAlign::Center, ui::VAlign::Center);
     }
 
     UiRect lblRect = { r.left, r.top, hasBadge ? (baseBadgeRect.left - 4.0f) : (pill.left - 12.0f), r.bottom };
-    drawText(label, lblRect, fmtBody_, lerpColor(COL_TEXT_PRIMARY, COL_TEXT_ACCENT, hT * 0.6f), DWRITE_TEXT_ALIGNMENT_LEADING);
+    drawText(label, lblRect, ui::FontRole::Body, lerpColor(COL_TEXT_PRIMARY, COL_TEXT_ACCENT, hT * 0.6f), ui::HAlign::Leading);
 
     float tClamped = std::clamp(anim.toggleT, 0.0f, 1.0f);
-    D2D1_COLOR_F offBase = lerpColor(rgba(220, 213, 202), rgba(55, 52, 47), themeAnimT_);
-    D2D1_COLOR_F offHover = lerpColor(rgba(205, 196, 184), rgba(70, 66, 60), themeAnimT_);
-    D2D1_COLOR_F offCol = lerpColor(offBase, offHover, hT);
-    D2D1_COLOR_F onCol  = lerpColor(COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, hT);
-    D2D1_COLOR_F switchBg = lerpColor(offCol, onCol, tClamped);
+    ui::Color offBase = lerpColor(rgba(220, 213, 202), rgba(55, 52, 47), themeAnimT_);
+    ui::Color offHover = lerpColor(rgba(205, 196, 184), rgba(70, 66, 60), themeAnimT_);
+    ui::Color offCol = lerpColor(offBase, offHover, hT);
+    ui::Color onCol  = lerpColor(COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, hT);
+    ui::Color switchBg = lerpColor(offCol, onCol, tClamped);
 
     // Ambient glow on active toggle
     if (tClamped > 0.05f) {
@@ -1720,12 +1739,12 @@ void CppDeskWindow::onPaint() {
         if (FAILED(d2dFactory_->CreateHwndRenderTarget(rtProps, hwndProps, &renderTarget_)) || !renderTarget_) {
             return;
         }
-        renderTarget_->CreateSolidColorBrush(COL_TEXT_PRIMARY, &solidBrush_);
+        renderTarget_->CreateSolidColorBrush(toD2D(COL_TEXT_PRIMARY), &solidBrush_);
     }
 
     clickRegions_.clear();
     renderTarget_->BeginDraw();
-    renderTarget_->Clear(COL_BG_MAIN);
+    renderTarget_->Clear(toD2D(COL_BG_MAIN));
 
     float topOffset = 0.0f;
     if (!isFullscreen_) {
@@ -1971,7 +1990,7 @@ void CppDeskWindow::onPaint() {
                     sink->Release();
 
                     // Fill beak with dark acrylic
-                    solidBrush_->SetColor(rgba(18, 17, 16, 0.96f * alpha));
+                    solidBrush_->SetColor(toD2D(rgba(18, 17, 16, 0.96f * alpha)));
                     renderTarget_->FillGeometry(beakGeo, solidBrush_);
                 }
                 beakGeo->Release();
@@ -1985,11 +2004,11 @@ void CppDeskWindow::onPaint() {
                           0.5f, rgba(255, 255, 255, 0.22f * alpha));
 
             // 1px glass border
-            D2D1_COLOR_F glassBorder = rgba(255, 255, 255, 0.13f * alpha);
+            ui::Color glassBorder = rgba(255, 255, 255, 0.13f * alpha);
             strokeRoundRect(cardRect, 7.0f, glassBorder, 1.0f);
 
             // Seamless beak border strokes pointing toward badge
-            solidBrush_->SetColor(glassBorder);
+            solidBrush_->SetColor(toD2D(glassBorder));
             if (placeBelow) {
                 fillRoundRect({ beakX - beakHalfW + 0.5f, cardTop - 0.5f, beakX + beakHalfW - 0.5f, cardTop + 1.5f },
                               0.0f, rgba(18, 17, 16, 0.96f * alpha));
@@ -2003,7 +2022,7 @@ void CppDeskWindow::onPaint() {
             }
 
             // Clean DirectWrite text rendering
-            solidBrush_->SetColor(rgba(240, 243, 248, 0.96f * alpha));
+            solidBrush_->SetColor(toD2D(rgba(240, 243, 248, 0.96f * alpha)));
             renderTarget_->DrawTextLayout(
                 D2D1::Point2F(cardRect.left + 12.0f, cardRect.top + 8.0f),
                 textLayout,
@@ -2078,7 +2097,7 @@ void CppDeskWindow::drawTopNavBar(float width, float& outTopOffset) {
                onDash ? COL_TEXT_ON_ACCENT : COL_TEXT_SECONDARY,
                8.5f, [this]() {
                    switchTab(ActiveTab::Dashboard);
-               }, fmtSmall_, false, D2D1::ColorF(0, 0, 0, 0),
+               }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0},
                onDash ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
     if (hasSession) {
@@ -2092,7 +2111,7 @@ void CppDeskWindow::drawTopNavBar(float width, float& outTopOffset) {
                    onSess ? COL_TEXT_ON_ACCENT : COL_TEXT_SECONDARY,
                    8.5f, [this]() {
                        switchTab(ActiveTab::RemoteSession);
-                   }, fmtSmall_, false, D2D1::ColorF(0, 0, 0, 0),
+                   }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0},
                    onSess ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
     }
 
@@ -2103,7 +2122,7 @@ void CppDeskWindow::drawTopNavBar(float width, float& outTopOffset) {
                onSett ? COL_TEXT_ON_ACCENT : COL_TEXT_SECONDARY,
                8.5f, [this]() {
                    switchTab(ActiveTab::Settings);
-               }, fmtSmall_, false, D2D1::ColorF(0, 0, 0, 0),
+               }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0},
                onSett ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
     // Right: Minimal Theme Icon Pill + Files & Chat Pill
@@ -2116,7 +2135,7 @@ void CppDeskWindow::drawTopNavBar(float width, float& outTopOffset) {
                    s.darkTheme = !s.darkTheme;
                    identity_.updateSettings(s);
                    applyWindowThemeAttribute();
-               }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
     UiRect themeAnim = getWidgetAnimRect("btn_nav_theme", themeBtn);
     drawIconTheme(themeAnim.centerX(), themeAnim.centerY(), 7.5f, isDark, COL_TEXT_PRIMARY);
 
@@ -2139,7 +2158,7 @@ void CppDeskWindow::drawTopNavBar(float width, float& outTopOffset) {
                        network_.markChatRead();
                    }
                    showFileDrawer_ = !showFileDrawer_;
-               }, fmtSmall_, !(showFileDrawer_ || unreadChat > 0), COL_BORDER,
+               }, ui::FontRole::Small, !(showFileDrawer_ || unreadChat > 0), COL_BORDER,
                (showFileDrawer_ || unreadChat > 0) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 }
 
@@ -2171,7 +2190,7 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
     float curY = leftCol.top + 22.0f;
 
     bool elevated = InputInjector::isElevated();
-    drawText("This Desk", { lx, curY, rx - (elevated ? 0.0f : 110.0f), curY + 26.0f }, fmtHeading_, withAlpha(COL_TEXT_PRIMARY, alpha));
+    drawText("This Desk", { lx, curY, rx - (elevated ? 0.0f : 110.0f), curY + 26.0f }, ui::FontRole::Heading, withAlpha(COL_TEXT_PRIMARY, alpha));
     if (!elevated) {
         UiRect elevBtn = { rx - 108.0f, curY, rx, curY + 26.0f };
         drawButton("btn_elevate_admin", elevBtn, "Elevate Admin",
@@ -2179,11 +2198,11 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
                        if (InputInjector::relaunchAsAdmin(hwnd_)) {
                            PostQuitMessage(0);
                        }
-                   }, fmtSmall_, true, COL_BORDER);
+                   }, ui::FontRole::Small, true, COL_BORDER);
     }
     curY += 26.0f;
     drawText("Share your ID and code to allow remote access.",
-             { lx, curY, rx, curY + 20.0f }, fmtSmall_, withAlpha(COL_TEXT_SECONDARY, alpha));
+             { lx, curY, rx, curY + 20.0f }, ui::FontRole::Small, withAlpha(COL_TEXT_SECONDARY, alpha));
     curY += 28.0f;
 
     // Hero Desk ID Card
@@ -2192,16 +2211,16 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
     strokeRoundRect(idBox, 13.0f, withAlpha(COL_BORDER_ALT, alpha), 1.2f);
 
     drawText("YOUR DESK ID", { idBox.left + 18.0f, idBox.top + 10.0f, idBox.right - 18.0f, idBox.top + 24.0f },
-             fmtSmall_, withAlpha(COL_TEXT_ACCENT, alpha));
+             ui::FontRole::Small, withAlpha(COL_TEXT_ACCENT, alpha));
     drawText(identity_.formattedDeskId(), { idBox.left + 18.0f, idBox.top + 26.0f, idBox.right - 108.0f, idBox.bottom - 8.0f },
-             fmtHeroId_, withAlpha(COL_PRIMARY_ACCENT, alpha));
+             ui::FontRole::HeroId, withAlpha(COL_PRIMARY_ACCENT, alpha));
 
     UiRect copyIdBtn = { idBox.right - 98.0f, idBox.top + 25.0f, idBox.right - 16.0f, idBox.bottom - 17.0f };
     drawButton("btn_copy_id", copyIdBtn, "Copy ID",
                COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.5f, [this]() {
                    ClipboardManager::setClipboardUtf8(identity_.formattedDeskId());
                    showToast("Copied Desk ID");
-               }, fmtSmall_);
+               }, ui::FontRole::Small);
 
     curY = idBox.bottom + 16.0f;
 
@@ -2221,24 +2240,24 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
 
     // Session Code Row
     float codeY = unattBox.top + 50.0f;
-    drawText("Session Code", { ux, codeY, ux + 96.0f, codeY + 32.0f }, fmtBody_, withAlpha(COL_TEXT_SECONDARY, alpha));
+    drawText("Session Code", { ux, codeY, ux + 96.0f, codeY + 32.0f }, ui::FontRole::Body, withAlpha(COL_TEXT_SECONDARY, alpha));
     UiRect codeBadge = { ux + 100.0f, codeY, urx - 134.0f, codeY + 32.0f };
     fillRoundRect(codeBadge, 7.5f, COL_BG_CARD);
     strokeRoundRect(codeBadge, 7.5f, COL_BORDER);
-    drawText(identity_.sessionCode(), codeBadge, fmtMono_, COL_PRIMARY_ACCENT, DWRITE_TEXT_ALIGNMENT_CENTER);
+    drawText(identity_.sessionCode(), codeBadge, ui::FontRole::Mono, COL_PRIMARY_ACCENT, ui::HAlign::Center);
 
     UiRect copyCodeBtn = { codeBadge.right + 6.0f, codeY, codeBadge.right + 66.0f, codeY + 32.0f };
     drawButton("btn_copy_code", copyCodeBtn, "Copy",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
                    ClipboardManager::setClipboardUtf8(identity_.sessionCode());
                    showToast("Copied session code");
-               }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
     UiRect regenCodeBtn = { copyCodeBtn.right + 6.0f, codeY, urx, codeY + 32.0f };
     drawButton("btn_regen_code", regenCodeBtn, "New",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
                    identity_.regenerateSessionCode();
-               }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
     fillRoundRect({ ux, codeY + 40.0f, urx, codeY + 41.0f }, 0.0f, withAlpha(COL_BORDER, 0.7f * alpha));
 
@@ -2252,7 +2271,7 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
     drawButton("btn_show_local_pass", showPassBtn, showLocalPassword_ ? "Hide" : "Show",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
                    showLocalPassword_ = !showLocalPassword_;
-               }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
     UiRect savePassBtn = { showPassBtn.right + 6.0f, passField.top, urx, passField.bottom };
     drawButton("btn_save_local_pass", savePassBtn, "Save",
@@ -2263,7 +2282,7 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
                    } else {
                        showToast("Enter a password first", true);
                    }
-               }, fmtSmall_);
+               }, ui::FontRole::Small);
 
     curY = unattBox.bottom + 16.0f;
 
@@ -2279,10 +2298,10 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
 
     if (hStatus.active) {
         drawPulseDot(hx + 5.0f, hy + 10.0f, 4.0f, COL_PRIMARY_ACCENT, alpha);
-        drawText("ACTIVE SESSION", { hx + 16.0f, hy, hrx, hy + 20.0f }, fmtSmall_, COL_PRIMARY_ACCENT);
+        drawText("ACTIVE SESSION", { hx + 16.0f, hy, hrx, hy + 20.0f }, ui::FontRole::Small, COL_PRIMARY_ACCENT);
         hy += 22.0f;
         std::string who = hStatus.viewerHostname + " (" + CryptoUtils::formatDeskId(hStatus.viewerDeskId) + ")";
-        drawText(who, { hx, hy, hrx, hy + 24.0f }, fmtSubheading_, COL_TEXT_PRIMARY);
+        drawText(who, { hx, hy, hrx, hy + 24.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
         hy += 26.0f;
 
         uint8_t perms = hStatus.permissions;
@@ -2308,13 +2327,13 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
                        COL_DANGER, COL_DANGER_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
                            network_.disconnectHostClient();
                            showToast("Disconnected viewer");
-                       }, fmtSmall_);
+                       }, ui::FontRole::Small);
         }
     } else {
         float midY = hostBox.centerY();
         drawPulseDot(hx + 6.0f, midY - 10.0f, 4.2f, COL_SUCCESS, alpha);
-        drawText("Ready for connections", { hx + 18.0f, midY - 22.0f, hrx, midY + 2.0f }, fmtSubheading_, COL_TEXT_PRIMARY);
-        drawText("Your desktop is ready to share.", { hx + 18.0f, midY + 2.0f, hrx, midY + 24.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        drawText("Ready for connections", { hx + 18.0f, midY - 22.0f, hrx, midY + 2.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
+        drawText("Your desktop is ready to share.", { hx + 18.0f, midY + 2.0f, hrx, midY + 24.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     }
 
     // ========== RIGHT COLUMN: REMOTE DESK & SAVED/NEARBY DESKS ==========
@@ -2326,10 +2345,10 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
     float crx = connectCard.right - 24.0f;
     float cy = connectCard.top + 20.0f;
 
-    drawText("Remote Desk", { cx, cy, crx, cy + 26.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    drawText("Remote Desk", { cx, cy, crx, cy + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
     cy += 25.0f;
     drawText("Enter a Desk ID to connect to another computer.",
-             { cx, cy, crx, cy + 20.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+             { cx, cy, crx, cy + 20.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     cy += 28.0f;
 
     float totalInputW = crx - cx;
@@ -2361,13 +2380,13 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
     auto discovered = network_.discoveredPeers();
     auto recents = identity_.recentSessions();
 
-    drawText("Saved & Nearby Desks", { px, py, prx - 110.0f, py + 26.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    drawText("Saved & Nearby Desks", { px, py, prx - 110.0f, py + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
     UiRect refreshBtn = { prx - 92.0f, py - 2.0f, prx, py + 28.0f };
     drawButton("btn_refresh_lan", refreshBtn, "Refresh",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
                    network_.sendDiscoveryQuery(0);
                    showToast("Refreshing nearby desks...");
-               }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
     py += 38.0f;
 
@@ -2391,7 +2410,7 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
                    isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
                    6.0f, [this, t]() {
                        dashboardFilterTag_ = t;
-                   }, fmtSmall_, !isActive, COL_BORDER,
+                   }, ui::FontRole::Small, !isActive, COL_BORDER,
                    isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
         chipX = chipRect.right + 5.0f;
     }
@@ -2494,10 +2513,10 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
         drawPulseDot(emptyBox.centerX(), cyEmpty - 24.0f, 5.5f, COL_PRIMARY_ACCENT, alpha);
         drawText("No matching desks found",
                  { emptyBox.left + 24.0f, cyEmpty - 8.0f, emptyBox.right - 24.0f, cyEmpty + 16.0f },
-                 fmtSubheading_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_CENTER);
+                 ui::FontRole::Subheading, COL_TEXT_PRIMARY, ui::HAlign::Center);
         drawText("Try changing search keywords or active filter tag.",
                  { emptyBox.left + 24.0f, cyEmpty + 18.0f, emptyBox.right - 24.0f, cyEmpty + 42.0f },
-                 fmtSmall_, COL_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_CENTER);
+                 ui::FontRole::Small, COL_TEXT_SECONDARY, ui::HAlign::Center);
     } else {
         int cols = 2;
         float gap = 14.0f;
@@ -2533,12 +2552,12 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
                 std::string badge = cardItems[i].isFavorite ? "FAVORITE • ONLINE" : "ONLINE";
                 if (!cardItems[i].tag.empty()) badge += " • [" + cardItems[i].tag + "]";
                 drawText(badge, { cardR.left + 28.0f, cardR.top + 10.0f, cardR.right - 92.0f, cardR.top + 26.0f },
-                         fmtSmall_, cardItems[i].isFavorite ? COL_PRIMARY_ACCENT : COL_TEXT_SECONDARY);
+                         ui::FontRole::Small, cardItems[i].isFavorite ? COL_PRIMARY_ACCENT : COL_TEXT_SECONDARY);
             } else {
                 std::string badge = cardItems[i].isFavorite ? "FAVORITE" : "RECENT";
                 if (!cardItems[i].tag.empty()) badge += " • [" + cardItems[i].tag + "]";
                 drawText(badge, { cardR.left + 14.0f, cardR.top + 10.0f, cardR.right - 92.0f, cardR.top + 26.0f },
-                         fmtSmall_, cardItems[i].isFavorite ? COL_PRIMARY_ACCENT : COL_TEXT_MUTED);
+                         ui::FontRole::Small, cardItems[i].isFavorite ? COL_PRIMARY_ACCENT : COL_TEXT_MUTED);
             }
 
             uint64_t peerId = cardItems[i].deskId;
@@ -2557,7 +2576,7 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
                                } else {
                                    showToast("Failed to create desktop shortcut", true);
                                }
-                            }, fmtSmall_, true, COL_BORDER, COL_PRIMARY_ACCENT);
+                            }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
             }
 
             // Edit Alias / Tag / Notes Button
@@ -2571,7 +2590,7 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
                                editTagInput_ = item.tag;
                                editNotesInput_ = item.notes;
                                showAddressBookEditModal_ = true;
-                           }, fmtSmall_, true, COL_BORDER, COL_PRIMARY_ACCENT);
+                           }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
             }
 
             // Vector Star Favorite button
@@ -2583,7 +2602,7 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
                            6.0f, [this, peerId, peerHost, peerEp]() {
                                identity_.addOrUpdateRecentSession(peerId, peerHost, peerEp);
                                identity_.toggleFavoriteSession(peerId);
-                           }, fmtSmall_);
+                           }, ui::FontRole::Small);
                 UiRect favAnim = getWidgetAnimRect(favId, favBtn);
                 drawIconStar(favAnim.centerX(), favAnim.centerY(), 5.8f, cardItems[i].isFavorite,
                              cardItems[i].isFavorite ? COL_PRIMARY_ACCENT : COL_TEXT_SECONDARY);
@@ -2597,7 +2616,7 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
                            COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_SECONDARY,
                            6.0f, [this, peerId]() {
                                identity_.removeRecentSession(peerId);
-                           }, fmtSmall_, false, D2D1::ColorF(0, 0, 0, 0), COL_TEXT_ON_ACCENT);
+                           }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0}, COL_TEXT_ON_ACCENT);
                 UiRect delAnim = getWidgetAnimRect(delId, delBtn);
                 float delHover = std::clamp(widgetAnims_[delId].hoverT, 0.0f, 1.0f);
                 drawIconClose(delAnim.centerX(), delAnim.centerY(), 3.6f,
@@ -2607,7 +2626,7 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
             std::string idFormatted = (peerId > 0) ? CryptoUtils::formatDeskId(peerId) : peerEp;
             std::string mainTitle = !cardItems[i].alias.empty() ? cardItems[i].alias : idFormatted;
             drawText(mainTitle, { cardR.left + 14.0f, cardR.top + 28.0f, cardR.right - 128.0f, cardR.top + 54.0f },
-                     fmtSubheading_, lerpColor(COL_TEXT_PRIMARY, COL_PRIMARY_ACCENT, std::clamp(cardHover, 0.0f, 1.0f) * 0.7f));
+                     ui::FontRole::Subheading, lerpColor(COL_TEXT_PRIMARY, COL_PRIMARY_ACCENT, std::clamp(cardHover, 0.0f, 1.0f) * 0.7f));
 
             std::string subInfo;
             if (!cardItems[i].alias.empty()) {
@@ -2616,7 +2635,7 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
                 subInfo = peerHost.empty() ? peerEp : peerHost;
             }
             drawText(subInfo, { cardR.left + 14.0f, cardR.top + 54.0f, cardR.right - 128.0f, cardR.bottom - 10.0f },
-                     fmtSmall_, COL_TEXT_SECONDARY);
+                     ui::FontRole::Small, COL_TEXT_SECONDARY);
 
             std::string targetStr = (peerId > 0) ? CryptoUtils::formatDeskId(peerId) : peerEp;
             UiRect quickConnBtn = { cardR.right - 98.0f, cardR.top + 38.0f, cardR.right - 12.0f, cardR.bottom - 16.0f };
@@ -2624,7 +2643,7 @@ void CppDeskWindow::drawDashboardView(const UiRect& bounds, float alpha) {
                        COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this, targetStr]() {
                            remoteIdInput_ = targetStr;
                            initiateConnection();
-                       }, fmtSmall_);
+                       }, ui::FontRole::Small);
 
             clickRegions_.push_back({ cardR, cardItemId, [this, targetStr]() {
                 remoteIdInput_ = targetStr;
@@ -2655,14 +2674,14 @@ void CppDeskWindow::drawSessionTabBar(const UiRect& bounds, float alpha) {
         bool isActive = (tab.id == sessionTabs_.activeTabId());
         UiRect chipRect = { curX, tabY, curX + tabW, tabY + tabH };
 
-        D2D1_COLOR_F chipBg = isActive ? COL_BG_CARD : withAlpha(COL_BG_INPUT, 0.75f);
-        D2D1_COLOR_F chipBorder = isActive ? COL_PRIMARY_ACCENT : COL_BORDER;
+        ui::Color chipBg = isActive ? COL_BG_CARD : withAlpha(COL_BG_INPUT, 0.75f);
+        ui::Color chipBorder = isActive ? COL_PRIMARY_ACCENT : COL_BORDER;
 
         // Base chip click area
         std::string tabChipId = "tab_chip_" + std::to_string(tab.id);
         drawButton(tabChipId, chipRect, "", chipBg, withAlpha(chipBg, 0.85f), COL_TEXT_PRIMARY, 6.0f, [this, tabId = tab.id]() {
             switchToSessionTab(tabId);
-        }, nullptr, true, chipBorder);
+        }, ui::FontRole::BodyBold, true, chipBorder);
 
         // Status indicator dot
         bool isConn = (tab.state == ViewerConnectionState::Connected);
@@ -2671,21 +2690,21 @@ void CppDeskWindow::drawSessionTabBar(const UiRect& bounds, float alpha) {
                              tab.state == ViewerConnectionState::Authenticating ||
                              tab.state == ViewerConnectionState::WaitingApproval ||
                              tab.state == ViewerConnectionState::Reconnecting);
-        D2D1_COLOR_F dotColor = isConn ? COL_SUCCESS : (isConnecting ? COL_WARNING : COL_TEXT_MUTED);
+        ui::Color dotColor = isConn ? COL_SUCCESS : (isConnecting ? COL_WARNING : COL_TEXT_MUTED);
         drawPulseDot(chipRect.left + 10.0f, chipRect.centerY(), 3.2f, dotColor, alpha);
 
         // Title
         std::string displayTitle = tab.title.empty() ? (tab.targetInput.empty() ? ("Desk " + std::to_string(tab.deskId)) : tab.targetInput) : tab.title;
         UiRect titleRect = { chipRect.left + 18.0f, chipRect.top, chipRect.right - 22.0f, chipRect.bottom };
-        drawText(displayTitle, titleRect, fmtSmall_, isActive ? COL_TEXT_PRIMARY : COL_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_LEADING);
+        drawText(displayTitle, titleRect, ui::FontRole::Small, isActive ? COL_TEXT_PRIMARY : COL_TEXT_SECONDARY, ui::HAlign::Leading);
 
         // Close button '×'
         UiRect closeRect = { chipRect.right - 20.0f, chipRect.top + 3.0f, chipRect.right - 4.0f, chipRect.bottom - 3.0f };
         std::string closeBtnId = "tab_close_" + std::to_string(tab.id);
-        drawButton(closeBtnId, closeRect, "×", D2D1::ColorF(0, 0, 0, 0), withAlpha(COL_DANGER, 0.35f),
+        drawButton(closeBtnId, closeRect, "×", ui::Color{0, 0, 0, 0}, withAlpha(COL_DANGER, 0.35f),
                    isActive ? COL_TEXT_PRIMARY : COL_TEXT_MUTED, 4.0f, [this, tabId = tab.id]() {
             closeSessionTab(tabId);
-        }, fmtSmall_);
+        }, ui::FontRole::Small);
 
         curX += tabW + 4.0f;
     }
@@ -2695,7 +2714,7 @@ void CppDeskWindow::drawSessionTabBar(const UiRect& bounds, float alpha) {
     drawButton("tab_plus_btn", plusRect, "+", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
         switchTab(ActiveTab::Dashboard);
         focusedField_ = FocusedField::RemoteId;
-    }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 }
 
 // ---------------- Remote Session View ----------------
@@ -2725,16 +2744,16 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
         std::string peerTitle = stats.remoteHostname.empty()
             ? CryptoUtils::formatDeskId(stats.remoteDeskId)
             : stats.remoteHostname;
-        drawText(peerTitle, { bx, hudBar.top, bx + 170.0f, hudBar.bottom }, fmtBodyBold_, COL_TEXT_PRIMARY);
+        drawText(peerTitle, { bx, hudBar.top, bx + 170.0f, hudBar.bottom }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
         bx += 174.0f;
 
         drawPulseDot(bx + 4.0f, hudBar.centerY(), 3.6f, COL_SUCCESS, alpha);
         if (appSett.showSessionHud) {
             char fpsBuf[48];
             std::snprintf(fpsBuf, sizeof(fpsBuf), "Connected • %.0f FPS", stats.fps);
-            drawText(fpsBuf, { bx + 13.0f, hudBar.top, bx + 165.0f, hudBar.bottom }, fmtSmall_, COL_TEXT_SECONDARY);
+            drawText(fpsBuf, { bx + 13.0f, hudBar.top, bx + 165.0f, hudBar.bottom }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         } else {
-            drawText("Connected", { bx + 13.0f, hudBar.top, bx + 110.0f, hudBar.bottom }, fmtSmall_, COL_TEXT_SECONDARY);
+            drawText("Connected", { bx + 13.0f, hudBar.top, bx + 110.0f, hudBar.bottom }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         }
 
         // Pinned Disconnect Button on far right
@@ -2759,7 +2778,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                            switchTab(ActiveTab::Dashboard);
                            showToast("Disconnected");
                        }
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
 
         // Viewport and container bounds for session controls
         float statusRight = bx + (appSett.showSessionHud ? 175.0f : 120.0f);
@@ -2768,12 +2787,12 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             std::string id;
             std::string label;
             float width;
-            D2D1_COLOR_F bgColor;
-            D2D1_COLOR_F hoverColor;
-            D2D1_COLOR_F textColor;
+            ui::Color bgColor;
+            ui::Color hoverColor;
+            ui::Color textColor;
             bool hasBorder;
-            D2D1_COLOR_F borderColor;
-            D2D1_COLOR_F hoverTextColor;
+            ui::Color borderColor;
+            ui::Color hoverTextColor;
             std::function<void()> onClick;
         };
 
@@ -3144,7 +3163,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                                sessionHudScrollTarget_ = std::clamp(sessionHudScrollTarget_ - 110.0f, 0.0f, sessionHudMaxScroll_);
                                InvalidateRect(hwnd_, nullptr, FALSE);
                            }
-                       }, fmtSmall_, true, COL_BORDER, hasLeft ? COL_TEXT_ACCENT : rgba(255, 255, 255, 0.25f));
+                       }, ui::FontRole::Small, true, COL_BORDER, hasLeft ? COL_TEXT_ACCENT : rgba(255, 255, 255, 0.25f));
 
             UiRect rBtn = { containerRect.right - 23.0f, containerRect.top + 2.0f, containerRect.right - 3.0f, containerRect.bottom - 2.0f };
             bool hasRight = sessionHudScrollTarget_ < sessionHudMaxScroll_ - 2.0f;
@@ -3157,7 +3176,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                                sessionHudScrollTarget_ = std::clamp(sessionHudScrollTarget_ + 110.0f, 0.0f, sessionHudMaxScroll_);
                                InvalidateRect(hwnd_, nullptr, FALSE);
                            }
-                       }, fmtSmall_, true, COL_BORDER, hasRight ? COL_TEXT_ACCENT : rgba(255, 255, 255, 0.25f));
+                       }, ui::FontRole::Small, true, COL_BORDER, hasRight ? COL_TEXT_ACCENT : rgba(255, 255, 255, 0.25f));
 
             stripViewport.left += 26.0f;
             stripViewport.right -= 26.0f;
@@ -3173,7 +3192,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             UiRect btnRect = { curBtnX, stripViewport.top + 2.0f, curBtnX + btn.width, stripViewport.bottom - 2.0f };
             if (btnRect.right > stripViewport.left && btnRect.left < stripViewport.right) {
                 drawButton(btn.id, btnRect, btn.label, btn.bgColor, btn.hoverColor, btn.textColor,
-                           7.5f, btn.onClick, fmtSmall_, btn.hasBorder, btn.borderColor, btn.hoverTextColor);
+                           7.5f, btn.onClick, ui::FontRole::Small, btn.hasBorder, btn.borderColor, btn.hoverTextColor);
                 if (!clickRegions_.empty() && clickRegions_.back().id == btn.id) {
                     clickRegions_.back().rect.left = std::max(clickRegions_.back().rect.left, stripViewport.left);
                     clickRegions_.back().rect.right = std::min(clickRegions_.back().rect.right, stripViewport.right);
@@ -3317,9 +3336,9 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
         if (remoteCursor_.visible && appSett.showRemoteCursor) {
             float curX = renderedCanvasRect_.left + remoteCursor_.normX * renderedCanvasRect_.width();
             float curY = renderedCanvasRect_.top + remoteCursor_.normY * renderedCanvasRect_.height();
-            solidBrush_->SetColor(withAlpha(COL_PRIMARY_ACCENT, 0.92f));
+            solidBrush_->SetColor(toD2D(withAlpha(COL_PRIMARY_ACCENT, 0.92f)));
             renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(curX, curY), 5.0f, 5.0f), solidBrush_);
-            solidBrush_->SetColor(rgba(255, 255, 255, 0.98f));
+            solidBrush_->SetColor(toD2D(rgba(255, 255, 255, 0.98f)));
             renderTarget_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(curX, curY), 6.0f, 6.0f), solidBrush_, 1.6f);
         }
 
@@ -3368,7 +3387,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                            COL_TEXT_ON_ACCENT, 5.0f, [this, m]() {
                                network_.selectRemoteMonitor(m.index);
                                showToast("Focused Display " + std::to_string(m.index + 1));
-                           }, fmtSmall_, true, withAlpha(COL_PRIMARY_ACCENT, 0.6f));
+                           }, ui::FontRole::Small, true, withAlpha(COL_PRIMARY_ACCENT, 0.6f));
             }
         }
 
@@ -3386,18 +3405,18 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                 float ripRadius = 16.0f + 64.0f * std::sin(t * 1.57079f);
                 float ripAlpha = (1.0f - t) * alpha;
 
-                solidBrush_->SetColor(withAlpha(COL_PRIMARY_ACCENT, ripAlpha * 0.7f));
+                solidBrush_->SetColor(toD2D(withAlpha(COL_PRIMARY_ACCENT, ripAlpha * 0.7f)));
                 renderTarget_->DrawEllipse(D2D1::Ellipse(canvasDropPos_, ripRadius, ripRadius), solidBrush_, 2.4f);
 
-                solidBrush_->SetColor(withAlpha(COL_PRIMARY_ACCENT, ripAlpha * 0.35f));
+                solidBrush_->SetColor(toD2D(withAlpha(COL_PRIMARY_ACCENT, ripAlpha * 0.35f)));
                 renderTarget_->FillEllipse(D2D1::Ellipse(canvasDropPos_, 12.0f * (1.0f - t), 12.0f * (1.0f - t)), solidBrush_);
 
                 UiRect badge = { canvasDropPos_.x - 85.0f, canvasDropPos_.y + ripRadius + 6.0f,
                                  canvasDropPos_.x + 85.0f, canvasDropPos_.y + ripRadius + 28.0f };
                 fillRoundRect(badge, 6.0f, rgba(28, 27, 25, ripAlpha * 0.92f));
                 strokeRoundRect(badge, 6.0f, withAlpha(COL_PRIMARY_ACCENT, ripAlpha * 0.5f));
-                drawText("Dropped " + std::to_string(canvasDropCount_) + " file(s)", badge, fmtSmall_,
-                         withAlpha(COL_TEXT_PRIMARY, ripAlpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+                drawText("Dropped " + std::to_string(canvasDropCount_) + " file(s)", badge, ui::FontRole::Small,
+                         withAlpha(COL_TEXT_PRIMARY, ripAlpha), ui::HAlign::Center);
             } else {
                 canvasDropEffectActive_ = false;
             }
@@ -3433,13 +3452,13 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
 
             std::string dirIcon = activeItem->isOutgoing ? "^" : "v";
             drawText(dirIcon, { hudPill.left + 10.0f, hudPill.top + 6.0f, hudPill.left + 24.0f, hudPill.top + 22.0f },
-                     fmtBodyBold_, COL_PRIMARY_ACCENT);
+                     ui::FontRole::BodyBold, COL_PRIMARY_ACCENT);
 
             drawText(activeItem->fileName, { hudPill.left + 26.0f, hudPill.top + 6.0f, hudPill.right - 50.0f, hudPill.top + 22.0f },
-                     fmtSmall_, COL_HUD_TEXT);
+                     ui::FontRole::Small, COL_HUD_TEXT);
 
             drawText(pctBuf, { hudPill.right - 48.0f, hudPill.top + 6.0f, hudPill.right - 10.0f, hudPill.top + 22.0f },
-                     fmtSmall_, COL_HUD_TEXT_ACCENT, DWRITE_TEXT_ALIGNMENT_TRAILING);
+                     ui::FontRole::Small, COL_HUD_TEXT_ACCENT, ui::HAlign::Trailing);
 
             UiRect barBg = { hudPill.left + 10.0f, hudPill.bottom - 14.0f, hudPill.right - 10.0f, hudPill.bottom - 8.0f };
             fillRoundRect(barBg, 3.0f, rgba(255, 255, 255, 0.08f));
@@ -3466,8 +3485,8 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
 
             uint64_t tick = GetTickCount64();
             float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(tick % 1000) / 1000.0f * 6.28318f);
-            D2D1_COLOR_F dotColor = D2D1::ColorF(0.95f, 0.2f, 0.2f, 0.5f + 0.5f * pulse);
-            solidBrush_->SetColor(dotColor);
+            ui::Color dotColor = ui::Color{0.95f, 0.2f, 0.2f, 0.5f + 0.5f * pulse};
+            solidBrush_->SetColor(toD2D(dotColor));
             renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(recPill.left + 16.0f, recPill.centerY()), 5.0f, 5.0f), solidBrush_);
 
             uint64_t durSec = sessionRecorder_.durationSeconds();
@@ -3476,7 +3495,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                           (unsigned long long)(durSec / 60), (unsigned long long)(durSec % 60));
 
             UiRect recTextRect = { recPill.left + 28.0f, recPill.top, recPill.right - 30.0f, recPill.bottom };
-            drawText(recTimeBuf, recTextRect, fmtSmall_, rgba(255, 255, 255, 0.95f), DWRITE_TEXT_ALIGNMENT_LEADING);
+            drawText(recTimeBuf, recTextRect, ui::FontRole::Small, rgba(255, 255, 255, 0.95f), ui::HAlign::Leading);
 
             // Interactive stop / dismiss button on pill
             UiRect recStopBtn = { recPill.right - 26.0f, recPill.top + 4.0f, recPill.right - 6.0f, recPill.bottom - 4.0f };
@@ -3485,7 +3504,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                        10.0f, [this]() {
                            toggleScreenRecording();
                            InvalidateRect(hwnd_, nullptr, FALSE);
-                       }, fmtSmall_);
+                       }, ui::FontRole::Small);
         }
 
         // Voice Intercom Live In-Canvas Pill (Feature 4)
@@ -3501,7 +3520,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                                 topY + icomH };
 
             bool isMuted = network_.isVoiceIntercomMicMuted();
-            D2D1_COLOR_F accentCol = isMuted ? rgba(239, 68, 68, 0.9f) : rgba(16, 185, 129, 0.9f);
+            ui::Color accentCol = isMuted ? rgba(239, 68, 68, 0.9f) : rgba(16, 185, 129, 0.9f);
 
             fillRoundRect(icomPill, 16.0f, rgba(15, 23, 42, 0.94f));
             strokeRoundRect(icomPill, 16.0f, withAlpha(accentCol, 0.75f), 1.2f);
@@ -3509,12 +3528,12 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             // Audio level indicator dot with size responding to RMS volume
             float lvl = network_.voiceIntercomInputLevel();
             float dotRadius = 4.0f + std::min(lvl * 12.0f, 4.0f);
-            solidBrush_->SetColor(accentCol);
+            solidBrush_->SetColor(toD2D(accentCol));
             renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(icomPill.left + 16.0f, icomPill.centerY()), dotRadius, dotRadius), solidBrush_);
 
             std::string icomText = isMuted ? "Mic: Muted" : "Voice: Live";
             UiRect icomTextRect = { icomPill.left + 28.0f, icomPill.top, icomPill.right - 30.0f, icomPill.bottom };
-            drawText(icomText, icomTextRect, fmtSmall_, rgba(255, 255, 255, 0.95f), DWRITE_TEXT_ALIGNMENT_LEADING);
+            drawText(icomText, icomTextRect, ui::FontRole::Small, rgba(255, 255, 255, 0.95f), ui::HAlign::Leading);
 
             // Interactive stop / dismiss button on pill
             UiRect icomStopBtn = { icomPill.right - 26.0f, icomPill.top + 4.0f, icomPill.right - 6.0f, icomPill.bottom - 4.0f };
@@ -3524,7 +3543,7 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                            network_.stopVoiceIntercom();
                            showToast("Voice Intercom stopped");
                            InvalidateRect(hwnd_, nullptr, FALSE);
-                       }, fmtSmall_);
+                       }, ui::FontRole::Small);
         }
     } else {
         renderedCanvasRect_ = {};
@@ -3541,11 +3560,11 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
 
             drawPulseDot(bannerRect.centerX(), bannerRect.top + 28.0f, 5.0f, COL_PRIMARY_ACCENT);
             drawText("Host Restarting...", { bannerRect.left + 20.0f, bannerRect.top + 42.0f, bannerRect.right - 20.0f, bannerRect.top + 68.0f },
-                     fmtHeading_, COL_HUD_TEXT, DWRITE_TEXT_ALIGNMENT_CENTER);
+                     ui::FontRole::Heading, COL_HUD_TEXT, ui::HAlign::Center);
 
             std::string subText = "Auto-reconnecting with security token...\nWaiting for remote system to come back online.";
             drawText(subText, { bannerRect.left + 20.0f, bannerRect.top + 70.0f, bannerRect.right - 20.0f, bannerRect.bottom - 46.0f },
-                     fmtSmall_, COL_HUD_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_CENTER);
+                     ui::FontRole::Small, COL_HUD_TEXT_SECONDARY, ui::HAlign::Center);
 
             UiRect cancelBtn = { bannerRect.centerX() - 70.0f, bannerRect.bottom - 38.0f, bannerRect.centerX() + 70.0f, bannerRect.bottom - 10.0f };
             drawButton("btn_cancel_reboot_rec", cancelBtn, "Cancel Reconnect",
@@ -3554,9 +3573,9 @@ void CppDeskWindow::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                            network_.disconnectViewer();
                            hardResetViewerUiState();
                            showToast("Auto-reconnection cancelled");
-                       }, fmtSmall_, true, COL_BORDER);
+                       }, ui::FontRole::Small, true, COL_BORDER);
         } else {
-            drawText(stats.statusMessage, stageRect, fmtSubheading_, COL_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_CENTER);
+            drawText(stats.statusMessage, stageRect, ui::FontRole::Subheading, COL_TEXT_SECONDARY, ui::HAlign::Center);
         }
     }
 
@@ -3590,7 +3609,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
     // Sidebar header
     float navPad = 12.0f;
     float navY = navCard.top + 16.0f;
-    drawText("SETTINGS", { navCard.left + 16.0f, navY, navCard.right - 16.0f, navY + 18.0f }, fmtSmall_, COL_TEXT_ACCENT);
+    drawText("SETTINGS", { navCard.left + 16.0f, navY, navCard.right - 16.0f, navY + 18.0f }, ui::FontRole::Small, COL_TEXT_ACCENT);
     navY += 26.0f;
 
     struct NavItem {
@@ -3629,14 +3648,14 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        settingsScrollOffset_ = 0.0f;
                        settingsScrollTarget_ = 0.0f;
                        settingsScrollVel_ = 0.0f;
-                   }, fmtSmall_, !isActive, COL_BORDER, isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, !isActive, COL_BORDER, isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         navY += 44.0f;
     }
 
     // Version label at bottom of sidebar
     UiRect verRect = { navCard.left + 12.0f, navCard.bottom - 28.0f, navCard.right - 12.0f, navCard.bottom - 10.0f };
-    drawText("v" + std::string(CPP_DESK_VERSION), verRect, fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+    drawText("v" + std::string(CPP_DESK_VERSION), verRect, ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
 
     // Right content pane calculation
     float sectionContentH = 340.0f;
@@ -3680,10 +3699,10 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
     float innerW = crx - cx;
 
     if (settingsSection_ == SettingsSection::Appearance) {
-        drawText("Appearance & Visuals", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        drawText("Appearance & Visuals", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
         drawText("Customize color theme, remote cursor visibility, and performance telemetry.",
-                 { cx, cy, crx, cy + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
         // 1. Theme Segmented Box
@@ -3692,7 +3711,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         strokeRoundRect(themeBox, 12.0f, COL_BORDER);
 
         drawText("THEME", { themeBox.left + 16.0f, themeBox.top + 8.0f, themeBox.right - 16.0f, themeBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
         float halfBtnW = (innerW - 32.0f - 10.0f) * 0.5f;
         UiRect lightBtn = { themeBox.left + 16.0f, themeBox.top + 26.0f, themeBox.left + 16.0f + halfBtnW, themeBox.top + 58.0f };
         UiRect darkBtn  = { lightBtn.right + 10.0f, themeBox.top + 26.0f, themeBox.right - 16.0f, themeBox.top + 58.0f };
@@ -3706,7 +3725,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        ns.darkTheme = false;
                        identity_.updateSettings(ns);
                        applyWindowThemeAttribute();
-                   }, fmtSmall_, s.darkTheme, COL_BORDER, !s.darkTheme ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, s.darkTheme, COL_BORDER, !s.darkTheme ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         drawButton("sett_theme_dark", darkBtn, "Dark",
                    s.darkTheme ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
@@ -3717,7 +3736,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        ns.darkTheme = true;
                        identity_.updateSettings(ns);
                        applyWindowThemeAttribute();
-                   }, fmtSmall_, !s.darkTheme, COL_BORDER, s.darkTheme ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, !s.darkTheme, COL_BORDER, s.darkTheme ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         cy = themeBox.bottom + 14.0f;
 
@@ -3727,7 +3746,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         strokeRoundRect(curBox, 12.0f, COL_BORDER);
 
         drawText("INTERFACE & CURSOR", { curBox.left + 16.0f, curBox.top + 8.0f, curBox.right - 16.0f, curBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         drawToggleSwitch("sett_show_cursor", { curBox.left + 16.0f, curBox.top + 26.0f, curBox.right - 16.0f, curBox.top + 52.0f },
                          s.showRemoteCursor, "Show remote cursor", [this]() {
@@ -3746,10 +3765,10 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         cy = curBox.bottom + 14.0f;
     }
     else if (settingsSection_ == SettingsSection::DisplayQuality) {
-        drawText("Display & Streaming Quality", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        drawText("Display & Streaming Quality", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
         drawText("Fine-tune connection presets, target framerate, video scaling, and hardware acceleration.",
-                 { cx, cy, crx, cy + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
         // 1. Connection Quality Profiles
@@ -3761,7 +3780,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         std::string profHeader = "QUALITY PRESET PROFILE: " + std::string(connectionProfileName(curProf));
         drawText(profHeader,
                  { profBox.left + 16.0f, profBox.top + 8.0f, profBox.right - 16.0f, profBox.top + 22.0f },
-                 fmtSmall_, (curProf == ConnectionProfile::Custom) ? COL_WARNING : COL_TEXT_ACCENT);
+                 ui::FontRole::Small, (curProf == ConnectionProfile::Custom) ? COL_WARNING : COL_TEXT_ACCENT);
 
         float quarterW = (innerW - 32.0f - 24.0f) / 4.0f;
         UiRect pLowBtn      = { profBox.left + 16.0f, profBox.top + 26.0f, profBox.left + 16.0f + quarterW, profBox.top + 58.0f };
@@ -3786,7 +3805,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                    (curProf == ConnectionProfile::LowBandwidth) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (curProf == ConnectionProfile::LowBandwidth) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (curProf == ConnectionProfile::LowBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [applyProfUi]() { applyProfUi(ConnectionProfile::LowBandwidth); }, fmtSmall_,
+                   8.0f, [applyProfUi]() { applyProfUi(ConnectionProfile::LowBandwidth); }, ui::FontRole::Small,
                    curProf != ConnectionProfile::LowBandwidth, COL_BORDER,
                    (curProf == ConnectionProfile::LowBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
@@ -3794,7 +3813,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                    (curProf == ConnectionProfile::BalancedBandwidth) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (curProf == ConnectionProfile::BalancedBandwidth) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (curProf == ConnectionProfile::BalancedBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [applyProfUi]() { applyProfUi(ConnectionProfile::BalancedBandwidth); }, fmtSmall_,
+                   8.0f, [applyProfUi]() { applyProfUi(ConnectionProfile::BalancedBandwidth); }, ui::FontRole::Small,
                    curProf != ConnectionProfile::BalancedBandwidth, COL_BORDER,
                    (curProf == ConnectionProfile::BalancedBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
@@ -3802,7 +3821,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                    (curProf == ConnectionProfile::HighBandwidth) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (curProf == ConnectionProfile::HighBandwidth) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (curProf == ConnectionProfile::HighBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [applyProfUi]() { applyProfUi(ConnectionProfile::HighBandwidth); }, fmtSmall_,
+                   8.0f, [applyProfUi]() { applyProfUi(ConnectionProfile::HighBandwidth); }, ui::FontRole::Small,
                    curProf != ConnectionProfile::HighBandwidth, COL_BORDER,
                    (curProf == ConnectionProfile::HighBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
@@ -3810,7 +3829,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                    (curProf == ConnectionProfile::VeryHighBandwidth) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (curProf == ConnectionProfile::VeryHighBandwidth) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (curProf == ConnectionProfile::VeryHighBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [applyProfUi]() { applyProfUi(ConnectionProfile::VeryHighBandwidth); }, fmtSmall_,
+                   8.0f, [applyProfUi]() { applyProfUi(ConnectionProfile::VeryHighBandwidth); }, ui::FontRole::Small,
                    curProf != ConnectionProfile::VeryHighBandwidth, COL_BORDER,
                    (curProf == ConnectionProfile::VeryHighBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
@@ -3823,7 +3842,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         drawText("FRAME RATE",
                  { fpsBox.left + 16.0f, fpsBox.top + 8.0f, fpsBox.right - 16.0f, fpsBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         uint8_t curFps = clampTargetFps(s.targetFps);
         UiRect fps15Btn = { fpsBox.left + 16.0f, fpsBox.top + 26.0f, fpsBox.left + 16.0f + quarterW, fpsBox.top + 58.0f };
@@ -3842,28 +3861,28 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                    (curFps == 15) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (curFps == 15) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (curFps == 15) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setFpsAction]() { setFpsAction(15); }, fmtSmall_, curFps != 15, COL_BORDER,
+                   8.0f, [setFpsAction]() { setFpsAction(15); }, ui::FontRole::Small, curFps != 15, COL_BORDER,
                    (curFps == 15) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         drawButton("sett_fps_30", fps30Btn, "30 FPS",
                    (curFps == 30) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (curFps == 30) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (curFps == 30) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setFpsAction]() { setFpsAction(30); }, fmtSmall_, curFps != 30, COL_BORDER,
+                   8.0f, [setFpsAction]() { setFpsAction(30); }, ui::FontRole::Small, curFps != 30, COL_BORDER,
                    (curFps == 30) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         drawButton("sett_fps_45", fps45Btn, "45 FPS",
                    (curFps == 45) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (curFps == 45) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (curFps == 45) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setFpsAction]() { setFpsAction(45); }, fmtSmall_, curFps != 45, COL_BORDER,
+                   8.0f, [setFpsAction]() { setFpsAction(45); }, ui::FontRole::Small, curFps != 45, COL_BORDER,
                    (curFps == 45) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         drawButton("sett_fps_60", fps60Btn, "60 FPS",
                    (curFps == 60) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (curFps == 60) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (curFps == 60) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setFpsAction]() { setFpsAction(60); }, fmtSmall_, curFps != 60, COL_BORDER,
+                   8.0f, [setFpsAction]() { setFpsAction(60); }, ui::FontRole::Small, curFps != 60, COL_BORDER,
                    (curFps == 60) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         drawToggleSwitch("sett_adaptive_fps", { fpsBox.left + 16.0f, fpsBox.top + 68.0f, fpsBox.right - 16.0f, fpsBox.top + 98.0f },
@@ -3882,7 +3901,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         strokeRoundRect(qualBox, 12.0f, COL_BORDER);
 
         drawText("QUALITY & SCALING", { qualBox.left + 16.0f, qualBox.top + 8.0f, qualBox.right - 16.0f, qualBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         QualityPreset defQ = s.defaultQuality;
         float thirdW = (innerW - 32.0f - 16.0f) / 3.0f;
@@ -3904,21 +3923,21 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                    (defQ == QualityPreset::Ultra) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (defQ == QualityPreset::Ultra) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (defQ == QualityPreset::Ultra) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setQualAction]() { setQualAction(QualityPreset::Ultra); }, fmtSmall_, defQ != QualityPreset::Ultra, COL_BORDER,
+                   8.0f, [setQualAction]() { setQualAction(QualityPreset::Ultra); }, ui::FontRole::Small, defQ != QualityPreset::Ultra, COL_BORDER,
                    (defQ == QualityPreset::Ultra) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         drawButton("sett_q_bal", qBalBtn, "Balanced",
                    (defQ == QualityPreset::Balanced) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (defQ == QualityPreset::Balanced) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (defQ == QualityPreset::Balanced) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setQualAction]() { setQualAction(QualityPreset::Balanced); }, fmtSmall_, defQ != QualityPreset::Balanced, COL_BORDER,
+                   8.0f, [setQualAction]() { setQualAction(QualityPreset::Balanced); }, ui::FontRole::Small, defQ != QualityPreset::Balanced, COL_BORDER,
                    (defQ == QualityPreset::Balanced) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         drawButton("sett_q_fast", qFastBtn, "Fast",
                    (defQ == QualityPreset::LowBandwidth) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (defQ == QualityPreset::LowBandwidth) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (defQ == QualityPreset::LowBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setQualAction]() { setQualAction(QualityPreset::LowBandwidth); }, fmtSmall_, defQ != QualityPreset::LowBandwidth, COL_BORDER,
+                   8.0f, [setQualAction]() { setQualAction(QualityPreset::LowBandwidth); }, ui::FontRole::Small, defQ != QualityPreset::LowBandwidth, COL_BORDER,
                    (defQ == QualityPreset::LowBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         uint8_t defScale = s.defaultScaleMode;
@@ -3939,28 +3958,28 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                    (defScale == 0) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (defScale == 0) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (defScale == 0) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setScaleAction]() { setScaleAction(0); }, fmtSmall_, defScale != 0, COL_BORDER,
+                   8.0f, [setScaleAction]() { setScaleAction(0); }, ui::FontRole::Small, defScale != 0, COL_BORDER,
                    (defScale == 0) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         drawButton("sett_sc_fill", scFillBtn, "Fill",
                    (defScale == 3) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (defScale == 3) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (defScale == 3) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setScaleAction]() { setScaleAction(3); }, fmtSmall_, defScale != 3, COL_BORDER,
+                   8.0f, [setScaleAction]() { setScaleAction(3); }, ui::FontRole::Small, defScale != 3, COL_BORDER,
                    (defScale == 3) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         drawButton("sett_sc_str", scStrBtn, "Stretch",
                    (defScale == 1) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (defScale == 1) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (defScale == 1) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setScaleAction]() { setScaleAction(1); }, fmtSmall_, defScale != 1, COL_BORDER,
+                   8.0f, [setScaleAction]() { setScaleAction(1); }, ui::FontRole::Small, defScale != 1, COL_BORDER,
                    (defScale == 1) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         drawButton("sett_sc_orig", scOrigBtn, "1:1",
                    (defScale == 2) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                    (defScale == 2) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    (defScale == 2) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setScaleAction]() { setScaleAction(2); }, fmtSmall_, defScale != 2, COL_BORDER,
+                   8.0f, [setScaleAction]() { setScaleAction(2); }, ui::FontRole::Small, defScale != 2, COL_BORDER,
                    (defScale == 2) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         cy = qualBox.bottom + 12.0f;
@@ -3971,7 +3990,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         strokeRoundRect(ovBox, 12.0f, COL_BORDER);
 
         drawText("GRAPHICS ACCELERATION & VIRTUAL DISPLAY", { ovBox.left + 16.0f, ovBox.top + 8.0f, ovBox.right - 16.0f, ovBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         drawToggleSwitch("sett_hw_accel", { ovBox.left + 16.0f, ovBox.top + 26.0f, ovBox.right - 16.0f, ovBox.top + 52.0f },
                          s.hardwareAcceleration, "Hardware accelerated rendering (GPU)", [this]() {
@@ -3999,10 +4018,10 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
             }
         }
 
-        drawText("Audio & Voice Intercom", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        drawText("Audio & Voice Intercom", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
         drawText("Configure microphone, output audio devices, live input levels, and playback defaults.",
-                 { cx, cy, crx, cy + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
         if (cachedInputDevices_.empty()) cachedInputDevices_ = VoiceIntercom::enumerateInputDevices();
@@ -4015,7 +4034,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         drawText("MICROPHONE & INPUT LEVEL",
                  { inBox.left + 16.0f, inBox.top + 8.0f, inBox.right - 16.0f, inBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         std::string activeInputName = "System Default";
         for (const auto& dev : cachedInputDevices_) {
@@ -4035,12 +4054,12 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                    6.0f, [this]() {
                        showAudioInputMenu_ = !showAudioInputMenu_;
                        showAudioOutputMenu_ = false;
-                   }, fmtSmall_, !showAudioInputMenu_, COL_BORDER,
+                   }, ui::FontRole::Small, !showAudioInputMenu_, COL_BORDER,
                    showAudioInputMenu_ ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         // Live VU Meter Bar
         drawText("Input Level", { inBox.left + 16.0f, inBox.top + 64.0f, inBox.left + 90.0f, inBox.top + 82.0f },
-                 fmtSmall_, COL_TEXT_SECONDARY);
+                 ui::FontRole::Small, COL_TEXT_SECONDARY);
         UiRect vuTrack = { inBox.left + 95.0f, inBox.top + 69.0f, inBox.right - 16.0f, inBox.top + 77.0f };
         fillRoundRect(vuTrack, 4.0f, COL_STAGE_BG);
         strokeRoundRect(vuTrack, 4.0f, COL_BORDER, 1.0f);
@@ -4056,7 +4075,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         float vuWidth = vuTrack.width() * vuSmoothLevel_;
         if (vuWidth > 0.0f) {
-            D2D1_COLOR_F vuCol = (vuSmoothLevel_ > 0.85f) ? COL_DANGER : ((vuSmoothLevel_ > 0.65f) ? rgba(255, 185, 0, 1.0f) : COL_SUCCESS);
+            ui::Color vuCol = (vuSmoothLevel_ > 0.85f) ? COL_DANGER : ((vuSmoothLevel_ > 0.65f) ? rgba(255, 185, 0, 1.0f) : COL_SUCCESS);
             fillRoundRect({ vuTrack.left, vuTrack.top, vuTrack.left + vuWidth, vuTrack.bottom }, 4.0f, vuCol);
         }
 
@@ -4069,7 +4088,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         drawText("OUTPUT DEVICE & CHIME",
                  { outBox.left + 16.0f, outBox.top + 8.0f, outBox.right - 16.0f, outBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         std::string activeOutputName = "System Default";
         for (const auto& dev : cachedOutputDevices_) {
@@ -4083,7 +4102,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         drawButton("sett_audio_test_chime", chimeBtnRect, "Test Chime",
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 6.0f, []() {
                        MessageBeep(MB_OK);
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
 
         UiRect outBtnRect = { outBox.left + 16.0f, outBox.top + 26.0f, chimeBtnRect.left - 10.0f, outBox.top + 52.0f };
         audioOutputBtnRect_ = outBtnRect;
@@ -4095,7 +4114,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                    6.0f, [this]() {
                        showAudioOutputMenu_ = !showAudioOutputMenu_;
                        showAudioInputMenu_ = false;
-                   }, fmtSmall_, !showAudioOutputMenu_, COL_BORDER,
+                   }, ui::FontRole::Small, !showAudioOutputMenu_, COL_BORDER,
                    showAudioOutputMenu_ ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         cy = outBox.bottom + 12.0f;
@@ -4107,11 +4126,11 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         drawText("VOLUME & MUTE DEFAULTS",
                  { defBox.left + 16.0f, defBox.top + 8.0f, defBox.right - 16.0f, defBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         float vy = defBox.top + 32.0f;
         drawText("Default Volume", { defBox.left + 16.0f, vy - 4.0f, defBox.left + 115.0f, vy + 16.0f },
-                 fmtSmall_, COL_TEXT_SECONDARY);
+                 ui::FontRole::Small, COL_TEXT_SECONDARY);
         UiRect volTrack = { defBox.left + 120.0f, vy, defBox.right - 64.0f, vy + 8.0f };
         fillRoundRect(volTrack, 4.0f, COL_STAGE_BG);
         strokeRoundRect(volTrack, 4.0f, COL_BORDER, 1.0f);
@@ -4120,13 +4139,13 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
             fillRoundRect({ volTrack.left, volTrack.top, volTrack.left + fillW, volTrack.bottom }, 4.0f, COL_PRIMARY_ACCENT);
         }
         float thumbX = volTrack.left + fillW;
-        solidBrush_->SetColor(COL_PRIMARY_ACCENT);
+        solidBrush_->SetColor(toD2D(COL_PRIMARY_ACCENT));
         renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(thumbX, volTrack.centerY()), 6.0f, 6.0f), solidBrush_);
-        solidBrush_->SetColor(rgba(255, 255, 255, 0.85f));
+        solidBrush_->SetColor(toD2D(rgba(255, 255, 255, 0.85f)));
         renderTarget_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(thumbX, volTrack.centerY()), 6.0f, 6.0f), solidBrush_, 1.5f);
 
         UiRect volValRect = { volTrack.right + 10.0f, vy - 6.0f, defBox.right - 16.0f, vy + 14.0f };
-        drawText(std::to_string(s.defaultAudioVolume) + "%", volValRect, fmtSmall_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        drawText(std::to_string(s.defaultAudioVolume) + "%", volValRect, ui::FontRole::Small, COL_TEXT_PRIMARY, ui::HAlign::Trailing);
 
         UiRect volClickZone = volTrack.inflate(0.0f, 8.0f);
         clickRegions_.push_back(ClickRegion{ volClickZone, "sett_audio_vol_slider", [this, volTrack]() {
@@ -4154,10 +4173,10 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         cy = defBox.bottom + 12.0f;
     }
     else if (settingsSection_ == SettingsSection::Permissions) {
-        drawText("Access Permissions", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        drawText("Access Permissions", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
         drawText("Configure default security permissions for incoming viewer connections.",
-                 { cx, cy, crx, cy + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
         UiRect permBox = { cx, cy, crx, cy + 172.0f };
@@ -4166,7 +4185,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         drawText("DEFAULT HOST PERMISSIONS",
                  { permBox.left + 16.0f, permBox.top + 8.0f, permBox.right - 16.0f, permBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         float py = permBox.top + 26.0f;
         drawToggleSwitch("sett_auto_accept", { permBox.left + 16.0f, py, permBox.right - 16.0f, py + 24.0f },
@@ -4215,10 +4234,10 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         cy = permBox.bottom + 12.0f;
     }
     else if (settingsSection_ == SettingsSection::TwoFactorAuth) {
-        drawText("Two-Factor Authentication", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        drawText("Two-Factor Authentication", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
         drawText("Require an RFC 6238 time-based authenticator code (TOTP) when connecting unattended.",
-                 { cx, cy, crx, cy + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
         UiRect totpBox = { cx, cy, crx, cy + 246.0f };
@@ -4227,7 +4246,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         drawText("TWO-FACTOR AUTHENTICATION (TOTP)",
                  { totpBox.left + 16.0f, totpBox.top + 8.0f, totpBox.right - 16.0f, totpBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         drawToggleSwitch("sett_totp_enable",
                          { totpBox.left + 16.0f, totpBox.top + 26.0f, totpBox.right - 16.0f, totpBox.top + 50.0f },
@@ -4250,7 +4269,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         float totpInfoX = qrRect.right + 12.0f;
         float totpInfoRx = totpBox.right - 16.0f;
 
-        drawText("Secret Key (Base32):", { totpInfoX, qrRect.top, totpInfoRx, qrRect.top + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        drawText("Secret Key (Base32):", { totpInfoX, qrRect.top, totpInfoRx, qrRect.top + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
 
         std::string curSecret = s.totpSecret.empty() ? identity_.totpManager().getSecretBase32() : s.totpSecret;
         std::string formattedKey = TotpManager::formatBase32Secret(curSecret);
@@ -4259,14 +4278,14 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(keyBox, 6.0f, COL_BG_INPUT);
         strokeRoundRect(keyBox, 6.0f, COL_BORDER);
         drawText(formattedKey, { keyBox.left + 8.0f, keyBox.top, keyBox.right - 8.0f, keyBox.bottom },
-                 fmtMono_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_LEADING);
+                 ui::FontRole::Mono, COL_TEXT_PRIMARY, ui::HAlign::Leading);
 
         UiRect copyBtn = { keyBox.right + 6.0f, keyBox.top, totpInfoRx, keyBox.bottom };
         drawButton("sett_totp_copy", copyBtn, "Copy",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this, curSecret]() {
                        ClipboardManager::setClipboardUtf8(curSecret);
                        showToast("Secret key copied to clipboard");
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         UiRect regenBtn = { totpInfoX, keyBox.bottom + 8.0f, totpInfoRx, keyBox.bottom + 36.0f };
         drawButton("sett_totp_regen", regenBtn, "Regenerate Secret Key",
@@ -4282,11 +4301,11 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        totpEnrollSuccess_ = false;
                        totpEnrollFeedback_ = "New key generated. Enter 6-digit code below to re-enable.";
                        showToast("New 2FA key generated", false, 1800);
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         float verifyY = qrRect.bottom + 10.0f;
         drawText("Enrollment Code Verification:", { totpBox.left + 16.0f, verifyY, totpBox.right - 16.0f, verifyY + 16.0f },
-                 fmtSmall_, COL_TEXT_SECONDARY);
+                 ui::FontRole::Small, COL_TEXT_SECONDARY);
         verifyY += 18.0f;
 
         float testFieldW = 120.0f;
@@ -4316,20 +4335,20 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        } else {
                            totpEnrollFeedback_ = "Please enter 6 digits.";
                        }
-                   }, fmtSmall_, s.totpEnabled, COL_BORDER);
+                   }, ui::FontRole::Small, s.totpEnabled, COL_BORDER);
 
         UiRect fbRect = { verifyBtn.right + 8.0f, verifyY, totpBox.right - 16.0f, verifyY + 30.0f };
-        D2D1_COLOR_F fbCol = totpEnrollSuccess_ ? COL_SUCCESS : (totpEnrollFeedback_.empty() ? COL_TEXT_MUTED : COL_DANGER);
+        ui::Color fbCol = totpEnrollSuccess_ ? COL_SUCCESS : (totpEnrollFeedback_.empty() ? COL_TEXT_MUTED : COL_DANGER);
         drawText(totpEnrollFeedback_.empty() ? (s.totpEnabled ? "2FA Active" : "Verification required") : totpEnrollFeedback_,
-                 fbRect, fmtSmall_, fbCol, DWRITE_TEXT_ALIGNMENT_LEADING);
+                 fbRect, ui::FontRole::Small, fbCol, ui::HAlign::Leading);
 
         cy = totpBox.bottom + 12.0f;
     }
     else if (settingsSection_ == SettingsSection::NetworkRelay) {
-        drawText("Network & Relay", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        drawText("Network & Relay", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
         drawText("Configure rendezvous servers, relay routing, and RFC 5389 STUN NAT traversal.",
-                 { cx, cy, crx, cy + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
         UiRect netBox = { cx, cy, crx, cy + 196.0f };
@@ -4338,7 +4357,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         drawText("RELAY & RENDEZVOUS NETWORK",
                  { netBox.left + 16.0f, netBox.top + 8.0f, netBox.left + 240.0f, netBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         float presetW = 54.0f;
         float presetH = 20.0f;
@@ -4355,7 +4374,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        relayServerEdit_ = "relay.cppdesk.io:50999";
                        stunServerEdit_ = "stun.l.google.com:19302";
                        relayModeEdit_ = 0;
-                   }, fmtSmall_, relayModeEdit_ != 0, COL_BORDER);
+                   }, ui::FontRole::Small, relayModeEdit_ != 0, COL_BORDER);
 
         drawButton("sett_pre_loc", localPreset, "Localhost",
                    (relayModeEdit_ == 1) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
@@ -4365,7 +4384,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        relayServerEdit_ = "127.0.0.1:50999";
                        stunServerEdit_ = "stun.l.google.com:19302";
                        relayModeEdit_ = 1;
-                   }, fmtSmall_, relayModeEdit_ != 1, COL_BORDER);
+                   }, ui::FontRole::Small, relayModeEdit_ != 1, COL_BORDER);
 
         drawButton("sett_pre_lan", lanPreset, "LAN",
                    (relayModeEdit_ == 2) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
@@ -4375,7 +4394,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        relayServerEdit_ = "127.0.0.1:50999";
                        stunServerEdit_ = "";
                        relayModeEdit_ = 2;
-                   }, fmtSmall_, relayModeEdit_ != 2, COL_BORDER);
+                   }, ui::FontRole::Small, relayModeEdit_ != 2, COL_BORDER);
 
         float row1Y = netBox.top + 28.0f;
         UiRect relayField = { netBox.left + 16.0f, row1Y, netBox.right - 16.0f, row1Y + 30.0f };
@@ -4402,7 +4421,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         drawButton("sett_ping_btn", pingBtn, isDiagActive ? "Testing..." : "Test & Ping",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.0f, [this]() {
                        network_.startNetworkDiagnostics(relayServerEdit_, stunServerEdit_);
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         drawButton("sett_apply_relay", saveBtn, "Save & Apply",
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 7.0f, [this]() {
@@ -4414,7 +4433,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        identity_.updateSettings(ns);
                        network_.setRelayAddressAndReconnect(relayServerEdit_);
                        showToast("Network settings applied & reconnected");
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
 
         bool relayRunning = network_.isLocalRelayRunning();
         drawButton("sett_toggle_relay", toggleRelayBtn, relayRunning ? "Relay: ON" : "Relay: OFF",
@@ -4430,14 +4449,14 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        } else {
                            showToast("Relay port already in use", true);
                        }
-                   }, fmtSmall_, !relayRunning, COL_BORDER, relayRunning ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, !relayRunning, COL_BORDER, relayRunning ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         float row4Y = row3Y + 33.0f;
         RelayProbeResult rDiag;
         StunNatResult sDiag;
         bool hasResult = network_.getNetworkDiagnosticResult(rDiag, sDiag);
 
-        D2D1_COLOR_F dotCol = COL_TEXT_MUTED;
+        ui::Color dotCol = COL_TEXT_MUTED;
         std::string diagText;
         if (isDiagActive) {
             dotCol = COL_WARNING;
@@ -4458,15 +4477,15 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         drawPulseDot(netBox.left + 22.0f, row4Y + 14.0f, 3.8f, dotCol, alpha);
         UiRect diagTextRect = { netBox.left + 32.0f, row4Y, netBox.right - 16.0f, row4Y + 28.0f };
-        drawText(diagText, diagTextRect, fmtSmall_, COL_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_LEADING);
+        drawText(diagText, diagTextRect, ui::FontRole::Small, COL_TEXT_SECONDARY, ui::HAlign::Leading);
 
         cy = netBox.bottom + 12.0f;
     }
     else if (settingsSection_ == SettingsSection::CurtainPrivacy) {
-        drawText("Curtain Screen & Privacy", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        drawText("Curtain Screen & Privacy", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
         drawText("Customize privacy curtain display and organization security branding.",
-                 { cx, cy, crx, cy + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
         UiRect privBox = { cx, cy, crx, cy + 128.0f };
@@ -4475,7 +4494,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         drawText("CURTAIN SCREEN & PRIVACY BRANDING",
                  { privBox.left + 16.0f, privBox.top + 8.0f, privBox.right - 16.0f, privBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         float py1 = privBox.top + 25.0f;
         float pSaveW = 68.0f;
@@ -4493,7 +4512,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        identity_.updateSettings(ns);
                        network_.configurePrivacyCurtain(ns.privacyCustomNotice, ns.privacyBrandName, ns.privacyShowDeskId);
                        showToast("Privacy screen branding updated");
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
 
         float py2 = py1 + 32.0f;
         UiRect noticeField = { privBox.left + 16.0f, py2, privBox.right - 16.0f, py2 + 28.0f };
@@ -4518,7 +4537,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         drawText("PRIVACY CLOAK SENSITIVE WINDOW & PII AUTO-REDACTION",
                  { cloakBox.left + 16.0f, cloakBox.top + 8.0f, cloakBox.right - 16.0f, cloakBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         float cy1 = cloakBox.top + 26.0f;
         drawToggleSwitch("sett_cloak_enable", { cloakBox.left + 16.0f, cy1, cloakBox.right - 16.0f, cy1 + 24.0f },
@@ -4530,7 +4549,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                          }, "Black out or pixelate designated sensitive windows prior to frame encoding.");
 
         float cy2 = cy1 + 30.0f;
-        drawText("REDACTION STYLE", { cloakBox.left + 16.0f, cy2, cloakBox.left + 160.0f, cy2 + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        drawText("REDACTION STYLE", { cloakBox.left + 16.0f, cy2, cloakBox.left + 160.0f, cy2 + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         float styleHalfW = (innerW - 32.0f - 8.0f) * 0.5f;
         UiRect charBtn = { cloakBox.left + 16.0f, cy2 + 18.0f, cloakBox.left + 16.0f + styleHalfW, cy2 + 46.0f };
         UiRect mosaicBtn = { charBtn.right + 8.0f, cy2 + 18.0f, cloakBox.right - 16.0f, cy2 + 46.0f };
@@ -4545,7 +4564,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        ns.privacyCloakStyle = 0;
                        identity_.updateSettings(ns);
                        showToast("Redaction style: Solid Charcoal");
-                   }, fmtSmall_, !isCharcoal, COL_BORDER);
+                   }, ui::FontRole::Small, !isCharcoal, COL_BORDER);
 
         drawButton("sett_cloak_style_mos", mosaicBtn, "Mosaic Blurring",
                    !isCharcoal ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
@@ -4556,10 +4575,10 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        ns.privacyCloakStyle = 1;
                        identity_.updateSettings(ns);
                        showToast("Redaction style: Mosaic Blurring");
-                   }, fmtSmall_, isCharcoal, COL_BORDER);
+                   }, ui::FontRole::Small, isCharcoal, COL_BORDER);
 
         float cy3 = cy2 + 52.0f;
-        drawText("SENSITIVE WINDOW KEYWORDS (COMMA-SEPARATED)", { cloakBox.left + 16.0f, cy3, cloakBox.right - 16.0f, cy3 + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        drawText("SENSITIVE WINDOW KEYWORDS (COMMA-SEPARATED)", { cloakBox.left + 16.0f, cy3, cloakBox.right - 16.0f, cy3 + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         float cSaveW = 68.0f;
         UiRect kwField = { cloakBox.left + 16.0f, cy3 + 18.0f, cloakBox.right - 16.0f - cSaveW - 8.0f, cy3 + 48.0f };
         UiRect kwSaveBtn = { cloakBox.right - 16.0f - cSaveW, cy3 + 18.0f, cloakBox.right - 16.0f, cy3 + 48.0f };
@@ -4573,15 +4592,15 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        ns.privacyCloakKeywords = privacyKeywordsEdit_;
                        identity_.updateSettings(ns);
                        showToast("Privacy Cloak keywords saved");
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
 
         cy = cloakBox.bottom + 12.0f;
     }
     else if (settingsSection_ == SettingsSection::SystemService) {
-        drawText("System Service & Integration", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        drawText("System Service & Integration", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
         drawText("Manage the elevated Windows service daemon, desktop shortcuts, and Action Center notifications.",
-                 { cx, cy, crx, cy + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
         // 1. Windows System Service
@@ -4591,17 +4610,17 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         drawText("WINDOWS SYSTEM SERVICE",
                  { svcBox.left + 16.0f, svcBox.top + 8.0f, svcBox.left + 240.0f, svcBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         ServiceStatusState svcState = WindowsServiceManager::getServiceState();
         std::string svcStateLabel = (svcState == ServiceStatusState::Running) ? "Running" :
                                     (svcState == ServiceStatusState::Stopped) ? "Stopped" : "Not Installed";
-        D2D1_COLOR_F svcStateCol = (svcState == ServiceStatusState::Running) ? COL_SUCCESS :
+        ui::Color svcStateCol = (svcState == ServiceStatusState::Running) ? COL_SUCCESS :
                                    (svcState == ServiceStatusState::Stopped) ? COL_WARNING : COL_TEXT_MUTED;
 
         drawPulseDot(svcBox.right - 100.0f, svcBox.top + 15.0f, 3.8f, svcStateCol, alpha);
         drawText(svcStateLabel, { svcBox.right - 90.0f, svcBox.top + 7.0f, svcBox.right - 16.0f, svcBox.top + 23.0f },
-                 fmtSmall_, svcStateCol, DWRITE_TEXT_ALIGNMENT_LEADING);
+                 ui::FontRole::Small, svcStateCol, ui::HAlign::Leading);
 
         float sBtnTop = svcBox.top + 28.0f;
         float sBtnBot = svcBox.top + 64.0f;
@@ -4629,7 +4648,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        } else {
                            showToast("Service already installed");
                        }
-                   }, fmtSmall_, isInstalled, COL_BORDER, !isInstalled ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, isInstalled, COL_BORDER, !isInstalled ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         drawButton("sett_svc_uninstall", uninstallBtn, "Uninstall",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
@@ -4643,7 +4662,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        } else {
                            showToast("Service not installed");
                        }
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         drawButton("sett_svc_start", startBtn, "Start",
                    (isInstalled && !isRunning) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
@@ -4659,7 +4678,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        } else if (!isInstalled) {
                            showToast("Install service first", true);
                        }
-                   }, fmtSmall_, !(isInstalled && !isRunning), COL_BORDER,
+                   }, ui::FontRole::Small, !(isInstalled && !isRunning), COL_BORDER,
                    (isInstalled && !isRunning) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         drawButton("sett_svc_stop", stopBtn, "Stop",
@@ -4674,7 +4693,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                                showToast("Failed to stop service", true);
                            }
                        }
-                   }, fmtSmall_, !isRunning, COL_BORDER, isRunning ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, !isRunning, COL_BORDER, isRunning ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         cy = svcBox.bottom + 12.0f;
 
@@ -4685,7 +4704,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         drawText("SYSTEM & NOTIFICATIONS",
                  { notifBox.left + 16.0f, notifBox.top + 8.0f, notifBox.right - 16.0f, notifBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         float ny = notifBox.top + 26.0f;
         drawToggleSwitch("sett_push_notif", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
@@ -4730,10 +4749,10 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         cy = notifBox.bottom + 12.0f;
     }
     else if (settingsSection_ == SettingsSection::About) {
-        drawText("About & Maintenance", { cx, cy, crx, cy + 24.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        drawText("About & Maintenance", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
         drawText("Software version, update checks, local file storage, and configuration reset.",
-                 { cx, cy, crx, cy + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
         // 1. Top Update Banner
@@ -4750,22 +4769,22 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
             renderTarget_->DrawBitmap(appIconBitmap_, dst, alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         } else {
             fillRoundRect(iconBadge, 10.0f, COL_PRIMARY_ACCENT);
-            drawText("CD", iconBadge, fmtSubheading_, COL_TEXT_ON_ACCENT, DWRITE_TEXT_ALIGNMENT_CENTER);
+            drawText("CD", iconBadge, ui::FontRole::Subheading, COL_TEXT_ON_ACCENT, ui::HAlign::Center);
         }
 
         float infoX = iconBadge.right + 14.0f;
         UiRect titleRect = { infoX, updateBanner.top + 12.0f, updateBanner.right - 300.0f, updateBanner.top + 34.0f };
         drawText("CppDesk v" + std::string(CPP_DESK_VERSION) + "  •  Fast, secure remote desktop for Windows",
-                 titleRect, fmtSubheading_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_LEADING);
+                 titleRect, ui::FontRole::Subheading, COL_TEXT_PRIMARY, ui::HAlign::Leading);
 
         float dotX = infoX + 5.0f;
         float dotY = updateBanner.top + 45.0f;
-        D2D1_COLOR_F statusDotCol = latestUpdateInfo_.updateRequired ? COL_DANGER : (isCheckingUpdates_ ? COL_WARNING : COL_SUCCESS);
+        ui::Color statusDotCol = latestUpdateInfo_.updateRequired ? COL_DANGER : (isCheckingUpdates_ ? COL_WARNING : COL_SUCCESS);
         drawPulseDot(dotX, dotY, 3.8f, statusDotCol);
 
         UiRect statusTextRect = { dotX + 11.0f, updateBanner.top + 35.0f, updateBanner.right - 300.0f, updateBanner.top + 55.0f };
-        D2D1_COLOR_F statusTxtCol = latestUpdateInfo_.updateRequired ? COL_DANGER : COL_TEXT_SECONDARY;
-        drawText(updateStatusText_, statusTextRect, fmtSmall_, statusTxtCol, DWRITE_TEXT_ALIGNMENT_LEADING);
+        ui::Color statusTxtCol = latestUpdateInfo_.updateRequired ? COL_DANGER : COL_TEXT_SECONDARY;
+        drawText(updateStatusText_, statusTextRect, ui::FontRole::Small, statusTxtCol, ui::HAlign::Leading);
 
         float btnH = 34.0f;
         float btnY = updateBanner.top + (updateBanner.height() - btnH) * 0.5f;
@@ -4776,7 +4795,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT,
                    8.0f, [this]() {
                        triggerUpdateCheck(true);
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
 
         float relW = 110.0f;
         UiRect relBtn = { chkBtn.left - 8.0f - relW, btnY, chkBtn.left - 8.0f, btnY + btnH };
@@ -4784,7 +4803,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
                    8.0f, [this]() {
                        ShellExecuteA(nullptr, "open", "https://github.com/oocsng/cppdesk/releases/latest", nullptr, nullptr, SW_SHOWNORMAL);
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         cy = updateBanner.bottom + 14.0f;
 
@@ -4796,7 +4815,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         float aPad = 16.0f;
         drawText("ABOUT CPPDESK",
                  { aboutBox.left + aPad, aboutBox.top + 8.0f, aboutBox.right - aPad, aboutBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         float aBtnW = 68.0f;
         float aBtnH = 26.0f;
@@ -4807,17 +4826,17 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         drawButton("sett_about_license", licBtn, "License",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, []() {
                        ShellExecuteA(nullptr, "open", "https://github.com/oocsng/cppdesk/blob/main/LICENSE", nullptr, nullptr, SW_SHOWNORMAL);
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         UiRect ghBtn = { licBtn.left - 8.0f - aBtnW, aBtnY, licBtn.left - 8.0f, aBtnY + aBtnH };
         drawButton("sett_about_github", ghBtn, "GitHub",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, []() {
                        ShellExecuteA(nullptr, "open", "https://github.com/oocsng/cppdesk", nullptr, nullptr, SW_SHOWNORMAL);
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         UiRect aTextRect = { aboutBox.left + aPad, aboutBox.top + 28.0f, ghBtn.left - 12.0f, aboutBox.top + 48.0f };
         drawText("CppDesk v" + std::string(CPP_DESK_VERSION) + " • Free & Open Source",
-                 aTextRect, fmtSmall_, COL_TEXT_SECONDARY);
+                 aTextRect, ui::FontRole::Small, COL_TEXT_SECONDARY);
 
         cy = aboutBox.bottom + 14.0f;
 
@@ -4828,7 +4847,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
 
         drawText("DATA & MAINTENANCE",
                  { maintBox.left + 16.0f, maintBox.top + 8.0f, maintBox.right - 16.0f, maintBox.top + 22.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         float mThirdW = (innerW - 32.0f - 16.0f) / 3.0f;
         float mBtnTop = maintBox.top + 28.0f;
@@ -4841,13 +4860,13 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         drawButton("sett_open_recv", openRecvBtn, "Received Files",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
                        network_.fileTransferManager().openReceiveDirectoryInExplorer();
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         drawButton("sett_clear_recents", clearRecBtn, "Clear History",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
                        identity_.clearRecentSessions();
                        showToast("History cleared");
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         drawButton("sett_reset_defaults", resetBtn, "Reset Settings",
                    COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_PRIMARY, 8.0f, [this]() {
@@ -4857,7 +4876,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                        network_.setAutoAcceptIncoming(false, PERM_ALL);
                        network_.setSessionFpsConfig(30, true);
                        showToast("Settings restored to defaults");
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ON_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ON_ACCENT);
 
         cy = maintBox.bottom + 12.0f;
     }
@@ -4895,7 +4914,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         bool hoverTrack = trackRect.inflate(4.0f, 2.0f).contains(mouseX_, mouseY_);
         fillRoundRect(trackRect, 3.0f, withAlpha(COL_BORDER, (hoverTrack || draggingSettingsScrollbar_) ? 0.38f * alpha : 0.18f * alpha));
 
-        D2D1_COLOR_F thumbCol = (draggingSettingsScrollbar_ || hoverTrack)
+        ui::Color thumbCol = (draggingSettingsScrollbar_ || hoverTrack)
             ? withAlpha(COL_PRIMARY_ACCENT, 0.85f * alpha)
             : withAlpha(COL_TEXT_MUTED, 0.55f * alpha);
         fillRoundRect(thumbRect, 3.0f, thumbCol);
@@ -4961,7 +4980,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                            network_.setVoiceInputDevice(dev.id);
                            showAudioInputMenu_ = false;
                            showToast("Selected Microphone: " + dev.name);
-                       }, fmtSmall_, !isCur, COL_BORDER);
+                       }, ui::FontRole::Small, !isCur, COL_BORDER);
             dy += itemH;
         }
     }
@@ -5023,7 +5042,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
                            network_.setVoiceOutputDevice(dev.id);
                            showAudioOutputMenu_ = false;
                            showToast("Selected Speaker: " + dev.name);
-                       }, fmtSmall_, !isCur, COL_BORDER);
+                       }, ui::FontRole::Small, !isCur, COL_BORDER);
             dy += itemH;
         }
     }
@@ -5075,7 +5094,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
             network_.setDiagnosticsActive(false);
         }
         showFileDrawer_ = false;
-    }, fmtSmall_, false, D2D1::ColorF(0, 0, 0, 0), COL_TEXT_ON_ACCENT);
+    }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0}, COL_TEXT_ON_ACCENT);
     UiRect closeAnim = getWidgetAnimRect("drawer_close", closeBtn);
     float closeHover = std::clamp(widgetAnims_["drawer_close"].hoverT, 0.0f, 1.0f);
     drawIconClose(closeAnim.centerX(), closeAnim.centerY(), 4.2f,
@@ -5085,7 +5104,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
     std::string chatTabLbl = unread > 0 ? ("Chat (" + std::to_string(unread) + ")") : "Chat";
 
     if (drawerTab_ == DrawerTab::Diagnostics) {
-        drawText("Task Manager", { x, y + 2.0f, closeBtn.left - 8.0f, y + 28.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        drawText("Task Manager", { x, y + 2.0f, closeBtn.left - 8.0f, y + 28.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         y += 36.0f;
     } else {
         struct DrawerTabDef {
@@ -5167,7 +5186,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                 drawButton("drawer_tab_scroll_l", lBtn, "◀", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
                     drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_ - 60.0f, 0.0f, drawerTabsMaxScroll_);
                     InvalidateRect(hwnd_, nullptr, FALSE);
-                }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
                 tabsViewport.left += 22.0f;
             }
             if (drawerTabsScrollTarget_ < drawerTabsMaxScroll_ - 2.0f) {
@@ -5175,7 +5194,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                 drawButton("drawer_tab_scroll_r", rBtn, "▶", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
                     drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_ + 60.0f, 0.0f, drawerTabsMaxScroll_);
                     InvalidateRect(hwnd_, nullptr, FALSE);
-                }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
                 tabsViewport.right -= 22.0f;
             }
         }
@@ -5193,7 +5212,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                            t.isActive ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                            t.isActive ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                            t.isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                           8.0f, t.onClick, fmtSmall_);
+                           8.0f, t.onClick, ui::FontRole::Small);
             }
             curTabX += t.width + 5.0f;
         }
@@ -5204,7 +5223,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
 
     if (drawerTab_ == DrawerTab::FilesAndClip) {
         drawText("Drop files anywhere or use the actions below.",
-                 { x, y, rx, y + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { x, y, rx, y + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         y += 24.0f;
 
         float halfW = (rx - x - 8.0f) * 0.5f;
@@ -5212,20 +5231,20 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         drawButton("drawer_send_file", sendFileBtn, "Send File...",
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
                        openSendFileDialog();
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
 
         UiRect openDirBtn = { sendFileBtn.right + 8.0f, y, rx, y + 36.0f };
         drawButton("drawer_open_dir", openDirBtn, "Received Files",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
                        network_.fileTransferManager().openReceiveDirectoryInExplorer();
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
         y += 44.0f;
 
         UiRect openPlayerBtn = { x, y, rx, y + 34.0f };
         drawButton("drawer_open_player", openPlayerBtn, "Recording Player...",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
                        openRecordingPlayer();
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
         y += 42.0f;
 
         UiRect syncClipBtn = { x, y, rx, y + 34.0f };
@@ -5233,23 +5252,23 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
                        network_.pushLocalClipboardNow();
                        showToast("Clipboard synced");
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
         double activeBw = network_.fileTransferManager().aggregateActiveBandwidthBps();
         std::string xferHeader = "TRANSFERS";
         if (activeBw > 0.0) {
             xferHeader += " • " + FileTransferItem::formatSpeed(activeBw);
         }
-        drawText(xferHeader, { x, y, rx - 60.0f, y + 18.0f }, fmtSmall_, activeBw > 0.0 ? COL_PRIMARY_ACCENT : COL_TEXT_MUTED);
+        drawText(xferHeader, { x, y, rx - 60.0f, y + 18.0f }, ui::FontRole::Small, activeBw > 0.0 ? COL_PRIMARY_ACCENT : COL_TEXT_MUTED);
         UiRect clrBtn = { rx - 56.0f, y - 2.0f, rx, y + 20.0f };
         drawButton("drawer_clear_done", clrBtn, "Clear", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_SECONDARY, 6.0f, [this]() {
             network_.fileTransferManager().clearCompleted();
-        }, fmtSmall_);
+        }, ui::FontRole::Small);
         y += 26.0f;
 
         auto items = network_.fileTransferManager().snapshotTransfers();
         if (items.empty()) {
             drawText("No file transfers yet.", { x, y + 20.0f, rx, y + 50.0f },
-                     fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+                     ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
         } else {
             for (size_t i = 0; i < items.size() && i < 16; ++i) {
                 if (y + 62.0f > r.bottom - 14.0f) break;
@@ -5264,9 +5283,9 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                 strokeRoundRect(card, 10.0f, COL_BORDER);
 
                 drawText(it.fileName, { card.left + 12.0f, card.top + 6.0f, card.right - 70.0f, card.top + 24.0f },
-                         fmtBodyBold_, COL_TEXT_PRIMARY);
+                         ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
                 drawText(it.statusText, { card.left + 12.0f, card.top + 24.0f, card.right - 70.0f, card.top + 40.0f },
-                         fmtSmall_, it.status == TransferStatus::Completed ? COL_SUCCESS :
+                         ui::FontRole::Small, it.status == TransferStatus::Completed ? COL_SUCCESS :
                                     (it.status == TransferStatus::Failed || it.status == TransferStatus::Cancelled) ? COL_DANGER : COL_PRIMARY_ACCENT);
 
                 if (it.status == TransferStatus::InProgress) {
@@ -5276,7 +5295,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                                COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_PRIMARY, 6.5f, [this, tid]() {
                                    network_.cancelFileTransfer(tid);
                                    showToast("Transfer cancelled");
-                               }, fmtSmall_, true, COL_BORDER, COL_TEXT_ON_ACCENT);
+                               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ON_ACCENT);
                 }
 
                 UiRect progBg = { card.left + 12.0f, card.bottom - 10.0f, card.right - 12.0f, card.bottom - 5.5f };
@@ -5292,7 +5311,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         }
     } else if (drawerTab_ == DrawerTab::LiveChat) {
         drawText("Messages",
-                 { x, y, rx, y + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { x, y, rx, y + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         y += 24.0f;
 
         UiRect chatBox = { x, y, rx, r.bottom - 64.0f };
@@ -5303,7 +5322,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         if (msgs.empty()) {
             drawText("No messages yet.",
                      { chatBox.left + 14.0f, chatBox.centerY() - 14.0f, chatBox.right - 14.0f, chatBox.centerY() + 14.0f },
-                     fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+                     ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
         } else {
             float rowBaseH = 46.0f;
             int totalMsgs = static_cast<int>(msgs.size());
@@ -5324,7 +5343,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                 strokeRoundRect(bubble, 9.5f, m.fromLocal ? COL_BORDER_ALT : COL_BORDER);
 
                 drawText(m.senderName, { bubble.left + 10.0f, bubble.top + 4.0f, bubble.right - 10.0f, bubble.top + 20.0f },
-                         fmtSmall_, m.fromLocal ? COL_PRIMARY_ACCENT : COL_TEXT_ACCENT);
+                         ui::FontRole::Small, m.fromLocal ? COL_PRIMARY_ACCENT : COL_TEXT_ACCENT);
 
                 if (m.hasImage) {
                     UiRect imgBadge = { bubble.left + 10.0f, bubble.top + 20.0f, bubble.right - 10.0f, bubble.top + 56.0f };
@@ -5334,15 +5353,15 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                     std::snprintf(imgInfo, sizeof(imgInfo), "[Image Attachment %ux%u - %zu KB]",
                                   m.imgWidth, m.imgHeight, m.imageJpegData.size() / 1024);
                     drawText(imgInfo, { imgBadge.left + 8.0f, imgBadge.top + 8.0f, imgBadge.right - 8.0f, imgBadge.bottom - 4.0f },
-                             fmtSmall_, COL_PRIMARY_ACCENT);
+                             ui::FontRole::Small, COL_PRIMARY_ACCENT);
 
                     if (!m.text.empty()) {
                         drawText(m.text, { bubble.left + 10.0f, bubble.top + 60.0f, bubble.right - 10.0f, bubble.bottom - 4.0f },
-                                 fmtBody_, COL_TEXT_PRIMARY);
+                                 ui::FontRole::Body, COL_TEXT_PRIMARY);
                     }
                 } else {
                     drawText(m.text, { bubble.left + 10.0f, bubble.top + 20.0f, bubble.right - 10.0f, bubble.bottom - 4.0f },
-                             fmtBody_, COL_TEXT_PRIMARY);
+                             ui::FontRole::Body, COL_TEXT_PRIMARY);
                 }
                 my += msgH + 6.0f;
             }
@@ -5364,16 +5383,16 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                        } else {
                            showToast("No image in clipboard (copy image first)", true);
                        }
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
 
         UiRect sendChatBtn = { clipImgBtn.right + 4.0f, chatField.top, rx, chatField.bottom };
         drawButton("btn_send_chat", sendChatBtn, "Send",
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.5f, [this]() {
                        sendChatFromInput();
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
     } else if (drawerTab_ == DrawerTab::RemoteTerminal) {
         drawText("Interactive Remote Host Console",
-                 { x, y, rx, y + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { x, y, rx, y + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         y += 24.0f;
 
         float qBtnW = (rx - x - 20.0f) / 5.0f;
@@ -5385,23 +5404,23 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
 
         drawButton("term_ipconfig", b1, "ipconfig", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
             network_.sendTerminalCommand("ipconfig");
-        }, fmtSmall_, true, COL_BORDER);
+        }, ui::FontRole::Small, true, COL_BORDER);
 
         drawButton("term_tasklist", b2, "tasklist", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
             network_.sendTerminalCommand("tasklist");
-        }, fmtSmall_, true, COL_BORDER);
+        }, ui::FontRole::Small, true, COL_BORDER);
 
         drawButton("term_netstat", b3, "netstat", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
             network_.sendTerminalCommand("netstat -ano");
-        }, fmtSmall_, true, COL_BORDER);
+        }, ui::FontRole::Small, true, COL_BORDER);
 
         drawButton("term_whoami", b4, "whoami", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
             network_.sendTerminalCommand("whoami");
-        }, fmtSmall_, true, COL_BORDER);
+        }, ui::FontRole::Small, true, COL_BORDER);
 
         drawButton("term_clear", b5, "Clear", COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_SECONDARY, 6.0f, [this]() {
             network_.clearTerminalScrollback();
-        }, fmtSmall_, false, D2D1::ColorF(0, 0, 0, 0), COL_TEXT_ON_ACCENT);
+        }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0}, COL_TEXT_ON_ACCENT);
 
         y += 32.0f;
 
@@ -5413,7 +5432,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         if (lines.empty()) {
             drawText("Host console ready. Type commands below or click quick actions.",
                      { termBox.left + 14.0f, termBox.centerY() - 14.0f, termBox.right - 14.0f, termBox.centerY() + 14.0f },
-                     fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+                     ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
         } else {
             float lineH = 18.0f;
             int maxVisible = std::max(1, static_cast<int>((termBox.height() - 16.0f) / lineH));
@@ -5427,10 +5446,10 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
 
             for (size_t i = startIdx; i < endIdx; ++i) {
                 UiRect lr = { termBox.left + 10.0f, ly, termBox.right - 10.0f, ly + lineH };
-                D2D1_COLOR_F lineCol = (lines[i].rfind("> ", 0) == 0)
+                ui::Color lineCol = (lines[i].rfind("> ", 0) == 0)
                     ? COL_PRIMARY_ACCENT
                     : rgba(140, 235, 175, 0.95f);
-                drawText(lines[i], lr, fmtMono_, lineCol, DWRITE_TEXT_ALIGNMENT_LEADING);
+                drawText(lines[i], lr, ui::FontRole::Mono, lineCol, ui::HAlign::Leading);
                 ly += lineH;
             }
         }
@@ -5443,10 +5462,10 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         drawButton("btn_send_term", sendTermBtn, "Run",
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.5f, [this]() {
                        sendTerminalFromInput();
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
     } else if (drawerTab_ == DrawerTab::Diagnostics) {
         drawText("Live Hardware & Process Telemetry",
-                 { x, y, rx, y + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { x, y, rx, y + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         y += 24.0f;
 
         auto diag = network_.latestDiagnostics();
@@ -5461,18 +5480,18 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         float hwy = hwBox.top + 8.0f;
 
         drawText("HARDWARE SPECIFICATIONS",
-                 { hwx, hwy, hwrx, hwy + 15.0f }, fmtSmall_, COL_TEXT_ACCENT);
+                 { hwx, hwy, hwrx, hwy + 15.0f }, ui::FontRole::Small, COL_TEXT_ACCENT);
         hwy += 18.0f;
 
         // CPU & Cores
         std::string cpuText = (diag.cpuModel.empty() ? "x86_64 Processor" : diag.cpuModel);
         if (diag.cpuCores > 0) cpuText += " (" + std::to_string(diag.cpuCores) + " Cores)";
-        drawText("CPU: " + cpuText, { hwx, hwy, hwrx, hwy + 16.0f }, fmtSmall_, COL_TEXT_PRIMARY);
+        drawText("CPU: " + cpuText, { hwx, hwy, hwrx, hwy + 16.0f }, ui::FontRole::Small, COL_TEXT_PRIMARY);
         hwy += 18.0f;
 
         // GPU Model
         std::string gpuText = (diag.gpuModel.empty() ? "Display Adapter" : diag.gpuModel);
-        drawText("GPU: " + gpuText, { hwx, hwy, hwrx, hwy + 16.0f }, fmtSmall_, COL_TEXT_PRIMARY);
+        drawText("GPU: " + gpuText, { hwx, hwy, hwrx, hwy + 16.0f }, ui::FontRole::Small, COL_TEXT_PRIMARY);
         hwy += 18.0f;
 
         // OS & Uptime
@@ -5484,7 +5503,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         char upBuf[64];
         if (days > 0) std::snprintf(upBuf, sizeof(upBuf), " • Uptime: %llud %lluh %llum", (unsigned long long)days, (unsigned long long)hrs, (unsigned long long)mins);
         else std::snprintf(upBuf, sizeof(upBuf), " • Uptime: %lluh %llum", (unsigned long long)hrs, (unsigned long long)mins);
-        drawText("OS: " + osText + upBuf, { hwx, hwy, hwrx, hwy + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        drawText("OS: " + osText + upBuf, { hwx, hwy, hwrx, hwy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
 
         y = hwBox.bottom + 10.0f;
 
@@ -5502,11 +5521,11 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         float cpu = std::clamp(diag.cpuUsagePercent, 0.0f, 100.0f);
         char cpuStr[64];
         std::snprintf(cpuStr, sizeof(cpuStr), "CPU: %.1f%%", cpu);
-        drawText(cpuStr, { mx, my, mrx, my + 16.0f }, fmtBodyBold_, COL_TEXT_PRIMARY);
+        drawText(cpuStr, { mx, my, mrx, my + 16.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
         UiRect cpuBarBg = { mx, my + 17.0f, mrx, my + 23.0f };
         fillRoundRect(cpuBarBg, 3.0f, rgba(255, 255, 255, 0.08f));
         UiRect cpuBarFill = { mx, my + 17.0f, mx + mBarW * (cpu / 100.0f), my + 23.0f };
-        D2D1_COLOR_F cpuCol = (cpu < 60.0f) ? COL_SUCCESS : (cpu < 85.0f) ? rgba(250, 173, 20, 1.0f) : COL_DANGER;
+        ui::Color cpuCol = (cpu < 60.0f) ? COL_SUCCESS : (cpu < 85.0f) ? rgba(250, 173, 20, 1.0f) : COL_DANGER;
         fillRoundRect(cpuBarFill, 3.0f, cpuCol);
         my += 29.0f;
 
@@ -5519,12 +5538,12 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         ramPct = std::clamp(ramPct, 0.0f, 100.0f);
         char ramStr[64];
         std::snprintf(ramStr, sizeof(ramStr), "RAM: %.1f / %.1f GB (%.0f%%)", ramUsedGb, ramTotalGb, ramPct);
-        drawText(ramStr, { mx, my, mrx, my + 16.0f }, fmtBodyBold_, COL_TEXT_PRIMARY);
+        drawText(ramStr, { mx, my, mrx, my + 16.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         UiRect ramBarBg = { mx, my + 17.0f, mrx, my + 23.0f };
         fillRoundRect(ramBarBg, 3.0f, rgba(255, 255, 255, 0.08f));
         UiRect ramBarFill = { mx, my + 17.0f, mx + mBarW * (ramPct / 100.0f), my + 23.0f };
-        D2D1_COLOR_F ramCol = (ramPct < 70.0f) ? COL_PRIMARY_ACCENT : (ramPct < 88.0f) ? rgba(250, 173, 20, 1.0f) : COL_DANGER;
+        ui::Color ramCol = (ramPct < 70.0f) ? COL_PRIMARY_ACCENT : (ramPct < 88.0f) ? rgba(250, 173, 20, 1.0f) : COL_DANGER;
         fillRoundRect(ramBarFill, 3.0f, ramCol);
         my += 29.0f;
 
@@ -5537,12 +5556,12 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         diskPct = std::clamp(diskPct, 0.0f, 100.0f);
         char diskStr[64];
         std::snprintf(diskStr, sizeof(diskStr), "Disk (C:): %.0f / %.0f GB (%.0f%%)", diskUsedGb, diskTotalGb, diskPct);
-        drawText(diskStr, { mx, my, mrx, my + 16.0f }, fmtBodyBold_, COL_TEXT_PRIMARY);
+        drawText(diskStr, { mx, my, mrx, my + 16.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         UiRect diskBarBg = { mx, my + 17.0f, mrx, my + 23.0f };
         fillRoundRect(diskBarBg, 3.0f, rgba(255, 255, 255, 0.08f));
         UiRect diskBarFill = { mx, my + 17.0f, mx + mBarW * (diskPct / 100.0f), my + 23.0f };
-        D2D1_COLOR_F diskCol = (diskPct < 75.0f) ? rgba(52, 199, 89, 1.0f) : (diskPct < 90.0f) ? rgba(250, 173, 20, 1.0f) : COL_DANGER;
+        ui::Color diskCol = (diskPct < 75.0f) ? rgba(52, 199, 89, 1.0f) : (diskPct < 90.0f) ? rgba(250, 173, 20, 1.0f) : COL_DANGER;
         fillRoundRect(diskBarFill, 3.0f, diskCol);
 
         y = metricsBox.bottom + 14.0f;
@@ -5559,14 +5578,14 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                        runTaskCommandInput_.clear();
                        runTaskWorkingDirInput_.clear();
                        focusedField_ = FocusedField::RunTaskCommand;
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
 
         UiRect refreshProcsBtn = { rx - 36.0f, y, rx, y + 30.0f };
         drawButton("btn_refresh_procs", refreshProcsBtn, "↺",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.0f, [this]() {
                        network_.setDiagnosticsActive(true);
                        showToast("Refreshing process telemetry...");
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         y += 36.0f;
 
@@ -5585,27 +5604,27 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
 
         UiRect hdrName = { colHeader.left + 6.0f, colHeader.top, colHeader.right - 200.0f, colHeader.bottom };
         drawButton("proc_hdr_name", hdrName, sortNameLbl,
-                   D2D1::ColorF(0,0,0,0), withAlpha(COL_PRIMARY_ACCENT, 0.15f), COL_TEXT_ACCENT, 4.0f, [this]() {
+                   ui::Color{0,0,0,0}, withAlpha(COL_PRIMARY_ACCENT, 0.15f), COL_TEXT_ACCENT, 4.0f, [this]() {
                        if (processSortColumn_ == ProcessSortColumn::Name) processSortAsc_ = !processSortAsc_;
                        else { processSortColumn_ = ProcessSortColumn::Name; processSortAsc_ = true; }
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
 
         UiRect hdrPid = { colHeader.right - 195.0f, colHeader.top, colHeader.right - 130.0f, colHeader.bottom };
         drawButton("proc_hdr_pid", hdrPid, sortPidLbl,
-                   D2D1::ColorF(0,0,0,0), withAlpha(COL_PRIMARY_ACCENT, 0.15f), COL_TEXT_ACCENT, 4.0f, [this]() {
+                   ui::Color{0,0,0,0}, withAlpha(COL_PRIMARY_ACCENT, 0.15f), COL_TEXT_ACCENT, 4.0f, [this]() {
                        if (processSortColumn_ == ProcessSortColumn::Pid) processSortAsc_ = !processSortAsc_;
                        else { processSortColumn_ = ProcessSortColumn::Pid; processSortAsc_ = false; }
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
 
         UiRect hdrRam = { colHeader.right - 125.0f, colHeader.top, colHeader.right - 65.0f, colHeader.bottom };
         drawButton("proc_hdr_ram", hdrRam, sortRamLbl,
-                   D2D1::ColorF(0,0,0,0), withAlpha(COL_PRIMARY_ACCENT, 0.15f), COL_TEXT_ACCENT, 4.0f, [this]() {
+                   ui::Color{0,0,0,0}, withAlpha(COL_PRIMARY_ACCENT, 0.15f), COL_TEXT_ACCENT, 4.0f, [this]() {
                        if (processSortColumn_ == ProcessSortColumn::Memory) processSortAsc_ = !processSortAsc_;
                        else { processSortColumn_ = ProcessSortColumn::Memory; processSortAsc_ = false; }
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
 
         UiRect hdrAction = { colHeader.right - 60.0f, colHeader.top, colHeader.right - 4.0f, colHeader.bottom };
-        drawText("Action", hdrAction, fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+        drawText("Action", hdrAction, ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
 
         // Filter and Sort Processes
         std::vector<ProcessTelemetryItem> filteredProcs;
@@ -5639,7 +5658,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
             std::string emptyMsg = diag.processes.empty() ? "Sampling host processes..." : "No matching processes found";
             drawText(emptyMsg,
                      { tableBox.left + 14.0f, tableBox.centerY() - 12.0f, tableBox.right - 14.0f, tableBox.centerY() + 12.0f },
-                     fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+                     ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
         } else {
             float rowH = 34.0f;
             float listTop = colHeader.bottom + 4.0f;
@@ -5672,18 +5691,18 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
 
                 // Process Name
                 drawText(proc.name, { rowRect.left + 8.0f, rowRect.top + 2.0f, rowRect.right - 200.0f, rowRect.bottom },
-                         fmtBodyBold_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_LEADING);
+                         ui::FontRole::BodyBold, COL_TEXT_PRIMARY, ui::HAlign::Leading);
 
                 // PID
                 drawText(std::to_string(proc.pid), { rowRect.right - 195.0f, rowRect.top + 2.0f, rowRect.right - 130.0f, rowRect.bottom },
-                         fmtMono_, COL_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_LEADING);
+                         ui::FontRole::Mono, COL_TEXT_SECONDARY, ui::HAlign::Leading);
 
                 // Memory in MB
                 double memMb = proc.workingSetBytes / (1024.0 * 1024.0);
                 char memBuf[32];
                 std::snprintf(memBuf, sizeof(memBuf), "%.0f MB", memMb);
                 drawText(memBuf, { rowRect.right - 130.0f, rowRect.top + 2.0f, rowRect.right - 68.0f, rowRect.bottom },
-                         fmtSmall_, COL_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_TRAILING);
+                         ui::FontRole::Small, COL_TEXT_SECONDARY, ui::HAlign::Trailing);
 
                 // "End Task" action button
                 UiRect killBtn = { rowRect.right - 62.0f, rowRect.top + 2.0f, rowRect.right - 4.0f, rowRect.bottom - 2.0f };
@@ -5695,7 +5714,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                            [this, targetPid, targetName]() {
                                network_.sendProcessKill(targetPid);
                                showToast("Terminating " + targetName + " (PID " + std::to_string(targetPid) + ")...");
-                           }, fmtSmall_, true, COL_BORDER, COL_TEXT_ON_ACCENT);
+                           }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ON_ACCENT);
 
                 py += rowH;
             }
@@ -5704,7 +5723,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         drawFileManagerDrawer({ x, y, rx, r.bottom - 16.0f });
     } else if (drawerTab_ == DrawerTab::ClipboardHistory) {
         drawText("In-Session Clipboard History Hub",
-                 { x, y, rx, y + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { x, y, rx, y + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         y += 24.0f;
 
         UiRect searchField = { x, y, rx - 72.0f, y + 32.0f };
@@ -5716,7 +5735,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                    COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_SECONDARY, 7.5f, [this]() {
                        network_.clipboardManager().history().clear();
                        showToast("Clipboard history cleared");
-                   }, fmtSmall_, false, D2D1::ColorF(0, 0, 0, 0), COL_TEXT_ON_ACCENT);
+                   }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0}, COL_TEXT_ON_ACCENT);
 
         y += 40.0f;
 
@@ -5728,7 +5747,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         if (histItems.empty()) {
             drawText("No clipboard history yet.",
                      { listBox.left + 14.0f, listBox.centerY() - 14.0f, listBox.right - 14.0f, listBox.centerY() + 14.0f },
-                     fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+                     ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
         } else {
             float cardH = 58.0f;
             int maxVisible = std::max(1, static_cast<int>((listBox.height() - 16.0f) / (cardH + 6.0f)));
@@ -5748,23 +5767,23 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                 // Type badge pill
                 float bx = card.left + 8.0f;
                 UiRect badgeRect = { bx, card.top + 6.0f, bx + 42.0f, card.top + 22.0f };
-                D2D1_COLOR_F badgeBg = (item.typeBadge == "URL") ? rgba(0, 122, 255, 0.25f) :
+                ui::Color badgeBg = (item.typeBadge == "URL") ? rgba(0, 122, 255, 0.25f) :
                                        (item.typeBadge == "Code") ? rgba(175, 82, 222, 0.25f) :
                                        (item.typeBadge == "Path") ? rgba(52, 199, 89, 0.25f) :
                                        rgba(142, 142, 147, 0.25f);
-                D2D1_COLOR_F badgeFg = (item.typeBadge == "URL") ? COL_PRIMARY_ACCENT :
+                ui::Color badgeFg = (item.typeBadge == "URL") ? COL_PRIMARY_ACCENT :
                                        (item.typeBadge == "Code") ? rgba(191, 90, 242, 1.0f) :
                                        (item.typeBadge == "Path") ? COL_SUCCESS :
                                        COL_TEXT_SECONDARY;
                 fillRoundRect(badgeRect, 4.0f, badgeBg);
-                drawText(item.typeBadge, badgeRect, fmtSmall_, badgeFg, DWRITE_TEXT_ALIGNMENT_CENTER);
+                drawText(item.typeBadge, badgeRect, ui::FontRole::Small, badgeFg, ui::HAlign::Center);
 
                 // Origin & chars
                 char metaStr[64];
                 std::snprintf(metaStr, sizeof(metaStr), "%s - %zu chars",
                               item.isFromRemote ? "Remote" : "Local", item.charCount);
                 drawText(metaStr, { badgeRect.right + 8.0f, card.top + 6.0f, card.right - 90.0f, card.top + 22.0f },
-                         fmtSmall_, COL_TEXT_MUTED);
+                         ui::FontRole::Small, COL_TEXT_MUTED);
 
                 // Copy button
                 uint32_t iid = item.id;
@@ -5774,18 +5793,18 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                                if (network_.clipboardManager().history().copyItemToClipboard(iid)) {
                                    showToast("Copied to clipboard");
                                }
-                           }, fmtSmall_);
+                           }, ui::FontRole::Small);
 
                 // Delete button
                 UiRect delBtn = { card.right - 30.0f, card.top + 6.0f, card.right - 6.0f, card.top + 26.0f };
                 drawButton("clip_del_" + std::to_string(iid), delBtn, "X",
                            COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_MUTED, 5.0f, [this, iid]() {
                                network_.clipboardManager().history().deleteItem(iid);
-                           }, fmtSmall_);
+                           }, ui::FontRole::Small);
 
                 // Text preview
                 drawText(item.previewText, { card.left + 8.0f, card.top + 28.0f, card.right - 8.0f, card.bottom - 4.0f },
-                         fmtSmall_, COL_TEXT_PRIMARY);
+                         ui::FontRole::Small, COL_TEXT_PRIMARY);
 
                 cy += cardH + 6.0f;
             }
@@ -5794,7 +5813,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         drawSyncDrawer({ x, y, rx, r.bottom - 16.0f });
     } else if (drawerTab_ == DrawerTab::Notes) {
         drawText("Collaborative Dual-Peer Real-Time Scratchpad",
-                 { x, y, rx, y + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { x, y, rx, y + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         y += 24.0f;
 
         // Diagnostic quick snippets toolbar
@@ -5809,21 +5828,21 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                        std::string snip = ScratchpadManager::generateSnippet("host", static_cast<uint32_t>(s.remoteDeskId), s.remoteHostname);
                        scratchpadTextEdit_ += snip;
                        network_.sendScratchpadText(scratchpadTextEdit_);
-                   }, fmtSmall_, true, COL_BORDER, COL_PRIMARY_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
 
         drawButton("btn_snip_sec", btnSec, "+ Security",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
                        std::string snip = ScratchpadManager::generateSnippet("security");
                        scratchpadTextEdit_ += snip;
                        network_.sendScratchpadText(scratchpadTextEdit_);
-                   }, fmtSmall_, true, COL_BORDER, COL_PRIMARY_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
 
         drawButton("btn_snip_time", btnTime, "+ Timestamp",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
                        std::string snip = ScratchpadManager::generateSnippet("timestamp");
                        scratchpadTextEdit_ += snip;
                        network_.sendScratchpadText(scratchpadTextEdit_);
-                   }, fmtSmall_, true, COL_BORDER, COL_PRIMARY_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
 
         y += 32.0f;
 
@@ -5834,7 +5853,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         if (lastEd > 0) {
             metaStr += " - Last edit by Desk: " + std::to_string(lastEd);
         }
-        drawText(metaStr, { x, y, rx, y + 16.0f }, fmtSmall_, COL_TEXT_MUTED);
+        drawText(metaStr, { x, y, rx, y + 16.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
         y += 20.0f;
 
         // Large Multi-line scratchpad text area
@@ -5848,16 +5867,16 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         }, true });
 
         std::string displayText = scratchpadTextEdit_.empty() ? "Type shared notes here in real time with peer..." : scratchpadTextEdit_;
-        D2D1_COLOR_F textCol = scratchpadTextEdit_.empty() ? COL_TEXT_MUTED : COL_TEXT_PRIMARY;
+        ui::Color textCol = scratchpadTextEdit_.empty() ? COL_TEXT_MUTED : COL_TEXT_PRIMARY;
         drawText(displayText, { textBox.left + 8.0f, textBox.top + 8.0f, textBox.right - 8.0f, textBox.bottom - 8.0f },
-                 fmtSmall_, textCol, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+                 ui::FontRole::Small, textCol, ui::HAlign::Leading, ui::VAlign::Top);
 
         // Clear button
         UiRect clrBtn = { rx - 70.0f, r.bottom - 40.0f, rx, r.bottom - 12.0f };
         drawButton("btn_scratch_clear", clrBtn, "Clear", COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_SECONDARY, 6.0f, [this]() {
             scratchpadTextEdit_.clear();
             network_.sendScratchpadText("");
-        }, fmtSmall_, false, D2D1::ColorF(0, 0, 0, 0), COL_TEXT_ON_ACCENT);
+        }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0}, COL_TEXT_ON_ACCENT);
     }
 }
 
@@ -5869,11 +5888,11 @@ void CppDeskWindow::drawSyncDrawer(const UiRect& contentRect) {
     float y = contentRect.top;
 
     drawText("Synchronize local and remote folder directories.",
-             { x, y, rx, y + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+             { x, y, rx, y + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     y += 22.0f;
 
     // 1. Local Folder Input
-    drawText("LOCAL FOLDER", { x, y, rx, y + 14.0f }, fmtSmall_, COL_TEXT_ACCENT);
+    drawText("LOCAL FOLDER", { x, y, rx, y + 14.0f }, ui::FontRole::Small, COL_TEXT_ACCENT);
     y += 16.0f;
     float browseW = 68.0f;
     UiRect localFieldRect = { x, y, rx - browseW - 6.0f, y + 30.0f };
@@ -5884,11 +5903,11 @@ void CppDeskWindow::drawSyncDrawer(const UiRect& contentRect) {
     drawButton("sync_browse_btn", browseBtnRect, "Browse...",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.0f, [this]() {
                    openPickFolderDialog(syncLocalPathEdit_);
-               }, fmtSmall_, true, COL_BORDER, COL_PRIMARY_ACCENT);
+               }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
     y += 36.0f;
 
     // 2. Remote Folder Input
-    drawText("REMOTE FOLDER", { x, y, rx, y + 14.0f }, fmtSmall_, COL_TEXT_ACCENT);
+    drawText("REMOTE FOLDER", { x, y, rx, y + 14.0f }, ui::FontRole::Small, COL_TEXT_ACCENT);
     y += 16.0f;
     UiRect remoteFieldRect = { x, y, rx, y + 30.0f };
     drawTextField("sync_remote_path", FocusedField::SyncRemotePath, remoteFieldRect,
@@ -5896,7 +5915,7 @@ void CppDeskWindow::drawSyncDrawer(const UiRect& contentRect) {
     y += 36.0f;
 
     // 3. Sync Mode Segmented Selector (Push, Pull, Two-Way)
-    drawText("SYNC MODE", { x, y, rx, y + 14.0f }, fmtSmall_, COL_TEXT_ACCENT);
+    drawText("SYNC MODE", { x, y, rx, y + 14.0f }, ui::FontRole::Small, COL_TEXT_ACCENT);
     y += 16.0f;
     float modeW = (rx - x - 8.0f) / 3.0f;
     UiRect modePush = { x, y, x + modeW, y + 28.0f };
@@ -5912,21 +5931,21 @@ void CppDeskWindow::drawSyncDrawer(const UiRect& contentRect) {
                isPush ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                isPush ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
                6.5f, [this]() { syncSelectedMode_ = SyncMode::PushMirror; },
-               fmtSmall_, !isPush, COL_BORDER, isPush ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+               ui::FontRole::Small, !isPush, COL_BORDER, isPush ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
     drawButton("sync_mode_pull", modePull, "Pull (<-)",
                isPull ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                isPull ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                isPull ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
                6.5f, [this]() { syncSelectedMode_ = SyncMode::PullMirror; },
-               fmtSmall_, !isPull, COL_BORDER, isPull ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+               ui::FontRole::Small, !isPull, COL_BORDER, isPull ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
     drawButton("sync_mode_twoway", modeTwoWay, "Two-Way (<->)",
                isTwoWay ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
                isTwoWay ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                isTwoWay ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
                6.5f, [this]() { syncSelectedMode_ = SyncMode::TwoWay; },
-               fmtSmall_, !isTwoWay, COL_BORDER, isTwoWay ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+               ui::FontRole::Small, !isTwoWay, COL_BORDER, isTwoWay ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
     y += 34.0f;
 
     // 4. Purge Toggle
@@ -5956,14 +5975,14 @@ void CppDeskWindow::drawSyncDrawer(const UiRect& contentRect) {
                    network_.requestRemoteScan(syncRemotePathEdit_);
                    network_.fileSyncManager().requestScan(syncLocalPathEdit_);
                    showToast("Scanning folder trees...");
-               }, fmtSmall_, true, COL_BORDER, COL_PRIMARY_ACCENT);
+               }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
 
     if (isRunning) {
         drawButton("sync_btn_cancel", btnAction, "Cancel Sync",
                    COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_PRIMARY, 7.5f, [this]() {
                        network_.cancelFolderSync();
                        showToast("Folder sync cancelled");
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ON_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ON_ACCENT);
     } else {
         drawButton("sync_btn_start", btnAction, "Start Sync",
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 7.5f, [this]() {
@@ -5974,7 +5993,7 @@ void CppDeskWindow::drawSyncDrawer(const UiRect& contentRect) {
                        network_.startFolderSync(syncLocalPathEdit_, syncRemotePathEdit_,
                                                 syncSelectedMode_, syncMirrorPurgeChoice_);
                        showToast("Starting synchronization...");
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
     }
     y += 38.0f;
 
@@ -5990,11 +6009,11 @@ void CppDeskWindow::drawSyncDrawer(const UiRect& contentRect) {
         default: stateStr = "Idle"; break;
     }
 
-    D2D1_COLOR_F statusCol = (status.state == SyncState::Completed) ? COL_SUCCESS :
+    ui::Color statusCol = (status.state == SyncState::Completed) ? COL_SUCCESS :
                              (status.state == SyncState::Failed) ? COL_DANGER :
                              (isRunning) ? COL_PRIMARY_ACCENT : COL_TEXT_SECONDARY;
 
-    drawText(stateStr, { x, y, rx, y + 16.0f }, fmtBodyBold_, statusCol);
+    drawText(stateStr, { x, y, rx, y + 16.0f }, ui::FontRole::BodyBold, statusCol);
     y += 20.0f;
 
     // Progress bar
@@ -6018,13 +6037,13 @@ void CppDeskWindow::drawSyncDrawer(const UiRect& contentRect) {
     double kbSec = static_cast<double>(status.bytesPerSec) / 1024.0;
     std::snprintf(statBuf, sizeof(statBuf), "Files: %u / %u  •  %.1f / %.1f MB  •  %.0f KB/s",
                   status.filesCompleted, status.totalFiles, mbDone, mbTotal, kbSec);
-    drawText(statBuf, { x, y, rx, y + 14.0f }, fmtSmall_, COL_TEXT_MUTED);
+    drawText(statBuf, { x, y, rx, y + 14.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
     y += 20.0f;
 
     // 7. Diff Actions List
     auto diffPlan = syncMgr.currentDiffPlan();
     std::string planHeader = "PLANNED ACTIONS (" + std::to_string(diffPlan.size()) + ")";
-    drawText(planHeader, { x, y, rx, y + 14.0f }, fmtSmall_, COL_TEXT_ACCENT);
+    drawText(planHeader, { x, y, rx, y + 14.0f }, ui::FontRole::Small, COL_TEXT_ACCENT);
     y += 18.0f;
 
     float listBottom = contentRect.bottom;
@@ -6035,8 +6054,8 @@ void CppDeskWindow::drawSyncDrawer(const UiRect& contentRect) {
 
         if (diffPlan.empty()) {
             drawText("No pending synchronization actions.",
-                     listBox, fmtSmall_, COL_TEXT_MUTED,
-                     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                     listBox, ui::FontRole::Small, COL_TEXT_MUTED,
+                     ui::HAlign::Center, ui::VAlign::Center);
         } else {
             float rowH = 30.0f;
             int maxVisible = static_cast<int>((listBox.height() - 8.0f) / rowH);
@@ -6056,8 +6075,8 @@ void CppDeskWindow::drawSyncDrawer(const UiRect& contentRect) {
                 strokeRoundRect(card, 5.0f, COL_BORDER);
 
                 std::string badge;
-                D2D1_COLOR_F badgeBg;
-                D2D1_COLOR_F badgeFg;
+                ui::Color badgeBg;
+                ui::Color badgeFg;
                 switch (item.action) {
                     case SyncActionType::CreateDir:
                         badge = "DIR";
@@ -6084,8 +6103,8 @@ void CppDeskWindow::drawSyncDrawer(const UiRect& contentRect) {
 
                 UiRect badgeRect = { card.left + 4.0f, card.top + 3.0f, card.left + 46.0f, card.bottom - 3.0f };
                 fillRoundRect(badgeRect, 3.5f, badgeBg);
-                drawText(badge, badgeRect, fmtSmall_, badgeFg,
-                         DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                drawText(badge, badgeRect, ui::FontRole::Small, badgeFg,
+                         ui::HAlign::Center, ui::VAlign::Center);
 
                 char szBuf[32] = {};
                 if (item.sizeBytes >= 1024 * 1024) {
@@ -6096,13 +6115,13 @@ void CppDeskWindow::drawSyncDrawer(const UiRect& contentRect) {
 
                 UiRect sizeRect = { card.right - 62.0f, card.top, card.right - 6.0f, card.bottom };
                 if (szBuf[0] != '\0') {
-                    drawText(szBuf, sizeRect, fmtSmall_, COL_TEXT_MUTED,
-                             DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    drawText(szBuf, sizeRect, ui::FontRole::Small, COL_TEXT_MUTED,
+                             ui::HAlign::Trailing, ui::VAlign::Center);
                 }
 
                 UiRect pathRect = { badgeRect.right + 6.0f, card.top, card.right - 68.0f, card.bottom };
-                drawText(item.relativePath, pathRect, fmtSmall_, COL_TEXT_PRIMARY,
-                         DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                drawText(item.relativePath, pathRect, ui::FontRole::Small, COL_TEXT_PRIMARY,
+                         ui::HAlign::Leading, ui::VAlign::Center);
 
                 cy += rowH;
             }
@@ -6134,15 +6153,15 @@ void CppDeskWindow::drawIncomingApprovalModal(float width, float height, float m
     float mrx = modal.right - 26.0f;
     float my = modal.top + 24.0f;
 
-    drawText("Connection Request", { mx, my, mrx, my + 28.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    drawText("Connection Request", { mx, my, mrx, my + 28.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
     my += 30.0f;
 
     std::string callerLine = req.callerHostname + " (" + CryptoUtils::formatDeskId(req.callerDeskId) + ")";
-    drawText(callerLine, { mx, my, mrx, my + 24.0f }, fmtSubheading_, COL_PRIMARY_ACCENT);
+    drawText(callerLine, { mx, my, mrx, my + 24.0f }, ui::FontRole::Subheading, COL_PRIMARY_ACCENT);
     my += 24.0f;
 
     drawText("Wants to connect to your desktop.",
-             { mx, my, mrx, my + 20.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+             { mx, my, mrx, my + 20.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 28.0f;
 
     drawToggleSwitch("modal_perm_input", { mx, my, mrx, my + 26.0f }, (modalPermissions_ & PERM_INPUT) != 0,
@@ -6169,7 +6188,7 @@ void CppDeskWindow::drawIncomingApprovalModal(float width, float height, float m
                COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_PRIMARY, 9.5f, [this]() {
                    network_.respondToIncomingRequest(false, 0);
                    showToast("Connection declined", true);
-               }, nullptr, true, COL_BORDER, COL_TEXT_ON_ACCENT);
+               }, ui::FontRole::BodyBold, true, COL_BORDER, COL_TEXT_ON_ACCENT);
 
     UiRect acceptBtn = { rejectBtn.right + 12.0f, my, mrx, my + 42.0f };
     drawButton("modal_accept", acceptBtn, "Accept",
@@ -6210,7 +6229,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
     std::string peerTitle = stats.remoteHostname.empty()
         ? CryptoUtils::formatDeskId(stats.remoteDeskId)
         : stats.remoteHostname;
-    drawText(peerTitle, { curX, pillTop, curX + 130.0f, pillBottom }, fmtSmall_, COL_TEXT_PRIMARY);
+    drawText(peerTitle, { curX, pillTop, curX + 130.0f, pillBottom }, ui::FontRole::Small, COL_TEXT_PRIMARY);
     curX += 136.0f;
 
     // 1. Display Switcher
@@ -6224,7 +6243,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                    showDisplayMenu_ = !showDisplayMenu_;
                    showAdminMenu_ = false;
                    showQualityMenu_ = false;
-               }, fmtSmall_, true, COL_BORDER);
+               }, ui::FontRole::Small, true, COL_BORDER);
     curX = monBtn.right + 6.0f;
 
     // 2. Admin Actions Menu
@@ -6237,7 +6256,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                    showAdminMenu_ = !showAdminMenu_;
                    showDisplayMenu_ = false;
                    showQualityMenu_ = false;
-               }, fmtSmall_, true, COL_BORDER);
+               }, ui::FontRole::Small, true, COL_BORDER);
     curX = adminBtn.right + 6.0f;
 
     // 3. Quality & FPS Menu
@@ -6256,7 +6275,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                    showQualityMenu_ = !showQualityMenu_;
                    showDisplayMenu_ = false;
                    showAdminMenu_ = false;
-               }, fmtSmall_, true, COL_BORDER);
+               }, ui::FontRole::Small, true, COL_BORDER);
     curX = qualBtn.right + 6.0f;
 
     // 4. Clipboard Sync Toggle
@@ -6270,7 +6289,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                    bool n = !clipOn;
                    network_.setClipboardSyncEnabled(n);
                    showToast(n ? "Clipboard Sync: Enabled" : "Clipboard Sync: Disabled");
-               }, fmtSmall_, !clipOn, COL_BORDER);
+               }, ui::FontRole::Small, !clipOn, COL_BORDER);
     curX = clipBtn.right + 6.0f;
 
     // Audio Mute / Volume Button
@@ -6287,7 +6306,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                    showDisplayMenu_ = false;
                    showAdminMenu_ = false;
                    showQualityMenu_ = false;
-               }, fmtSmall_, islandAudioMuted, COL_BORDER);
+               }, ui::FontRole::Small, islandAudioMuted, COL_BORDER);
     curX = islandAudioBtn.right + 6.0f;
 
     // Port Forwarding Tunnels Button
@@ -6298,7 +6317,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                showPortForwardModal_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
                8.0f, [this]() {
                    showPortForwardModal_ = !showPortForwardModal_;
-               }, fmtSmall_, !showPortForwardModal_, COL_BORDER);
+               }, ui::FontRole::Small, !showPortForwardModal_, COL_BORDER);
     curX = islandTunnelBtn.right + 6.0f;
 
     // Whiteboard Button
@@ -6310,7 +6329,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                8.0f, [this]() {
                    whiteboardActive_ = !whiteboardActive_;
                    showToast(whiteboardActive_ ? "Whiteboard active" : "Whiteboard hidden");
-               }, fmtSmall_, !whiteboardActive_, COL_BORDER);
+               }, ui::FontRole::Small, !whiteboardActive_, COL_BORDER);
     curX = islandWbBtn.right + 6.0f;
 
     // 5. Chat Button
@@ -6331,7 +6350,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                        network_.markChatRead();
                        focusedField_ = FocusedField::ChatInput;
                    }
-               }, fmtSmall_, !(islandChatOpen || unreadChat > 0), COL_BORDER,
+               }, ui::FontRole::Small, !(islandChatOpen || unreadChat > 0), COL_BORDER,
                (islandChatOpen || unreadChat > 0) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
     curX = islandChatBtn.right + 6.0f;
 
@@ -6351,7 +6370,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                        drawerTab_ = DrawerTab::Diagnostics;
                        network_.setDiagnosticsActive(true);
                    }
-               }, fmtSmall_, !islandDiagOpen, COL_BORDER,
+               }, ui::FontRole::Small, !islandDiagOpen, COL_BORDER,
                islandDiagOpen ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
     curX = islandTaskMgrBtn.right + 6.0f;
 
@@ -6364,7 +6383,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                8.0f, [this]() {
                    showPerformanceHud_ = !showPerformanceHud_;
                    showToast(showPerformanceHud_ ? "Performance HUD: ON" : "Performance HUD: OFF");
-               }, fmtSmall_, !showPerformanceHud_, COL_BORDER);
+               }, ui::FontRole::Small, !showPerformanceHud_, COL_BORDER);
     curX = islandHudBtn.right + 6.0f;
 
     // Rewind Button
@@ -6383,7 +6402,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                    }
                    showToast(showRewindScrubber_ ? "Rewind Scrubber Active" : "Snapped to Live");
                    InvalidateRect(hwnd_, nullptr, FALSE);
-               }, fmtSmall_, !showRewindScrubber_, COL_BORDER);
+               }, ui::FontRole::Small, !showRewindScrubber_, COL_BORDER);
     curX = islandRewindBtn.right + 6.0f;
 
     // Command Palette Button
@@ -6404,7 +6423,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                        focusedField_ = FocusedField::None;
                    }
                    InvalidateRect(hwnd_, nullptr, FALSE);
-               }, fmtSmall_, !showOmnibarModal_, COL_BORDER);
+               }, ui::FontRole::Small, !showOmnibarModal_, COL_BORDER);
     curX = islandPaletteBtn.right + 6.0f;
 
     // 6. Pin Button
@@ -6416,7 +6435,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                8.0f, [this]() {
                    floatingToolbarPinned_ = !floatingToolbarPinned_;
                    showToast(floatingToolbarPinned_ ? "Toolbar Pinned" : "Toolbar Auto-hide");
-               }, fmtSmall_, !floatingToolbarPinned_, COL_BORDER);
+               }, ui::FontRole::Small, !floatingToolbarPinned_, COL_BORDER);
     curX = pinBtn.right + 6.0f;
 
     // Fullscreen Exit Button
@@ -6425,7 +6444,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
                8.0f, [this]() {
                    toggleFullscreen();
-               }, fmtSmall_, true, COL_BORDER);
+               }, ui::FontRole::Small, true, COL_BORDER);
 
     // Shortcuts Button "?" (Relocated to far right unobtrusive corner)
     UiRect helpBtn = { pillRight - 40.0f, pillTop + 6.0f, pillRight - 10.0f, pillBottom - 6.0f };
@@ -6433,7 +6452,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
                8.0f, [this]() {
                    toggleShortcutsModal();
-               }, fmtBodyBold_, true, COL_BORDER);
+               }, ui::FontRole::BodyBold, true, COL_BORDER);
 
     // Dropdown 1: Display Switcher Menu
     if (displayMenuAnimT_ > 0.005f) {
@@ -6454,7 +6473,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
             UiRect itemR = { dropRect.left + 8.0f, dy, dropRect.right - 8.0f, dy + 28.0f };
             drawButton("drop_mon_0", itemR, "Primary Display (Default)",
                        COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 6.0f,
-                       [this]() { showDisplayMenu_ = false; }, fmtSmall_);
+                       [this]() { showDisplayMenu_ = false; }, ui::FontRole::Small);
             dy += itemH;
         } else {
             if (stats.monitors.size() > 1) {
@@ -6468,7 +6487,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                                network_.selectRemoteMonitor(-1);
                                showDisplayMenu_ = false;
                                showToast("Switched to All Displays (Grid View)");
-                           }, fmtSmall_, !isAll, COL_BORDER);
+                           }, ui::FontRole::Small, !isAll, COL_BORDER);
                 dy += itemH;
             }
             for (size_t i = 0; i < stats.monitors.size(); ++i) {
@@ -6494,14 +6513,14 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                                    network_.selectRemoteMonitor(m.index);
                                    showDisplayMenu_ = false;
                                    showToast("Switched to " + m.name);
-                               }, fmtSmall_, !isCur, COL_BORDER);
+                               }, ui::FontRole::Small, !isCur, COL_BORDER);
 
                     drawButton("drop_mon_del_" + std::to_string(i), closeR, "X",
                                COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_PRIMARY,
                                6.0f, [this, m]() {
                                    network_.requestDestroyVirtualDisplay(m.virtualId);
                                    showToast("Removing virtual display...");
-                               }, fmtSmall_, true, COL_BORDER);
+                               }, ui::FontRole::Small, true, COL_BORDER);
                 } else {
                     std::string label = m.name.empty() ? ("Display " + std::to_string(m.index + 1)) : m.name;
                     drawButton(btnId, itemR, label,
@@ -6512,7 +6531,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                                    network_.selectRemoteMonitor(m.index);
                                    showDisplayMenu_ = false;
                                    showToast("Switched to Display " + std::to_string(m.index + 1));
-                               }, fmtSmall_, !isCur, COL_BORDER);
+                               }, ui::FontRole::Small, !isCur, COL_BORDER);
                 }
                 dy += itemH;
             }
@@ -6521,7 +6540,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
         // Section: + Add Virtual Display
         dy += 4.0f;
         UiRect addTitleR = { dropRect.left + 10.0f, dy, dropRect.right - 10.0f, dy + 18.0f };
-        drawText("+ Add Virtual Display", addTitleR, fmtSmall_, withAlpha(COL_TEXT_SECONDARY, menuAlpha));
+        drawText("+ Add Virtual Display", addTitleR, ui::FontRole::Small, withAlpha(COL_TEXT_SECONDARY, menuAlpha));
         dy += 20.0f;
 
         float chipSpacing = 4.0f;
@@ -6537,7 +6556,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                        network_.requestCreateVirtualDisplay(1920, 1080, 60);
                        showToast("Creating virtual display (1920x1080)...");
                        showDisplayMenu_ = false;
-                    }, fmtSmall_, true, COL_BORDER);
+                    }, ui::FontRole::Small, true, COL_BORDER);
 
         // Chip 2: 1440p
         UiRect chip2R = { chip1R.right + chipSpacing, dy, chip1R.right + chipSpacing + chipW, dy + chipH };
@@ -6547,7 +6566,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                        network_.requestCreateVirtualDisplay(2560, 1440, 60);
                        showToast("Creating virtual display (2560x1440)...");
                        showDisplayMenu_ = false;
-                   }, fmtSmall_, true, COL_BORDER);
+                   }, ui::FontRole::Small, true, COL_BORDER);
 
         // Chip 3: 4K
         UiRect chip3R = { chip2R.right + chipSpacing, dy, chip2R.right + chipSpacing + chipW, dy + chipH };
@@ -6557,7 +6576,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                        network_.requestCreateVirtualDisplay(3840, 2160, 60);
                        showToast("Creating virtual display (3840x2160)...");
                        showDisplayMenu_ = false;
-                   }, fmtSmall_, true, COL_BORDER);
+                   }, ui::FontRole::Small, true, COL_BORDER);
 
         // Chip 4: Fit Window
         UiRect chip4R = { chip3R.right + chipSpacing, dy, dropRect.right - 8.0f, dy + chipH };
@@ -6569,7 +6588,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                        network_.requestCreateVirtualDisplay(fitW, fitH, 60);
                        showToast("Creating virtual display (" + std::to_string(fitW) + "x" + std::to_string(fitH) + ")...");
                        showDisplayMenu_ = false;
-                   }, fmtSmall_, true, COL_BORDER);
+                   }, ui::FontRole::Small, true, COL_BORDER);
     }
 
     // Dropdown 2: Admin Actions Menu
@@ -6590,7 +6609,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                        network_.sendSystemAction(SystemActionType::LockWorkstation);
                        showAdminMenu_ = false;
                        showToast("Remote Workstation Locked");
-                   }, fmtSmall_, true, COL_BORDER);
+                   }, ui::FontRole::Small, true, COL_BORDER);
         dy += itemH;
 
         UiRect r2 = { dropRect.left + 8.0f, dy, dropRect.right - 8.0f, dy + 28.0f };
@@ -6599,7 +6618,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                        network_.sendSystemAction(SystemActionType::ShowDesktop);
                        showAdminMenu_ = false;
                        showToast("Remote Show Desktop");
-                   }, fmtSmall_, true, COL_BORDER);
+                   }, ui::FontRole::Small, true, COL_BORDER);
         dy += itemH;
 
         UiRect r3 = { dropRect.left + 8.0f, dy, dropRect.right - 8.0f, dy + 28.0f };
@@ -6608,7 +6627,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                        network_.sendSystemAction(SystemActionType::SendCtrlAltDel);
                        showAdminMenu_ = false;
                        showToast("Sent Ctrl+Alt+Del to remote PC");
-                   }, fmtSmall_, true, COL_BORDER);
+                   }, ui::FontRole::Small, true, COL_BORDER);
         dy += itemH;
 
         UiRect r4 = { dropRect.left + 8.0f, dy, dropRect.right - 8.0f, dy + 28.0f };
@@ -6616,7 +6635,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
                        showAdminMenu_ = false;
                        showRebootConfirmModal_ = true;
-                   }, fmtSmall_, true, COL_BORDER);
+                   }, ui::FontRole::Small, true, COL_BORDER);
         dy += itemH;
 
         UiRect r5 = { dropRect.left + 8.0f, dy, dropRect.right - 8.0f, dy + 28.0f };
@@ -6625,7 +6644,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                        network_.sendSystemAction(SystemActionType::EmergencyReboot);
                        showAdminMenu_ = false;
                        showToast("Remote Emergency Reboot sent", true);
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
     }
 
     // Dropdown 3: Quality & FPS Menu
@@ -6659,7 +6678,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                            identity_.updateSettings(ns);
                            showQualityMenu_ = false;
                            showToast(std::string("Applied ") + connectionProfileName(prof) + " Profile");
-                       }, fmtSmall_, !isCur, COL_BORDER);
+                       }, ui::FontRole::Small, !isCur, COL_BORDER);
             dy += itemH;
         };
 
@@ -6685,7 +6704,7 @@ void CppDeskWindow::drawDynamicIslandToolbar(float width, float height) {
                            identity_.updateSettings(ns);
                            showQualityMenu_ = false;
                            showToast("FPS Target: " + std::to_string(fps));
-                       }, fmtSmall_, !isCur, COL_BORDER);
+                       }, ui::FontRole::Small, !isCur, COL_BORDER);
             dy += itemH;
         };
 
@@ -6765,7 +6784,7 @@ void CppDeskWindow::drawClipboardTransferPill(float width, float /*height*/) {
         std::snprintf(buf, sizeof(buf), "%s • %d%%", fname.c_str(), pct);
     }
     UiRect textRect = { pillLeft + 28.0f, pillTop, pillRight - 38.0f, pillBottom };
-    drawText(buf, textRect, fmtSmall_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_LEADING);
+    drawText(buf, textRect, ui::FontRole::Small, COL_TEXT_PRIMARY, ui::HAlign::Leading);
 
     // Interactive Cancel Button "✕"
     UiRect cancelBtn = { pillRight - 32.0f, pillTop + 6.0f, pillRight - 8.0f, pillBottom - 6.0f };
@@ -6774,7 +6793,7 @@ void CppDeskWindow::drawClipboardTransferPill(float width, float /*height*/) {
                8.0f, [this]() {
                    network_.clipboardFileTransferManager().cancelActiveTransfer();
                    showToast("Clipboard transfer cancelled");
-               }, fmtSmall_, true, COL_BORDER);
+               }, ui::FontRole::Small, true, COL_BORDER);
 }
 
 // ---------------- macOS Keyboard Shortcuts Sheet Modal ----------------
@@ -6807,16 +6826,16 @@ void CppDeskWindow::drawShortcutsModal(float width, float height, float modalPro
     float mrx = modal.right - 28.0f;
     float my = modal.top + 24.0f;
 
-    drawText("Keyboard Shortcuts", { mx, my, mrx - 40.0f, my + 28.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    drawText("Keyboard Shortcuts", { mx, my, mrx - 40.0f, my + 28.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
 
     UiRect closeBtn = { mrx - 28.0f, my, mrx, my + 28.0f };
     drawButton("modal_sc_close", closeBtn, "×",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 14.0f,
-               [this]() { showShortcutsModal_ = false; }, fmtHeading_);
+               [this]() { showShortcutsModal_ = false; }, ui::FontRole::Heading);
     my += 38.0f;
 
     drawText("Speed up remote navigation and desktop control with global hotkeys.",
-             { mx, my, mrx, my + 20.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+             { mx, my, mrx, my + 20.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 26.0f;
 
     struct ShortcutRow {
@@ -6843,17 +6862,17 @@ void CppDeskWindow::drawShortcutsModal(float width, float height, float modalPro
         UiRect badgeRect = { mx, my, mx + 160.0f, my + 24.0f };
         fillRoundRect(badgeRect, 6.0f, COL_BG_SUBTLE);
         strokeRoundRect(badgeRect, 6.0f, COL_BORDER, 1.0f);
-        drawText(r.key, badgeRect, fmtMono_, COL_TEXT_ACCENT, DWRITE_TEXT_ALIGNMENT_CENTER);
+        drawText(r.key, badgeRect, ui::FontRole::Mono, COL_TEXT_ACCENT, ui::HAlign::Center);
 
         UiRect descRect = { mx + 172.0f, my, mrx, my + 24.0f };
-        drawText(r.desc, descRect, fmtBody_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_LEADING);
+        drawText(r.desc, descRect, ui::FontRole::Body, COL_TEXT_PRIMARY, ui::HAlign::Leading);
 
         my += rowH;
     }
 
     my += 8.0f;
     drawText("Tip: In Fullscreen, move your mouse to the top edge to reveal the Dynamic Island.",
-             { mx, my, mrx, my + 20.0f }, fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+             { mx, my, mrx, my + 20.0f }, ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -6888,20 +6907,20 @@ void CppDeskWindow::drawPortForwardModal(float width, float height, float modalP
     float mrx = modal.right - 28.0f;
     float my = modal.top + 22.0f;
 
-    drawText("TCP Port Forwarding & Tunneling", { mx, my, mrx - 40.0f, my + 28.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    drawText("TCP Port Forwarding & Tunneling", { mx, my, mrx - 40.0f, my + 28.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
 
     UiRect closeBtn = { mrx - 28.0f, my, mrx, my + 28.0f };
     drawButton("modal_pf_close", closeBtn, "×",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 14.0f,
-               [this]() { showPortForwardModal_ = false; }, fmtHeading_);
+               [this]() { showPortForwardModal_ = false; }, ui::FontRole::Heading);
     my += 34.0f;
 
     drawText("Forward local network ports securely to services on the remote PC.",
-             { mx, my, mrx, my + 20.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+             { mx, my, mrx, my + 20.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 26.0f;
 
     // Presets Row
-    drawText("QUICK PRESETS", { mx, my, mrx, my + 16.0f }, fmtSmall_, COL_TEXT_MUTED);
+    drawText("QUICK PRESETS", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
     my += 20.0f;
 
     float preW = (mrx - mx - 18.0f) / 4.0f;
@@ -6914,30 +6933,30 @@ void CppDeskWindow::drawPortForwardModal(float width, float height, float modalP
         forwardLocalPortEdit_ = "33890";
         forwardTargetPortEdit_ = "3389";
         forwardDescEdit_ = "RDP Remote Desktop";
-    }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
     drawButton("pre_ssh", p2, "SSH (2222->22)", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.5f, [this]() {
         forwardLocalPortEdit_ = "2222";
         forwardTargetPortEdit_ = "22";
         forwardDescEdit_ = "SSH Terminal";
-    }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
     drawButton("pre_web", p3, "Web (8080->80)", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.5f, [this]() {
         forwardLocalPortEdit_ = "8080";
         forwardTargetPortEdit_ = "80";
         forwardDescEdit_ = "Web Server";
-    }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
     drawButton("pre_vnc", p4, "VNC (5901->5900)", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.5f, [this]() {
         forwardLocalPortEdit_ = "5901";
         forwardTargetPortEdit_ = "5900";
         forwardDescEdit_ = "VNC Server";
-    }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
     my += 36.0f;
 
     // Add Rule Inputs Row
-    drawText("NEW TUNNEL RULE", { mx, my, mrx, my + 16.0f }, fmtSmall_, COL_TEXT_MUTED);
+    drawText("NEW TUNNEL RULE", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
     my += 20.0f;
 
     float fLocalW = 100.0f;
@@ -6968,12 +6987,12 @@ void CppDeskWindow::drawPortForwardModal(float width, float height, float modalP
         } catch (...) {
             showToast("Invalid port number", true);
         }
-    }, fmtSmall_);
+    }, ui::FontRole::Small);
 
     my += 44.0f;
 
     // Active Rules Table
-    drawText("ACTIVE TUNNELS", { mx, my, mrx, my + 16.0f }, fmtSmall_, COL_TEXT_MUTED);
+    drawText("ACTIVE TUNNELS", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
     my += 20.0f;
 
     UiRect tableBox = { mx, my, mrx, modal.bottom - 22.0f };
@@ -6984,7 +7003,7 @@ void CppDeskWindow::drawPortForwardModal(float width, float height, float modalP
     if (rules.empty()) {
         drawText("No port forwarding rules configured. Add one above or select a preset.",
                  { tableBox.left + 16.0f, tableBox.centerY() - 14.0f, tableBox.right - 16.0f, tableBox.centerY() + 14.0f },
-                 fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+                 ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
     } else {
         float rTop = tableBox.top + 8.0f;
         float itemH = 46.0f;
@@ -6999,7 +7018,7 @@ void CppDeskWindow::drawPortForwardModal(float width, float height, float modalP
 
             std::string routeStr = "127.0.0.1:" + std::to_string(r.localPort) + "  ➔  Remote :" + std::to_string(r.targetPort);
             drawText(routeStr, { cardR.left + 26.0f, cardR.top + 4.0f, cardR.right - 140.0f, cardR.top + 22.0f },
-                     fmtBodyBold_, COL_TEXT_PRIMARY);
+                     ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
             std::string sub = r.description.empty() ? "TCP Proxy" : r.description;
             char statsBuf[96];
@@ -7007,7 +7026,7 @@ void CppDeskWindow::drawPortForwardModal(float width, float height, float modalP
                           r.bytesTransferredIn / 1024.0f, r.bytesTransferredOut / 1024.0f);
             sub += statsBuf;
             drawText(sub, { cardR.left + 26.0f, cardR.top + 22.0f, cardR.right - 140.0f, cardR.bottom - 4.0f },
-                     fmtSmall_, COL_TEXT_SECONDARY);
+                     ui::FontRole::Small, COL_TEXT_SECONDARY);
 
             uint32_t rid = r.ruleId;
             bool isAct = r.active;
@@ -7018,7 +7037,7 @@ void CppDeskWindow::drawPortForwardModal(float width, float height, float modalP
                        isAct ? COL_TEXT_PRIMARY : COL_TEXT_ON_ACCENT,
                        6.0f, [this, rid, isAct]() {
                            network_.setPortForwardRuleActive(rid, !isAct);
-                       }, fmtSmall_, isAct, COL_BORDER);
+                       }, ui::FontRole::Small, isAct, COL_BORDER);
 
             UiRect delBtn = { cardR.right - 60.0f, cardR.top + 7.0f, cardR.right - 8.0f, cardR.bottom - 7.0f };
             drawButton("rule_del_" + std::to_string(rid), delBtn, "Del",
@@ -7026,7 +7045,7 @@ void CppDeskWindow::drawPortForwardModal(float width, float height, float modalP
                        6.0f, [this, rid]() {
                            network_.removePortForwardRule(rid);
                            showToast("Tunnel rule removed");
-                       }, fmtSmall_, false, D2D1::ColorF(0, 0, 0, 0), COL_TEXT_ON_ACCENT);
+                       }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0}, COL_TEXT_ON_ACCENT);
 
             rTop += itemH;
         }
@@ -7065,20 +7084,20 @@ void CppDeskWindow::drawAddressBookModal(float width, float height, float modalP
     float mrx = modal.right - 28.0f;
     float my = modal.top + 22.0f;
 
-    drawText("Edit Desk Details", { mx, my, mrx - 40.0f, my + 26.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    drawText("Edit Desk Details", { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
 
     UiRect closeBtn = { mrx - 28.0f, my, mrx, my + 28.0f };
     drawButton("modal_ab_close", closeBtn, "×",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 14.0f,
-               [this]() { showAddressBookEditModal_ = false; }, fmtHeading_);
+               [this]() { showAddressBookEditModal_ = false; }, ui::FontRole::Heading);
     my += 34.0f;
 
     std::string idText = "Desk ID: " + CryptoUtils::formatDeskId(editingDeskId_);
-    drawText(idText, { mx, my, mrx, my + 18.0f }, fmtSmall_, COL_PRIMARY_ACCENT);
+    drawText(idText, { mx, my, mrx, my + 18.0f }, ui::FontRole::Small, COL_PRIMARY_ACCENT);
     my += 24.0f;
 
     // Alias Field
-    drawText("Machine Alias / Display Name", { mx, my, mrx, my + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+    drawText("Machine Alias / Display Name", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 18.0f;
     UiRect aliasField = { mx, my, mrx, my + 34.0f };
     drawTextField("field_edit_alias", FocusedField::EditAlias, aliasField,
@@ -7086,7 +7105,7 @@ void CppDeskWindow::drawAddressBookModal(float width, float height, float modalP
     my += 44.0f;
 
     // Tag Field
-    drawText("Category Tag (e.g. Work, Servers, Personal)", { mx, my, mrx, my + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+    drawText("Category Tag (e.g. Work, Servers, Personal)", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 18.0f;
     UiRect tagField = { mx, my, mrx, my + 34.0f };
     drawTextField("field_edit_tag", FocusedField::EditTag, tagField,
@@ -7094,7 +7113,7 @@ void CppDeskWindow::drawAddressBookModal(float width, float height, float modalP
     my += 44.0f;
 
     // Notes Field
-    drawText("Notes & Remarks", { mx, my, mrx, my + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+    drawText("Notes & Remarks", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 18.0f;
     UiRect notesField = { mx, my, mrx, my + 34.0f };
     drawTextField("field_edit_notes", FocusedField::EditNotes, notesField,
@@ -7107,7 +7126,7 @@ void CppDeskWindow::drawAddressBookModal(float width, float height, float modalP
     drawButton("modal_ab_cancel", cancelBtn, "Cancel",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
                    showAddressBookEditModal_ = false;
-               }, fmtSmall_, true, COL_BORDER);
+               }, ui::FontRole::Small, true, COL_BORDER);
 
     UiRect saveBtn = { cancelBtn.right + 12.0f, my, mrx, my + 36.0f };
     drawButton("modal_ab_save", saveBtn, "Save Details",
@@ -7115,7 +7134,7 @@ void CppDeskWindow::drawAddressBookModal(float width, float height, float modalP
                    identity_.updateRecentSessionMetadata(editingDeskId_, editAliasInput_, editTagInput_, editNotesInput_);
                    showAddressBookEditModal_ = false;
                    showToast("Saved desk details");
-               }, fmtSmall_);
+               }, ui::FontRole::Small);
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -7287,7 +7306,7 @@ void CppDeskWindow::drawFileManagerDrawer(const UiRect& contentRect) {
         const float px = area.left + 8.0f;
         const float prx = area.right - 8.0f;
         float py = area.top + 6.0f;
-        drawText(paneIdx == 0 ? "This PC" : "Remote Host", { px, py, prx, py + 16.0f }, fmtSmall_,
+        drawText(paneIdx == 0 ? "This PC" : "Remote Host", { px, py, prx, py + 16.0f }, ui::FontRole::Small,
                  active ? COL_TEXT_ACCENT : COL_TEXT_SECONDARY);
         py += 18.0f;
 
@@ -7296,14 +7315,14 @@ void CppDeskWindow::drawFileManagerDrawer(const UiRect& contentRect) {
             activeFilePane_ = paneIdx;
             const FileBrowserPaneState& s = (paneIdx == 0) ? localFilePane_ : remoteFilePane_;
             navigateFilePane(paneIdx, RemoteFileBrowserManager::getParentDirectory(s.currentPath));
-        }, fmtSmall_, true, COL_BORDER);
+        }, ui::FontRole::Small, true, COL_BORDER);
 
         UiRect refreshBtn = { prx - 26.0f, py, prx, py + 28.0f };
         drawButton(idp + "refresh", refreshBtn, "↺", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this, paneIdx]() {
             activeFilePane_ = paneIdx;
             const std::string cur = ((paneIdx == 0) ? localFilePane_ : remoteFilePane_).currentPath;
             navigateFilePane(paneIdx, cur.empty() ? "$DRIVES$" : cur);
-        }, fmtSmall_, true, COL_BORDER);
+        }, ui::FontRole::Small, true, COL_BORDER);
 
         UiRect pathField = { upBtn.right + 4.0f, py, refreshBtn.left - 4.0f, py + 28.0f };
         drawTextField(idp + "path", paneIdx == 0 ? FocusedField::FileBrowserLocalPath : FocusedField::FileBrowserRemotePath,
@@ -7322,12 +7341,12 @@ void CppDeskWindow::drawFileManagerDrawer(const UiRect& contentRect) {
         const int first = static_cast<int>(st.scrollOffset);
 
         if (st.isLoading) {
-            drawText("Loading...", listBox, fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+            drawText("Loading...", listBox, ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
         } else if (total == 0) {
             std::string msg = !st.statusMessage.empty() ? st.statusMessage
                               : (st.currentPath.empty() ? "Not loaded" : "Empty");
-            drawText(msg, { listBox.left + 8.0f, listBox.top, listBox.right - 8.0f, listBox.bottom }, fmtSmall_,
-                     st.statusMessage.empty() ? COL_TEXT_MUTED : COL_DANGER, DWRITE_TEXT_ALIGNMENT_CENTER);
+            drawText(msg, { listBox.left + 8.0f, listBox.top, listBox.right - 8.0f, listBox.bottom }, ui::FontRole::Small,
+                     st.statusMessage.empty() ? COL_TEXT_MUTED : COL_DANGER, ui::HAlign::Center);
         } else {
             float ry = listBox.top + 2.0f;
             for (int i = first; i < total && (i - first) < visible; ++i) {
@@ -7343,10 +7362,10 @@ void CppDeskWindow::drawFileManagerDrawer(const UiRect& contentRect) {
                 const float sizeW = e.isDirectory ? 0.0f : 64.0f;
                 drawText(e.isDirectory ? std::string("▸ ") + e.name : e.name,
                          { row.left + 6.0f, row.top, row.right - sizeW - 6.0f, row.bottom },
-                         e.isDirectory ? fmtBodyBold_ : fmtBody_, COL_TEXT_PRIMARY);
+                         e.isDirectory ? ui::FontRole::BodyBold : ui::FontRole::Body, COL_TEXT_PRIMARY);
                 if (!e.isDirectory) {
                     drawText(RFB::formatFileSize(e.sizeBytes), { row.right - sizeW - 4.0f, row.top, row.right - 4.0f, row.bottom },
-                             fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_TRAILING);
+                             ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Trailing);
                 }
                 clickRegions_.push_back({ row, idp + "row_" + std::to_string(i), [this, paneIdx, i]() {
                     activateFilePaneEntry(paneIdx, i);
@@ -7370,7 +7389,7 @@ void CppDeskWindow::drawFileManagerDrawer(const UiRect& contentRect) {
         } else if (total > 0) {
             footer = std::to_string(total - 1) + " items";
         }
-        drawText(footer, { px, listBox.bottom + 2.0f, prx, area.bottom - 2.0f }, fmtSmall_, COL_TEXT_MUTED);
+        drawText(footer, { px, listBox.bottom + 2.0f, prx, area.bottom - 2.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
     };
 
     drawPane(0, { panesArea.left, panesArea.top, panesArea.left + paneW, panesArea.bottom });
@@ -7392,7 +7411,7 @@ void CppDeskWindow::drawFileManagerDrawer(const UiRect& contentRect) {
         const std::string full = RemoteFileBrowserManager::joinPath(localFilePane_.currentPath, name);
         if (network_.sendFilePath(std::filesystem::path(utf8ToWide(full))) > 0) showToast("Uploading " + name);
         else showToast("Could not send " + name, true);
-    }, fmtSmall_);
+    }, ui::FontRole::Small);
 
     drawButton("fm_download", btnRect(1), "← Download", COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
         const FileBrowserItemEntry* sel = remoteFilePane_.selectedEntry();
@@ -7403,14 +7422,14 @@ void CppDeskWindow::drawFileManagerDrawer(const UiRect& contentRect) {
         const std::string name = sel->name;
         network_.sendRemoteFileDownload(RemoteFileBrowserManager::joinPath(remoteFilePane_.currentPath, name), name);
         showToast("Requested " + name + " - progress is in the Files tab");
-    }, fmtSmall_);
+    }, ui::FontRole::Small);
 
     drawButton("fm_newdir", btnRect(2), "New Folder", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f,
-               [this]() { openFileBrowserModal(activeFilePane_, 0); }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+               [this]() { openFileBrowserModal(activeFilePane_, 0); }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
     drawButton("fm_rename", btnRect(3), "Rename", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f,
-               [this]() { openFileBrowserModal(activeFilePane_, 1); }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+               [this]() { openFileBrowserModal(activeFilePane_, 1); }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
     drawButton("fm_delete", btnRect(4), "Delete", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_DANGER, 8.0f,
-               [this]() { openFileBrowserModal(activeFilePane_, 2); }, fmtSmall_, true, COL_BORDER, COL_DANGER);
+               [this]() { openFileBrowserModal(activeFilePane_, 2); }, ui::FontRole::Small, true, COL_BORDER, COL_DANGER);
 }
 
 void CppDeskWindow::drawRunTaskModal(float width, float height, float modalProgress) {
@@ -7439,25 +7458,25 @@ void CppDeskWindow::drawRunTaskModal(float width, float height, float modalProgr
     float mrx = modal.right - 26.0f;
     float my = modal.top + 22.0f;
 
-    drawText("Run Task on Host", { mx, my, mrx - 40.0f, my + 26.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    drawText("Run Task on Host", { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
     UiRect closeBtn = { mrx - 26.0f, my, mrx, my + 26.0f };
     drawButton("modal_runtask_close", closeBtn, "×", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 13.0f, [this]() {
         showRunTaskModal_ = false;
         focusedField_ = FocusedField::None;
-    }, fmtHeading_);
+    }, ui::FontRole::Heading);
     my += 34.0f;
 
     drawText("Launches a program on the remote desktop. Needs remote input permission.",
-             { mx, my, mrx, my + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+             { mx, my, mrx, my + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 26.0f;
 
-    drawText("Command line", { mx, my, mrx, my + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+    drawText("Command line", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 18.0f;
     drawTextField("field_runtask_cmd", FocusedField::RunTaskCommand, { mx, my, mrx, my + 34.0f },
                   runTaskCommandInput_, "e.g. notepad.exe C:\\notes.txt", false);
     my += 44.0f;
 
-    drawText("Working directory (optional)", { mx, my, mrx, my + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+    drawText("Working directory (optional)", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 18.0f;
     drawTextField("field_runtask_dir", FocusedField::RunTaskWorkingDir, { mx, my, mrx, my + 34.0f },
                   runTaskWorkingDirInput_, "e.g. C:\\Users", false);
@@ -7469,10 +7488,10 @@ void CppDeskWindow::drawRunTaskModal(float width, float height, float modalProgr
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
                    showRunTaskModal_ = false;
                    focusedField_ = FocusedField::None;
-               }, fmtSmall_, true, COL_BORDER);
+               }, ui::FontRole::Small, true, COL_BORDER);
     drawButton("modal_runtask_run", { mrx - btnW, my, mrx, my + btnH }, "Run",
                COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f,
-               [this]() { submitRunTask(); }, fmtSmall_);
+               [this]() { submitRunTask(); }, ui::FontRole::Small);
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -7508,32 +7527,32 @@ void CppDeskWindow::drawFileBrowserActionModal(float width, float height, float 
     float my = modal.top + 22.0f;
 
     const char* title = (kind == 0) ? "New Folder" : (kind == 1 ? "Rename" : "Delete");
-    drawText(title, { mx, my, mrx - 40.0f, my + 26.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    drawText(title, { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
     UiRect closeBtn = { mrx - 26.0f, my, mrx, my + 26.0f };
     drawButton("modal_fileaction_close", closeBtn, "×", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 13.0f,
-               [this]() { closeFileBrowserModal(); }, fmtHeading_);
+               [this]() { closeFileBrowserModal(); }, ui::FontRole::Heading);
     my += 36.0f;
 
     const std::string where = local ? "This PC" : "the remote host";
     if (kind == 0) {
         const std::string& dir = local ? localFilePane_.currentPath : remoteFilePane_.currentPath;
-        drawText("Create in " + dir, { mx, my, mrx, my + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        drawText("Create in " + dir, { mx, my, mrx, my + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         my += 24.0f;
         drawTextField("field_fileaction_newdir", FocusedField::FileBrowserNewDir, { mx, my, mrx, my + 34.0f },
                       fileBrowserNewDirName_, "Folder name", false);
         my += 54.0f;
     } else if (kind == 1) {
-        drawText("Rename \"" + fileBrowserModalTargetName_ + "\" on " + where, { mx, my, mrx, my + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        drawText("Rename \"" + fileBrowserModalTargetName_ + "\" on " + where, { mx, my, mrx, my + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         my += 24.0f;
         drawTextField("field_fileaction_rename", FocusedField::FileBrowserRename, { mx, my, mrx, my + 34.0f },
                       fileBrowserRenameName_, "New name", false);
         my += 54.0f;
     } else {
         drawText("Permanently delete \"" + fileBrowserModalTargetName_ + "\" from " + where + "?",
-                 { mx, my, mrx, my + 22.0f }, fmtBodyBold_, COL_TEXT_PRIMARY);
+                 { mx, my, mrx, my + 22.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
         my += 26.0f;
         drawText("This cannot be undone. A folder is deleted with everything inside it.",
-                 { mx, my, mrx, my + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+                 { mx, my, mrx, my + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         my += 40.0f;
     }
 
@@ -7541,10 +7560,10 @@ void CppDeskWindow::drawFileBrowserActionModal(float width, float height, float 
     float btnH = 34.0f;
     drawButton("modal_fileaction_cancel", { mrx - btnW * 2.0f - 10.0f, my, mrx - btnW - 10.0f, my + btnH }, "Cancel",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() { closeFileBrowserModal(); },
-               fmtSmall_, true, COL_BORDER);
+               ui::FontRole::Small, true, COL_BORDER);
     drawButton("modal_fileaction_confirm", { mrx - btnW, my, mrx, my + btnH }, isDelete ? "Delete" : (kind == 1 ? "Rename" : "Create"),
                isDelete ? COL_DANGER : COL_PRIMARY_ACCENT, isDelete ? COL_DANGER_HV : COL_PRIMARY_ACCENT_HV,
-               COL_TEXT_ON_ACCENT, 8.0f, [this]() { submitFileBrowserModal(); }, fmtSmall_);
+               COL_TEXT_ON_ACCENT, 8.0f, [this]() { submitFileBrowserModal(); }, ui::FontRole::Small);
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -7579,23 +7598,23 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
         UiRect badgeRect = { mx, my, mx + 160.0f, my + 24.0f };
         fillRoundRect(badgeRect, 6.0f, rgba(217, 130, 43, 0.18f));
         strokeRoundRect(badgeRect, 6.0f, rgba(217, 130, 43, 0.45f), 1.0f);
-        drawText("VERSION MISMATCH", badgeRect, fmtSmall_, COL_WARNING, DWRITE_TEXT_ALIGNMENT_CENTER);
+        drawText("VERSION MISMATCH", badgeRect, ui::FontRole::Small, COL_WARNING, ui::HAlign::Center);
         my += 34.0f;
 
-        drawText("Host Version Upgrade Notice", { mx, my, mrx, my + 30.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        drawText("Host Version Upgrade Notice", { mx, my, mrx, my + 30.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         my += 34.0f;
 
         std::string verText = "Host is running v" + peerMismatchHostVer_ + " (Local Viewer is v" + peerMismatchViewerVer_ + ").";
-        drawText(verText, { mx, my, mrx, my + 20.0f }, fmtBodyBold_, COL_PRIMARY_ACCENT);
+        drawText(verText, { mx, my, mrx, my + 20.0f }, ui::FontRole::BodyBold, COL_PRIMARY_ACCENT);
         my += 28.0f;
     } else {
         UiRect badgeRect = { mx, my, mx + 160.0f, my + 24.0f };
         fillRoundRect(badgeRect, 6.0f, rgba(235, 87, 87, 0.18f));
         strokeRoundRect(badgeRect, 6.0f, rgba(235, 87, 87, 0.45f), 1.0f);
-        drawText("MANDATORY UPDATE", badgeRect, fmtSmall_, COL_DANGER, DWRITE_TEXT_ALIGNMENT_CENTER);
+        drawText("MANDATORY UPDATE", badgeRect, ui::FontRole::Small, COL_DANGER, ui::HAlign::Center);
         my += 34.0f;
 
-        drawText("Update Required to Continue", { mx, my, mrx, my + 30.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+        drawText("Update Required to Continue", { mx, my, mrx, my + 30.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         my += 34.0f;
 
         std::string latestVerClean = latestUpdateInfo_.latestVersion;
@@ -7603,7 +7622,7 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
             latestVerClean = latestVerClean.substr(1);
         }
         std::string verText = "CppDesk v" + latestVerClean + " is now available (Current: v" + CPP_DESK_VERSION + ").";
-        drawText(verText, { mx, my, mrx, my + 20.0f }, fmtBodyBold_, COL_PRIMARY_ACCENT);
+        drawText(verText, { mx, my, mrx, my + 20.0f }, ui::FontRole::BodyBold, COL_PRIMARY_ACCENT);
         my += 28.0f;
     }
 
@@ -7616,7 +7635,7 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
         ? "The remote host is running a newer version of CppDesk with updated protocol features.\n\nUpgrading to v" + peerMismatchHostVer_ + " is recommended for full feature compatibility."
         : "To ensure end-to-end cryptographic security, protocol compatibility, and uninterrupted remote desktop connections, all clients must update to the latest release.\n\nRemote sessions are locked until CppDesk is updated.";
     drawText(descText, { infoBox.left + 14.0f, infoBox.top + 8.0f, infoBox.right - 14.0f, infoBox.bottom - 8.0f },
-             fmtSmall_, COL_TEXT_SECONDARY);
+             ui::FontRole::Small, COL_TEXT_SECONDARY);
     my = infoBox.bottom + 16.0f;
 
     // Live Download Progress Bar and telemetry if downloading
@@ -7642,7 +7661,7 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
         } else {
             std::snprintf(statBuf, sizeof(statBuf), "%s", updateStatusMsg_.c_str());
         }
-        drawText(statBuf, { mx, my, mrx, my + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        drawText(statBuf, { mx, my, mrx, my + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         my += 26.0f;
     } else {
         my += 10.0f;
@@ -7658,12 +7677,12 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
                        showUpdateRequiredModal_ = false;
                        showPeerMismatchModal_ = false;
                        InvalidateRect(hwnd_, nullptr, FALSE);
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
     } else {
         drawButton("update_modal_exit", leftBtn, "Exit CppDesk",
                    COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_PRIMARY, 9.0f, [this]() {
                        DestroyWindow(hwnd_);
-                   }, fmtSmall_, true, COL_BORDER, COL_TEXT_ON_ACCENT);
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ON_ACCENT);
     }
 
     UiRect dlBtn = { leftBtn.right + 14.0f, my, mrx, my + 40.0f };
@@ -7747,7 +7766,7 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
                        },
                        latestUpdateInfo_.assetSha256
                    );
-               }, fmtSmall_);
+               }, ui::FontRole::Small);
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -7782,16 +7801,16 @@ void CppDeskWindow::drawRebootConfirmModal(float width, float height, float moda
     float mrx = modal.right - 26.0f;
     float my = modal.top + 22.0f;
 
-    drawText("Remote Reboot & Reconnect", { mx, my, mrx - 40.0f, my + 26.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    drawText("Remote Reboot & Reconnect", { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
 
     UiRect closeBtn = { mrx - 26.0f, my, mrx, my + 26.0f };
     drawButton("modal_reboot_close", closeBtn, "×",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 13.0f,
-               [this]() { showRebootConfirmModal_ = false; }, fmtHeading_);
+               [this]() { showRebootConfirmModal_ = false; }, ui::FontRole::Heading);
     my += 34.0f;
 
     drawText("The remote machine will restart and automatically reconnect once Windows boots back up. A secure resume token will authenticate the new session without requiring a password.",
-             { mx, my, mrx, my + 44.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+             { mx, my, mrx, my + 44.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 52.0f;
 
     // Safe mode toggle
@@ -7810,7 +7829,7 @@ void CppDeskWindow::drawRebootConfirmModal(float width, float height, float moda
 
     drawButton("modal_reboot_cancel", cancelBtn, "Cancel",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f,
-               [this]() { showRebootConfirmModal_ = false; }, fmtSmall_, true, COL_BORDER);
+               [this]() { showRebootConfirmModal_ = false; }, ui::FontRole::Small, true, COL_BORDER);
 
     drawButton("modal_reboot_confirm", rebootBtn, "Reboot & Reconnect",
                COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f,
@@ -7821,7 +7840,7 @@ void CppDeskWindow::drawRebootConfirmModal(float width, float height, float moda
                    } else {
                        showToast("Failed to request reboot", true);
                    }
-               }, fmtSmall_);
+               }, ui::FontRole::Small);
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -7855,7 +7874,7 @@ void CppDeskWindow::drawHwAccelRestartModal(float width, float height, float mod
     float mrx = modal.right - 26.0f;
     float my = modal.top + 22.0f;
 
-    drawText("Restart CppDesk", { mx, my, mrx - 40.0f, my + 26.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    drawText("Restart CppDesk", { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
 
     UiRect closeBtn = { mrx - 26.0f, my, mrx, my + 26.0f };
     drawButton("modal_hwaccel_close", closeBtn, "x",
@@ -7863,7 +7882,7 @@ void CppDeskWindow::drawHwAccelRestartModal(float width, float height, float mod
                [this]() {
                    showHwAccelRestartModal_ = false;
                    showToast("Setting saved. Restart CppDesk to apply changes.");
-               }, fmtHeading_);
+               }, ui::FontRole::Heading);
     my += 34.0f;
 
     std::string promptMsg = pendingHwAccelChoice_
@@ -7871,7 +7890,7 @@ void CppDeskWindow::drawHwAccelRestartModal(float width, float height, float mod
         : "Hardware accelerated GPU rendering has been disabled (switching to CPU software rasterization). A restart is required to re-initialize graphics pipelines.";
 
     drawText(promptMsg + "\nWould you like to restart CppDesk now?",
-             { mx, my, mrx, my + 54.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+             { mx, my, mrx, my + 54.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 66.0f;
 
     // Action buttons
@@ -7885,7 +7904,7 @@ void CppDeskWindow::drawHwAccelRestartModal(float width, float height, float mod
                [this]() {
                    showHwAccelRestartModal_ = false;
                    showToast("Setting saved. Restart CppDesk to apply changes.");
-               }, fmtSmall_, true, COL_BORDER);
+               }, ui::FontRole::Small, true, COL_BORDER);
 
     drawButton("modal_hwaccel_now", nowBtn, "Restart Now",
                COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f,
@@ -7896,7 +7915,7 @@ void CppDeskWindow::drawHwAccelRestartModal(float width, float height, float mod
                        ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
                    }
                    DestroyWindow(hwnd_);
-               }, fmtSmall_);
+               }, ui::FontRole::Small);
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -7963,7 +7982,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
     float my = modal.top + 20.0f;
 
     // Header bar
-    drawText("Session Recording Player", { mx, my, mrx - 120.0f, my + 26.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    drawText("Session Recording Player", { mx, my, mrx - 120.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
 
     // "Open..." button
     UiRect openBtnRect = { mrx - 110.0f, my, mrx - 40.0f, my + 28.0f };
@@ -7987,13 +8006,13 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                            openRecordingPlayer(path);
                        }
                    }
-               }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
     // Close button
     UiRect closeBtn = { mrx - 30.0f, my, mrx, my + 28.0f };
     drawButton("player_modal_close", closeBtn, "×",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 14.0f,
-               [this]() { closeRecordingPlayer(); }, fmtHeading_);
+               [this]() { closeRecordingPlayer(); }, ui::FontRole::Heading);
 
     my += 34.0f;
 
@@ -8007,7 +8026,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
     } else {
         subtitle = "No recording loaded. Click Open to select an AVI file.";
     }
-    drawText(subtitle, { mx, my, mrx, my + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+    drawText(subtitle, { mx, my, mrx, my + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 24.0f;
 
     // Viewport canvas
@@ -8065,8 +8084,8 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
         }
     } else {
         drawText("Open an AVI recording to inspect frames, scrub timeline, and export clips",
-                 viewport, fmtBody_, COL_TEXT_MUTED,
-                 DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                 viewport, ui::FontRole::Body, COL_TEXT_MUTED,
+                 ui::HAlign::Center, ui::VAlign::Center);
     }
 
     // Timeline Scrubber Bar
@@ -8098,7 +8117,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
 
         // Thumb handle
         UiRect thumbRect = { thumbX - 6.0f, scrubY + 2.0f, thumbX + 6.0f, scrubY + 14.0f };
-        fillRoundRect(thumbRect, 6.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f));
+        fillRoundRect(thumbRect, 6.0f, ui::Color{1.0f, 1.0f, 1.0f, 1.0f});
         strokeRoundRect(thumbRect, 6.0f, COL_PRIMARY_ACCENT, 1.5f);
     }
 
@@ -8133,9 +8152,9 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                       curSec / 60, curSec % 60,
                       durSec / 60, durSec % 60,
                       curFrame + 1, totFrames);
-        drawText(timeBuf, { mx, timeY, mrx, timeY + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        drawText(timeBuf, { mx, timeY, mrx, timeY + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     } else {
-        drawText("00:00 / 00:00   •   Frame 0 / 0", { mx, timeY, mrx, timeY + 16.0f }, fmtSmall_, COL_TEXT_MUTED);
+        drawText("00:00 / 00:00   •   Frame 0 / 0", { mx, timeY, mrx, timeY + 16.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
     }
 
     // Transport Controls Bar
@@ -8149,7 +8168,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f,
                [this]() {
                    if (recordingPlayer_) recordingPlayer_->stepFrame(-1);
-               }, fmtSmall_);
+               }, ui::FontRole::Small);
     cx = prevBtn.right + 6.0f;
 
     // Play/Pause Toggle
@@ -8159,7 +8178,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 6.0f,
                [this]() {
                    if (recordingPlayer_) recordingPlayer_->togglePlayPause();
-               }, fmtSmall_);
+               }, ui::FontRole::Small);
     cx = playBtn.right + 6.0f;
 
     // Step Next >|
@@ -8168,7 +8187,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f,
                [this]() {
                    if (recordingPlayer_) recordingPlayer_->stepFrame(+1);
-               }, fmtSmall_);
+               }, ui::FontRole::Small);
     cx = nextBtn.right + 14.0f;
 
     // Speed chips: 0.5x, 1x, 2x, 4x
@@ -8183,7 +8202,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                    6.0f,
                    [this, spd]() {
                        if (recordingPlayer_) recordingPlayer_->setSpeed(spd);
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
         cx = r.right + 6.0f;
     };
 
@@ -8205,7 +8224,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                        if (hasTrimOut_ && trimInFrame_ > trimOutFrame_) trimOutFrame_ = trimInFrame_;
                        showToast("Trim In set to Frame " + std::to_string(trimInFrame_ + 1));
                    }
-               }, fmtSmall_, true, COL_BORDER);
+               }, ui::FontRole::Small, true, COL_BORDER);
     cx = markInBtn.right + 6.0f;
 
     // Mark Out
@@ -8220,7 +8239,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                        if (hasTrimIn_ && trimOutFrame_ < trimInFrame_) trimInFrame_ = trimOutFrame_;
                        showToast("Trim Out set to Frame " + std::to_string(trimOutFrame_ + 1));
                    }
-               }, fmtSmall_, true, COL_BORDER);
+               }, ui::FontRole::Small, true, COL_BORDER);
     cx = markOutBtn.right + 6.0f;
 
     // Reset Trim
@@ -8234,7 +8253,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                        trimInFrame_ = 0;
                        trimOutFrame_ = 0;
                        showToast("Trim range reset");
-                   }, fmtSmall_);
+                   }, ui::FontRole::Small);
         cx = resetTrimBtn.right + 6.0f;
     }
 
@@ -8258,7 +8277,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                    } else {
                        showToast("Failed to export trimmed clip", true);
                    }
-               }, fmtSmall_);
+               }, ui::FontRole::Small);
     rx = trimBtn.left - 8.0f;
 
     UiRect snapBtn = { rx - 76.0f, ctlY, rx, ctlY + btnH };
@@ -8277,7 +8296,7 @@ void CppDeskWindow::drawRecordingPlayerModal(float width, float height, float mo
                    } else {
                        showToast("Failed to save snapshot", true);
                    }
-               }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -8309,7 +8328,7 @@ void CppDeskWindow::renderQrCodeDirect2D(
     float startX = rect.left + (rect.width() - qrTotal) * 0.5f;
     float startY = rect.top + (rect.height() - qrTotal) * 0.5f;
 
-    solidBrush_->SetColor(withAlpha(rgba(18, 18, 18), alpha));
+    solidBrush_->SetColor(toD2D(withAlpha(rgba(18, 18, 18), alpha)));
 
     for (int y = 0; y < matrixSize; ++y) {
         for (int x = 0; x < matrixSize; ++x) {
@@ -8381,21 +8400,21 @@ void CppDeskWindow::drawTotpChallengeModal(float clientW, float clientH) {
     UiRect badge = { mx, my, mx + 160.0f, my + 22.0f };
     fillRoundRect(badge, 5.0f, rgba(217, 119, 87, 0.18f));
     strokeRoundRect(badge, 5.0f, rgba(217, 119, 87, 0.45f), 1.0f);
-    drawText("TWO-FACTOR AUTHENTICATION", badge, fmtSmall_, COL_PRIMARY_ACCENT, DWRITE_TEXT_ALIGNMENT_CENTER);
+    drawText("TWO-FACTOR AUTHENTICATION", badge, ui::FontRole::Small, COL_PRIMARY_ACCENT, ui::HAlign::Center);
 
     UiRect closeBtn = { mrx - 26.0f, my, mrx, my + 26.0f };
     drawButton("modal_totp_close", closeBtn, "x",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 13.0f, [this]() {
                    network_.cancelViewerTotp();
                    showTotpModal_ = false;
-               }, fmtHeading_);
+               }, ui::FontRole::Heading);
     my += 30.0f;
 
-    drawText("Enter Security Code", { mx, my, mrx - 30.0f, my + 26.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    drawText("Enter Security Code", { mx, my, mrx - 30.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
     my += 28.0f;
 
     std::string promptText = "The host requires a 6-digit TOTP verification code from your authenticator app to authorize unattended access.";
-    drawText(promptText, { mx, my, mrx, my + 32.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+    drawText(promptText, { mx, my, mrx, my + 32.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 38.0f;
 
     UiRect codeField = { mx, my, mrx, my + 36.0f };
@@ -8404,7 +8423,7 @@ void CppDeskWindow::drawTotpChallengeModal(float clientW, float clientH) {
     my += 42.0f;
 
     if (!totpModalError_.empty()) {
-        drawText(totpModalError_, { mx, my, mrx, my + 18.0f }, fmtSmall_, COL_DANGER, DWRITE_TEXT_ALIGNMENT_CENTER);
+        drawText(totpModalError_, { mx, my, mrx, my + 18.0f }, ui::FontRole::Small, COL_DANGER, ui::HAlign::Center);
     }
     my += 20.0f;
 
@@ -8414,7 +8433,7 @@ void CppDeskWindow::drawTotpChallengeModal(float clientW, float clientH) {
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
                    network_.cancelViewerTotp();
                    showTotpModal_ = false;
-               }, fmtSmall_, true, COL_BORDER);
+               }, ui::FontRole::Small, true, COL_BORDER);
 
     UiRect verifyBtn = { cancelBtn.right + 12.0f, my, mrx, my + 36.0f };
     drawButton("modal_totp_submit", verifyBtn, "Verify & Connect",
@@ -8425,7 +8444,7 @@ void CppDeskWindow::drawTotpChallengeModal(float clientW, float clientH) {
                    } else {
                        totpModalError_ = "Please enter 6 digits.";
                    }
-               }, fmtSmall_);
+               }, ui::FontRole::Small);
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -8462,13 +8481,13 @@ void CppDeskWindow::drawWhiteboardOverlay(const UiRect& canvasRect) {
         if (s.tool == WhiteboardTool::Highlighter) {
             alpha = 0.35f;
         }
-        D2D1_COLOR_F col = rgba(
+        ui::Color col = rgba(
             (s.argbColor >> 16) & 0xFF,
             (s.argbColor >> 8) & 0xFF,
             s.argbColor & 0xFF,
             alpha
         );
-        solidBrush_->SetColor(col);
+        solidBrush_->SetColor(toD2D(col));
 
         float strokeThick = (s.tool == WhiteboardTool::Highlighter) ? (s.thickness * 2.5f) : s.thickness;
 
@@ -8514,11 +8533,11 @@ void CppDeskWindow::drawWhiteboardOverlay(const UiRect& canvasRect) {
     if (network_.whiteboardManager().getLaserPointer(lx, ly, lalpha)) {
         float lpx = canvasRect.left + lx * canvasRect.width();
         float lpy = canvasRect.top + ly * canvasRect.height();
-        solidBrush_->SetColor(rgba(255, 59, 48, 0.28f * lalpha));
+        solidBrush_->SetColor(toD2D(rgba(255, 59, 48, 0.28f * lalpha)));
         renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(lpx, lpy), 14.0f, 14.0f), solidBrush_);
-        solidBrush_->SetColor(rgba(255, 59, 48, 0.95f * lalpha));
+        solidBrush_->SetColor(toD2D(rgba(255, 59, 48, 0.95f * lalpha)));
         renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(lpx, lpy), 5.5f, 5.5f), solidBrush_);
-        solidBrush_->SetColor(rgba(255, 255, 255, 0.98f * lalpha));
+        solidBrush_->SetColor(toD2D(rgba(255, 255, 255, 0.98f * lalpha)));
         renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(lpx, lpy), 2.2f, 2.2f), solidBrush_);
     }
 
@@ -8549,7 +8568,7 @@ void CppDeskWindow::drawWhiteboardOverlay(const UiRect& canvasRect) {
                    8.0f, [this, tool]() {
                        whiteboardTool_ = tool;
                        network_.whiteboardManager().setActiveTool(tool);
-                   }, fmtSmall_, !isSel, COL_BORDER);
+                   }, ui::FontRole::Small, !isSel, COL_BORDER);
         curX = tr.right + 5.0f;
     };
 
@@ -8566,7 +8585,7 @@ void CppDeskWindow::drawWhiteboardOverlay(const UiRect& canvasRect) {
                    network_.whiteboardManager().clearAllStrokes();
                    network_.sendWhiteboardClear();
                    showToast("Whiteboard cleared");
-               }, fmtSmall_, true, COL_BORDER, COL_TEXT_ON_ACCENT);
+               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ON_ACCENT);
     curX = clearBtn.right + 10.0f;
 
     // Vertical separator
@@ -8586,7 +8605,7 @@ void CppDeskWindow::drawWhiteboardOverlay(const UiRect& canvasRect) {
     for (const auto& sw : swatches) {
         bool isSel = (whiteboardColor_ == sw.argb);
         UiRect cr = { curX, palTop + 11.0f, curX + 20.0f, palBottom - 11.0f };
-        D2D1_COLOR_F c = rgba(
+        ui::Color c = rgba(
             (sw.argb >> 16) & 0xFF,
             (sw.argb >> 8) & 0xFF,
             sw.argb & 0xFF
@@ -8613,7 +8632,7 @@ void CppDeskWindow::drawWhiteboardOverlay(const UiRect& canvasRect) {
                8.0f, [this]() {
                    whiteboardActive_ = false;
                    showToast("Whiteboard closed");
-               }, fmtBodyBold_, true, COL_BORDER);
+               }, ui::FontRole::BodyBold, true, COL_BORDER);
 }
 
 // ---------------- Real-Time Performance & Diagnostics HUD Overlay ----------------
@@ -8650,14 +8669,14 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
     drawPulseDot(curX + 4.0f, hudCard.top + 16.0f, 3.6f, rgba(16, 185, 129, hudProgress), hudProgress);
     curX += 16.0f;
     drawText("DIAGNOSTICS & TELEMETRY", { curX, hudCard.top + 8.0f, hudCard.right - 36.0f, hudCard.top + 26.0f },
-             fmtSmall_, withAlpha(COL_HUD_TEXT, hudProgress));
+             ui::FontRole::Small, withAlpha(COL_HUD_TEXT, hudProgress));
 
     UiRect closeBtn = { hudCard.right - 28.0f, hudCard.top + 7.0f, hudCard.right - 8.0f, hudCard.top + 27.0f };
     drawButton("hud_close_btn", closeBtn, "×",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_SECONDARY,
                6.0f, [this]() {
                    showPerformanceHud_ = false;
-               }, fmtSmall_, true, COL_BORDER);
+               }, ui::FontRole::Small, true, COL_BORDER);
 
     // Thin separator line
     fillRoundRect({ hudCard.left + 12.0f, hudCard.top + 33.0f, hudCard.right - 12.0f, hudCard.top + 34.0f },
@@ -8668,52 +8687,52 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
     // Row 1: Framerate & Display
     float curFps = stats.fps;
     float frameTimeMs = (curFps > 0.5f) ? (1000.0f / curFps) : 0.0f;
-    D2D1_COLOR_F fpsColor = (curFps >= 50.0f) ? rgba(16, 185, 129, hudProgress) :
+    ui::Color fpsColor = (curFps >= 50.0f) ? rgba(16, 185, 129, hudProgress) :
                             (curFps >= 25.0f) ? rgba(245, 158, 11, hudProgress) :
                                                 rgba(239, 68, 68, hudProgress);
 
     char fpsBuf[64];
     std::snprintf(fpsBuf, sizeof(fpsBuf), "%.0f FPS (%.1f ms)", curFps, frameTimeMs);
     drawText(fpsBuf, { hudCard.left + 14.0f, cy, hudCard.left + 160.0f, cy + 18.0f },
-             fmtBodyBold_, fpsColor);
+             ui::FontRole::BodyBold, fpsColor);
 
     char resBuf[64];
     const char* presetName = (stats.qualityPreset == QualityPreset::Ultra) ? "Ultra" :
                              (stats.qualityPreset == QualityPreset::Balanced) ? "Balanced" : "Low";
     std::snprintf(resBuf, sizeof(resBuf), "%dx%d • %s", stats.frameWidth, stats.frameHeight, presetName);
     drawText(resBuf, { hudCard.left + 160.0f, cy, hudCard.right - 14.0f, cy + 18.0f },
-             fmtSmall_, withAlpha(COL_HUD_TEXT_SECONDARY, hudProgress), DWRITE_TEXT_ALIGNMENT_TRAILING);
+             ui::FontRole::Small, withAlpha(COL_HUD_TEXT_SECONDARY, hudProgress), ui::HAlign::Trailing);
 
     cy += 24.0f;
 
     // Row 2: Latency Pipeline (Capture | Encode | Decode)
     drawText("LATENCY PIPELINE", { hudCard.left + 14.0f, cy, hudCard.right - 14.0f, cy + 14.0f },
-             fmtSmall_, withAlpha(COL_HUD_TEXT_MUTED, hudProgress * 0.85f));
+             ui::FontRole::Small, withAlpha(COL_HUD_TEXT_MUTED, hudProgress * 0.85f));
     cy += 16.0f;
 
     char pipeBuf[80];
     std::snprintf(pipeBuf, sizeof(pipeBuf), "Cap: %.1f ms   Enc: %.1f ms   Dec: %.1f ms",
                   stats.captureLatencyMs, stats.encodeLatencyMs, stats.decodeLatencyMs);
     drawText(pipeBuf, { hudCard.left + 14.0f, cy, hudCard.right - 14.0f, cy + 18.0f },
-             fmtMono_ ? fmtMono_ : fmtSmall_, withAlpha(COL_HUD_TEXT, hudProgress));
+             ui::FontRole::Mono, withAlpha(COL_HUD_TEXT, hudProgress));
 
     cy += 24.0f;
 
     // Row 3: Network Ping & Bitrate
-    D2D1_COLOR_F pingColor = (stats.rttMs < 35) ? rgba(16, 185, 129, hudProgress) :
+    ui::Color pingColor = (stats.rttMs < 35) ? rgba(16, 185, 129, hudProgress) :
                              (stats.rttMs < 85) ? rgba(245, 158, 11, hudProgress) :
                                                   rgba(239, 68, 68, hudProgress);
     char netBuf[64];
     std::snprintf(netBuf, sizeof(netBuf), "RTT: %u ms   •   %.1f kbps", stats.rttMs, stats.kbps);
     drawText(netBuf, { hudCard.left + 14.0f, cy, hudCard.left + 190.0f, cy + 18.0f },
-             fmtSmall_, pingColor);
+             ui::FontRole::Small, pingColor);
 
     char compBuf[64];
     std::snprintf(compBuf, sizeof(compBuf), "Comp: %.1f:1 (%u tiles)",
                   ((std::isfinite(stats.compressionRatio) && stats.compressionRatio > 0.1f) ? stats.compressionRatio : 1.0f),
                   stats.deltaTilesCount);
     drawText(compBuf, { hudCard.left + 160.0f, cy, hudCard.right - 14.0f, cy + 18.0f },
-             fmtSmall_, withAlpha(COL_HUD_TEXT_SECONDARY, hudProgress), DWRITE_TEXT_ALIGNMENT_TRAILING);
+             ui::FontRole::Small, withAlpha(COL_HUD_TEXT_SECONDARY, hudProgress), ui::HAlign::Trailing);
 
     cy += 20.0f;
 
@@ -8724,8 +8743,8 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
     } else {
         UiRect sparkRect = { hudCard.left + 14.0f, cy, hudCard.right - 14.0f, cy + 28.0f };
         fillRoundRect(sparkRect, 4.0f, withAlpha(COL_BG_SUBTLE, hudProgress * 0.5f));
-        drawText("Sampling network latency...", sparkRect, fmtSmall_,
-                 withAlpha(COL_HUD_TEXT_MUTED, hudProgress), DWRITE_TEXT_ALIGNMENT_CENTER);
+        drawText("Sampling network latency...", sparkRect, ui::FontRole::Small,
+                 withAlpha(COL_HUD_TEXT_MUTED, hudProgress), ui::HAlign::Center);
     }
 
     cy += 34.0f;
@@ -8733,7 +8752,7 @@ void CppDeskWindow::drawPerformanceHud(const UiRect& stageRect, float alpha) {
     // Row 5: Hotkey helper
     drawText("Press Ctrl + Shift + O to toggle overlay",
              { hudCard.left + 14.0f, cy, hudCard.right - 14.0f, cy + 16.0f },
-             fmtSmall_, withAlpha(COL_HUD_TEXT_MUTED, hudProgress * 0.70f), DWRITE_TEXT_ALIGNMENT_CENTER);
+             ui::FontRole::Small, withAlpha(COL_HUD_TEXT_MUTED, hudProgress * 0.70f), ui::HAlign::Center);
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -8757,7 +8776,7 @@ void CppDeskWindow::drawToastBanner(float width, float height, float toastProgre
 
     drawPulseDot(r.left + 18.0f, r.centerY(), 3.6f, toastIsError_ ? COL_DANGER : COL_PRIMARY_ACCENT, alpha);
     drawText(toastText_, { r.left + 28.0f, r.top, r.right - 18.0f, r.bottom },
-             fmtBodyBold_, withAlpha(COL_TEXT_PRIMARY, alpha), DWRITE_TEXT_ALIGNMENT_CENTER);
+             ui::FontRole::BodyBold, withAlpha(COL_TEXT_PRIMARY, alpha), ui::HAlign::Center);
 }
 
 // ---------------- Master Volume Popup ----------------
@@ -8796,16 +8815,16 @@ void CppDeskWindow::drawAudioVolumePopup(float anchorX, float anchorY) {
     float tr = popRect.right - 16.0f;
 
     // Header: "Remote Audio" and Close button
-    drawText("Remote Audio", { tx, ty, tr - 28.0f, ty + 20.0f }, fmtSubheading_, withAlpha(COL_TEXT_PRIMARY, popAlpha));
+    drawText("Remote Audio", { tx, ty, tr - 28.0f, ty + 20.0f }, ui::FontRole::Subheading, withAlpha(COL_TEXT_PRIMARY, popAlpha));
 
     UiRect closeBtn = { tr - 22.0f, ty - 2.0f, tr, ty + 20.0f };
     drawButton("audio_pop_close", closeBtn, "x",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 10.0f,
-               [this]() { showAudioVolumePopup_ = false; }, fmtSmall_);
+               [this]() { showAudioVolumePopup_ = false; }, ui::FontRole::Small);
 
     ty += 24.0f;
     std::string volStatus = isMuted ? "Status: Muted (Ctrl+Shift+M)" : ("Volume: " + std::to_string(curVol) + "% (Ctrl+Shift+M)");
-    drawText(volStatus, { tx, ty, tr, ty + 16.0f }, fmtSmall_, withAlpha(isMuted ? COL_TEXT_SECONDARY : COL_PRIMARY_ACCENT, popAlpha));
+    drawText(volStatus, { tx, ty, tr, ty + 16.0f }, ui::FontRole::Small, withAlpha(isMuted ? COL_TEXT_SECONDARY : COL_PRIMARY_ACCENT, popAlpha));
 
     ty += 22.0f;
     // Slider Track
@@ -8821,9 +8840,9 @@ void CppDeskWindow::drawAudioVolumePopup(float anchorX, float anchorY) {
     }
     // Slider thumb
     float thumbX = isMuted ? trackRect.left : (trackRect.left + fillWidth);
-    solidBrush_->SetColor(withAlpha(COL_PRIMARY_ACCENT, popAlpha));
+    solidBrush_->SetColor(toD2D(withAlpha(COL_PRIMARY_ACCENT, popAlpha)));
     renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(thumbX, trackRect.centerY()), 6.0f, 6.0f), solidBrush_);
-    solidBrush_->SetColor(withAlpha(rgba(255, 255, 255, 0.8f), popAlpha));
+    solidBrush_->SetColor(toD2D(withAlpha(rgba(255, 255, 255, 0.8f), popAlpha)));
     renderTarget_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(thumbX, trackRect.centerY()), 6.0f, 6.0f), solidBrush_, 1.5f);
 
     // Click anywhere on track to set volume
@@ -8853,7 +8872,7 @@ void CppDeskWindow::drawAudioVolumePopup(float anchorX, float anchorY) {
                6.0f, [this, isMuted]() {
                    network_.setAudioMuted(!isMuted);
                    showToast(!isMuted ? "Audio muted (Ctrl+Shift+M)" : "Audio unmuted (Ctrl+Shift+M)");
-               }, fmtSmall_, !isMuted, COL_BORDER);
+               }, ui::FontRole::Small, !isMuted, COL_BORDER);
 
     float pxPreset = muteBtn.right + 8.0f;
     auto addPreset = [&](const std::string& id, const std::string& lbl, int pVol) {
@@ -8866,7 +8885,7 @@ void CppDeskWindow::drawAudioVolumePopup(float anchorX, float anchorY) {
                    6.0f, [this, pVol]() {
                        network_.setAudioVolume(pVol);
                        network_.setAudioMuted(false);
-                   }, fmtSmall_, !isCurrent, COL_BORDER);
+                   }, ui::FontRole::Small, !isCurrent, COL_BORDER);
         pxPreset = pr.right + 4.0f;
     };
     addPreset("audio_pop_p30", "30%", 30);
@@ -10208,7 +10227,7 @@ void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
         std::snprintf(buf, sizeof(buf), "REWIND: -%.1fs (FROZEN)", static_cast<double>(rewindOffsetMs_) / 1000.0);
         timeLbl = buf;
     }
-    drawText(timeLbl, { bx, by, bx + 240.0f, by + 16.0f }, fmtSmall_, withAlpha((rewindOffsetMs_ > 0) ? COL_WARNING : COL_SUCCESS, animAlpha));
+    drawText(timeLbl, { bx, by, bx + 240.0f, by + 16.0f }, ui::FontRole::Small, withAlpha((rewindOffsetMs_ > 0) ? COL_WARNING : COL_SUCCESS, animAlpha));
 
     float trackY = by + 24.0f;
     float trackLeft = bx;
@@ -10259,7 +10278,7 @@ void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
                    uint64_t actualTs = 0;
                    rewindBuffer_.getFrameAtOffset(rewindOffsetMs_, rewindCachedFrameBgra_, rewindCachedW_, rewindCachedH_, actualTs);
                    InvalidateRect(hwnd_, nullptr, FALSE);
-               }, fmtSmall_, true, withAlpha(COL_BORDER, animAlpha));
+               }, ui::FontRole::Small, true, withAlpha(COL_BORDER, animAlpha));
 
     UiRect stepNextBtn = { stepPrevBtn.right + 4.0f, btnY, stepPrevBtn.right + 36.0f, btnY + btnH };
     drawButton("btn_rewind_next", stepNextBtn, "+1s",
@@ -10272,7 +10291,7 @@ void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
                        rewindBuffer_.getFrameAtOffset(rewindOffsetMs_, rewindCachedFrameBgra_, rewindCachedW_, rewindCachedH_, actualTs);
                    }
                    InvalidateRect(hwnd_, nullptr, FALSE);
-               }, fmtSmall_, true, withAlpha(COL_BORDER, animAlpha));
+               }, ui::FontRole::Small, true, withAlpha(COL_BORDER, animAlpha));
 
     UiRect copyBtn = { stepNextBtn.right + 6.0f, btnY, stepNextBtn.right + 76.0f, btnY + btnH };
     drawButton("btn_rewind_copy", copyBtn, "Snapshot",
@@ -10284,7 +10303,7 @@ void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
                    if (pData && sw > 0 && sh > 0) {
                        showToast("Snapshot saved (" + std::to_string(sw) + "x" + std::to_string(sh) + ")");
                    }
-               }, fmtSmall_, true, withAlpha(COL_BORDER, animAlpha), withAlpha(COL_TEXT_ACCENT, animAlpha));
+               }, ui::FontRole::Small, true, withAlpha(COL_BORDER, animAlpha), withAlpha(COL_TEXT_ACCENT, animAlpha));
 
     UiRect liveBtn = { copyBtn.right + 6.0f, btnY, copyBtn.right + 58.0f, btnY + btnH };
     drawButton("btn_rewind_live", liveBtn, "Live",
@@ -10298,7 +10317,7 @@ void CppDeskWindow::drawRewindScrubberBar(const UiRect& stage) {
                    if (remoteBitmap_) { remoteBitmap_->Release(); remoteBitmap_ = nullptr; bitmapW_ = 0; bitmapH_ = 0; }
                    showToast("Snapped to live stream");
                    InvalidateRect(hwnd_, nullptr, FALSE);
-               }, fmtSmall_);
+               }, ui::FontRole::Small);
 }
 
 void CppDeskWindow::drawOmnibarModal(float width, float height, float modalProgress) {
@@ -10336,7 +10355,7 @@ void CppDeskWindow::drawOmnibarModal(float width, float height, float modalProgr
     drawButton("modal_omni_close", closeBtn, "x", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_SECONDARY, 6.0f, [this]() {
         showOmnibarModal_ = false;
         focusedField_ = FocusedField::None;
-    }, fmtSmall_);
+    }, ui::FontRole::Small);
 
     my += 46.0f;
 
@@ -10352,7 +10371,7 @@ void CppDeskWindow::drawOmnibarModal(float width, float height, float modalProgr
 
     if (omnibarFiltered_.empty()) {
         drawText("No matching commands found. Type custom command or check query.", listBox,
-                 fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                 ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center, ui::VAlign::Center);
     } else {
         float itemH = 36.0f;
         int maxItems = std::min((int)omnibarFiltered_.size(), 5);
@@ -10368,11 +10387,11 @@ void CppDeskWindow::drawOmnibarModal(float width, float height, float modalProgr
 
             UiRect catBadge = { itemR.left + 8.0f, itemR.top + 6.0f, itemR.left + 74.0f, itemR.bottom - 6.0f };
             fillRoundRect(catBadge, 4.0f, withAlpha(COL_PRIMARY_ACCENT, 0.15f));
-            drawText(cmd.category, catBadge, fmtSmall_, COL_TEXT_ACCENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            drawText(cmd.category, catBadge, ui::FontRole::Small, COL_TEXT_ACCENT, ui::HAlign::Center, ui::VAlign::Center);
 
             std::string line = cmd.title + "  (" + cmd.commandLine + ")";
             drawText(line, { catBadge.right + 10.0f, itemR.top + 6.0f, itemR.right - 60.0f, itemR.bottom - 6.0f },
-                     fmtSmall_, isSel ? COL_TEXT_PRIMARY : COL_TEXT_SECONDARY, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                     ui::FontRole::Small, isSel ? COL_TEXT_PRIMARY : COL_TEXT_SECONDARY, ui::HAlign::Leading, ui::VAlign::Center);
 
             clickRegions_.push_back({ itemR, "omni_item_" + std::to_string(i), [this, i, cmd]() {
                 omnibarSelectedIndex_ = i;
@@ -10392,14 +10411,14 @@ void CppDeskWindow::drawOmnibarModal(float width, float height, float modalProgr
 
         std::string outHdr = "Output (Exit Code: " + std::to_string(omnibarLastExitCode_) + "):";
         drawText(outHdr, { outBox.left + 8.0f, outBox.top + 6.0f, outBox.right - 8.0f, outBox.top + 20.0f },
-                 fmtSmall_, COL_TEXT_ACCENT);
+                 ui::FontRole::Small, COL_TEXT_ACCENT);
 
         std::string displayOut = omnibarLastOutput_.empty() ? "[No stdout output]" : omnibarLastOutput_;
         if (displayOut.size() > 500) {
             displayOut = displayOut.substr(0, 500) + "...";
         }
         drawText(displayOut, { outBox.left + 8.0f, outBox.top + 22.0f, outBox.right - 8.0f, outBox.bottom - 6.0f },
-                 fmtSmall_, COL_TEXT_PRIMARY, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+                 ui::FontRole::Small, COL_TEXT_PRIMARY, ui::HAlign::Leading, ui::VAlign::Top);
     }
 
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());

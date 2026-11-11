@@ -34,6 +34,7 @@ set(CORE_SOURCES
     src/ui/notification_manager.cpp
     src/ui/ui_platform.cpp
     src/ui/recording_canvas.cpp
+    src/ui/theme.cpp
 )
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -42,7 +43,6 @@ if(WIN32)
     list(APPEND CORE_SOURCES
         src/simd/simd_kernels.S
         src/control/windows_service_manager.cpp
-        src/ui/theme.cpp
     )
 
     add_compile_definitions(

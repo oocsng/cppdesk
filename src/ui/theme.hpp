@@ -1,78 +1,65 @@
 #pragma once
 
-// Shared UI palette for the Windows Direct2D client (warm cream / espresso with terracotta accent).
+// Shared UI palette for the client (warm cream / espresso with terracotta accent).
 // Every token is defined once as a light/dark pair in theme.cpp; updateActivePalette() blends the live
 // COL_* globals between the two.
 
-#include <d2d1.h>
+#include "canvas.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <span>
 
 namespace cppdesk {
 
-inline D2D1_COLOR_F rgba(uint8_t r, uint8_t g, uint8_t b, float a = 1.0f) {
-    return D2D1::ColorF(r / 255.0f, g / 255.0f, b / 255.0f, a);
-}
+// The palette is in platform-neutral colors; the helpers come from the canvas types.
+using ui::rgba;
+using ui::withAlpha;
+using ui::lerpColor;
 
-inline D2D1_COLOR_F withAlpha(D2D1_COLOR_F c, float aMultiplier) {
-    return D2D1::ColorF(c.r, c.g, c.b, std::clamp(c.a * aMultiplier, 0.0f, 1.0f));
-}
-
-inline D2D1_COLOR_F lerpColor(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b, float t) {
-    t = std::clamp(t, 0.0f, 1.0f);
-    return D2D1::ColorF(
-        a.r + (b.r - a.r) * t,
-        a.g + (b.g - a.g) * t,
-        a.b + (b.b - a.b) * t,
-        a.a + (b.a - a.a) * t
-    );
-}
-
-extern D2D1_COLOR_F COL_BG_MAIN;
-extern D2D1_COLOR_F COL_BG_NAV;
-extern D2D1_COLOR_F COL_BG_CARD;
-extern D2D1_COLOR_F COL_BG_SUBTLE;
-extern D2D1_COLOR_F COL_BG_CARD_ALT;
-extern D2D1_COLOR_F COL_BG_INPUT;
-extern D2D1_COLOR_F COL_BG_INPUT_FOCUS;
-extern D2D1_COLOR_F COL_BORDER;
-extern D2D1_COLOR_F COL_BORDER_ALT;
-extern D2D1_COLOR_F COL_BORDER_FOCUS;
-extern D2D1_COLOR_F COL_PRIMARY_ACCENT;
-extern D2D1_COLOR_F COL_PRIMARY_ACCENT_HV;
-extern D2D1_COLOR_F COL_SEC_BTN_BG;
-extern D2D1_COLOR_F COL_SEC_BTN_HV;
-extern D2D1_COLOR_F COL_SUCCESS;
-extern D2D1_COLOR_F COL_WARNING;
-extern D2D1_COLOR_F COL_DANGER;
-extern D2D1_COLOR_F COL_DANGER_HV;
-extern D2D1_COLOR_F COL_TEXT_PRIMARY;
-extern D2D1_COLOR_F COL_TEXT_SECONDARY;
-extern D2D1_COLOR_F COL_TEXT_MUTED;
-extern D2D1_COLOR_F COL_TEXT_ACCENT;
-extern D2D1_COLOR_F COL_TEXT_ON_ACCENT;
-extern D2D1_COLOR_F COL_STAGE_BG;
-extern D2D1_COLOR_F COL_HUD_BG;   // floating overlay pill; dark in both modes
-extern D2D1_COLOR_F COL_HUD_TEXT;            // text on always-dark overlays: fixed light colors in both modes
-extern D2D1_COLOR_F COL_HUD_TEXT_SECONDARY;
-extern D2D1_COLOR_F COL_HUD_TEXT_MUTED;
-extern D2D1_COLOR_F COL_HUD_TEXT_ACCENT;
+extern ui::Color COL_BG_MAIN;
+extern ui::Color COL_BG_NAV;
+extern ui::Color COL_BG_CARD;
+extern ui::Color COL_BG_SUBTLE;
+extern ui::Color COL_BG_CARD_ALT;
+extern ui::Color COL_BG_INPUT;
+extern ui::Color COL_BG_INPUT_FOCUS;
+extern ui::Color COL_BORDER;
+extern ui::Color COL_BORDER_ALT;
+extern ui::Color COL_BORDER_FOCUS;
+extern ui::Color COL_PRIMARY_ACCENT;
+extern ui::Color COL_PRIMARY_ACCENT_HV;
+extern ui::Color COL_SEC_BTN_BG;
+extern ui::Color COL_SEC_BTN_HV;
+extern ui::Color COL_SUCCESS;
+extern ui::Color COL_WARNING;
+extern ui::Color COL_DANGER;
+extern ui::Color COL_DANGER_HV;
+extern ui::Color COL_TEXT_PRIMARY;
+extern ui::Color COL_TEXT_SECONDARY;
+extern ui::Color COL_TEXT_MUTED;
+extern ui::Color COL_TEXT_ACCENT;
+extern ui::Color COL_TEXT_ON_ACCENT;
+extern ui::Color COL_STAGE_BG;
+extern ui::Color COL_HUD_BG;   // floating overlay pill; dark in both modes
+extern ui::Color COL_HUD_TEXT;            // text on always-dark overlays: fixed light colors in both modes
+extern ui::Color COL_HUD_TEXT_SECONDARY;
+extern ui::Color COL_HUD_TEXT_MUTED;
+extern ui::Color COL_HUD_TEXT_ACCENT;
 
 // Sets every live COL_* token to lerp(light, dark, darkT). darkT is clamped to 0..1.
 void updateActivePalette(float darkT);
 
 struct PaletteToken {
     const char*          name;
-    D2D1_COLOR_F*        live;
-    D2D1_COLOR_F         light;
-    D2D1_COLOR_F         dark;
+    ui::Color*        live;
+    ui::Color         light;
+    ui::Color         dark;
 };
 
 std::span<const PaletteToken> paletteTokens();
 
 // WCAG 2.x contrast ratio (1..21) between two opaque colors; alpha is ignored.
-double contrastRatio(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b);
+double contrastRatio(const ui::Color& a, const ui::Color& b);
 
 // Layout, type and motion scales. Values are in DIPs. New screen work should use these instead of literals.
 namespace theme {

@@ -40,8 +40,8 @@
 #ifdef DeleteFile
 #undef DeleteFile
 #endif
-#include "../src/ui/theme.hpp"
 #endif
+#include "../src/ui/theme.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -6815,8 +6815,7 @@ void testLinuxPlatformSupport() {
     }
 }
 
-#if defined(_WIN32)
-bool themeColorNear(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b) {
+bool themeColorNear(const ui::Color& a, const ui::Color& b) {
     return std::fabs(a.r - b.r) < 1e-5f && std::fabs(a.g - b.g) < 1e-5f &&
            std::fabs(a.b - b.b) < 1e-5f && std::fabs(a.a - b.a) < 1e-5f;
 }
@@ -6852,8 +6851,8 @@ void testThemeTableEndpoints() {
     }
 }
 
-void contrastCheck(const char* fgName, const D2D1_COLOR_F& fg, const char* bgName,
-                   const D2D1_COLOR_F& bg, double minRatio, float darkT) {
+void contrastCheck(const char* fgName, const ui::Color& fg, const char* bgName,
+                   const ui::Color& bg, double minRatio, float darkT) {
     double ratio = contrastRatio(fg, bg);
     if (ratio < minRatio) {
         std::cerr << "[CONTRAST] " << fgName << " on " << bgName << " at darkT=" << darkT
@@ -6870,7 +6869,7 @@ void testThemePaletteContrast() {
 
     for (float darkT : { 0.0f, 1.0f }) {
         updateActivePalette(darkT);
-        const D2D1_COLOR_F surfaces[] = { COL_BG_MAIN, COL_BG_NAV, COL_BG_CARD, COL_BG_SUBTLE, COL_BG_CARD_ALT,
+        const ui::Color surfaces[] = { COL_BG_MAIN, COL_BG_NAV, COL_BG_CARD, COL_BG_SUBTLE, COL_BG_CARD_ALT,
                                           COL_BG_INPUT, COL_BG_INPUT_FOCUS, COL_SEC_BTN_BG, COL_SEC_BTN_HV };
         for (const auto& bg : surfaces) {
             CONTRAST_CHECK(COL_TEXT_PRIMARY, bg, 4.5);
@@ -6936,7 +6935,6 @@ void testThemeScales() {
         TEST_ASSERT(s.omega > 0.0f && s.zeta > 0.0f && s.zeta < 1.0f);
     }
 }
-#endif
 
 void testDpiConversion() {
     std::cout << "[TEST 56] DPI Pixel/DIP Conversion..." << std::endl;
@@ -7804,11 +7802,9 @@ int main() {
         testCrossPlatformMacOsAndWindowsFoundation(); std::cout << "Test 50 done\n" << std::flush;
         testCrossPlatformUiWindowingAndMacOsViewer(); std::cout << "Test 51 done\n" << std::flush;
         testLinuxPlatformSupport(); std::cout << "Test 52 done\n" << std::flush;
-#if defined(_WIN32)
         testThemeTableEndpoints(); std::cout << "Test 53 done\n" << std::flush;
         testThemePaletteContrast(); std::cout << "Test 54 done\n" << std::flush;
         testThemeScales(); std::cout << "Test 55 done\n" << std::flush;
-#endif
         testDpiConversion(); std::cout << "Test 56 done\n" << std::flush;
         testRemoteFileBrowserPaths(); std::cout << "Test 57 done\n" << std::flush;
         testRemoteFileBrowserProtocol(); std::cout << "Test 58 done\n" << std::flush;
