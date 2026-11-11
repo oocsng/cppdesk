@@ -203,6 +203,7 @@ public:
     ~NetworkEngine();
 
     bool start();
+    bool isRunning() const { return running_.load(); }
     void stop();
 
     // Local IP & listening status
@@ -655,6 +656,7 @@ private:
     std::unordered_map<uint32_t, ActiveTunnel> viewerTunnels_;
     std::unordered_map<uint32_t, ActiveTunnel> hostTunnels_;
     std::thread                                viewerTunnelThread_;
+    std::mutex                                 viewerTunnelThreadMutex_;
     std::atomic<bool>                          viewerTunnelActive_{false};
     std::thread                                hostTunnelThread_;
     std::atomic<bool>                          hostTunnelActive_{false};

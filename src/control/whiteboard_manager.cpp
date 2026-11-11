@@ -1,4 +1,5 @@
 #include "whiteboard_manager.hpp"
+#include "../core/win_compat.hpp"
 
 #include <cstring>
 #include <algorithm>
@@ -17,9 +18,11 @@ uint64_t nowMs() {
 WhiteboardManager::WhiteboardManager() = default;
 
 WhiteboardManager::~WhiteboardManager() {
+#if defined(_WIN32)
     if (hwndOverlay_) {
         SetWindowLongPtrW(hwndOverlay_, GWLP_USERDATA, 0);
     }
+#endif
     hideHostOverlay();
 }
 

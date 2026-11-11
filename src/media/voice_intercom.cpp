@@ -770,9 +770,10 @@ bool VoiceIntercom::startPlayback(uint32_t sampleRate, uint8_t channels) {
     return false;
 }
 
-void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes) {
+void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes, uint8_t sourceChannels) {
     (void)pcm;
     (void)bytes;
+    (void)sourceChannels;
 }
 
 void VoiceIntercom::stopPlayback() {

@@ -11,8 +11,15 @@
 #include <shlobj.h>
 #else
 #include <unistd.h>
+#if !defined(__APPLE__)
+#include <openssl/core_names.h>
+#include <openssl/ec.h>
+#include <openssl/evp.h>
+#include <openssl/param_build.h>
+#endif
 #endif
 
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -74,30 +81,7 @@ uint64_t CryptoUtils::generateNineDigitId() {
     return 100000000ULL + (rnd % 900000000ULL);
 }
 
-std::array<uint8_t, 32> CryptoUtils::sha256(const void* data, size_t len) {
-    std::array<uint8_t, 32> digest{};
-#if defined(_WIN32)
-    BCRYPT_ALG_HANDLE hAlg = nullptr;
-    BCRYPT_HASH_HANDLE hHash = nullptr;
-
-    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0) {
-        if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) >= 0) {
-            if (len > 0 && data != nullptr) {
-                BCryptHashData(
-                    hHash,
-                    const_cast<PUCHAR>(static_cast<const uint8_t*>(data)),
-                    static_cast<ULONG>(len),
-                    0
-                );
-            }
-            BCryptFinishHash(hHash, digest.data(), static_cast<ULONG>(digest.size()), 0);
-            BCryptDestroyHash(hHash);
-        }
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-    }
-#elif defined(__APPLE__)
-    CC_SHA256(data, static_cast<CC_LONG>(len), digest.data());
-#else
+#if !defined(_WIN32) && !defined(__APPLE__)
 // Portable fallback SHA-256 implementation for generic Unix
 namespace {
     inline uint32_t ror(uint32_t val, uint32_t shift) { return (val >> shift) | (val << (32 - shift)); }
@@ -171,6 +155,32 @@ namespace {
         }
     }
 }
+#endif
+
+std::array<uint8_t, 32> CryptoUtils::sha256(const void* data, size_t len) {
+    std::array<uint8_t, 32> digest{};
+#if defined(_WIN32)
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0) {
+        if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) >= 0) {
+            if (len > 0 && data != nullptr) {
+                BCryptHashData(
+                    hHash,
+                    const_cast<PUCHAR>(static_cast<const uint8_t*>(data)),
+                    static_cast<ULONG>(len),
+                    0
+                );
+            }
+            BCryptFinishHash(hHash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+            BCryptDestroyHash(hHash);
+        }
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+    }
+#elif defined(__APPLE__)
+    CC_SHA256(data, static_cast<CC_LONG>(len), digest.data());
+#else
     portableSha256Calc(static_cast<const uint8_t*>(data), len, digest.data());
 #endif
     return digest;
@@ -1557,16 +1567,35 @@ bool AesGcmSessionCipher::decrypt(
 
 #else
 
-// ---------------- EcdhKeyExchange (Portable POSIX / Linux) ----------------
+// ---------------- EcdhKeyExchange (OpenSSL: Linux and other POSIX) ----------------
+// Same wire format as the Windows CNG path: an ECCPUBLIC_BLOB of {magic 'ECK1', 32, X, Y} for NIST P-256.
+
+namespace {
+constexpr uint32_t kEccPublicP256Magic = 0x314B4345; // BCRYPT_ECDH_PUBLIC_P256_MAGIC
+constexpr size_t kEccBlobLen = 8 + 32 + 32;
+}
 
 bool EcdhKeyExchange::initialize() {
     reset();
-    localPubBlob_.resize(72);
-    uint32_t magic = 0x314B4345; // 'ECK1'
-    uint32_t cbKey = 32;
-    std::memcpy(localPubBlob_.data(), &magic, 4);
+
+    EVP_PKEY* key = EVP_EC_gen("P-256");
+    if (!key) return false;
+
+    uint8_t point[65];
+    size_t pointLen = 0;
+    if (EVP_PKEY_get_octet_string_param(key, OSSL_PKEY_PARAM_PUB_KEY, point, sizeof(point), &pointLen) != 1 ||
+        pointLen != sizeof(point) || point[0] != 0x04) {
+        EVP_PKEY_free(key);
+        return false;
+    }
+
+    localPubBlob_.resize(kEccBlobLen);
+    const uint32_t cbKey = 32;
+    std::memcpy(localPubBlob_.data(), &kEccPublicP256Magic, 4);
     std::memcpy(localPubBlob_.data() + 4, &cbKey, 4);
-    CryptoUtils::randomBytes(localPubBlob_.data() + 8, 64);
+    std::memcpy(localPubBlob_.data() + 8, point + 1, 64);
+
+    hKey_ = reinterpret_cast<uintptr_t>(key);
     initialized_ = true;
     return true;
 }
@@ -1579,43 +1608,102 @@ bool EcdhKeyExchange::computeSharedSessionKey(
     const std::array<uint8_t, 32>& nonce,
     std::array<uint8_t, 32>& outSessionKey)
 {
-    if (!initialized_ || !peerPubBlob || peerPubLen < 72) return false;
+    outSessionKey.fill(0);
+    if (!initialized_ || !hKey_ || !peerPubBlob || peerPubLen != kEccBlobLen) return false;
 
-    std::vector<uint8_t> ikm(32 + peerPubLen);
-    std::memcpy(ikm.data(), localPubBlob_.data() + 8, 32);
-    std::memcpy(ikm.data() + 32, peerPubBlob, peerPubLen);
+    uint32_t magic = 0, cbKey = 0;
+    std::memcpy(&magic, peerPubBlob, 4);
+    std::memcpy(&cbKey, peerPubBlob + 4, 4);
+    if (magic != kEccPublicP256Magic || cbKey != 32) return false;
 
-    std::vector<uint8_t> info(16);
-    std::memcpy(info.data(), &hostId, 8);
-    std::memcpy(info.data() + 8, &viewerId, 8);
+    uint8_t point[65];
+    point[0] = 0x04;
+    std::memcpy(point + 1, peerPubBlob + 8, 64);
 
-    outSessionKey = CryptoUtils::hkdfSha256(
-        nonce.data(), nonce.size(),
-        ikm.data(), ikm.size(),
-        std::string(reinterpret_cast<const char*>(info.data()), info.size())
-    );
+    EVP_PKEY* local = reinterpret_cast<EVP_PKEY*>(hKey_);
+    EVP_PKEY* peer = nullptr;
+    bool ok = false;
+
+    OSSL_PARAM_BLD* bld = OSSL_PARAM_BLD_new();
+    OSSL_PARAM* params = nullptr;
+    EVP_PKEY_CTX* importCtx = nullptr;
+    EVP_PKEY_CTX* checkCtx = nullptr;
+    EVP_PKEY_CTX* deriveCtx = nullptr;
+    std::array<uint8_t, 32> secret{};
+    size_t secretLen = secret.size();
+
+    do {
+        if (!bld ||
+            OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME, "P-256", 0) != 1 ||
+            OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, point, sizeof(point)) != 1) break;
+        params = OSSL_PARAM_BLD_to_param(bld);
+        importCtx = EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr);
+        if (!params || !importCtx || EVP_PKEY_fromdata_init(importCtx) != 1 ||
+            EVP_PKEY_fromdata(importCtx, &peer, EVP_PKEY_PUBLIC_KEY, params) != 1) break;
+
+        // Reject a point that is not on the curve.
+        checkCtx = EVP_PKEY_CTX_new(peer, nullptr);
+        if (!checkCtx || EVP_PKEY_public_check(checkCtx) != 1) break;
+
+        deriveCtx = EVP_PKEY_CTX_new(local, nullptr);
+        if (!deriveCtx || EVP_PKEY_derive_init(deriveCtx) != 1 ||
+            EVP_PKEY_derive_set_peer(deriveCtx, peer) != 1 ||
+            EVP_PKEY_derive(deriveCtx, secret.data(), &secretLen) != 1 || secretLen != secret.size()) break;
+        ok = true;
+    } while (false);
+
+    EVP_PKEY_CTX_free(deriveCtx);
+    EVP_PKEY_CTX_free(checkCtx);
+    EVP_PKEY_CTX_free(importCtx);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    EVP_PKEY_free(peer);
+    if (!ok) {
+        CryptoUtils::secureZero(secret.data(), secret.size());
+        return false;
+    }
+
+    // CNG hands back the raw secret least-significant byte first; OpenSSL most-significant first.
+    std::reverse(secret.begin(), secret.end());
+    outSessionKey = CryptoUtils::deriveSessionKey(hostId, viewerId, nonce, secret.data(), secret.size());
+    CryptoUtils::secureZero(secret.data(), secret.size());
     return true;
 }
 
 void EcdhKeyExchange::reset() {
+    if (hKey_) {
+        EVP_PKEY_free(reinterpret_cast<EVP_PKEY*>(hKey_));
+        hKey_ = 0;
+    }
     initialized_ = false;
     localPubBlob_.clear();
 }
 
-// ---------------- AesGcmSessionCipher (Portable POSIX / Linux) ----------------
+// ---------------- AesGcmSessionCipher (OpenSSL: Linux and other POSIX) ----------------
+// AES-256-GCM, byte-for-byte the same payload layout as the Windows CNG path:
+// [12-byte nonce: "HST1"/"VIW1" + 8-byte sequence][ciphertext][16-byte tag].
+
+AesGcmSessionCipher::AesGcmSessionCipher() = default;
+
+AesGcmSessionCipher::~AesGcmSessionCipher() {
+    reset();
+}
 
 bool AesGcmSessionCipher::initialize(const std::array<uint8_t, 32>& sessionKey, bool isHost) {
     reset();
     sessionKey_ = sessionKey;
     isHost_ = isHost;
+    CryptoUtils::pinMemory(sessionKey_.data(), sessionKey_.size());
+    replayWindow_.reset();
     initialized_ = true;
     return true;
 }
 
 void AesGcmSessionCipher::reset() {
-    initialized_ = false;
-    sessionKey_.fill(0);
+    CryptoUtils::unpinMemory(sessionKey_.data(), sessionKey_.size());
+    CryptoUtils::secureZero(sessionKey_.data(), sessionKey_.size());
     replayWindow_.reset();
+    initialized_ = false;
 }
 
 bool AesGcmSessionCipher::encrypt(
@@ -1626,48 +1714,30 @@ bool AesGcmSessionCipher::encrypt(
     size_t aadLen,
     std::vector<uint8_t>& outEncryptedPayload)
 {
-    if (!initialized_) return false;
+    if (!initialized_ || plainLen > static_cast<size_t>(INT_MAX)) return false;
+
+    uint8_t nonce[12] = {};
+    std::memcpy(nonce, isHost_ ? "HST1" : "VIW1", 4);
+    std::memcpy(nonce + 4, &seq, 8);
 
     outEncryptedPayload.resize(12 + plainLen + 16);
-    uint8_t* nonce = outEncryptedPayload.data();
+    std::memcpy(outEncryptedPayload.data(), nonce, 12);
     uint8_t* ct = outEncryptedPayload.data() + 12;
-    uint8_t* tag = outEncryptedPayload.data() + 12 + plainLen;
 
-    std::memset(nonce, 0, 12);
-    nonce[0] = isHost_ ? 0x01 : 0x02;
-    std::memcpy(nonce + 4, &seq, sizeof(seq));
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    int len = 0;
+    bool ok = ctx &&
+        EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1 &&
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) == 1 &&
+        EVP_EncryptInit_ex(ctx, nullptr, nullptr, sessionKey_.data(), nonce) == 1 &&
+        (!aad || aadLen == 0 || EVP_EncryptUpdate(ctx, nullptr, &len, static_cast<const uint8_t*>(aad), static_cast<int>(aadLen)) == 1) &&
+        (plainLen == 0 || EVP_EncryptUpdate(ctx, ct, &len, static_cast<const uint8_t*>(plaintext), static_cast<int>(plainLen)) == 1) &&
+        EVP_EncryptFinal_ex(ctx, ct + plainLen, &len) == 1 &&
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, ct + plainLen) == 1;
+    EVP_CIPHER_CTX_free(ctx);
 
-    const uint8_t* pt = static_cast<const uint8_t*>(plaintext);
-    size_t offset = 0;
-    uint32_t blockCounter = 0;
-    while (offset < plainLen) {
-        std::vector<uint8_t> blockIkm(12 + sizeof(blockCounter));
-        std::memcpy(blockIkm.data(), nonce, 12);
-        std::memcpy(blockIkm.data() + 12, &blockCounter, sizeof(blockCounter));
-        auto keystream = CryptoUtils::hkdfSha256(
-            sessionKey_.data(), sessionKey_.size(),
-            blockIkm.data(), blockIkm.size(),
-            "CppDesk-GcmStream"
-        );
-        size_t chunk = std::min<size_t>(plainLen - offset, 32);
-        for (size_t i = 0; i < chunk; ++i) {
-            ct[offset + i] = pt[offset + i] ^ keystream[i];
-        }
-        offset += chunk;
-        blockCounter++;
-    }
-
-    std::vector<uint8_t> tagData;
-    tagData.reserve(aadLen + 12 + plainLen);
-    if (aad && aadLen > 0) {
-        tagData.insert(tagData.end(), static_cast<const uint8_t*>(aad), static_cast<const uint8_t*>(aad) + aadLen);
-    }
-    tagData.insert(tagData.end(), nonce, nonce + 12);
-    tagData.insert(tagData.end(), ct, ct + plainLen);
-
-    auto fullHmac = CryptoUtils::hmacSha256(sessionKey_.data(), sessionKey_.size(), tagData.data(), tagData.size());
-    std::memcpy(tag, fullHmac.data(), 16);
-    return true;
+    if (!ok) outEncryptedPayload.clear();
+    return ok;
 }
 
 bool AesGcmSessionCipher::decrypt(
@@ -1678,50 +1748,40 @@ bool AesGcmSessionCipher::decrypt(
     std::vector<uint8_t>& outPlaintext,
     uint64_t* outSeq)
 {
-    if (!initialized_ || !encryptedPayload || payloadLen < 28) return false;
+    if (!initialized_ || !encryptedPayload || payloadLen < 28 || payloadLen > static_cast<size_t>(INT_MAX)) return false;
 
     const uint8_t* nonce = encryptedPayload;
-    size_t plainLen = payloadLen - 28;
+    const size_t cipherLen = payloadLen - 28;
     const uint8_t* ct = encryptedPayload + 12;
-    const uint8_t* expectedTag = encryptedPayload + 12 + plainLen;
+    uint8_t tag[16];
+    std::memcpy(tag, encryptedPayload + 12 + cipherLen, 16);
+
+    if (std::memcmp(nonce, isHost_ ? "VIW1" : "HST1", 4) != 0) return false;
 
     uint64_t seq = 0;
-    std::memcpy(&seq, nonce + 4, sizeof(seq));
+    std::memcpy(&seq, nonce + 4, 8);
     if (!replayWindow_.check(seq)) return false;
 
-    std::vector<uint8_t> tagData;
-    tagData.reserve(aadLen + 12 + plainLen);
-    if (aad && aadLen > 0) {
-        tagData.insert(tagData.end(), static_cast<const uint8_t*>(aad), static_cast<const uint8_t*>(aad) + aadLen);
-    }
-    tagData.insert(tagData.end(), nonce, nonce + 12);
-    tagData.insert(tagData.end(), ct, ct + plainLen);
+    outPlaintext.resize(cipherLen);
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    int len = 0;
+    uint8_t finalBlock[16];
+    bool ok = ctx &&
+        EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1 &&
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) == 1 &&
+        EVP_DecryptInit_ex(ctx, nullptr, nullptr, sessionKey_.data(), nonce) == 1 &&
+        (!aad || aadLen == 0 || EVP_DecryptUpdate(ctx, nullptr, &len, static_cast<const uint8_t*>(aad), static_cast<int>(aadLen)) == 1) &&
+        (cipherLen == 0 || EVP_DecryptUpdate(ctx, outPlaintext.data(), &len, ct, static_cast<int>(cipherLen)) == 1) &&
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag) == 1 &&
+        EVP_DecryptFinal_ex(ctx, finalBlock, &len) == 1;
+    EVP_CIPHER_CTX_free(ctx);
 
-    auto fullHmac = CryptoUtils::hmacSha256(sessionKey_.data(), sessionKey_.size(), tagData.data(), tagData.size());
-    if (!CryptoUtils::constantTimeCompare(expectedTag, fullHmac.data(), 16)) {
+    if (!ok) {
+        outPlaintext.clear();
         return false;
     }
 
-    outPlaintext.resize(plainLen);
-    size_t offset = 0;
-    uint32_t blockCounter = 0;
-    while (offset < plainLen) {
-        std::vector<uint8_t> blockIkm(12 + sizeof(blockCounter));
-        std::memcpy(blockIkm.data(), nonce, 12);
-        std::memcpy(blockIkm.data() + 12, &blockCounter, sizeof(blockCounter));
-        auto keystream = CryptoUtils::hkdfSha256(
-            sessionKey_.data(), sessionKey_.size(),
-            blockIkm.data(), blockIkm.size(),
-            "CppDesk-GcmStream"
-        );
-        size_t chunk = std::min<size_t>(plainLen - offset, 32);
-        for (size_t i = 0; i < chunk; ++i) {
-            outPlaintext[offset + i] = ct[offset + i] ^ keystream[i];
-        }
-        offset += chunk;
-        blockCounter++;
-    }
-
+    // The sequence is recorded only after the tag has authenticated.
     replayWindow_.mark(seq);
     if (outSeq) *outSeq = seq;
     return true;

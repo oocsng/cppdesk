@@ -1241,7 +1241,12 @@ void ClipboardFileTransferManager::purgeStaging() {
 }
 
 bool ClipboardFileTransferManager::pollLocalClipboardFiles(const SendPacketFn& sendPacket) {
+#if defined(_WIN32)
     uint32_t seq = GetClipboardSequenceNumber();
+#else
+    // shortcut: there is no clipboard change counter or file clipboard here, so nothing is ever offered.
+    uint32_t seq = lastSequenceNumber_;
+#endif
     if (seq == lastSequenceNumber_) return false;
     lastSequenceNumber_ = seq;
 

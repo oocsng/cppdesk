@@ -6,12 +6,7 @@
 #endif
 #include <windows.h>
 #else
-struct RECT {
-    int32_t left = 0;
-    int32_t top = 0;
-    int32_t right = 0;
-    int32_t bottom = 0;
-};
+#include "../core/win_compat.hpp"
 #endif
 #include <vector>
 #include <string>

@@ -23,5 +23,16 @@ jobs:
           $env:PATH = "$env:RUNNER_TEMP\msys64\ucrt64\bin;$env:PATH"
           ./build.ps1 -Test
 
-  # shortcut: no Linux job. ./build.sh --test fails to compile (about 240 errors, mostly Windows-only
-  # types in src/net/network_engine.cpp), so a job here could only ever be red. Add one back with the port.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ xvfb libzstd-dev libssl-dev libx11-dev libxtst-dev libxext-dev libxrandr-dev libjpeg-dev
+      - name: Build and run the test suite
+        # The capture and input tests need an X server.
+        run: xvfb-run -a -s "-screen 0 1920x1080x24" ./build.sh --test
+      - name: Build the app
+        run: cmake --build build --target CppDesk -j 4

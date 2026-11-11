@@ -8,6 +8,7 @@
 #include "../src/net/updater.hpp"
 #include "../src/net/connection_limiter.hpp"
 #include "../src/net/relay_owner.hpp"
+#include "../src/core/win_compat.hpp"
 #include "../src/ui/notification_manager.hpp"
 #include "../src/media/session_recorder.hpp"
 #include "../src/media/session_recording_player.hpp"
@@ -774,6 +775,7 @@ void testEcdhAndAesGcmEngine() {
 
     // 5. InputInjector UAC Desktop Elevation Query (Option 5A)
     bool isElev = InputInjector::isElevated();
+#if defined(_WIN32)
     HANDLE hToken = nullptr;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
         TOKEN_ELEVATION elev{};
@@ -787,6 +789,7 @@ void testEcdhAndAesGcmEngine() {
     } else {
         TEST_ASSERT(!isElev);
     }
+#endif
 }
 
 void testV201FeaturesAndResilience() {
@@ -891,6 +894,7 @@ void testV201FeaturesAndResilience() {
 
     // 7. InputInjector Elevation & Safe Desktop Sync
     bool isElev = InputInjector::isElevated();
+#if defined(_WIN32)
     HANDLE hToken = nullptr;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
         TOKEN_ELEVATION elev{};
@@ -916,6 +920,7 @@ void testV201FeaturesAndResilience() {
     if (GetCursorPos(&pt)) {
         TEST_ASSERT(pt.x >= 0 && pt.y >= 0);
     }
+#endif
 }
 
 void testNotificationSystemAndTray() {
@@ -985,6 +990,7 @@ void testNotificationSystemAndTray() {
     TEST_ASSERT(!notifMgr.isFlashing());
 
     // 4. NOTIFYICON_VERSION_4 event decoding (uID packed in HIWORD, event packed in LOWORD)
+#if defined(_WIN32)
     constexpr uint16_t testIconId = 1;
     LPARAM v4ContextMenu = MAKELPARAM(WM_CONTEXTMENU, testIconId);
     LPARAM v4LButtonUp   = MAKELPARAM(WM_LBUTTONUP, testIconId);
@@ -1001,6 +1007,7 @@ void testNotificationSystemAndTray() {
     TEST_ASSERT(LOWORD(v4BalloonClk) == NIN_BALLOONUSERCLICK);
     TEST_ASSERT(HIWORD(v4ContextMenu) == testIconId);
     TEST_ASSERT(HIWORD(v4LButtonDbl) == testIconId);
+#endif
 
     notifMgr.shutdown();
 }
@@ -1871,6 +1878,7 @@ void testMultiSessionTabbedManagement() {
     }
 }
 
+#if defined(_WIN32)
 void testNativeClipboardFileTransfer() {
     std::cout << "[TEST 19] Native OS Clipboard File Copy-Paste & COM Virtual Streams...\n";
 
@@ -2127,6 +2135,7 @@ void testNativeClipboardFileTransfer() {
         TEST_ASSERT(mgr.activeFileName() == "received_file_3.bin");
     }
 }
+#endif
 
 void testSelfHostedRelayAndStunDiagnostics() {
     std::cout << "[Test 20] Self-Hosted Relay, RFC 5389 STUN NAT Discovery & Diagnostics...\n" << std::flush;
@@ -2185,11 +2194,11 @@ void testSelfHostedRelayAndStunDiagnostics() {
             FD_ZERO(&rfds);
             FD_SET(mockStunSock, &rfds);
             timeval tv{ 1, 500000 };
-            int sel = select(0, &rfds, nullptr, nullptr, &tv);
+            int sel = select(socket_select_nfds(mockStunSock), &rfds, nullptr, nullptr, &tv);
             if (sel > 0 && FD_ISSET(mockStunSock, &rfds)) {
                 uint8_t reqBuf[256] = {};
                 sockaddr_in clientAddr{};
-                int clen = sizeof(clientAddr);
+                socklen_t clen = sizeof(clientAddr);
                 int n = recvfrom(mockStunSock, reinterpret_cast<char*>(reqBuf), sizeof(reqBuf), 0,
                                  reinterpret_cast<sockaddr*>(&clientAddr), &clen);
                 if (n >= 20) {
@@ -2456,7 +2465,7 @@ void testRichChatMediaAndClipboardHistoryHub() {
         for (int retry = 0; retry < 5; ++retry) {
             currentClip = ClipboardManager::getClipboardUtf8();
             if (currentClip == "https://aerodesk.app/download") break;
-            Sleep(10);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         TEST_ASSERT(currentClip == "https://aerodesk.app/download");
     }
@@ -2479,6 +2488,7 @@ void testRichChatMediaAndClipboardHistoryHub() {
     }
 }
 
+#if defined(_WIN32)
 void testWindowsServiceAndRemoteRebootReconnect() {
     std::cout << "[TEST 23] Elevated Windows Service & Remote Reboot-with-Reconnect...\n";
 
@@ -2605,6 +2615,7 @@ void testWindowsServiceAndRemoteRebootReconnect() {
         TEST_ASSERT(!netEng.isAutoReconnectingWithToken());
     }
 }
+#endif
 
 void testDesktopShortcutsAndUriProtocol() {
     std::cout << "[TEST 24] Desktop Shortcuts, URI Protocol Handler & CLI Auto-Connect...\n";
@@ -2625,6 +2636,7 @@ void testDesktopShortcutsAndUriProtocol() {
     TEST_ASSERT(ShortcutManager::parseStartupConnectTarget(L"CppDesk.exe --other-flag") == "");
     TEST_ASSERT(ShortcutManager::parseStartupConnectTarget(L"") == "");
 
+#if defined(_WIN32)
     // 3. URI Protocol registry state check
     bool initialReg = ShortcutManager::isUriProtocolRegistered();
     bool regSuccess = ShortcutManager::setUriProtocolRegistered(true);
@@ -2634,6 +2646,7 @@ void testDesktopShortcutsAndUriProtocol() {
         ShortcutManager::setUriProtocolRegistered(false);
         TEST_ASSERT(!ShortcutManager::isUriProtocolRegistered());
     }
+#endif
 }
 
 void testFileTransferSpeedTelemetryAndEta() {
@@ -2767,8 +2780,10 @@ void testMultiMonitorGridViewAndVirtualDesktop() {
 
     MonitorDesc allDesc = capturer.currentMonitor();
     TEST_ASSERT(allDesc.index == -1);
+#if defined(_WIN32)
     TEST_ASSERT(allDesc.width == std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN)));
     TEST_ASSERT(allDesc.height == std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN)));
+#endif
     TEST_ASSERT(capturer.frameWidth() == allDesc.width);
     TEST_ASSERT(capturer.frameHeight() == allDesc.height);
 
@@ -3065,14 +3080,18 @@ void testDxgiDirtyRectsAndGdiRecycling() {
     ok = capturer.captureDirtyTiles(true, QualityPreset::Balanced, gdiTiles1, gdiKf1, cursor);
     TEST_ASSERT(ok);
     TEST_ASSERT(gdiKf1);
+#if defined(_WIN32)
     TEST_ASSERT(capturer.hasGdiCachedResources());
+#endif
 
     // Subsequent capture reuses existing GDI memory DC and DIB section without re-allocation
     std::vector<EncodedTile> gdiTiles2;
     bool gdiKf2 = false;
     ok = capturer.captureDirtyTiles(false, QualityPreset::Balanced, gdiTiles2, gdiKf2, cursor);
     TEST_ASSERT(ok);
+#if defined(_WIN32)
     TEST_ASSERT(capturer.hasGdiCachedResources());
+#endif
 }
 
 void testCodecContextRecyclingAndZeroCopyTasks() {
@@ -3182,7 +3201,7 @@ void testScatterGatherFrameSendAndSocketBuffers() {
     NetworkEngine::setTcpNoDelay(s);
 
     int sndBuf = 0;
-    int optLen = sizeof(sndBuf);
+    socklen_t optLen = sizeof(sndBuf);
     int res = getsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&sndBuf), &optLen);
     TEST_ASSERT(res == 0);
     // On Windows, requested 2MB buffer should scale well above default 64KB (at least 1MB)
@@ -3206,7 +3225,7 @@ void testScatterGatherFrameSendAndSocketBuffers() {
     TEST_ASSERT(bind(listenSock, reinterpret_cast<sockaddr*>(&sin), sizeof(sin)) == 0);
     TEST_ASSERT(listen(listenSock, 1) == 0);
 
-    int sinLen = sizeof(sin);
+    socklen_t sinLen = sizeof(sin);
     TEST_ASSERT(getsockname(listenSock, reinterpret_cast<sockaddr*>(&sin), &sinLen) == 0);
 
     SOCKET clientSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -3280,6 +3299,7 @@ void testPrecisionTimerPacingAndRecycledBuffers() {
     std::cout << "[TEST 35] 1ms Multimedia Timer Pacing & Recycled Working Buffers...\n" << std::flush;
 
     // 1. Verify 1ms Windows Timer Granularity Request & Capability
+#if defined(_WIN32)
     TIMECAPS tc{};
     MMRESULT rCaps = timeGetDevCaps(&tc, sizeof(tc));
     TEST_ASSERT(rCaps == TIMERR_NOERROR);
@@ -3290,6 +3310,7 @@ void testPrecisionTimerPacingAndRecycledBuffers() {
 
     MMRESULT rEnd = timeEndPeriod(1);
     TEST_ASSERT(rEnd == TIMERR_NOERROR);
+#endif
 
     // 2. Verify ScreenCapturer Recycled Working Buffers
     ScreenCapturer capturer;
@@ -3315,7 +3336,7 @@ void testPrecisionTimerPacingAndRecycledBuffers() {
     TEST_ASSERT(bind(listenSock, reinterpret_cast<sockaddr*>(&sin), sizeof(sin)) == 0);
     TEST_ASSERT(listen(listenSock, 1) == 0);
 
-    int sinLen = sizeof(sin);
+    socklen_t sinLen = sizeof(sin);
     TEST_ASSERT(getsockname(listenSock, reinterpret_cast<sockaddr*>(&sin), &sinLen) == 0);
 
     SOCKET clientSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -3677,6 +3698,7 @@ void testInputCoalescingAndZeroAllocEvents() {
         mon.height = 1080;
         mon.isPrimary = true;
 
+#if defined(_WIN32)
         // Verify injectMouseMove executes smoothly using cached metrics
         InputInjector::injectMouseMove(0.5f, 0.5f, mon);
         POINT pt1{};
@@ -3685,6 +3707,7 @@ void testInputCoalescingAndZeroAllocEvents() {
         POINT pt2{};
         GetCursorPos(&pt2);
         TEST_ASSERT(pt1.x >= 0 && pt1.y >= 0 && pt2.x >= 0 && pt2.y >= 0);
+#endif
     }
 }
 
@@ -3737,6 +3760,7 @@ void testHostOutboxAndCachedGeometries() {
         TEST_ASSERT(r.readU32() == 0xCAFEBABE);
     }
 
+#if defined(_WIN32)
     // 4. Direct2D pre-cached unit star geometry creation and bounds validation
     {
         ID2D1Factory* factory = nullptr;
@@ -3776,6 +3800,7 @@ void testHostOutboxAndCachedGeometries() {
             factory->Release();
         }
     }
+#endif
 }
 
 void testParallelViewerDecodeAndTabFrameCache() {
@@ -3927,6 +3952,7 @@ void testAvx2BlitRowBgraOpaque() {
     }
 }
 
+#if defined(_WIN32)
 void testZeroAllocAudioAndStackWideText() {
     std::cout << "[TEST 42] Zero-Allocation Audio Scratch Buffers & Stack-Buffered UTF-8 Text Conversion...\n";
 
@@ -3984,6 +4010,7 @@ void testZeroAllocAudioAndStackWideText() {
         }
     }
 }
+#endif
 
 void testVirtualDisplayManagerAndHeadlessEmulation() {
     std::cout << "[TEST 43] Virtual Multi-Display Driver & Headless Display Emulation Subsystem...\n" << std::flush;
@@ -4408,6 +4435,7 @@ void testHardwareDpmsAndScreenBlanking() {
     ScreenBlankManager::wakeDisplays();
     TEST_ASSERT(ScreenBlankManager::instance().isBlankActive() == preActive);
 
+#if defined(_WIN32)
     // 6. Low-Level Hook Filter Logic
     // Mouse tests
     TEST_ASSERT(!ScreenBlankManager::isPhysicalEvent(LLMHF_INJECTED, true));
@@ -4428,8 +4456,10 @@ void testHardwareDpmsAndScreenBlanking() {
     KBDLLHOOKSTRUCT kbdHookPhysical{};
     kbdHookPhysical.flags = 0;
     TEST_ASSERT(ScreenBlankManager::isPhysicalKeyboardInput(kbdHookPhysical));
+#endif
 
     // 7. ScreenBlankManager Lifecycle & Emergency Callback
+#if defined(_WIN32)
     {
         auto& sbm = ScreenBlankManager::instance();
         TEST_ASSERT(!sbm.isBlankActive());
@@ -4454,6 +4484,7 @@ void testHardwareDpmsAndScreenBlanking() {
         TEST_ASSERT(!sbm.isBlankActive());
         sbm.setEmergencyWakeCallback(nullptr);
     }
+#endif
 
     // 8. NetworkEngine Integration APIs (safe when disconnected)
     {
@@ -4608,6 +4639,7 @@ void testSessionRecordingPlayerAndTranscoder() {
             TEST_ASSERT(bih.biBitCount == 32);
         }
 
+#if defined(_WIN32)
         TEST_ASSERT(player.exportSnapshotPng(snapPngPath));
         TEST_ASSERT(std::filesystem::exists(snapPngPath));
         {
@@ -4618,6 +4650,7 @@ void testSessionRecordingPlayerAndTranscoder() {
             // PNG signature: 0x89 0x50 0x4E 0x47 0x0D 0x0A 0x1A 0x0A
             TEST_ASSERT(sig[0] == 0x89 && sig[1] == 'P' && sig[2] == 'N' && sig[3] == 'G');
         }
+#endif
 
         // 6. Lossless Clip Trimming Verification
         // Trim frames 2 through 6 (5 frames total: 2, 3, 4, 5, 6)
@@ -5521,6 +5554,7 @@ void testPeerVersionHandshakeAndSelfUpdater() {
         TEST_ASSERT(missingSize == 0);
     }
 
+#if defined(_WIN32)
     // Part 5: PE Binary Integrity Validation & Self-Update Command Construction
     {
         // 5a. Validate valid PE binary mockup
@@ -5596,6 +5630,7 @@ void testPeerVersionHandshakeAndSelfUpdater() {
         DeleteFileW(testSrc.c_str());
         DeleteFileW(testDest.c_str());
     }
+#endif
 
     // Part 6: Smooth Horizontal Scroll Spring Simulation
     {
@@ -7649,11 +7684,15 @@ int main() {
         testBidirectionalVoiceIntercom(); std::cout << "Test 16 done\n" << std::flush;
         testVirtualDisplayFitAndResolutionMatching(); std::cout << "Test 17 done\n" << std::flush;
         testMultiSessionTabbedManagement(); std::cout << "Test 18 done\n" << std::flush;
+#if defined(_WIN32)
         testNativeClipboardFileTransfer(); std::cout << "Test 19 done\n" << std::flush;
+#endif
         testSelfHostedRelayAndStunDiagnostics(); std::cout << "Test 20 done\n" << std::flush;
         testPerformanceHudMetricsAndTelemetry(); std::cout << "Test 21 done\n" << std::flush;
         testRichChatMediaAndClipboardHistoryHub(); std::cout << "Test 22 done\n" << std::flush;
+#if defined(_WIN32)
         testWindowsServiceAndRemoteRebootReconnect(); std::cout << "Test 23 done\n" << std::flush;
+#endif
         testDesktopShortcutsAndUriProtocol(); std::cout << "Test 24 done\n" << std::flush;
         testFileTransferSpeedTelemetryAndEta(); std::cout << "Test 25 done\n" << std::flush;
         testAudioControlsAndMuteSync(); std::cout << "Test 26 done\n" << std::flush;
@@ -7672,7 +7711,9 @@ int main() {
         testHostOutboxAndCachedGeometries(); std::cout << "Test 39 done\n" << std::flush;
         testParallelViewerDecodeAndTabFrameCache(); std::cout << "Test 40 done\n" << std::flush;
         testAvx2BlitRowBgraOpaque(); std::cout << "Test 41 done\n" << std::flush;
+#if defined(_WIN32)
         testZeroAllocAudioAndStackWideText(); std::cout << "Test 42 done\n" << std::flush;
+#endif
         testVirtualDisplayManagerAndHeadlessEmulation(); std::cout << "Test 43 done\n" << std::flush;
         testHardwareDpmsAndScreenBlanking(); std::cout << "Test 44 done\n" << std::flush;
         testSessionRecordingPlayerAndTranscoder(); std::cout << "Test 45 done\n" << std::flush;

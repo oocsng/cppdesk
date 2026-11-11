@@ -170,22 +170,19 @@ bool ShortcutManager::setUriProtocolRegistered(bool enable) {
 #endif
 }
 
+#if !defined(_WIN32)
+// There is no URL-scheme registry to write to here.
+bool ShortcutManager::setUriProtocolRegistered(bool) {
+    return false;
+}
+#endif
+
 std::string ShortcutManager::parseStartupConnectTarget(const std::wstring& cmdLine) {
     if (cmdLine.empty()) {
         return "";
     }
-#if !defined(_WIN32)
-    std::string s(cmdLine.begin(), cmdLine.end());
-    size_t pos = s.find("--connect ");
-    if (pos != std::string::npos) {
-        return sanitizeDeskId(s.substr(pos + 10));
-    }
-    pos = s.find("cppdesk://");
-    if (pos != std::string::npos) {
-        return sanitizeDeskId(s.substr(pos + 10));
-    }
-    return "";
-#else
+    std::vector<std::wstring> args;
+#if defined(_WIN32)
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(cmdLine.c_str(), &argc);
     if (!argv || argc <= 0) {
@@ -194,16 +191,40 @@ std::string ShortcutManager::parseStartupConnectTarget(const std::wstring& cmdLi
         }
         return "";
     }
+    for (int i = 0; i < winArgc; ++i) args.emplace_back(argv[i]);
+    LocalFree(argv);
+#else
+    // Split on spaces, keeping a double-quoted argument whole.
+    {
+        std::wstring cur;
+        bool inQuotes = false, have = false;
+        for (wchar_t c : cmdLine) {
+            if (c == L'"') {
+                inQuotes = !inQuotes;
+                have = true;
+            } else if (c == L' ' && !inQuotes) {
+                if (have) args.push_back(cur);
+                cur.clear();
+                have = false;
+            } else {
+                cur += c;
+                have = true;
+            }
+        }
+        if (have) args.push_back(cur);
+    }
+#endif
+    const int argc = static_cast<int>(args.size());
 
     std::string targetId;
 
     for (int i = 0; i < argc; ++i) {
-        std::wstring arg = argv[i];
+        std::wstring arg = args[i];
 
         // Check for --connect <id> or -c <id>
         if (arg == L"--connect" || arg == L"-c") {
             if (i + 1 < argc) {
-                std::wstring val = argv[i + 1];
+                std::wstring val = args[i + 1];
                 std::string s(val.begin(), val.end());
                 std::string clean = sanitizeDeskId(s);
                 if (clean.size() == 9) {
@@ -234,9 +255,7 @@ std::string ShortcutManager::parseStartupConnectTarget(const std::wstring& cmdLi
         }
     }
 
-    LocalFree(argv);
     return targetId;
-#endif
 }
 
 } // namespace cppdesk

@@ -50,6 +50,7 @@ extern "C" {
 #include <X11/extensions/Xrandr.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include "xlib_threads.hpp"
 #endif
 #if __has_include(<jpeglib.h>)
 #include <jpeglib.h>
@@ -79,8 +80,13 @@ static void safeJpegErrorExit(j_common_ptr cinfo) {
 
 namespace cppdesk {
 
+#if !defined(_WIN32)
+#include "../core/win_compat.hpp"
+#endif
+
 namespace {
 
+#if defined(_WIN32)
 ULONG_PTR g_gdiplusToken = 0;
 std::once_flag g_gdiplusInitFlag;
 CLSID g_jpegEncoderClsid = {};
@@ -104,6 +110,7 @@ bool findJpegEncoderClsid(CLSID* pClsid) {
     }
     return false;
 }
+#endif
 
 uint64_t hashTileBgra(const uint8_t* frame, int frameStride, int startX, int startY, int w, int h) {
     const uint8_t* tileTopLeft = frame + static_cast<size_t>(startY) * frameStride + static_cast<size_t>(startX) * 4;
@@ -164,12 +171,14 @@ thread_local ThreadZstdContext tl_zstd;
 static std::mutex g_gdiplusCodecMutex;
 
 void TileCodec::initGdiPlus() {
+#if defined(_WIN32)
     std::call_once(g_gdiplusInitFlag, []() {
         Gdiplus::GdiplusStartupInput input;
         if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &input, nullptr) == Gdiplus::Ok) {
             g_hasJpegClsid = findJpegEncoderClsid(&g_jpegEncoderClsid);
         }
     });
+#endif
 }
 
 void TileCodec::shutdownGdiPlus() {
@@ -786,19 +795,23 @@ void TileThreadPool::parallelDecode(std::vector<DecodeTask>& tasks) {
 // ---------------- ScreenCapturer::DxgiImpl ----------------
 
 struct ScreenCapturer::DxgiImpl {
+#if defined(_WIN32)
     ID3D11Device*           device = nullptr;
     ID3D11DeviceContext*    context = nullptr;
     IDXGIOutputDuplication* duplication = nullptr;
     ID3D11Texture2D*        stagingTex = nullptr;
+#endif
     int                     texW = 0;
     int                     texH = 0;
     std::vector<uint8_t>    metadataBuf;
 
     void release() {
+#if defined(_WIN32)
         if (stagingTex) { stagingTex->Release(); stagingTex = nullptr; }
         if (duplication) { duplication->Release(); duplication = nullptr; }
         if (context) { context->Release(); context = nullptr; }
         if (device) { device->Release(); device = nullptr; }
+#endif
         texW = 0;
         texH = 0;
         metadataBuf.clear();
@@ -876,6 +889,7 @@ std::vector<MonitorDesc> ScreenCapturer::enumerateMonitors() {
     }
 #elif defined(__linux__) || defined(__unix__)
 #if __has_include(<X11/Xlib.h>)
+    ensureXlibThreads();
     Display* dpy = XOpenDisplay(nullptr);
     if (dpy) {
         int screen = DefaultScreen(dpy);
@@ -953,8 +967,13 @@ std::vector<MonitorDesc> ScreenCapturer::enumerateMonitors() {
         fallback.index = 0;
         fallback.x = 0;
         fallback.y = 0;
+#if defined(_WIN32)
         fallback.width = std::max(800, GetSystemMetrics(SM_CXSCREEN));
         fallback.height = std::max(600, GetSystemMetrics(SM_CYSCREEN));
+#else
+        fallback.width = 800;
+        fallback.height = 600;
+#endif
         fallback.isPrimary = true;
         fallback.name = "Primary Display";
         fallback.isVirtual = false;
@@ -970,10 +989,26 @@ bool ScreenCapturer::selectMonitor(int monitorIndex) {
     if (monitorIndex == -1) {
         activeMonitorIdx_ = -1;
         activeMonitor_.index = -1;
+#if defined(_WIN32)
         activeMonitor_.x = GetSystemMetrics(SM_XVIRTUALSCREEN);
         activeMonitor_.y = GetSystemMetrics(SM_YVIRTUALSCREEN);
         activeMonitor_.width = std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
         activeMonitor_.height = std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
+#else
+        // The bounding box of every monitor.
+        int minX = monitors_[0].x, minY = monitors_[0].y;
+        int maxX = monitors_[0].x + monitors_[0].width, maxY = monitors_[0].y + monitors_[0].height;
+        for (const auto& m : monitors_) {
+            minX = std::min<int>(minX, m.x);
+            minY = std::min<int>(minY, m.y);
+            maxX = std::max<int>(maxX, m.x + m.width);
+            maxY = std::max<int>(maxY, m.y + m.height);
+        }
+        activeMonitor_.x = minX;
+        activeMonitor_.y = minY;
+        activeMonitor_.width = std::max(1, maxX - minX);
+        activeMonitor_.height = std::max(1, maxY - minY);
+#endif
         activeMonitor_.isPrimary = false;
         activeMonitor_.name = "All Displays (Grid View)";
         activeMonitor_.isVirtual = false;
@@ -1026,6 +1061,7 @@ void ScreenCapturer::triggerDxgiAccessLostForTest() {
     releaseDxgi();
 }
 
+#if defined(_WIN32)
 bool ScreenCapturer::initDxgiForMonitor(int monitorIndex) {
     releaseDxgi();
 
@@ -1140,7 +1176,11 @@ bool ScreenCapturer::initDxgiForMonitor(int monitorIndex) {
     dxgiInitialized_ = true;
     return true;
 }
+#else
+bool ScreenCapturer::initDxgiForMonitor(int) { return false; }
+#endif
 
+#if defined(_WIN32)
 bool ScreenCapturer::captureViaDxgi(bool& outFrameUpdated, std::vector<RECT>& outDirtyRects, bool& outHasExplicitDirtyRects) {
     outFrameUpdated = false;
     outHasExplicitDirtyRects = false;
@@ -1243,7 +1283,11 @@ bool ScreenCapturer::captureViaDxgi(bool& outFrameUpdated, std::vector<RECT>& ou
     dxgi_->duplication->ReleaseFrame();
     return hasValidFrame_;
 }
+#else
+bool ScreenCapturer::captureViaDxgi(bool&, std::vector<RECT>&, bool&) { return false; }
+#endif
 
+#if defined(_WIN32)
 void ScreenCapturer::releaseGdiResources() {
     if (gdiMemDC_) {
         DeleteDC(gdiMemDC_);
@@ -1257,7 +1301,11 @@ void ScreenCapturer::releaseGdiResources() {
     gdiWidth_ = 0;
     gdiHeight_ = 0;
 }
+#else
+void ScreenCapturer::releaseGdiResources() {}
+#endif
 
+#if defined(_WIN32)
 bool ScreenCapturer::captureViaGdi() {
     int w = std::max(1, activeMonitor_.width);
     int h = std::max(1, activeMonitor_.height);
@@ -1336,6 +1384,9 @@ bool ScreenCapturer::captureViaGdi() {
 
     return hasValidFrame_;
 }
+#else
+bool ScreenCapturer::captureViaGdi() { return false; }
+#endif
 
 bool ScreenCapturer::captureViaCoreGraphics() {
 #if defined(__APPLE__)
@@ -1414,6 +1465,7 @@ bool ScreenCapturer::captureViaCoreGraphics() {
 
 bool ScreenCapturer::captureViaX11() {
 #if (defined(__linux__) || defined(__unix__)) && __has_include(<X11/Xlib.h>)
+    ensureXlibThreads();
     Display* dpy = XOpenDisplay(nullptr);
     if (!dpy) return false;
 
@@ -1529,6 +1581,7 @@ CursorState ScreenCapturer::captureCursorState() const {
     }
 #elif defined(__linux__) || defined(__unix__)
 #if __has_include(<X11/Xlib.h>)
+    ensureXlibThreads();
     Display* dpy = XOpenDisplay(nullptr);
     if (dpy) {
         Window root = DefaultRootWindow(dpy);

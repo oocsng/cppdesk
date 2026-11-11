@@ -111,6 +111,7 @@ elseif(UNIX AND NOT APPLE)
 
     find_package(X11 QUIET)
     find_package(JPEG QUIET)
+    find_package(OpenSSL REQUIRED)
     find_library(LIB_ZSTD zstd REQUIRED)
     find_library(LIB_XTST Xtst)
     find_library(LIB_XRANDR Xrandr)
@@ -118,6 +119,7 @@ elseif(UNIX AND NOT APPLE)
 
     set(PLATFORM_LIBS
         ${LIB_ZSTD}
+        OpenSSL::Crypto
         pthread
         dl
     )

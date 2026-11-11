@@ -1,6 +1,7 @@
 #include "virtual_display_manager.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace cppdesk {
@@ -135,14 +136,15 @@ bool VirtualDisplayManager::hasIddCxDriver() {
 }
 
 bool VirtualDisplayManager::allocateSoftwareSurface(SurfaceState& surface, uint32_t width, uint32_t height) {
-#if !defined(_WIN32)
-    (void)surface; (void)width; (void)height;
-    return false;
-#else
     if (width == 0 || height == 0 || width > 8192 || height > 8192) {
         return false;
     }
     releaseSoftwareSurface(surface);
+#if !defined(_WIN32)
+    // A plain pixel buffer; there is no GDI surface to draw text on here.
+    surface.pBits = std::calloc(static_cast<size_t>(width) * height, 4);
+    return surface.pBits != nullptr;
+#else
 
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -168,7 +170,8 @@ bool VirtualDisplayManager::allocateSoftwareSurface(SurfaceState& surface, uint3
 
 void VirtualDisplayManager::releaseSoftwareSurface(SurfaceState& surface) {
 #if !defined(_WIN32)
-    (void)surface;
+    std::free(surface.pBits);
+    surface.pBits = nullptr;
 #else
     if (surface.hdc) {
         if (surface.hOldBm) {
