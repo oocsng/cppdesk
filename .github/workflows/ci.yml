@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-zstd
+      - name: Build and run the test suite
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:RUNNER_TEMP\msys64\ucrt64\bin;$env:PATH"
+          ./build.ps1 -Test
+
+  linux:
+    runs-on: ubuntu-latest
+    # shortcut: the Linux path has never been compiled in CI, so a failure here
+    # does not block merges yet; remove continue-on-error once it is green.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libzstd-dev libx11-dev libxtst-dev libxext-dev libxrandr-dev libjpeg-dev
+      - name: Build and run the test suite
+        run: ./build.sh --test
