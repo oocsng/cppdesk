@@ -1,4 +1,5 @@
 #include "updater.hpp"
+#include "../core/crypto_identity.hpp"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -28,6 +29,19 @@ std::wstring toWide(const std::string& str) {
 #else
     return std::wstring(str.begin(), str.end());
 #endif
+}
+
+// "sha256:<64 hex>" -> lower-case hex; anything else -> "".
+std::string parseSha256Digest(const std::string& digest) {
+    static const std::string prefix = "sha256:";
+    if (digest.size() != prefix.size() + 64 || digest.compare(0, prefix.size(), prefix) != 0) return "";
+    std::string hex = digest.substr(prefix.size());
+    for (char& c : hex) {
+        unsigned char u = static_cast<unsigned char>(c);
+        if (!std::isxdigit(u)) return "";
+        c = static_cast<char>(std::tolower(u));
+    }
+    return hex;
 }
 
 } // namespace
@@ -243,7 +257,7 @@ UpdateInfo AutoUpdater::queryLatestReleaseSync(
         info.releaseUrl = releaseUrl;
     }
     info.releaseNotes = extractJsonString(responseBody, "body");
-    info.directDownloadUrl = extractAssetDownloadUrl(responseBody, "CppDesk.exe", &info.assetSizeBytes);
+    info.directDownloadUrl = extractAssetDownloadUrl(responseBody, "CppDesk.exe", &info.assetSizeBytes, &info.assetSha256);
 
     if (!info.latestVersion.empty()) {
         info.checkSucceeded = true;
@@ -274,8 +288,9 @@ void AutoUpdater::checkForUpdatesAsync(
     }).detach();
 }
 
-std::string AutoUpdater::extractAssetDownloadUrl(const std::string& json, const std::string& assetName, uint64_t* outSize) {
+std::string AutoUpdater::extractAssetDownloadUrl(const std::string& json, const std::string& assetName, uint64_t* outSize, std::string* outSha256) {
     if (outSize) *outSize = 0;
+    if (outSha256) outSha256->clear();
     if (json.empty() || assetName.empty()) return "";
 
     size_t pos = 0;
@@ -286,6 +301,7 @@ std::string AutoUpdater::extractAssetDownloadUrl(const std::string& json, const 
             std::string assetObj = json.substr(objStart, objEnd - objStart + 1);
             std::string dlUrl = extractJsonString(assetObj, "browser_download_url");
             if (!dlUrl.empty()) {
+                if (outSha256) *outSha256 = parseSha256Digest(extractJsonString(assetObj, "digest"));
                 if (outSize) {
                     size_t sizeKey = assetObj.find("\"size\"");
                     if (sizeKey != std::string::npos) {
@@ -317,12 +333,13 @@ void AutoUpdater::downloadUpdateAssetAsync(
     const std::string& downloadUrl,
     const std::wstring& targetPath,
     UpdateProgressCallback onProgress,
-    std::function<void(bool success, const std::string& error)> onComplete)
+    std::function<void(bool success, const std::string& error)> onComplete,
+    const std::string& expectedSha256)
 {
 #if !defined(_WIN32)
     if (onComplete) onComplete(false, "Auto-updater not supported on this platform");
 #else
-    std::thread([downloadUrl, targetPath, onProgress, onComplete]() {
+    std::thread([downloadUrl, targetPath, onProgress, onComplete, expectedSha256]() {
         if (downloadUrl.empty() || targetPath.empty()) {
             if (onComplete) onComplete(false, "Invalid URL or target path");
             return;
@@ -515,6 +532,12 @@ void AutoUpdater::downloadUpdateAssetAsync(
             return;
         }
 
+        if (!expectedSha256.empty() && !fileMatchesSha256(targetPath, expectedSha256)) {
+            DeleteFileW(targetPath.c_str());
+            if (onComplete) onComplete(false, "Update checksum mismatch (SHA-256)");
+            return;
+        }
+
         if (onProgress) {
             onProgress(downloadedBytes, totalBytes, currentSpeedBps);
         }
@@ -528,11 +551,39 @@ void AutoUpdater::downloadUpdateAssetAsync(
 
 #if !defined(_WIN32)
 bool AutoUpdater::validatePeBinary(const std::wstring&) { return false; }
+bool AutoUpdater::fileMatchesSha256(const std::wstring&, const std::string&) { return false; }
 int AutoUpdater::applySelfUpdateAndRestart(const std::wstring&, const std::wstring&, uint32_t, bool) { return 1; }
 int AutoUpdater::applySelfUpdateAndRestart(const std::wstring&, uint32_t) { return 1; }
 std::wstring AutoUpdater::buildSelfUpdateCommand(const std::wstring&, const std::wstring&) { return L""; }
 bool AutoUpdater::launchSelfUpdate(const std::wstring&, const std::wstring&) { return false; }
 #else
+bool AutoUpdater::fileMatchesSha256(const std::wstring& filePath, const std::string& expectedHex) {
+    if (expectedHex.empty()) return false;
+
+    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    // shortcut: whole file in memory (the exe is a few MB); stream it if releases ever grow large.
+    std::vector<uint8_t> data;
+    constexpr DWORD kChunk = 1 << 20;
+    std::vector<uint8_t> chunk(kChunk);
+    bool ok = true;
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(hFile, chunk.data(), kChunk, &got, nullptr)) { ok = false; break; }
+        if (got == 0) break;
+        data.insert(data.end(), chunk.begin(), chunk.begin() + got);
+    }
+    CloseHandle(hFile);
+    if (!ok) return false;
+
+    std::string actual = CryptoUtils::toHex(CryptoUtils::sha256(data.data(), data.size()).data(), 32);
+    std::string expected = expectedHex;
+    for (char& c : expected) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return actual == expected;
+}
+
 bool AutoUpdater::validatePeBinary(const std::wstring& filePath) {
     if (filePath.empty()) return false;
 

@@ -4779,7 +4779,7 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         drawButton("sett_view_release_top", relBtn, "Release Notes",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
                    8.0f, [this]() {
-                       ShellExecuteA(nullptr, "open", "https://github.com/nmnghia2527/cppdesk/releases/latest", nullptr, nullptr, SW_SHOWNORMAL);
+                       ShellExecuteA(nullptr, "open", "https://github.com/oocsng/cppdesk/releases/latest", nullptr, nullptr, SW_SHOWNORMAL);
                    }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
 
         cy = updateBanner.bottom + 14.0f;
@@ -4802,13 +4802,13 @@ void CppDeskWindow::drawSettingsView(const UiRect& bounds, float alpha) {
         UiRect licBtn = { aBtnRight - aBtnW, aBtnY, aBtnRight, aBtnY + aBtnH };
         drawButton("sett_about_license", licBtn, "License",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, []() {
-                       ShellExecuteA(nullptr, "open", "https://github.com/nmnghia2527/cppdesk/blob/main/LICENSE", nullptr, nullptr, SW_SHOWNORMAL);
+                       ShellExecuteA(nullptr, "open", "https://github.com/oocsng/cppdesk/blob/main/LICENSE", nullptr, nullptr, SW_SHOWNORMAL);
                    }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
 
         UiRect ghBtn = { licBtn.left - 8.0f - aBtnW, aBtnY, licBtn.left - 8.0f, aBtnY + aBtnH };
         drawButton("sett_about_github", ghBtn, "GitHub",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, []() {
-                       ShellExecuteA(nullptr, "open", "https://github.com/nmnghia2527/cppdesk", nullptr, nullptr, SW_SHOWNORMAL);
+                       ShellExecuteA(nullptr, "open", "https://github.com/oocsng/cppdesk", nullptr, nullptr, SW_SHOWNORMAL);
                    }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
 
         UiRect aTextRect = { aboutBox.left + aPad, aboutBox.top + 28.0f, ghBtn.left - 12.0f, aboutBox.top + 48.0f };
@@ -7677,7 +7677,7 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
                    std::string dlUrl = latestUpdateInfo_.directDownloadUrl;
                    if (dlUrl.empty()) {
                        std::string targetUrl = latestUpdateInfo_.releaseUrl.empty()
-                           ? "https://github.com/nmnghia2527/cppdesk/releases/latest"
+                           ? "https://github.com/oocsng/cppdesk/releases/latest"
                            : latestUpdateInfo_.releaseUrl;
                        ShellExecuteA(nullptr, "open", targetUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                        return;
@@ -7740,7 +7740,8 @@ void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float mod
                                showToast("Failed to launch updater process", true);
                                if (h) InvalidateRect(h, nullptr, FALSE);
                            }
-                       }
+                       },
+                       latestUpdateInfo_.assetSha256
                    );
                }, fmtSmall_);
 
@@ -8434,7 +8435,7 @@ void CppDeskWindow::triggerUpdateCheck(bool manual) {
     }
 
     HWND targetHwnd = hwnd_;
-    AutoUpdater::checkForUpdatesAsync("nmnghia2527", "cppdesk", CPP_DESK_VERSION, [targetHwnd, manual](const UpdateInfo& info) {
+    AutoUpdater::checkForUpdatesAsync("oocsng", "cppdesk", CPP_DESK_VERSION, [targetHwnd, manual](const UpdateInfo& info) {
         if (targetHwnd && IsWindow(targetHwnd)) {
             auto* pInfo = new UpdateInfo(info);
             if (!PostMessageW(targetHwnd, WM_DESK_UPDATE_CHECK_DONE, reinterpret_cast<WPARAM>(pInfo), manual ? 1 : 0)) {

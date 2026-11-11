@@ -3537,7 +3537,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             VersionUpgradeNoticePayload notice;
                             notice.senderVersion = CPP_DESK_VERSION;
                             notice.minimumVersion = CPP_DESK_VERSION;
-                            notice.downloadUrl = "https://github.com/nmnghia2527/cppdesk/releases/latest";
+                            notice.downloadUrl = "https://github.com/oocsng/cppdesk/releases/latest";
                             notice.message = "Connected viewer is running CppDesk " + std::string(CPP_DESK_VERSION) + ". Host update recommended.";
                             std::vector<uint8_t> noticeBuf;
                             serializeVersionUpgradeNotice(notice, noticeBuf);

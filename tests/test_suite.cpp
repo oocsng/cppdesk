@@ -6992,6 +6992,56 @@ void testRemoteFileBrowserPaths() {
     fs::remove_all(root, ec);
 }
 
+void testUpdaterIntegrity() {
+    std::cout << "[TEST 59] Updater Asset Digest and File Verification..." << std::endl;
+
+    const std::string abcHex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    std::string upperHex = abcHex;
+    for (char& c : upperHex) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+
+    std::string json =
+        "{\"assets\":["
+        "{\"name\":\"CppDesk.zip\",\"size\":5,\"digest\":\"sha256:" + std::string(64, 'a') + "\","
+        "\"browser_download_url\":\"https://example.com/CppDesk.zip\"},"
+        "{\"name\":\"CppDesk.exe\",\"uploader\":{\"login\":\"x\"},\"size\":42,\"digest\":\"sha256:" + upperHex + "\","
+        "\"browser_download_url\":\"https://example.com/CppDesk.exe\"}]}";
+
+    uint64_t size = 0;
+    std::string sha;
+    std::string url = AutoUpdater::extractAssetDownloadUrl(json, "CppDesk.exe", &size, &sha);
+    TEST_ASSERT(url == "https://example.com/CppDesk.exe");
+    TEST_ASSERT(size == 42);
+    TEST_ASSERT(sha == abcHex); // lower-cased, prefix stripped
+
+    // Releases that predate GitHub asset digests, or a malformed digest, yield no expectation.
+    std::string noDigest = "{\"assets\":[{\"name\":\"CppDesk.exe\",\"size\":1,"
+                           "\"browser_download_url\":\"https://example.com/CppDesk.exe\"}]}";
+    sha = "stale";
+    AutoUpdater::extractAssetDownloadUrl(noDigest, "CppDesk.exe", &size, &sha);
+    TEST_ASSERT(sha.empty());
+
+    std::string badDigest = "{\"assets\":[{\"name\":\"CppDesk.exe\",\"size\":1,\"digest\":\"sha256:zz\","
+                            "\"browser_download_url\":\"https://example.com/CppDesk.exe\"}]}";
+    AutoUpdater::extractAssetDownloadUrl(badDigest, "CppDesk.exe", &size, &sha);
+    TEST_ASSERT(sha.empty());
+
+#if defined(_WIN32)
+    wchar_t tmpDir[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tmpDir);
+    std::wstring path = std::wstring(tmpDir) + L"cppdesk_digest_test.bin";
+    {
+        std::ofstream f(path.c_str(), std::ios::binary | std::ios::trunc);
+        f << "abc";
+    }
+    TEST_ASSERT(AutoUpdater::fileMatchesSha256(path, abcHex));
+    TEST_ASSERT(AutoUpdater::fileMatchesSha256(path, upperHex));
+    TEST_ASSERT(!AutoUpdater::fileMatchesSha256(path, std::string(64, '0')));
+    TEST_ASSERT(!AutoUpdater::fileMatchesSha256(path, ""));
+    DeleteFileW(path.c_str());
+    TEST_ASSERT(!AutoUpdater::fileMatchesSha256(path, abcHex)); // missing file never matches
+#endif
+}
+
 void testRemoteFileBrowserProtocol() {
     std::cout << "[TEST 58] Remote File Browser Protocol..." << std::endl;
 
@@ -7139,6 +7189,7 @@ int main() {
         testDpiConversion(); std::cout << "Test 56 done\n" << std::flush;
         testRemoteFileBrowserPaths(); std::cout << "Test 57 done\n" << std::flush;
         testRemoteFileBrowserProtocol(); std::cout << "Test 58 done\n" << std::flush;
+        testUpdaterIntegrity(); std::cout << "Test 59 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
