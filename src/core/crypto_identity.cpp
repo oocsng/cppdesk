@@ -540,6 +540,9 @@ bool IdentityManager::loadOrCreate() {
                 unattendedEnabled_ = (val == "1" || val == "true");
             } else if (key == "unattended_verifier") {
                 if (val.size() == 64) unattendedVerifier_ = val;
+            } else if (key == "relay_owner_key") {
+                auto bytes = CryptoUtils::fromHex(val);
+                if (bytes.size() == relayOwnerKey_.size()) std::copy(bytes.begin(), bytes.end(), relayOwnerKey_.begin());
             } else if (key == "unattended_password") {
                 legacyPlainPassword = val;
             } else if (key == "relay_server") {
@@ -686,6 +689,11 @@ bool IdentityManager::loadOrCreate() {
         sessionCode_ = generateRandomSixCharCode();
     }
 
+    if (!CryptoUtils::isUsableKey(relayOwnerKey_)) {
+        CryptoUtils::randomBytes(relayOwnerKey_.data(), relayOwnerKey_.size());
+        modified = true;
+    }
+
     // Transparently migrate legacy plaintext password to salted SHA-256 verifier
     if (!legacyPlainPassword.empty() && unattendedVerifier_.empty()) {
         unattendedVerifier_ = CryptoUtils::hashPassword(legacyPlainPassword, std::to_string(deskId_));
@@ -711,6 +719,7 @@ bool IdentityManager::save() const {
     out << "listen_port=" << listenPort_ << "\n";
     out << "unattended_enabled=" << (unattendedEnabled_ ? "1" : "0") << "\n";
     out << "unattended_verifier=" << unattendedVerifier_ << "\n";
+    out << "relay_owner_key=" << CryptoUtils::toHex(relayOwnerKey_.data(), relayOwnerKey_.size()) << "\n";
     out << "relay_server=" << (settings_.relayServer.empty() ? relayServerAddr_ : settings_.relayServer) << "\n";
     out << "relay_auth_key=" << settings_.relayAuthKey << "\n";
     out << "stun_server=" << settings_.stunServer << "\n";

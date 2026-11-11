@@ -7,6 +7,7 @@
 #include "../src/net/network_engine.hpp"
 #include "../src/net/updater.hpp"
 #include "../src/net/connection_limiter.hpp"
+#include "../src/net/relay_owner.hpp"
 #include "../src/ui/notification_manager.hpp"
 #include "../src/media/session_recorder.hpp"
 #include "../src/media/session_recording_player.hpp"
@@ -7400,6 +7401,224 @@ void testRemoteFileBrowserProtocol() {
     TEST_ASSERT(!engine.executeProcessLaunch("", "", 0xFF, pid, perr) && !perr.empty());
 }
 
+void testRelayDeskOwnership() {
+    std::cout << "[TEST 65] Relay desk-ID ownership (enroll, prove, refuse hijack)..." << std::endl;
+    using namespace relayowner;
+
+    // Part A: the registry on its own.
+    {
+        Key keyA{}, keyB{};
+        keyA.fill(0x11);
+        keyB.fill(0x22);
+        Nonce n1{}, n2{};
+        n1.fill(0x01);
+        n2.fill(0x02);
+
+        OwnerRegistry reg;
+        TEST_ASSERT(!reg.hasOwner(1001, 0));
+        TEST_ASSERT(reg.enroll(1001, keyA, 0));
+        TEST_ASSERT(reg.hasOwner(1001, 1000));
+        TEST_ASSERT(!reg.enroll(1001, keyB, 1000));          // an enrolled ID cannot be re-enrolled
+
+        Key proof = computeProof(keyA, 1001, n1);
+        TEST_ASSERT(reg.verify(1001, n1, proof, 2000));
+        TEST_ASSERT(!reg.verify(1001, n2, proof, 2000));      // proof replayed against a fresh nonce
+        TEST_ASSERT(!reg.verify(1002, n1, proof, 2000));      // proof for another desk ID
+        TEST_ASSERT(!reg.verify(1001, n1, computeProof(keyB, 1001, n1), 2000)); // wrong key
+        TEST_ASSERT(computeProof(keyA, 1001, n1) != computeProof(keyA, 1002, n1));
+
+        // A record lapses after the TTL, and activity keeps it alive.
+        TEST_ASSERT(reg.hasOwner(1001, 2000 + TTL_MS - 1));
+        reg.touch(1001, 3000);
+        TEST_ASSERT(reg.hasOwner(1001, 3000 + TTL_MS - 1));
+        TEST_ASSERT(!reg.hasOwner(1001, 3000 + TTL_MS + 1));
+        TEST_ASSERT(reg.enroll(1001, keyB, 3000 + TTL_MS + 1)); // free again once lapsed
+
+        // The key a host sends is specific to its relay.
+        Key install{};
+        install.fill(0x33);
+        TEST_ASSERT(deriveRelayKey(install, "relay.example:50000") == deriveRelayKey(install, "relay.example:50000"));
+        TEST_ASSERT(deriveRelayKey(install, "relay.example:50000") != deriveRelayKey(install, "other.example:50000"));
+        TEST_ASSERT(deriveRelayKey(install, "relay.example:50000") != install);
+    }
+
+    // Part B: a real RelayServer, spoken to over TCP.
+    socket_init_network();
+    const uint16_t port = 50991;
+    RelayServer relay;
+    TEST_ASSERT(relay.start(port));
+
+    std::mutex sendMu;
+    auto dial = [&]() -> uintptr_t {
+        socket_t s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET_VAL) return ~uintptr_t(0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(port);
+        inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+#if defined(_WIN32)
+        DWORD tv = 3000;
+#else
+        timeval tv{3, 0};
+#endif
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        if (connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+            socket_close(s);
+            return ~uintptr_t(0);
+        }
+        return static_cast<uintptr_t>(s);
+    };
+    auto hangUp = [](uintptr_t s) { socket_close(static_cast<socket_t>(s)); };
+    auto send = [&](uintptr_t s, PacketType t, const ByteWriter& w) {
+        return NetworkEngine::sendFrame(s, t, 0, w.buffer().data(), w.buffer().size(), sendMu);
+    };
+
+    struct RegReply { int challengeMode = -1; Nonce nonce{}; int ack = -1; };
+    auto beginRegister = [&](uintptr_t s, uint64_t id, const std::string& host, bool ownerCap) {
+        ByteWriter w;
+        w.writeU64(id);
+        w.writeString(host);
+        w.writeString("127.0.0.1");
+        w.writeU16(50999);
+        if (ownerCap) w.writeU8(OWNER_CAP);
+        RegReply r;
+        FrameHeader h{};
+        std::vector<uint8_t> p;
+        if (!send(s, PacketType::RELAY_REGISTER, w) || !NetworkEngine::recvFrame(s, h, p)) return r;
+        if (h.type == static_cast<uint8_t>(PacketType::RELAY_REGISTER_CHALLENGE) && p.size() == 1 + NONCE_LEN) {
+            r.challengeMode = p[0];
+            std::copy(p.begin() + 1, p.end(), r.nonce.begin());
+        } else if (h.type == static_cast<uint8_t>(PacketType::RELAY_REGISTER_ACK) && !p.empty()) {
+            r.ack = p[0];
+        }
+        return r;
+    };
+    auto answer = [&](uintptr_t s, const Key& value) {
+        ByteWriter w;
+        w.writeBytes(value.data(), value.size());
+        FrameHeader h{};
+        std::vector<uint8_t> p;
+        if (!send(s, PacketType::RELAY_REGISTER_PROOF, w) || !NetworkEngine::recvFrame(s, h, p)) return -1;
+        return (h.type == static_cast<uint8_t>(PacketType::RELAY_REGISTER_ACK) && !p.empty()) ? int(p[0]) : -1;
+    };
+    // The host name a lookup returns, "" when the ID is not registered.
+    auto lookup = [&](uint64_t id) -> std::string {
+        uintptr_t s = dial();
+        if (s == ~uintptr_t(0)) return "<dial failed>";
+        ByteWriter w;
+        w.writeU64(id);
+        std::string name = "<no reply>";
+        FrameHeader h{};
+        std::vector<uint8_t> p;
+        if (send(s, PacketType::RELAY_LOOKUP, w) && NetworkEngine::recvFrame(s, h, p) &&
+            h.type == static_cast<uint8_t>(PacketType::RELAY_LOOKUP_RESP)) {
+            ByteReader r(p);
+            bool found = r.readU8() != 0;
+            r.readString();
+            r.readU16();
+            std::string hostName = r.readString();
+            name = found ? hostName : "";
+        }
+        hangUp(s);
+        return name;
+    };
+
+    const uint64_t deskId = 482910375ULL;
+    Key ownerKey{};
+    ownerKey.fill(0x5A);
+
+    // 1. The owner's first registration enrolls its key.
+    uintptr_t owner = dial();
+    RegReply first = beginRegister(owner, deskId, "owner-host", true);
+    TEST_ASSERT(first.challengeMode == MODE_ENROLL);
+    TEST_ASSERT(answer(owner, ownerKey) == 1);
+    TEST_ASSERT(lookup(deskId) == "owner-host");
+
+    // 2. A host that sends no proof at all cannot take the ID.
+    uintptr_t legacyThief = dial();
+    TEST_ASSERT(beginRegister(legacyThief, deskId, "evil-legacy", false).ack == 0);
+    hangUp(legacyThief);
+    TEST_ASSERT(lookup(deskId) == "owner-host");
+
+    // 3. Wrong proof, and the owner's own earlier proof replayed against a new nonce, are both refused.
+    Key earlierProof = computeProof(ownerKey, deskId, first.nonce);
+    uintptr_t forger = dial();
+    RegReply forgerChallenge = beginRegister(forger, deskId, "evil-forger", true);
+    TEST_ASSERT(forgerChallenge.challengeMode == MODE_PROVE);
+    Key bogus{};
+    bogus.fill(0x66);
+    TEST_ASSERT(answer(forger, bogus) == 0);
+    hangUp(forger);
+    uintptr_t replayer = dial();
+    TEST_ASSERT(beginRegister(replayer, deskId, "evil-replay", true).challengeMode == MODE_PROVE);
+    TEST_ASSERT(answer(replayer, earlierProof) == 0);
+    hangUp(replayer);
+    TEST_ASSERT(lookup(deskId) == "owner-host");
+
+    // 4. A challenge answer that never arrives does not register anything either.
+    uintptr_t silent = dial();
+    TEST_ASSERT(beginRegister(silent, deskId, "evil-silent", true).challengeMode == MODE_PROVE);
+    hangUp(silent);
+    TEST_ASSERT(lookup(deskId) == "owner-host");
+
+    // 5. The owner reconnects and takes its registration back from its own stale connection.
+    uintptr_t again = dial();
+    RegReply second = beginRegister(again, deskId, "owner-host-2", true);
+    TEST_ASSERT(second.challengeMode == MODE_PROVE);
+    TEST_ASSERT(answer(again, computeProof(ownerKey, deskId, second.nonce)) == 1);
+    TEST_ASSERT(lookup(deskId) == "owner-host-2");
+
+    // 6. A host from before this feature still registers an ID nobody owns.
+    uintptr_t legacy = dial();
+    TEST_ASSERT(beginRegister(legacy, 391827465ULL, "legacy-host", false).ack == 1);
+    TEST_ASSERT(lookup(391827465ULL) == "legacy-host");
+
+    hangUp(owner);
+    hangUp(again);
+    hangUp(legacy);
+
+    // 6b. With the owner offline, nobody else can take its ID by registering first.
+    for (int i = 0; i < 40 && !lookup(deskId).empty(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    TEST_ASSERT(lookup(deskId).empty());
+    uintptr_t squatLegacy = dial();
+    TEST_ASSERT(beginRegister(squatLegacy, deskId, "squatter-legacy", false).ack == 0);
+    hangUp(squatLegacy);
+    uintptr_t squatCapable = dial();
+    TEST_ASSERT(beginRegister(squatCapable, deskId, "squatter-capable", true).challengeMode == MODE_PROVE);
+    hangUp(squatCapable);
+    TEST_ASSERT(lookup(deskId).empty());
+
+    // 7. A real host engine enrolls, and the ID is then protected against a stranger.
+    {
+        IdentityManager idMgr(94);
+        idMgr.loadOrCreate();
+        TEST_ASSERT(CryptoUtils::isUsableKey(idMgr.relayOwnerKey()));
+        Key persistedKey = idMgr.relayOwnerKey();
+        IdentityManager reloaded(94);
+        reloaded.loadOrCreate();
+        TEST_ASSERT(reloaded.relayOwnerKey() == persistedKey);   // survives a restart
+
+        NetworkEngine engine(idMgr);
+        TEST_ASSERT(engine.start());
+        engine.setRelayAddressAndReconnect("127.0.0.1:" + std::to_string(port));
+        for (int i = 0; i < 80 && lookup(idMgr.deskId()).empty(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        TEST_ASSERT(lookup(idMgr.deskId()) == idMgr.hostname());
+
+        uintptr_t thief = dial();
+        TEST_ASSERT(beginRegister(thief, idMgr.deskId(), "evil-vs-engine", false).ack == 0);
+        hangUp(thief);
+        TEST_ASSERT(lookup(idMgr.deskId()) == idMgr.hostname());
+
+        engine.stop();
+    }
+
+    relay.stop();
+}
+
 } // namespace
 
 int main() {
@@ -7478,6 +7697,7 @@ int main() {
         testUnicodeTextInput(); std::cout << "Test 62 done\n" << std::flush;
         testBoundAuthResponse(); std::cout << "Test 63 done\n" << std::flush;
         testConnectionLimiter(); std::cout << "Test 64 done\n" << std::flush;
+        testRelayDeskOwnership(); std::cout << "Test 65 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";

@@ -168,7 +168,9 @@ enum class PacketType : uint8_t {
     RELAY_CONNECT_REQ   = 0x54,
     RELAY_INCOMING_REQ  = 0x55,
     RELAY_BRIDGE_ACCEPT = 0x56,
-    RELAY_BRIDGE_READY  = 0x57
+    RELAY_BRIDGE_READY  = 0x57,
+    RELAY_REGISTER_CHALLENGE = 0x5A, // Relay -> Host: prove (or enroll) ownership of the desk ID
+    RELAY_REGISTER_PROOF     = 0x5B  // Host -> Relay: HMAC proof, or the key itself when enrolling
 };
 
 enum class SystemActionType : uint8_t {

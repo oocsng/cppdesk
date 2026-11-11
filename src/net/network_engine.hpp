@@ -2,6 +2,7 @@
 
 #include "socket_compat.hpp"
 #include "connection_limiter.hpp"
+#include "relay_owner.hpp"
 #include "../core/protocol.hpp"
 #include "../core/crypto_identity.hpp"
 #include "../capture/screen_capture.hpp"
@@ -188,6 +189,7 @@ private:
     std::condition_variable     bridgeCv_;
     std::vector<RegisteredHost> hosts_;
     std::vector<PendingBridge>  bridges_;
+    relayowner::OwnerRegistry   owners_;   // desk IDs whose owner key this relay holds
 
     // One thread per connection: cap them so a single address cannot exhaust the host.
     // Each registered host holds one connection and each bridged session two.

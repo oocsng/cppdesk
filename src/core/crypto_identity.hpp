@@ -276,6 +276,9 @@ public:
     bool hasStoredPasswordVerifier() const { return !unattendedVerifier_.empty(); }
     const std::string& passwordVerifier() const { return unattendedVerifier_; }
 
+    // Secret that proves this install owns its desk ID on a relay; created on first run, kept in the config file.
+    const std::array<uint8_t, 32>& relayOwnerKey() const { return relayOwnerKey_; }
+
     // Dynamic 6-character One-Time Session Password (in-memory only, regenerable anytime)
     const std::string& sessionCode() const { return sessionCode_; }
     std::string regenerateSessionCode();
@@ -316,6 +319,7 @@ private:
     bool                            unattendedEnabled_ = true;
     std::string                     unattendedPassword_; // In-memory only (never written in plaintext to disk)
     std::string                     unattendedVerifier_; // Salted SHA-256 verifier persisted in config_*.ini
+    std::array<uint8_t, 32>         relayOwnerKey_{};    // Hex in the config file; see relayOwnerKey()
     std::string                     sessionCode_;        // Dynamic 6-char One-Time Session Password
     std::string                     relayServerAddr_ = "127.0.0.1:50999";
     std::vector<RecentSessionEntry> recentSessions_;

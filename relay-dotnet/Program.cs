@@ -24,6 +24,23 @@ internal static class Program
     private const byte PacketRelayIncomingReq  = 0x55;
     private const byte PacketRelayBridgeAccept = 0x56;
     private const byte PacketRelayBridgeReady  = 0x57;
+    private const byte PacketRelayRegisterChallenge = 0x5A;
+    private const byte PacketRelayRegisterProof     = 0x5B;
+
+    private const byte OwnerCap = 1;        // trailing byte on RELAY_REGISTER: "I can prove ownership"
+    private const byte ModeProve = 0;       // challenge: answer with HMAC(key, label || deskId || nonce)
+    private const byte ModeEnroll = 1;      // challenge: answer with the key itself
+    private const int OwnerNonceLength = 16;
+    private const int OwnerKeyLength = 32;
+    private const int OwnerMaxRecords = 100_000;
+    private static readonly TimeSpan OwnerTtl = TimeSpan.FromDays(7);   // an ID nobody has used for this long is free again
+    private static readonly byte[] OwnerLabel = Encoding.ASCII.GetBytes("CppDesk-relay-owner-v1");
+
+    // Desk IDs whose owner key this relay holds. A host's first registration enrolls its key (trust on first
+    // use); later ones must answer a fresh challenge, so knowing an ID is not enough to take it over.
+    // shortcut: in memory only, so a relay restart forgets every owner and the first registrant wins again; persist when relays run for months.
+    private sealed record OwnerRecord(byte[] Key, DateTime LastSeenUtc);
+    private static readonly Dictionary<ulong, OwnerRecord> Owners = new();
 
     private sealed record RegisteredHost(
         ulong DeskId,
@@ -86,7 +103,7 @@ internal static class Program
         if (selfTest)
         {
             _ = Task.Run(() => AcceptLoopAsync(listener, cts.Token));
-            bool ok = await RunSelfTestAsync(boundPort) && await RunHardeningSelfTestAsync(boundPort);
+            bool ok = await RunSelfTestAsync(boundPort) && await RunHardeningSelfTestAsync(boundPort) && await RunOwnershipSelfTestAsync(boundPort);
             cts.Cancel();
             listener.Stop();
             return ok ? 0 : 1;
@@ -213,8 +230,35 @@ internal static class Program
                         ip = ep.Address.ToString();
                     }
 
-                    if (Hosts.TryGetValue(deskId, out var existing) &&
-                        (DateTime.UtcNow - existing.LastSeenUtc) < TimeSpan.FromSeconds(45))
+                    // Hosts from before ownership proofs end the frame here.
+                    bool ownerCapable = pos < payload.Length && payload[pos] == OwnerCap;
+                    if (ownerCapable)
+                    {
+                        byte[] nonce = RandomNumberGenerator.GetBytes(OwnerNonceLength);
+                        bool enrolling = !HasLiveOwner(deskId);
+                        byte[] challenge = new byte[1 + OwnerNonceLength];
+                        challenge[0] = enrolling ? ModeEnroll : ModeProve;
+                        nonce.CopyTo(challenge, 1);
+                        await WriteFrameAsync(stream, PacketRelayRegisterChallenge, 0, challenge, ct);
+
+                        var (pOk, pType, _, proof) = await ReadFrameAsync(stream, firstFrameCts.Token);
+                        bool proven = pOk && pType == PacketRelayRegisterProof && proof.Length == OwnerKeyLength &&
+                                      (enrolling ? EnrollOwner(deskId, proof) : VerifyOwner(deskId, nonce, proof));
+                        if (!proven)
+                        {
+                            await WriteFrameAsync(stream, PacketRelayRegisterAck, 0, new byte[] { 0 }, ct);
+                            return;
+                        }
+
+                        // The owner takes its registration over from its own stale connection.
+                        if (Hosts.TryGetValue(deskId, out var stale))
+                        {
+                            try { stale.ControlStream.Dispose(); } catch { }
+                        }
+                    }
+                    else if (HasLiveOwner(deskId) ||
+                             (Hosts.TryGetValue(deskId, out var existing) &&
+                              (DateTime.UtcNow - existing.LastSeenUtc) < TimeSpan.FromSeconds(45)))
                     {
                         await WriteFrameAsync(stream, PacketRelayRegisterAck, 0, new byte[] { 0 }, ct);
                         return;
@@ -236,6 +280,7 @@ internal static class Program
                             var (pOk, pType, _, _) = await ReadFrameAsync(stream, pingCts.Token);
                             if (!pOk) break;
                             host.LastSeenUtc = DateTime.UtcNow;
+                            if (ownerCapable) TouchOwner(deskId);
                             pingCts.CancelAfter(TimeSpan.FromSeconds(90));
                             if (pType == PacketPing)
                             {
@@ -253,6 +298,7 @@ internal static class Program
                     }
                     finally
                     {
+                        if (ownerCapable) TouchOwner(deskId);
                         if (((ICollection<KeyValuePair<ulong, RegisteredHost>>)Hosts)
                                 .Remove(new KeyValuePair<ulong, RegisteredHost>(deskId, host)))
                         {
@@ -426,7 +472,7 @@ internal static class Program
         uint size = BinaryPrimitives.ReadUInt32LittleEndian(hdr.AsSpan(6, 4));
         uint cap = type switch
         {
-            PacketRelayRegister or PacketRelayLookup or PacketRelayConnectReq or PacketRelayBridgeAccept => MaxControlFrame,
+            PacketRelayRegister or PacketRelayLookup or PacketRelayConnectReq or PacketRelayBridgeAccept or PacketRelayRegisterProof => MaxControlFrame,
             _ => MaxPayloadSize
         };
         if (size > cap) return (false, 0, 0, Array.Empty<byte>());
@@ -606,6 +652,207 @@ internal static class Program
             _firstFrameTimeout = savedTimeout;
             _maxConnectionsPerIp = savedMax;
         }
+    }
+
+    private static byte[] ComputeOwnerProof(byte[] key, ulong deskId, byte[] nonce)
+    {
+        byte[] msg = new byte[OwnerLabel.Length + 8 + nonce.Length];
+        OwnerLabel.CopyTo(msg, 0);
+        BinaryPrimitives.WriteUInt64LittleEndian(msg.AsSpan(OwnerLabel.Length, 8), deskId);
+        nonce.CopyTo(msg, OwnerLabel.Length + 8);
+        return HMACSHA256.HashData(key, msg);
+    }
+
+    private static bool HasLiveOwner(ulong deskId)
+    {
+        lock (Owners) return LiveOwnerLocked(deskId) is not null;
+    }
+
+    private static OwnerRecord? LiveOwnerLocked(ulong deskId)
+    {
+        if (!Owners.TryGetValue(deskId, out var rec)) return null;
+        if (DateTime.UtcNow - rec.LastSeenUtc > OwnerTtl)
+        {
+            Owners.Remove(deskId);
+            return null;
+        }
+        return rec;
+    }
+
+    // False when the ID already has a live owner. A full table accepts the ID unprotected rather than lock real hosts out.
+    private static bool EnrollOwner(ulong deskId, byte[] key)
+    {
+        lock (Owners)
+        {
+            if (LiveOwnerLocked(deskId) is not null) return false;
+            if (Owners.Count < OwnerMaxRecords || Owners.ContainsKey(deskId))
+            {
+                Owners[deskId] = new OwnerRecord(key, DateTime.UtcNow);
+            }
+            return true;
+        }
+    }
+
+    private static bool VerifyOwner(ulong deskId, byte[] nonce, byte[] proof)
+    {
+        lock (Owners)
+        {
+            var rec = LiveOwnerLocked(deskId);
+            if (rec is null) return false;
+            if (!CryptographicOperations.FixedTimeEquals(ComputeOwnerProof(rec.Key, deskId, nonce), proof)) return false;
+            Owners[deskId] = rec with { LastSeenUtc = DateTime.UtcNow };
+            return true;
+        }
+    }
+
+    private static void TouchOwner(ulong deskId)
+    {
+        lock (Owners)
+        {
+            if (LiveOwnerLocked(deskId) is { } rec) Owners[deskId] = rec with { LastSeenUtc = DateTime.UtcNow };
+        }
+    }
+
+    private static async Task<bool> RunOwnershipSelfTestAsync(int port)
+    {
+        const ulong deskId = 731904286UL;
+        byte[] key = new byte[OwnerKeyLength];
+        Array.Fill(key, (byte)0x5A);
+
+        async Task<(TcpClient Client, NetworkStream Stream)> Dial()
+        {
+            var c = new TcpClient();
+            await c.ConnectAsync(IPAddress.Loopback, port);
+            return (c, c.GetStream());
+        }
+
+        static byte[] RegisterPayload(ulong id, string host, bool ownerCap)
+        {
+            using var ms = new MemoryStream();
+            WriteU64(ms, id);
+            WriteString(ms, host);
+            WriteString(ms, "127.0.0.1");
+            WriteU16(ms, 50991);
+            if (ownerCap) ms.WriteByte(OwnerCap);
+            return ms.ToArray();
+        }
+
+        // Sends REGISTER and returns (challenge mode, nonce) or (-1, ack byte) when the relay answered with an ack.
+        async Task<(int Mode, byte[] Data)> Register(NetworkStream s, ulong id, string host, bool ownerCap)
+        {
+            await WriteFrameAsync(s, PacketRelayRegister, 0, RegisterPayload(id, host, ownerCap), CancellationToken.None);
+            var (ok, type, _, pay) = await ReadFrameAsync(s, CancellationToken.None);
+            if (!ok) return (-2, Array.Empty<byte>());
+            if (type == PacketRelayRegisterChallenge && pay.Length == 1 + OwnerNonceLength) return (pay[0], pay[1..]);
+            if (type == PacketRelayRegisterAck && pay.Length >= 1) return (-1, new[] { pay[0] });
+            return (-2, Array.Empty<byte>());
+        }
+
+        async Task<int> Answer(NetworkStream s, byte[] value)
+        {
+            await WriteFrameAsync(s, PacketRelayRegisterProof, 0, value, CancellationToken.None);
+            var (ok, type, _, pay) = await ReadFrameAsync(s, CancellationToken.None);
+            return ok && type == PacketRelayRegisterAck && pay.Length >= 1 ? pay[0] : -2;
+        }
+
+        async Task<string> Lookup(ulong id)
+        {
+            var (c, s) = await Dial();
+            using (c)
+            {
+                using var ms = new MemoryStream();
+                WriteU64(ms, id);
+                await WriteFrameAsync(s, PacketRelayLookup, 0, ms.ToArray(), CancellationToken.None);
+                var (ok, type, _, pay) = await ReadFrameAsync(s, CancellationToken.None);
+                if (!ok || type != PacketRelayLookupResp) return "<no reply>";
+                int pos = 0;
+                byte found = pay[pos++];
+                ReadString(pay, ref pos);
+                ReadU16(pay, ref pos);
+                string name = ReadString(pay, ref pos);
+                return found == 1 ? name : "";
+            }
+        }
+
+        bool Fail(string why)
+        {
+            Log($"Self-test FAILED: desk-ID ownership: {why}");
+            return false;
+        }
+
+        // The owner's first registration enrolls its key.
+        var (ownerClient, ownerStream) = await Dial();
+        using (ownerClient)
+        {
+            var first = await Register(ownerStream, deskId, "owner-host", true);
+            if (first.Mode != ModeEnroll) return Fail("first registration was not asked to enroll");
+            if (await Answer(ownerStream, key) != 1) return Fail("enrollment was refused");
+            if (await Lookup(deskId) != "owner-host") return Fail("enrolled host not found");
+
+            // A host that sends no proof cannot take the ID.
+            var (c1, s1) = await Dial();
+            using (c1)
+            {
+                var r = await Register(s1, deskId, "evil-legacy", false);
+                if (r.Mode != -1 || r.Data[0] != 0) return Fail("proof-less registration was accepted");
+            }
+
+            // A wrong proof and the owner's earlier proof replayed against a new nonce are refused.
+            byte[] earlierProof = ComputeOwnerProof(key, deskId, first.Data);
+            var (c2, s2) = await Dial();
+            using (c2)
+            {
+                var r = await Register(s2, deskId, "evil-forger", true);
+                if (r.Mode != ModeProve) return Fail("owned ID was not challenged to prove");
+                if (await Answer(s2, new byte[OwnerKeyLength]) != 0) return Fail("wrong proof was accepted");
+            }
+            var (c3, s3) = await Dial();
+            using (c3)
+            {
+                var r = await Register(s3, deskId, "evil-replay", true);
+                if (r.Mode != ModeProve) return Fail("owned ID was not challenged to prove (replay)");
+                if (await Answer(s3, earlierProof) != 0) return Fail("replayed proof was accepted");
+            }
+            if (await Lookup(deskId) != "owner-host") return Fail("a failed attempt displaced the owner");
+
+            // The owner comes back and takes its registration over from its own stale connection.
+            var (c4, s4) = await Dial();
+            using (c4)
+            {
+                var r = await Register(s4, deskId, "owner-host-2", true);
+                if (r.Mode != ModeProve) return Fail("owner was not challenged to prove");
+                if (await Answer(s4, ComputeOwnerProof(key, deskId, r.Data)) != 1) return Fail("owner's valid proof was refused");
+                if (await Lookup(deskId) != "owner-host-2") return Fail("owner did not take the registration back");
+            }
+        }
+
+        // With the owner offline, nobody else can take its ID by registering first.
+        await Task.Delay(300);
+        if (await Lookup(deskId) != "") return Fail("owner should be offline by now");
+        var (c6, s6) = await Dial();
+        using (c6)
+        {
+            var r = await Register(s6, deskId, "squatter-legacy", false);
+            if (r.Mode != -1 || r.Data[0] != 0) return Fail("proof-less host took an offline owner's ID");
+        }
+        var (c7, s7) = await Dial();
+        using (c7)
+        {
+            var r = await Register(s7, deskId, "squatter-capable", true);
+            if (r.Mode != ModeProve) return Fail("offline owner's ID was offered for enrollment");
+        }
+
+        // A host from before this feature still registers an ID nobody owns.
+        var (c5, s5) = await Dial();
+        using (c5)
+        {
+            var r = await Register(s5, 731904287UL, "legacy-host", false);
+            if (r.Mode != -1 || r.Data[0] != 1) return Fail("legacy host could not register an unowned ID");
+            if (await Lookup(731904287UL) != "legacy-host") return Fail("legacy host not found");
+        }
+
+        Log("Self-test verified: desk-ID ownership (enroll, prove, refuse hijack)");
+        return true;
     }
 
     private static async Task<bool> RunSelfTestAsync(int port)

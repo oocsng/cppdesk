@@ -796,6 +796,50 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
             uint16_t tcpPort = r.readU16();
 
             std::string effectiveIp = (peerIp == "127.0.0.1" && !reportedIp.empty()) ? reportedIp : peerIp;
+            // Hosts from before ownership proofs end the frame here.
+            const bool ownerCapable = r.remaining() >= 1 && r.readU8() == relayowner::OWNER_CAP;
+
+            auto sendAck = [&](uint8_t accepted) {
+                ByteWriter aw;
+                aw.writeU8(accepted);
+                FrameHeader ackHdr{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::RELAY_REGISTER_ACK), 0, static_cast<uint32_t>(aw.buffer().size()) };
+                sendAllBytes(toWinSock(sock), &ackHdr, sizeof(ackHdr));
+                sendAllBytes(toWinSock(sock), aw.buffer().data(), aw.buffer().size());
+            };
+
+            // An ID that has an owner is only ever taken over by a host that proves it.
+            if (ownerCapable) {
+                relayowner::Nonce nonce{};
+                CryptoUtils::randomBytes(nonce.data(), nonce.size());
+                const bool enrolling = !owners_.hasOwner(deskId, nowTickMs());
+                ByteWriter cw;
+                cw.writeU8(enrolling ? relayowner::MODE_ENROLL : relayowner::MODE_PROVE);
+                cw.writeBytes(nonce.data(), nonce.size());
+                FrameHeader chHdr{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::RELAY_REGISTER_CHALLENGE), 0, static_cast<uint32_t>(cw.buffer().size()) };
+                sendAllBytes(toWinSock(sock), &chHdr, sizeof(chHdr));
+                sendAllBytes(toWinSock(sock), cw.buffer().data(), cw.buffer().size());
+
+                FrameHeader pHdr{};
+                relayowner::Key proof{};
+                bool proven = recvAllBytes(toWinSock(sock), &pHdr, sizeof(pHdr)) &&
+                              pHdr.magic == PROTOCOL_MAGIC &&
+                              pHdr.type == static_cast<uint8_t>(PacketType::RELAY_REGISTER_PROOF) &&
+                              pHdr.payloadSize == proof.size() &&
+                              recvAllBytes(toWinSock(sock), proof.data(), proof.size());
+                if (proven) {
+                    proven = enrolling ? owners_.enroll(deskId, proof, nowTickMs())
+                                       : owners_.verify(deskId, nonce, proof, nowTickMs());
+                }
+                if (!proven) {
+                    sendAck(0);
+                    closeWinSock(sock);
+                    return;
+                }
+            } else if (owners_.hasOwner(deskId, nowTickMs())) {
+                sendAck(0);
+                closeWinSock(sock);
+                return;
+            }
 
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -819,11 +863,7 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
                 hosts_.push_back(rh);
             }
 
-            ByteWriter w;
-            w.writeU8(1);
-            FrameHeader ackHdr{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::RELAY_REGISTER_ACK), 0, static_cast<uint32_t>(w.buffer().size()) };
-            sendAllBytes(toWinSock(sock), &ackHdr, sizeof(ackHdr));
-            sendAllBytes(toWinSock(sock), w.buffer().data(), w.buffer().size());
+            sendAck(1);
 
             setSocketTimeoutMs(toWinSock(sock), 30000);
             while (running_.load()) {
@@ -835,12 +875,14 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
                 if (chdr.payloadSize > 0 && !recvAllBytes(toWinSock(sock), cpay.data(), chdr.payloadSize)) {
                     break;
                 }
+                if (ownerCapable) owners_.touch(deskId, nowTickMs());
                 if (static_cast<PacketType>(chdr.type) == PacketType::PING) {
                     FrameHeader pong{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::PONG), 0, 0 };
                     sendAllBytes(toWinSock(sock), &pong, sizeof(pong));
                 }
             }
 
+            if (ownerCapable) owners_.touch(deskId, nowTickMs());
             std::lock_guard<std::mutex> lock(mutex_);
             hosts_.erase(
                 std::remove_if(hosts_.begin(), hosts_.end(), [&](const RegisteredHost& h) {
@@ -1273,6 +1315,14 @@ void NetworkEngine::relayRegistrationLoop() {
         w.writeString(identity_.hostname());
         w.writeString(localIp_);
         w.writeU16(identity_.listenPort());
+        w.writeU8(relayowner::OWNER_CAP);
+
+        // The key this relay is shown is derived for it alone, from the secret kept in the config file.
+        std::string relayName = rHost;
+        std::transform(relayName.begin(), relayName.end(), relayName.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        relayName += ":" + std::to_string(rPort);
+        const relayowner::Key relayKey = relayowner::deriveRelayKey(identity_.relayOwnerKey(), relayName);
 
         std::mutex regMutex;
         if (!sendFrame(relayControlSock_, PacketType::RELAY_REGISTER, 0, w.buffer().data(), w.buffer().size(), regMutex)) {
@@ -1304,6 +1354,16 @@ void NetworkEngine::relayRegistrationLoop() {
             }
 
             PacketType pt = static_cast<PacketType>(hdr.type);
+            if (pt == PacketType::RELAY_REGISTER_CHALLENGE) {
+                if (pay.size() != 1 + relayowner::NONCE_LEN) break;
+                relayowner::Nonce nonce{};
+                std::copy(pay.begin() + 1, pay.end(), nonce.begin());
+                relayowner::Key reply = (pay[0] == relayowner::MODE_ENROLL)
+                    ? relayKey
+                    : relayowner::computeProof(relayKey, identity_.deskId(), nonce);
+                if (!sendFrame(relayControlSock_, PacketType::RELAY_REGISTER_PROOF, 0, reply.data(), reply.size(), regMutex)) break;
+                continue;
+            }
             if (pt == PacketType::RELAY_INCOMING_REQ) {
                 try {
                     ByteReader r(pay);
