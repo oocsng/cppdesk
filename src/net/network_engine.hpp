@@ -1,6 +1,7 @@
 #pragma once
 
 #include "socket_compat.hpp"
+#include "connection_limiter.hpp"
 #include "../core/protocol.hpp"
 #include "../core/crypto_identity.hpp"
 #include "../capture/screen_capture.hpp"
@@ -187,6 +188,11 @@ private:
     std::condition_variable     bridgeCv_;
     std::vector<RegisteredHost> hosts_;
     std::vector<PendingBridge>  bridges_;
+
+    // One thread per connection: cap them so a single address cannot exhaust the host.
+    // Each registered host holds one connection and each bridged session two.
+    // Shared with the detached connection threads, which can outlive this object.
+    std::shared_ptr<ConnectionLimiter> connLimiter_ = std::make_shared<ConnectionLimiter>(512, 64);
 };
 
 class NetworkEngine {

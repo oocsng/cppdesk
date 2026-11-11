@@ -6,6 +6,7 @@
 #include "../src/control/clipboard_file_manager.hpp"
 #include "../src/net/network_engine.hpp"
 #include "../src/net/updater.hpp"
+#include "../src/net/connection_limiter.hpp"
 #include "../src/ui/notification_manager.hpp"
 #include "../src/media/session_recorder.hpp"
 #include "../src/media/session_recording_player.hpp"
@@ -7293,6 +7294,37 @@ void testBoundAuthResponse() {
     TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, codeLegacy, &keyA));
 }
 
+void testConnectionLimiter() {
+    std::cout << "[TEST 64] Relay Connection Limiter (total and per-IP caps)..." << std::endl;
+
+    ConnectionLimiter lim(5, 3);
+    TEST_ASSERT(lim.tryAcquire("10.0.0.1"));
+    TEST_ASSERT(lim.tryAcquire("10.0.0.1"));
+    TEST_ASSERT(lim.tryAcquire("10.0.0.1"));
+    TEST_ASSERT(!lim.tryAcquire("10.0.0.1"));   // per-IP cap
+    TEST_ASSERT(lim.tryAcquire("10.0.0.2"));    // another address is unaffected
+    TEST_ASSERT(lim.tryAcquire("10.0.0.2"));
+    TEST_ASSERT(lim.total() == 5);
+    TEST_ASSERT(!lim.tryAcquire("10.0.0.3"));   // total cap
+
+    lim.release("10.0.0.1");
+    TEST_ASSERT(lim.total() == 4);
+    TEST_ASSERT(lim.tryAcquire("10.0.0.3"));    // freed capacity is reusable
+    TEST_ASSERT(!lim.tryAcquire("10.0.0.2"));   // total is full again although 10.0.0.2 is under its own cap
+    TEST_ASSERT(lim.total() == 5);
+
+    // Releasing something never acquired must not underflow or free someone else's slot
+    ConnectionLimiter fresh(2, 2);
+    fresh.release("1.2.3.4");
+    TEST_ASSERT(fresh.total() == 0);
+    TEST_ASSERT(fresh.tryAcquire("5.6.7.8"));
+    fresh.release("1.2.3.4");
+    TEST_ASSERT(fresh.total() == 1);
+    fresh.release("5.6.7.8");
+    TEST_ASSERT(fresh.total() == 0);
+    TEST_ASSERT(fresh.tryAcquire("5.6.7.8") && fresh.tryAcquire("5.6.7.8") && !fresh.tryAcquire("5.6.7.8"));
+}
+
 void testRemoteFileBrowserProtocol() {
     std::cout << "[TEST 58] Remote File Browser Protocol..." << std::endl;
 
@@ -7445,6 +7477,7 @@ int main() {
         testFileBrowserLoadTimeout(); std::cout << "Test 61 done\n" << std::flush;
         testUnicodeTextInput(); std::cout << "Test 62 done\n" << std::flush;
         testBoundAuthResponse(); std::cout << "Test 63 done\n" << std::flush;
+        testConnectionLimiter(); std::cout << "Test 64 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";

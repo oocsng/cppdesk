@@ -756,7 +756,15 @@ void RelayServer::acceptLoop() {
         inet_ntop(AF_INET, &clientAddr.sin_addr, ipStr, sizeof(ipStr));
         std::string peerIp = ipStr;
 
-        std::thread(&RelayServer::handleClientSocket, this, fromWinSock(cs), peerIp).detach();
+        if (!connLimiter_->tryAcquire(peerIp)) {
+            uintptr_t rejected = fromWinSock(cs);
+            closeWinSock(rejected);
+            continue;
+        }
+        std::thread([this, limiter = connLimiter_, sock = fromWinSock(cs), peerIp]() {
+            handleClientSocket(sock, peerIp);
+            limiter->release(peerIp);
+        }).detach();
     }
 }
 
