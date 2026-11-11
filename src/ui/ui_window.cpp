@@ -9366,7 +9366,7 @@ void CppDeskWindow::onCharInput(wchar_t ch) {
     }
 
     if (ch == L'\b') {
-        if (!target->empty()) target->pop_back();
+        textinput::popLastCodePoint(*target);
     } else if (ch == 1) {
         target->clear();
     } else if (ch == 3) {
@@ -9465,18 +9465,19 @@ void CppDeskWindow::onCharInput(wchar_t ch) {
             }
         }
         std::string clip = ClipboardManager::getClipboardUtf8();
-        for (char c : clip) {
-            if (isTotp) {
-                if (c >= '0' && c <= '9' && target->size() < maxLen) {
-                    target->push_back(c);
-                }
-            } else if ((c >= 32 && c < 127) || c == '\n') {
-                if (target->size() < maxLen) target->push_back(c);
+        if (isTotp) {
+            for (char c : clip) {
+                if (c >= '0' && c <= '9' && target->size() < maxLen) target->push_back(c);
             }
+        } else {
+            textinput::appendUtf8Text(*target, clip, maxLen, true);
         }
-    } else if (ch >= 32 && ch < 127 && target->size() < maxLen) {
-        if (!isTotp || (ch >= L'0' && ch <= L'9')) {
-            target->push_back(static_cast<char>(ch));
+    } else {
+        char32_t cp = 0;
+        if (charAssembler_.push(static_cast<char16_t>(ch), cp)) {
+            if (!isTotp || (cp >= U'0' && cp <= U'9')) {
+                textinput::appendCodePoint(*target, cp, maxLen);
+            }
         }
     }
 

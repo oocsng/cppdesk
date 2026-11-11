@@ -25,6 +25,7 @@
 #include "../src/control/command_palette.hpp"
 #include "../src/ui/ui_platform.hpp"
 #include "../src/ui/dpi.hpp"
+#include "../src/ui/text_input.hpp"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -7166,6 +7167,88 @@ void testFileBrowserLoadTimeout() {
     TEST_ASSERT(idle.statusMessage.empty());
 }
 
+void testUnicodeTextInput() {
+    std::cout << "[TEST 62] Unicode Text Input (UTF-16 assembly, UTF-8 editing)..." << std::endl;
+    using namespace textinput;
+
+    // UTF-16 code units from WM_CHAR -> code points
+    {
+        Utf16Assembler a;
+        char32_t cp = 0;
+        TEST_ASSERT(a.push(L'A', cp) && cp == U'A');
+        TEST_ASSERT(a.push(0x00E9, cp) && cp == 0x00E9);          // e-acute, one unit
+        TEST_ASSERT(a.push(0x4F60, cp) && cp == 0x4F60);          // CJK, one unit
+        TEST_ASSERT(!a.push(0xD83D, cp));                          // high surrogate waits
+        TEST_ASSERT(a.push(0xDE00, cp) && cp == 0x1F600);         // low surrogate completes the pair
+        TEST_ASSERT(!a.push(0xDE00, cp));                          // stray low surrogate dropped
+        TEST_ASSERT(!a.push(0xD83D, cp));
+        TEST_ASSERT(a.push(L'z', cp) && cp == U'z');              // high followed by a normal unit: high dropped
+    }
+
+    // Appending code points
+    {
+        std::string s;
+        TEST_ASSERT(appendCodePoint(s, 0x00E9, 64) && s == "\xC3\xA9");
+        TEST_ASSERT(appendCodePoint(s, 0x4F60, 64) && s == "\xC3\xA9\xE4\xBD\xA0");
+        TEST_ASSERT(appendCodePoint(s, 0x1F600, 64) && s.size() == 9);
+        TEST_ASSERT(!appendCodePoint(s, 0x1B, 64));                // escape control char
+        TEST_ASSERT(!appendCodePoint(s, 0x7F, 64));
+        TEST_ASSERT(!appendCodePoint(s, 0x85, 64));                // C1 control
+        TEST_ASSERT(!appendCodePoint(s, 0xD800, 64));              // lone surrogate
+        TEST_ASSERT(!appendCodePoint(s, 0x110000, 64));            // beyond Unicode
+        TEST_ASSERT(!appendCodePoint(s, U'\n', 64));
+        TEST_ASSERT(appendCodePoint(s, U'\n', 64, true));
+        TEST_ASSERT(s.size() == 10);
+
+        // A character that does not fit whole is rejected, never split
+        std::string t = "ab";
+        TEST_ASSERT(!appendCodePoint(t, 0x00E9, 3));
+        TEST_ASSERT(t == "ab");
+        TEST_ASSERT(appendCodePoint(t, U'c', 3) && t == "abc");
+        TEST_ASSERT(!appendCodePoint(t, U'd', 3));
+    }
+
+    // Backspace removes a whole character
+    {
+        std::string s = "a\xE4\xBD\xA0";
+        popLastCodePoint(s); TEST_ASSERT(s == "a");
+        s = "a\xF0\x9F\x98\x80";
+        popLastCodePoint(s); TEST_ASSERT(s == "a");
+        s = "\xC3\xA9";
+        popLastCodePoint(s); TEST_ASSERT(s.empty());
+        popLastCodePoint(s); TEST_ASSERT(s.empty());
+        s = "ab";
+        popLastCodePoint(s); TEST_ASSERT(s == "a");
+    }
+
+    // Pasted text: keep valid text, drop controls and malformed bytes
+    {
+        std::string s;
+        appendUtf8Text(s, "h\xC3\xA9llo\r\n\tw", 64, true);
+        TEST_ASSERT(s == "h\xC3\xA9llo\nw");
+
+        s.clear();
+        appendUtf8Text(s, "a\xFF" "b\xE4\xBD" "c", 64, true);    // 0xFF and a truncated sequence skipped
+        TEST_ASSERT(s == "abc");
+
+        s.clear();
+        appendUtf8Text(s, "\xC0\x80" "x", 64, true);             // overlong NUL rejected
+        TEST_ASSERT(s == "x");
+
+        s.clear();
+        appendUtf8Text(s, "\xED\xA0\x80" "x", 64, true);         // encoded surrogate rejected
+        TEST_ASSERT(s == "x");
+
+        s.clear();
+        appendUtf8Text(s, "a\xE4\xBD\xA0\xE4\xBD\xA0", 5, true); // stops before a character that would not fit
+        TEST_ASSERT(s == "a\xE4\xBD\xA0");
+
+        s.clear();
+        appendUtf8Text(s, "line1\nline2", 64, false);            // single-line fields drop newlines
+        TEST_ASSERT(s == "line1line2");
+    }
+}
+
 void testRemoteFileBrowserProtocol() {
     std::cout << "[TEST 58] Remote File Browser Protocol..." << std::endl;
 
@@ -7316,6 +7399,7 @@ int main() {
         testUpdaterIntegrity(); std::cout << "Test 59 done\n" << std::flush;
         testDeserializersSurviveHostileInput(); std::cout << "Test 60 done\n" << std::flush;
         testFileBrowserLoadTimeout(); std::cout << "Test 61 done\n" << std::flush;
+        testUnicodeTextInput(); std::cout << "Test 62 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";

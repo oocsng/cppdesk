@@ -2,6 +2,7 @@
 
 #include "ui_platform.hpp"
 #include "dpi.hpp"
+#include "text_input.hpp"
 #include "../core/protocol.hpp"
 #include "../core/crypto_identity.hpp"
 #include "../net/network_engine.hpp"
@@ -349,6 +350,7 @@ private:
     bool                    showFileBrowserDeleteModal_ = false;
     float                   fileBrowserModalAnimT_ = 0.0f;
     float                   fileBrowserModalAnimVel_ = 0.0f;
+    textinput::Utf16Assembler charAssembler_; // joins WM_CHAR surrogate pairs
     int                     fileBrowserModalPane_ = 0;        // pane the open action modal applies to
     int                     fileBrowserModalKind_ = 0;        // 0 = new folder, 1 = rename, 2 = delete; kept while the modal fades out
     std::string             fileBrowserModalTargetPath_;      // item being renamed or deleted
