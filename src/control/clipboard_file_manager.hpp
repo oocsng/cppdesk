@@ -8,6 +8,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <fstream>
+#include <filesystem>
 #include <memory>
 #include <functional>
 #include <algorithm>
@@ -111,6 +112,10 @@ public:
 
     // Queue a local file to be sent to the connected peer
     uint32_t startOutgoingFile(const std::string& filePath, const SendPacketFn& sendPacket,
+                               FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads,
+                               float dropNx = 0.0f, float dropNy = 0.0f);
+    // For paths already decoded from UTF-8 (the remote file browser); a std::string path is read as the ANSI code page.
+    uint32_t startOutgoingFile(const std::filesystem::path& path, const SendPacketFn& sendPacket,
                                FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads,
                                float dropNx = 0.0f, float dropNy = 0.0f);
 

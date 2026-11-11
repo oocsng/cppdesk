@@ -12,6 +12,9 @@
 
 #include <filesystem>
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <ctime>
@@ -21,6 +24,8 @@ namespace cppdesk {
 namespace {
 
 #if defined(_WIN32)
+constexpr char kSep = '\\';
+
 std::wstring utf8ToWide(const std::string& str) {
     if (str.empty()) return std::wstring();
     int len = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, nullptr, 0);
@@ -38,7 +43,75 @@ std::string wideToUtf8(const std::wstring& wstr) {
     WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, u.data(), len, nullptr, nullptr);
     return u;
 }
+#else
+constexpr char kSep = '/';
 #endif
+
+// Paths cross the wire as UTF-8. On Windows a narrow std::filesystem::path is read as the ANSI code page,
+// so convert explicitly in both directions.
+std::filesystem::path toPath(const std::string& utf8) {
+#if defined(_WIN32)
+    return std::filesystem::path(utf8ToWide(utf8));
+#else
+    return std::filesystem::path(utf8);
+#endif
+}
+
+std::string fromPath(const std::filesystem::path& p) {
+#if defined(_WIN32)
+    return wideToUtf8(p.wstring());
+#else
+    return p.string();
+#endif
+}
+
+bool isSep(char c) { return c == '\\' || c == '/'; }
+
+std::string trimTrailingSeps(std::string p) {
+    while (!p.empty() && isSep(p.back())) p.pop_back();
+    return p;
+}
+
+// Resolves a client-supplied path to an absolute path that is not a drive or share root.
+// "C:\" trims to "C:" (drive-relative), which is not absolute, so drive roots are refused as well.
+bool resolveNonRootPath(const std::string& utf8, std::filesystem::path& out, std::string& outError) {
+    std::string trimmed = trimTrailingSeps(utf8);
+    if (trimmed.empty()) {
+        outError = "Refusing to operate on an empty or root path";
+        return false;
+    }
+    std::filesystem::path p = toPath(trimmed);
+    if (!p.is_absolute() || !p.has_relative_path()) {
+        outError = "Refusing to operate on a relative path or a drive root: " + utf8;
+        return false;
+    }
+    out = std::move(p);
+    return true;
+}
+
+bool isValidEntryName(const std::string& name) {
+    if (name.empty() || name == "." || name == "..") return false;
+#if defined(_WIN32)
+    const char* bad = "\\/:*?\"<>|";
+#else
+    const char* bad = "/";
+#endif
+    for (char c : name) {
+        if (c == '\0' || std::strchr(bad, c) != nullptr) return false;
+    }
+    return true;
+}
+
+bool nameLess(const FileBrowserItemEntry& a, const FileBrowserItemEntry& b) {
+    size_t n = std::min(a.name.size(), b.name.size());
+    for (size_t i = 0; i < n; ++i) {
+        int ca = std::tolower(static_cast<unsigned char>(a.name[i]));
+        int cb = std::tolower(static_cast<unsigned char>(b.name[i]));
+        if (ca != cb) return ca < cb;
+    }
+    if (a.name.size() != b.name.size()) return a.name.size() < b.name.size();
+    return a.name < b.name;
+}
 
 } // namespace
 
@@ -47,7 +120,7 @@ std::vector<std::string> RemoteFileBrowserManager::getLocalDrives() {
 #if defined(_WIN32)
     DWORD mask = GetLogicalDrives();
     for (char d = 'A'; d <= 'Z'; ++d) {
-        if (mask & (1 << (d - 'A'))) {
+        if (mask & (1u << (d - 'A'))) {
             std::string root;
             root += d;
             root += ":\\";
@@ -69,23 +142,31 @@ std::vector<std::string> RemoteFileBrowserManager::getLocalDrives() {
 std::string RemoteFileBrowserManager::normalizeDirectoryPath(const std::string& path) {
     if (path.empty() || path == "$DRIVES$") return "$DRIVES$";
     std::string p = path;
+#if defined(_WIN32)
     for (char& c : p) {
         if (c == '/') c = '\\';
     }
-    if (!p.empty() && p.back() != '\\') {
-        p.push_back('\\');
-    }
+#endif
+    if (!isSep(p.back())) p.push_back(kSep);
     return p;
 }
 
+// Pure string logic so a Windows viewer can compute the parent of a POSIX host path (and the reverse).
+// The result keeps its trailing separator: "C:\Users\bob" -> "C:\Users\", "C:\Users" -> "C:\", "C:\" -> drive list.
 std::string RemoteFileBrowserManager::getParentDirectory(const std::string& path) {
     if (path.empty() || path == "$DRIVES$") return "$DRIVES$";
-    std::filesystem::path fp(path);
-    if (!fp.has_parent_path() || fp.parent_path() == fp) {
-        return "$DRIVES$";
-    }
-    std::string parentStr = fp.parent_path().string();
-    return normalizeDirectoryPath(parentStr);
+    std::string p = trimTrailingSeps(path);
+    if (p.empty()) return "$DRIVES$";
+    size_t pos = p.find_last_of("\\/");
+    if (pos == std::string::npos) return "$DRIVES$";
+    return p.substr(0, pos + 1);
+}
+
+std::string RemoteFileBrowserManager::joinPath(const std::string& dir, const std::string& name) {
+    if (dir.empty() || dir == "$DRIVES$") return name;
+    if (isSep(dir.back())) return dir + name;
+    char sep = (dir.find('\\') != std::string::npos) ? '\\' : (dir.find('/') != std::string::npos ? '/' : kSep);
+    return dir + sep + name;
 }
 
 bool RemoteFileBrowserManager::listLocalDirectory(const std::string& path,
@@ -111,7 +192,7 @@ bool RemoteFileBrowserManager::listLocalDirectory(const std::string& path,
     }
 
     std::error_code ec;
-    std::filesystem::path dirPath(path);
+    std::filesystem::path dirPath = toPath(path);
     if (!std::filesystem::exists(dirPath, ec)) {
         outError = "Directory not found: " + path;
         return false;
@@ -124,32 +205,33 @@ bool RemoteFileBrowserManager::listLocalDirectory(const std::string& path,
     outCanonicalPath = normalizeDirectoryPath(path);
 
     // Parent directory navigation entry
-    if (outCanonicalPath != "$DRIVES$") {
-        FileBrowserItemEntry parentEntry;
-        parentEntry.name = "..";
-        parentEntry.isDirectory = 1;
-        parentEntry.sizeBytes = 0;
-        parentEntry.mtimeSec = 0;
-        parentEntry.attributes = 0x10;
-        outEntries.push_back(std::move(parentEntry));
-    }
+    FileBrowserItemEntry parentEntry;
+    parentEntry.name = "..";
+    parentEntry.isDirectory = 1;
+    parentEntry.sizeBytes = 0;
+    parentEntry.mtimeSec = 0;
+    parentEntry.attributes = 0x10;
+    outEntries.push_back(std::move(parentEntry));
 
     std::vector<FileBrowserItemEntry> dirs;
     std::vector<FileBrowserItemEntry> files;
 
-    std::filesystem::directory_iterator it(
-        dirPath,
-        std::filesystem::directory_options::skip_permission_denied,
-        ec
-    );
+    // No skip_permission_denied: an unreadable directory must report an error, not look empty.
+    std::filesystem::directory_iterator it(dirPath, ec);
     std::filesystem::directory_iterator end;
+    if (ec) {
+        outError = "Cannot read directory: " + ec.message();
+        outEntries.clear();
+        return false;
+    }
 
-    while (!ec && it != end) {
+    while (it != end) {
         const auto& entry = *it;
         std::error_code entryEc;
-        std::string filename = entry.path().filename().string();
+        std::string filename = fromPath(entry.path().filename());
         if (filename.empty()) {
             it.increment(ec);
+            if (ec) break;
             continue;
         }
 
@@ -180,13 +262,17 @@ bool RemoteFileBrowserManager::listLocalDirectory(const std::string& path,
         }
 
         it.increment(ec);
+        if (ec) break;
     }
 
-    auto sortAlpha = [](const FileBrowserItemEntry& a, const FileBrowserItemEntry& b) {
-        return a.name < b.name;
-    };
-    std::sort(dirs.begin(), dirs.end(), sortAlpha);
-    std::sort(files.begin(), files.end(), sortAlpha);
+    if (ec) {
+        outError = "Cannot read directory: " + ec.message();
+        outEntries.clear();
+        return false;
+    }
+
+    std::sort(dirs.begin(), dirs.end(), nameLess);
+    std::sort(files.begin(), files.end(), nameLess);
 
     for (auto& d : dirs) outEntries.push_back(std::move(d));
     for (auto& f : files) outEntries.push_back(std::move(f));
@@ -197,7 +283,12 @@ bool RemoteFileBrowserManager::listLocalDirectory(const std::string& path,
 bool RemoteFileBrowserManager::createLocalDirectory(const std::string& path, std::string& outError) {
     outError.clear();
     std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::path(path), ec);
+    std::filesystem::path p = toPath(trimTrailingSeps(path));
+    if (path.empty() || !p.is_absolute()) {
+        outError = "Refusing to create a directory from a relative path: " + path;
+        return false;
+    }
+    std::filesystem::create_directories(p, ec);
     if (ec) {
         outError = "Failed to create directory: " + ec.message();
         return false;
@@ -207,8 +298,10 @@ bool RemoteFileBrowserManager::createLocalDirectory(const std::string& path, std
 
 bool RemoteFileBrowserManager::deleteLocalItem(const std::string& path, std::string& outError) {
     outError.clear();
+    std::filesystem::path target;
+    if (!resolveNonRootPath(path, target, outError)) return false;
+
     std::error_code ec;
-    std::filesystem::path target(path);
     if (!std::filesystem::exists(target, ec)) {
         outError = "Item does not exist: " + path;
         return false;
@@ -224,14 +317,25 @@ bool RemoteFileBrowserManager::deleteLocalItem(const std::string& path, std::str
 
 bool RemoteFileBrowserManager::renameLocalItem(const std::string& oldPath, const std::string& newName, std::string& outError) {
     outError.clear();
+    // newName is a bare name inside the same directory. A separator, "..", or a drive would move the item elsewhere.
+    if (!isValidEntryName(newName)) {
+        outError = "Invalid name: " + newName;
+        return false;
+    }
+    std::filesystem::path oldP;
+    if (!resolveNonRootPath(oldPath, oldP, outError)) return false;
+
     std::error_code ec;
-    std::filesystem::path oldP(oldPath);
     if (!std::filesystem::exists(oldP, ec)) {
         outError = "Original item does not exist: " + oldPath;
         return false;
     }
 
-    std::filesystem::path newP = oldP.parent_path() / newName;
+    std::filesystem::path newP = oldP.parent_path() / toPath(newName);
+    if (std::filesystem::exists(newP, ec) && !std::filesystem::equivalent(oldP, newP, ec)) {
+        outError = "An item named '" + newName + "' already exists";
+        return false;
+    }
     std::filesystem::rename(oldP, newP, ec);
     if (ec) {
         outError = "Failed to rename: " + ec.message();

@@ -21,6 +21,7 @@ set(CORE_SOURCES
     src/control/input_injector.cpp
     src/control/shell_clipboard.cpp
     src/control/clipboard_file_manager.cpp
+    src/control/remote_file_browser.cpp
     src/control/whiteboard_manager.cpp
     src/control/file_sync_manager.cpp
     src/control/session_tab_manager.cpp

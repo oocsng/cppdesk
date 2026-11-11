@@ -1718,6 +1718,8 @@ inline bool deserializeFileBrowserListResp(const uint8_t* data, size_t size, Fil
         out.errorMessage = r.readString();
         uint32_t count = r.readU32();
         out.entries.clear();
+        // Smallest possible entry: empty name (2) + size (8) + isDirectory (1) + mtime (8) + attributes (4).
+        if (count > r.remaining() / 23) return false;
         out.entries.reserve(count);
         for (uint32_t i = 0; i < count; ++i) {
             FileBrowserItemEntry e;

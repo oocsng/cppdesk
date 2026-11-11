@@ -600,7 +600,11 @@ void FileTransferManager::openReceiveDirectoryInExplorer() const {
 
 uint32_t FileTransferManager::startOutgoingFile(const std::string& filePath, const SendPacketFn& sendPacket,
                                                FileOfferTarget targetHint, float dropNx, float dropNy) {
-    std::filesystem::path p(filePath);
+    return startOutgoingFile(std::filesystem::path(filePath), sendPacket, targetHint, dropNx, dropNy);
+}
+
+uint32_t FileTransferManager::startOutgoingFile(const std::filesystem::path& p, const SendPacketFn& sendPacket,
+                                               FileOfferTarget targetHint, float dropNx, float dropNy) {
     std::error_code ec;
     if (!std::filesystem::exists(p, ec) || !std::filesystem::is_regular_file(p, ec)) {
         return 0;
@@ -611,9 +615,20 @@ uint32_t FileTransferManager::startOutgoingFile(const std::string& filePath, con
         return 0;
     }
 
+    // string() can throw for names the ANSI code page cannot represent; fall back to UTF-8 rather than unwinding the session thread.
+    auto narrow = [](const std::filesystem::path& x) {
+        try {
+            return x.string();
+        } catch (...) {
+            auto u = x.u8string();
+            return std::string(reinterpret_cast<const char*>(u.data()), u.size());
+        }
+    };
+    const std::string filePath = narrow(p);
+
     auto out = std::make_unique<ActiveOutgoing>();
     out->filePath = filePath;
-    out->fileName = sanitizeFilename(p.filename().string());
+    out->fileName = sanitizeFilename(narrow(p.filename()));
     out->totalBytes = fsize;
     out->offset = 0;
     out->startTimeMs = currentTimeMs();

@@ -17,6 +17,8 @@ struct FileBrowserPaneState {
     float scrollOffset = 0.0f;
     std::string statusMessage;
     bool isLoading = false;
+    int lastClickIndex = -1;       // double-click detection
+    uint64_t lastClickTick = 0;
 
     const FileBrowserItemEntry* selectedEntry() const {
         if (selectedIndex >= 0 && selectedIndex < static_cast<int>(entries.size())) {
@@ -41,6 +43,8 @@ public:
     static std::string formatFileTimestamp(uint64_t mtimeSec);
     static std::string normalizeDirectoryPath(const std::string& path);
     static std::string getParentDirectory(const std::string& path);
+    // Joins a directory path and an entry name with the separator the directory already uses (Windows or POSIX host).
+    static std::string joinPath(const std::string& dir, const std::string& name);
 };
 
 } // namespace cppdesk

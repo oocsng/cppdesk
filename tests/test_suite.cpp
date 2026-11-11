@@ -6910,6 +6910,163 @@ void testDpiConversion() {
     TEST_ASSERT(snapToPx(10.4f, 0) == 10.0f);
 }
 
+void testRemoteFileBrowserPaths() {
+    std::cout << "[TEST 57] Remote File Browser Paths & Safety..." << std::endl;
+    using RFB = RemoteFileBrowserManager;
+
+    // Path helpers are pure string logic and must understand both Windows and POSIX hosts.
+    TEST_ASSERT(RFB::normalizeDirectoryPath("") == "$DRIVES$");
+    TEST_ASSERT(RFB::getParentDirectory("C:\\Users\\") == "C:\\");
+    TEST_ASSERT(RFB::getParentDirectory("C:\\Users\\bob\\") == "C:\\Users\\");
+    TEST_ASSERT(RFB::getParentDirectory("C:\\Users\\bob") == "C:\\Users\\");
+    TEST_ASSERT(RFB::getParentDirectory("C:\\") == "$DRIVES$");
+    TEST_ASSERT(RFB::getParentDirectory("$DRIVES$") == "$DRIVES$");
+    TEST_ASSERT(RFB::getParentDirectory("/home/bob/") == "/home/");
+    TEST_ASSERT(RFB::getParentDirectory("/home/") == "/");
+    TEST_ASSERT(RFB::getParentDirectory("/") == "$DRIVES$");
+    TEST_ASSERT(RFB::joinPath("C:\\Users\\", "bob") == "C:\\Users\\bob");
+    TEST_ASSERT(RFB::joinPath("C:\\Users", "bob") == "C:\\Users\\bob");
+    TEST_ASSERT(RFB::joinPath("/home/", "bob") == "/home/bob");
+    TEST_ASSERT(RFB::joinPath("$DRIVES$", "C:\\") == "C:\\");
+    TEST_ASSERT(RFB::joinPath("", "D:\\") == "D:\\");
+
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / "cppdesk_fb_test";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    fs::create_directories(root / "zdir", ec);
+    fs::create_directories(root / "adir", ec);
+    { std::ofstream(root / "b.txt") << "bb"; }
+    { std::ofstream(root / "a.txt") << "a"; }
+    std::string rootStr = root.string();
+
+    std::vector<FileBrowserItemEntry> entries;
+    std::string canon, err;
+    TEST_ASSERT(RFB::listLocalDirectory(rootStr, entries, canon, err));
+    TEST_ASSERT(entries.size() == 5);
+    TEST_ASSERT(entries[0].name == ".." && entries[1].name == "adir" && entries[2].name == "zdir");
+    TEST_ASSERT(entries[3].name == "a.txt" && entries[4].name == "b.txt" && entries[4].sizeBytes == 2);
+    TEST_ASSERT(!canon.empty() && (canon.back() == '\\' || canon.back() == '/'));
+    TEST_ASSERT(!RFB::listLocalDirectory((root / "missing").string(), entries, canon, err) && !err.empty());
+
+    // Rename takes a bare name only: separators, "..", absolute paths and empty names must not move files.
+    TEST_ASSERT(!RFB::renameLocalItem((root / "a.txt").string(), "", err));
+    TEST_ASSERT(!RFB::renameLocalItem((root / "a.txt").string(), "..", err));
+    TEST_ASSERT(!RFB::renameLocalItem((root / "a.txt").string(), "adir/a.txt", err));
+    TEST_ASSERT(!RFB::renameLocalItem((root / "a.txt").string(), "adir\\a.txt", err));
+    TEST_ASSERT(!RFB::renameLocalItem((root / "a.txt").string(), (root / "adir" / "x.txt").string(), err));
+    TEST_ASSERT(fs::exists(root / "a.txt") && !fs::exists(root / "adir" / "a.txt") && !fs::exists(root / "adir" / "x.txt"));
+    TEST_ASSERT(RFB::renameLocalItem((root / "a.txt").string(), "c.txt", err));
+    TEST_ASSERT(fs::exists(root / "c.txt") && !fs::exists(root / "a.txt"));
+    // A directory path with a trailing separator must rename the directory, not move it into itself.
+    TEST_ASSERT(RFB::renameLocalItem(RFB::normalizeDirectoryPath((root / "zdir").string()), "ydir", err));
+    TEST_ASSERT(fs::is_directory(root / "ydir") && !fs::exists(root / "zdir"));
+
+    // Delete must never take a drive root or the virtual drive list.
+    TEST_ASSERT(!RFB::deleteLocalItem("", err));
+    TEST_ASSERT(!RFB::deleteLocalItem("$DRIVES$", err));
+    TEST_ASSERT(!RFB::deleteLocalItem(root.root_path().string(), err));
+    TEST_ASSERT(fs::exists(root));
+    TEST_ASSERT(RFB::deleteLocalItem((root / "adir").string(), err) && !fs::exists(root / "adir"));
+    TEST_ASSERT(!RFB::deleteLocalItem((root / "adir").string(), err));
+
+    TEST_ASSERT(RFB::createLocalDirectory((root / "new" / "inner").string(), err) && fs::is_directory(root / "new" / "inner"));
+    TEST_ASSERT(!RFB::createLocalDirectory("", err));
+
+#if defined(_WIN32)
+    // Names cross the wire as UTF-8; the Windows filesystem layer must not read them as the ANSI code page.
+    const std::string utf8Name = "caf\xC3\xA9.txt";   // "café.txt"
+    const std::string utf8Dir = "d\xC3\xA9sir";       // "désir"
+    TEST_ASSERT(RFB::createLocalDirectory(rootStr + "\\" + utf8Dir, err));
+    TEST_ASSERT(fs::is_directory(root / L"d\u00e9sir"));
+    { std::ofstream(root / L"caf\u00e9.txt") << "x"; }
+    TEST_ASSERT(RFB::listLocalDirectory(rootStr, entries, canon, err));
+    bool sawFile = false, sawDir = false;
+    for (const auto& e : entries) { sawFile |= (e.name == utf8Name); sawDir |= (e.name == utf8Dir); }
+    TEST_ASSERT(sawFile && sawDir);
+    TEST_ASSERT(RFB::renameLocalItem(rootStr + "\\" + utf8Name, "r\xC3\xA9sum\xC3\xA9.txt", err));
+    TEST_ASSERT(fs::exists(root / L"r\u00e9sum\u00e9.txt"));
+    TEST_ASSERT(RFB::deleteLocalItem(rootStr + "\\" + utf8Dir, err) && !fs::exists(root / L"d\u00e9sir"));
+#endif
+
+    fs::remove_all(root, ec);
+}
+
+void testRemoteFileBrowserProtocol() {
+    std::cout << "[TEST 58] Remote File Browser Protocol..." << std::endl;
+
+    FileBrowserListRespPayload list;
+    list.requestId = 7;
+    list.statusCode = 0;
+    list.currentPath = "C:\\Users\\";
+    list.entries.push_back({ "docs", 0, 1, 1700000000ULL, 0x10 });
+    list.entries.push_back({ "a.txt", 123456789012ULL, 0, 1700000001ULL, 0x20 });
+    std::vector<uint8_t> buf;
+    serializeFileBrowserListResp(list, buf);
+    FileBrowserListRespPayload back;
+    TEST_ASSERT(deserializeFileBrowserListResp(buf.data(), buf.size(), back));
+    TEST_ASSERT(back.requestId == 7 && back.currentPath == list.currentPath && back.entries.size() == 2);
+    TEST_ASSERT(back.entries[1].name == "a.txt" && back.entries[1].sizeBytes == 123456789012ULL && back.entries[1].mtimeSec == 1700000001ULL);
+    TEST_ASSERT(back.entries[0].isDirectory == 1);
+
+    // Every truncation of a valid payload is rejected, never read past the end.
+    for (size_t n = 0; n < buf.size(); ++n) {
+        FileBrowserListRespPayload cut;
+        TEST_ASSERT(!deserializeFileBrowserListResp(buf.data(), n, cut));
+    }
+
+    // A hostile entry count that the payload cannot possibly hold is rejected without reserving memory for it.
+    {
+        ByteWriter w;
+        w.writeU32(1);
+        w.writeU8(0);
+        w.writeString("C:\\");
+        w.writeString("");
+        w.writeU32(0xFFFFFFFFu);
+        std::vector<uint8_t> evil = w.takeBuffer();
+        FileBrowserListRespPayload out;
+        TEST_ASSERT(!deserializeFileBrowserListResp(evil.data(), evil.size(), out));
+        TEST_ASSERT(out.entries.empty() && out.entries.capacity() < 1000);
+    }
+
+    FileBrowserActionReqPayload act;
+    act.actionId = 9; act.actionType = static_cast<uint8_t>(FileBrowserActionType::Rename);
+    act.targetPath = "C:\\x\\a.txt"; act.newOrDestName = "b.txt";
+    serializeFileBrowserActionReq(act, buf);
+    FileBrowserActionReqPayload actBack;
+    TEST_ASSERT(deserializeFileBrowserActionReq(buf.data(), buf.size(), actBack));
+    TEST_ASSERT(actBack.actionId == 9 && actBack.actionType == 3 && actBack.targetPath == act.targetPath && actBack.newOrDestName == "b.txt");
+
+    FileBrowserActionRespPayload ar;
+    ar.actionId = 9; ar.actionType = 3; ar.statusCode = 1; ar.message = "nope";
+    serializeFileBrowserActionResp(ar, buf);
+    FileBrowserActionRespPayload arBack;
+    TEST_ASSERT(deserializeFileBrowserActionResp(buf.data(), buf.size(), arBack));
+    TEST_ASSERT(arBack.statusCode == 1 && arBack.message == "nope");
+
+    FileBrowserDownloadReqPayload dl;
+    dl.requestId = 3; dl.remoteFilePath = "C:\\x\\a.txt"; dl.destFileName = "a.txt";
+    serializeFileBrowserDownloadReq(dl, buf);
+    FileBrowserDownloadReqPayload dlBack;
+    TEST_ASSERT(deserializeFileBrowserDownloadReq(buf.data(), buf.size(), dlBack));
+    TEST_ASSERT(dlBack.remoteFilePath == dl.remoteFilePath);
+
+    ProcessLaunchReqPayload pl;
+    pl.launchId = 5; pl.commandLine = "notepad.exe C:\\a.txt"; pl.workingDir = "C:\\";
+    serializeProcessLaunchReq(pl, buf);
+    ProcessLaunchReqPayload plBack;
+    TEST_ASSERT(deserializeProcessLaunchReq(buf.data(), buf.size(), plBack));
+    TEST_ASSERT(plBack.commandLine == pl.commandLine && plBack.workingDir == "C:\\");
+    TEST_ASSERT(!deserializeProcessLaunchReq(buf.data(), 3, plBack));
+
+    // The host must refuse a launch without input permission and an empty command line.
+    IdentityManager idMgr(104);
+    NetworkEngine engine(idMgr);
+    uint32_t pid = 99; std::string perr;
+    TEST_ASSERT(!engine.executeProcessLaunch("notepad.exe", "", 0, pid, perr) && pid == 0 && !perr.empty());
+    TEST_ASSERT(!engine.executeProcessLaunch("", "", 0xFF, pid, perr) && !perr.empty());
+}
+
 } // namespace
 
 int main() {
@@ -6980,6 +7137,8 @@ int main() {
         testThemeScales(); std::cout << "Test 55 done\n" << std::flush;
 #endif
         testDpiConversion(); std::cout << "Test 56 done\n" << std::flush;
+        testRemoteFileBrowserPaths(); std::cout << "Test 57 done\n" << std::flush;
+        testRemoteFileBrowserProtocol(); std::cout << "Test 58 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";

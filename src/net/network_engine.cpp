@@ -2517,6 +2517,19 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                     serializeFileBrowserListResp(resp, respBuf);
                                     sendPacketHelper(PacketType::FILE_BROWSER_LIST_RESP, respBuf);
                                 }
+                            } else {
+                                // Answer a denied request so the viewer's pane does not wait on it forever.
+                                FileBrowserListReqPayload req;
+                                if (deserializeFileBrowserListReq(rpay.data(), rpay.size(), req)) {
+                                    FileBrowserListRespPayload resp;
+                                    resp.requestId = req.requestId;
+                                    resp.statusCode = 1;
+                                    resp.currentPath = req.path;
+                                    resp.errorMessage = "File access is not permitted for this session";
+                                    std::vector<uint8_t> respBuf;
+                                    serializeFileBrowserListResp(resp, respBuf);
+                                    sendPacketHelper(PacketType::FILE_BROWSER_LIST_RESP, respBuf);
+                                }
                             }
                             break;
                         }
@@ -2542,16 +2555,47 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                     serializeFileBrowserActionResp(resp, respBuf);
                                     sendPacketHelper(PacketType::FILE_BROWSER_ACTION_RESP, respBuf);
                                 }
+                            } else {
+                                FileBrowserActionReqPayload req;
+                                if (deserializeFileBrowserActionReq(rpay.data(), rpay.size(), req)) {
+                                    FileBrowserActionRespPayload resp;
+                                    resp.actionId = req.actionId;
+                                    resp.actionType = req.actionType;
+                                    resp.statusCode = 1;
+                                    resp.message = "File access is not permitted for this session";
+                                    std::vector<uint8_t> respBuf;
+                                    serializeFileBrowserActionResp(resp, respBuf);
+                                    sendPacketHelper(PacketType::FILE_BROWSER_ACTION_RESP, respBuf);
+                                }
                             }
                             break;
                         }
                         case PacketType::FILE_BROWSER_DOWNLOAD_REQ: {
-                            if (perms & PERM_FILE_TRANSFER) {
-                                FileBrowserDownloadReqPayload req;
-                                if (deserializeFileBrowserDownloadReq(rpay.data(), rpay.size(), req)) {
-                                    fileManager_.startOutgoingFile(req.remoteFilePath, [&](PacketType pt, const std::vector<uint8_t>& pbuf) {
+                            FileBrowserDownloadReqPayload req;
+                            if (deserializeFileBrowserDownloadReq(rpay.data(), rpay.size(), req)) {
+                                FileBrowserActionRespPayload resp;
+                                resp.actionId = req.requestId;
+                                resp.actionType = 0;
+                                resp.statusCode = 1;
+                                if (!(perms & PERM_FILE_TRANSFER)) {
+                                    resp.message = "File access is not permitted for this session";
+                                } else {
+#if defined(_WIN32)
+                                    std::filesystem::path dlPath(utf8ToWide(req.remoteFilePath));
+#else
+                                    std::filesystem::path dlPath(req.remoteFilePath);
+#endif
+                                    uint32_t tid = fileManager_.startOutgoingFile(dlPath, [&](PacketType pt, const std::vector<uint8_t>& pbuf) {
                                         return sendPacketHelper(pt, pbuf);
                                     });
+                                    if (tid != 0) resp.statusCode = 0;
+                                    else resp.message = "Cannot send '" + req.remoteFilePath + "' (not a regular file, too large, or unreadable)";
+                                }
+                                // Success is signalled by the FILE_OFFER itself; only failures need an answer.
+                                if (resp.statusCode != 0) {
+                                    std::vector<uint8_t> respBuf;
+                                    serializeFileBrowserActionResp(resp, respBuf);
+                                    sendPacketHelper(PacketType::FILE_BROWSER_ACTION_RESP, respBuf);
                                 }
                             }
                             break;
@@ -4493,6 +4537,10 @@ void NetworkEngine::applyConnectionProfile(ConnectionProfile profile) {
 }
 
 uint32_t NetworkEngine::sendFile(const std::string& filePath, FileOfferTarget targetHint, float dropNx, float dropNy) {
+    return sendFilePath(std::filesystem::path(filePath), targetHint, dropNx, dropNy);
+}
+
+uint32_t NetworkEngine::sendFilePath(const std::filesystem::path& filePath, FileOfferTarget targetHint, float dropNx, float dropNy) {
     uintptr_t vSock = viewerSock_.load();
     uintptr_t hSock = activeHostClientSock_.load();
 

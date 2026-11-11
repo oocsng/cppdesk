@@ -279,6 +279,10 @@ public:
     uint32_t sendFile(const std::string& filePath,
                       FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads,
                       float dropNx = 0.0f, float dropNy = 0.0f);
+    // Same as sendFile for a path already decoded from UTF-8 (a std::string path is read as the ANSI code page).
+    uint32_t sendFilePath(const std::filesystem::path& filePath,
+                          FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads,
+                          float dropNx = 0.0f, float dropNy = 0.0f);
     int sendDropPath(const std::string& path,
                      FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads,
                      float dropNx = 0.0f, float dropNy = 0.0f);
