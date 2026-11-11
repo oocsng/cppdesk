@@ -25,3 +25,4 @@ __pycache__/
 *.pyc
 *_running.exe
 *_prev.exe
+docs/superpowers/
