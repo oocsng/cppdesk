@@ -175,6 +175,12 @@ private:
     void drawIncomingApprovalModal(float width, float height, float modalProgress);
     void drawRunTaskModal(float width, float height, float modalProgress);
     void drawFileBrowserActionModal(float width, float height, float modalProgress);
+    void navigateFilePane(int pane, const std::string& path);
+    void activateFilePaneEntry(int pane, int index);
+    void openFileBrowserModal(int pane, int action);   // action: 0 = new folder, 1 = rename, 2 = delete
+    void submitFileBrowserModal();
+    void closeFileBrowserModal();
+    void submitRunTask();
     void drawDynamicIslandToolbar(float width, float height);
     void drawClipboardTransferPill(float width, float height);
     void drawShortcutsModal(float width, float height, float modalProgress);
@@ -326,6 +332,7 @@ private:
     uint32_t                selectedProcessPid_ = 0;
     bool                    showRunTaskModal_ = false;
     float                   runTaskModalAnimT_ = 0.0f;
+    float                   runTaskModalAnimVel_ = 0.0f;
     std::string             runTaskCommandInput_;
     std::string             runTaskWorkingDirInput_;
 
@@ -341,8 +348,12 @@ private:
     bool                    showFileBrowserRenameModal_ = false;
     bool                    showFileBrowserDeleteModal_ = false;
     float                   fileBrowserModalAnimT_ = 0.0f;
-    float                   localFileScrollOffset_ = 0.0f;
-    float                   remoteFileScrollOffset_ = 0.0f;
+    float                   fileBrowserModalAnimVel_ = 0.0f;
+    int                     fileBrowserModalPane_ = 0;        // pane the open action modal applies to
+    int                     fileBrowserModalKind_ = 0;        // 0 = new folder, 1 = rename, 2 = delete; kept while the modal fades out
+    std::string             fileBrowserModalTargetPath_;      // item being renamed or deleted
+    std::string             fileBrowserModalTargetName_;
+    float                   filePaneSplitX_ = 0.0f;           // x between the two panes; routes the mouse wheel
 
     // Pending incoming request local permission checkboxes
     uint8_t                 modalPermissions_ = PERM_ALL;

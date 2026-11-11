@@ -639,14 +639,12 @@ bool CppDeskWindow::stepAnimations(float dt) {
 
     // 18. Run Task Modal Spring
     float targetRunTaskModal = showRunTaskModal_ ? 1.0f : 0.0f;
-    float runTaskVel = 0.0f;
-    if (stepSpring(runTaskModalAnimT_, runTaskVel, targetRunTaskModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(runTaskModalAnimT_, runTaskModalAnimVel_, targetRunTaskModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 19. File Browser Action Modals Spring
     bool anyFileModal = (showFileBrowserNewDirModal_ || showFileBrowserRenameModal_ || showFileBrowserDeleteModal_);
     float targetFileModal = anyFileModal ? 1.0f : 0.0f;
-    float fileModalVel = 0.0f;
-    if (stepSpring(fileBrowserModalAnimT_, fileModalVel, targetFileModal, 28.0f, 0.74f, dt)) active = true;
+    if (stepSpring(fileBrowserModalAnimT_, fileBrowserModalAnimVel_, targetFileModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 20. Settings Tab Smooth Scroll Spring
     if (!draggingSettingsScrollbar_) {
@@ -5034,9 +5032,13 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
         auto resp = network_.latestRemoteFileList();
         remoteFilePane_.isLoading = false;
         if (resp.statusCode == 0) {
+            // A new listing invalidates the selection; keeping the old index would point a Delete at the wrong item.
+            if (resp.currentPath != remoteFilePane_.currentPath) remoteFilePane_.scrollOffset = 0.0f;
+            remoteFilePane_.selectedIndex = -1;
+            remoteFilePane_.lastClickIndex = -1;
             remoteFilePane_.currentPath = resp.currentPath;
             remoteFilePane_.entries = std::move(resp.entries);
-            fileBrowserInputRemotePath_ = resp.currentPath;
+            fileBrowserInputRemotePath_ = (resp.currentPath == "$DRIVES$") ? std::string() : resp.currentPath;
             remoteFilePane_.statusMessage.clear();
         } else {
             remoteFilePane_.statusMessage = resp.errorMessage;
@@ -5102,7 +5104,7 @@ void CppDeskWindow::drawFileTransferDrawer(const UiRect& bounds, float slideProg
                     RemoteFileBrowserManager::listLocalDirectory("$DRIVES$", localFilePane_.entries, canon, err);
                     localFilePane_.currentPath = canon;
                     localFilePane_.availableDrives = RemoteFileBrowserManager::getLocalDrives();
-                    fileBrowserInputLocalPath_ = canon;
+                    fileBrowserInputLocalPath_.clear();
                 }
                 if (remoteFilePane_.entries.empty()) {
                     network_.requestRemoteFileList("$DRIVES$");
@@ -7114,6 +7116,435 @@ void CppDeskWindow::drawAddressBookModal(float width, float height, float modalP
     renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
 
+// ---------------- Dual-Pane File Explorer, Run Task & File Action Modals ----------------
+
+void CppDeskWindow::navigateFilePane(int pane, const std::string& path) {
+    if (pane == 0) {
+        std::vector<FileBrowserItemEntry> entries;
+        std::string canon, err;
+        if (!RemoteFileBrowserManager::listLocalDirectory(path, entries, canon, err)) {
+            localFilePane_.statusMessage = err;
+            showToast(err, true);
+            return;
+        }
+        if (canon != localFilePane_.currentPath) localFilePane_.scrollOffset = 0.0f;
+        localFilePane_.entries = std::move(entries);
+        localFilePane_.currentPath = canon;
+        localFilePane_.selectedIndex = -1;
+        localFilePane_.lastClickIndex = -1;
+        localFilePane_.statusMessage.clear();
+        fileBrowserInputLocalPath_ = (canon == "$DRIVES$") ? std::string() : canon;
+    } else {
+        remoteFilePane_.isLoading = true;
+        network_.requestRemoteFileList(path.empty() ? "$DRIVES$" : path);
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CppDeskWindow::activateFilePaneEntry(int pane, int index) {
+    FileBrowserPaneState& st = (pane == 0) ? localFilePane_ : remoteFilePane_;
+    activeFilePane_ = pane;
+    if (index < 0 || index >= static_cast<int>(st.entries.size())) return;
+
+    const uint64_t now = GetTickCount64();
+    const bool doubleClick = (st.lastClickIndex == index && now - st.lastClickTick < 450);
+    st.lastClickIndex = index;
+    st.lastClickTick = now;
+    st.selectedIndex = index;
+    if (!doubleClick) return;
+
+    const FileBrowserItemEntry entry = st.entries[index];  // copy: navigating replaces the entry list
+    if (!entry.isDirectory) return;
+    const std::string target = (entry.name == "..")
+        ? RemoteFileBrowserManager::getParentDirectory(st.currentPath)
+        : RemoteFileBrowserManager::joinPath(st.currentPath, entry.name);
+    navigateFilePane(pane, target);
+}
+
+void CppDeskWindow::openFileBrowserModal(int pane, int action) {
+    FileBrowserPaneState& st = (pane == 0) ? localFilePane_ : remoteFilePane_;
+    if (action == 0) {
+        if (st.currentPath.empty() || st.currentPath == "$DRIVES$") {
+            showToast("Open a folder first", true);
+            return;
+        }
+    } else {
+        const FileBrowserItemEntry* sel = st.selectedEntry();
+        if (!sel || sel->name == ".." || st.currentPath.empty() || st.currentPath == "$DRIVES$") {
+            showToast("Select a file or folder first", true);
+            return;
+        }
+        fileBrowserModalTargetPath_ = RemoteFileBrowserManager::joinPath(st.currentPath, sel->name);
+        fileBrowserModalTargetName_ = sel->name;
+    }
+
+    fileBrowserModalPane_ = pane;
+    fileBrowserModalKind_ = action;
+    showFileBrowserNewDirModal_ = (action == 0);
+    showFileBrowserRenameModal_ = (action == 1);
+    showFileBrowserDeleteModal_ = (action == 2);
+    if (action == 0) {
+        fileBrowserNewDirName_.clear();
+        focusedField_ = FocusedField::FileBrowserNewDir;
+    } else if (action == 1) {
+        fileBrowserRenameName_ = fileBrowserModalTargetName_;
+        focusedField_ = FocusedField::FileBrowserRename;
+    } else {
+        focusedField_ = FocusedField::None;
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CppDeskWindow::closeFileBrowserModal() {
+    showFileBrowserNewDirModal_ = false;
+    showFileBrowserRenameModal_ = false;
+    showFileBrowserDeleteModal_ = false;
+    focusedField_ = FocusedField::None;
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CppDeskWindow::submitFileBrowserModal() {
+    const bool local = (fileBrowserModalPane_ == 0);
+    const std::string dir = local ? localFilePane_.currentPath : remoteFilePane_.currentPath;
+    std::string err;
+
+    if (showFileBrowserNewDirModal_ || showFileBrowserRenameModal_) {
+        const std::string& name = showFileBrowserNewDirModal_ ? fileBrowserNewDirName_ : fileBrowserRenameName_;
+        if (name.empty() || name == "." || name == ".." || name.find_first_of("\\/") != std::string::npos) {
+            showToast("Enter a plain name without slashes", true);
+            return;
+        }
+    }
+
+    if (showFileBrowserNewDirModal_) {
+        const std::string path = RemoteFileBrowserManager::joinPath(dir, fileBrowserNewDirName_);
+        if (local) {
+            if (RemoteFileBrowserManager::createLocalDirectory(path, err)) showToast("Folder created");
+            else showToast(err, true);
+            navigateFilePane(0, dir);
+        } else {
+            network_.sendRemoteFileAction(static_cast<uint8_t>(FileBrowserActionType::CreateDir), path, "");
+        }
+    } else if (showFileBrowserRenameModal_) {
+        if (local) {
+            if (RemoteFileBrowserManager::renameLocalItem(fileBrowserModalTargetPath_, fileBrowserRenameName_, err)) showToast("Renamed");
+            else showToast(err, true);
+            navigateFilePane(0, dir);
+        } else {
+            network_.sendRemoteFileAction(static_cast<uint8_t>(FileBrowserActionType::Rename),
+                                          fileBrowserModalTargetPath_, fileBrowserRenameName_);
+        }
+    } else if (showFileBrowserDeleteModal_) {
+        if (local) {
+            if (RemoteFileBrowserManager::deleteLocalItem(fileBrowserModalTargetPath_, err)) showToast("Deleted");
+            else showToast(err, true);
+            navigateFilePane(0, dir);
+        } else {
+            network_.sendRemoteFileAction(static_cast<uint8_t>(FileBrowserActionType::Delete),
+                                          fileBrowserModalTargetPath_, "");
+        }
+    }
+    closeFileBrowserModal();
+}
+
+void CppDeskWindow::submitRunTask() {
+    size_t b = runTaskCommandInput_.find_first_not_of(" \t");
+    size_t e = runTaskCommandInput_.find_last_not_of(" \t");
+    if (b == std::string::npos) {
+        showToast("Enter a command to run", true);
+        return;
+    }
+    network_.sendProcessLaunch(runTaskCommandInput_.substr(b, e - b + 1), runTaskWorkingDirInput_);
+    showRunTaskModal_ = false;
+    focusedField_ = FocusedField::None;
+    showToast("Launch requested...");
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void CppDeskWindow::drawFileManagerDrawer(const UiRect& contentRect) {
+    using RFB = RemoteFileBrowserManager;
+    const float gap = 8.0f;
+    const float actionBarH = 34.0f;
+
+    UiRect panesArea = { contentRect.left, contentRect.top, contentRect.right, contentRect.bottom - actionBarH - 8.0f };
+    const float paneW = (panesArea.width() - gap) * 0.5f;
+    filePaneSplitX_ = panesArea.left + paneW + gap * 0.5f;
+
+    auto drawPane = [&](int paneIdx, const UiRect& area) {
+        FileBrowserPaneState& st = (paneIdx == 0) ? localFilePane_ : remoteFilePane_;
+        const bool active = (activeFilePane_ == paneIdx);
+        const std::string idp = (paneIdx == 0) ? "fm_l_" : "fm_r_";
+
+        fillRoundRect(area, 10.0f, COL_BG_SUBTLE);
+        strokeRoundRect(area, 10.0f, active ? COL_PRIMARY_ACCENT : COL_BORDER, active ? 1.4f : 1.0f);
+        // Registered first so rows and buttons drawn after it win the hit test.
+        clickRegions_.push_back({ area, idp + "area", [this, paneIdx]() { activeFilePane_ = paneIdx; }, false });
+
+        const float px = area.left + 8.0f;
+        const float prx = area.right - 8.0f;
+        float py = area.top + 6.0f;
+        drawText(paneIdx == 0 ? "This PC" : "Remote Host", { px, py, prx, py + 16.0f }, fmtSmall_,
+                 active ? COL_TEXT_ACCENT : COL_TEXT_SECONDARY);
+        py += 18.0f;
+
+        UiRect upBtn = { px, py, px + 26.0f, py + 28.0f };
+        drawButton(idp + "up", upBtn, "↑", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this, paneIdx]() {
+            activeFilePane_ = paneIdx;
+            const FileBrowserPaneState& s = (paneIdx == 0) ? localFilePane_ : remoteFilePane_;
+            navigateFilePane(paneIdx, RemoteFileBrowserManager::getParentDirectory(s.currentPath));
+        }, fmtSmall_, true, COL_BORDER);
+
+        UiRect refreshBtn = { prx - 26.0f, py, prx, py + 28.0f };
+        drawButton(idp + "refresh", refreshBtn, "↺", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this, paneIdx]() {
+            activeFilePane_ = paneIdx;
+            const std::string cur = ((paneIdx == 0) ? localFilePane_ : remoteFilePane_).currentPath;
+            navigateFilePane(paneIdx, cur.empty() ? "$DRIVES$" : cur);
+        }, fmtSmall_, true, COL_BORDER);
+
+        UiRect pathField = { upBtn.right + 4.0f, py, refreshBtn.left - 4.0f, py + 28.0f };
+        drawTextField(idp + "path", paneIdx == 0 ? FocusedField::FileBrowserLocalPath : FocusedField::FileBrowserRemotePath,
+                      pathField, paneIdx == 0 ? fileBrowserInputLocalPath_ : fileBrowserInputRemotePath_,
+                      "Drives - type a path, Enter", false);
+        py += 34.0f;
+
+        UiRect listBox = { px, py, prx, area.bottom - 22.0f };
+        fillRoundRect(listBox, 7.0f, COL_BG_CARD);
+
+        const float rowH = 24.0f;
+        const int visible = std::max(1, static_cast<int>((listBox.height() - 4.0f) / rowH));
+        const int total = static_cast<int>(st.entries.size());
+        const int maxScroll = std::max(0, total - visible);
+        st.scrollOffset = std::clamp(st.scrollOffset, 0.0f, static_cast<float>(maxScroll));
+        const int first = static_cast<int>(st.scrollOffset);
+
+        if (st.isLoading) {
+            drawText("Loading...", listBox, fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else if (total == 0) {
+            std::string msg = !st.statusMessage.empty() ? st.statusMessage
+                              : (st.currentPath.empty() ? "Not loaded" : "Empty");
+            drawText(msg, { listBox.left + 8.0f, listBox.top, listBox.right - 8.0f, listBox.bottom }, fmtSmall_,
+                     st.statusMessage.empty() ? COL_TEXT_MUTED : COL_DANGER, DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else {
+            float ry = listBox.top + 2.0f;
+            for (int i = first; i < total && (i - first) < visible; ++i) {
+                const FileBrowserItemEntry& e = st.entries[i];
+                UiRect row = { listBox.left + 3.0f, ry, listBox.right - (maxScroll > 0 ? 10.0f : 3.0f), ry + rowH - 2.0f };
+
+                if (st.selectedIndex == i) {
+                    fillRoundRect(row, 5.0f, withAlpha(COL_PRIMARY_ACCENT, 0.22f));
+                } else if (row.contains(mouseX_, mouseY_)) {
+                    fillRoundRect(row, 5.0f, withAlpha(COL_PRIMARY_ACCENT, 0.10f));
+                }
+
+                const float sizeW = e.isDirectory ? 0.0f : 64.0f;
+                drawText(e.isDirectory ? std::string("▸ ") + e.name : e.name,
+                         { row.left + 6.0f, row.top, row.right - sizeW - 6.0f, row.bottom },
+                         e.isDirectory ? fmtBodyBold_ : fmtBody_, COL_TEXT_PRIMARY);
+                if (!e.isDirectory) {
+                    drawText(RFB::formatFileSize(e.sizeBytes), { row.right - sizeW - 4.0f, row.top, row.right - 4.0f, row.bottom },
+                             fmtSmall_, COL_TEXT_MUTED, DWRITE_TEXT_ALIGNMENT_TRAILING);
+                }
+                clickRegions_.push_back({ row, idp + "row_" + std::to_string(i), [this, paneIdx, i]() {
+                    activateFilePaneEntry(paneIdx, i);
+                }, false });
+                ry += rowH;
+            }
+
+            if (maxScroll > 0) {
+                UiRect track = { listBox.right - 7.0f, listBox.top + 4.0f, listBox.right - 4.0f, listBox.bottom - 4.0f };
+                fillRoundRect(track, 1.5f, withAlpha(COL_BORDER, 0.5f));
+                float thumbH = std::max(18.0f, track.height() * static_cast<float>(visible) / static_cast<float>(total));
+                float thumbTop = track.top + (track.height() - thumbH) * (st.scrollOffset / static_cast<float>(maxScroll));
+                fillRoundRect({ track.left, thumbTop, track.right, thumbTop + thumbH }, 1.5f, COL_TEXT_MUTED);
+            }
+        }
+
+        std::string footer;
+        if (const FileBrowserItemEntry* sel = st.selectedEntry(); sel && sel->name != "..") {
+            footer = sel->isDirectory ? sel->name : sel->name + "  " + RFB::formatFileSize(sel->sizeBytes);
+            if (sel->mtimeSec != 0) footer += "  " + RFB::formatFileTimestamp(sel->mtimeSec);
+        } else if (total > 0) {
+            footer = std::to_string(total - 1) + " items";
+        }
+        drawText(footer, { px, listBox.bottom + 2.0f, prx, area.bottom - 2.0f }, fmtSmall_, COL_TEXT_MUTED);
+    };
+
+    drawPane(0, { panesArea.left, panesArea.top, panesArea.left + paneW, panesArea.bottom });
+    drawPane(1, { panesArea.right - paneW, panesArea.top, panesArea.right, panesArea.bottom });
+
+    // Action bar
+    const float by = panesArea.bottom + 8.0f;
+    const float btnGap = 6.0f;
+    const float bw = (contentRect.width() - btnGap * 4.0f) / 5.0f;
+    auto btnRect = [&](int i) { return UiRect{ contentRect.left + i * (bw + btnGap), by, contentRect.left + i * (bw + btnGap) + bw, by + actionBarH }; };
+
+    drawButton("fm_upload", btnRect(0), "Upload →", COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
+        const FileBrowserItemEntry* sel = localFilePane_.selectedEntry();
+        if (!sel || sel->isDirectory) {
+            showToast("Select a file in 'This PC' to upload", true);
+            return;
+        }
+        const std::string name = sel->name;
+        const std::string full = RemoteFileBrowserManager::joinPath(localFilePane_.currentPath, name);
+        if (network_.sendFilePath(std::filesystem::path(utf8ToWide(full))) > 0) showToast("Uploading " + name);
+        else showToast("Could not send " + name, true);
+    }, fmtSmall_);
+
+    drawButton("fm_download", btnRect(1), "← Download", COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
+        const FileBrowserItemEntry* sel = remoteFilePane_.selectedEntry();
+        if (!sel || sel->isDirectory) {
+            showToast("Select a file in 'Remote Host' to download", true);
+            return;
+        }
+        const std::string name = sel->name;
+        network_.sendRemoteFileDownload(RemoteFileBrowserManager::joinPath(remoteFilePane_.currentPath, name), name);
+        showToast("Requested " + name + " - progress is in the Files tab");
+    }, fmtSmall_);
+
+    drawButton("fm_newdir", btnRect(2), "New Folder", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f,
+               [this]() { openFileBrowserModal(activeFilePane_, 0); }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+    drawButton("fm_rename", btnRect(3), "Rename", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f,
+               [this]() { openFileBrowserModal(activeFilePane_, 1); }, fmtSmall_, true, COL_BORDER, COL_TEXT_ACCENT);
+    drawButton("fm_delete", btnRect(4), "Delete", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_DANGER, 8.0f,
+               [this]() { openFileBrowserModal(activeFilePane_, 2); }, fmtSmall_, true, COL_BORDER, COL_DANGER);
+}
+
+void CppDeskWindow::drawRunTaskModal(float width, float height, float modalProgress) {
+    if (!showRunTaskModal_ && modalProgress <= 0.01f) return;
+
+    float alpha = std::clamp(modalProgress, 0.0f, 1.0f);
+    fillRoundRect({ 0.0f, 0.0f, width, height }, 0.0f, rgba(28, 24, 20, 0.55f * alpha));
+
+    clickRegions_.push_back({ { 0.0f, 0.0f, width, height }, "modal_runtask_scrim", [this]() {
+        showRunTaskModal_ = false;
+        focusedField_ = FocusedField::None;
+    }, false });
+
+    float mw = 500.0f;
+    float mh = 290.0f;
+    UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
+    clickRegions_.push_back({ modal, "modal_runtask_absorb", []() {}, false });
+
+    float scale = 0.90f + 0.10f * modalProgress;
+    renderTarget_->SetTransform(
+        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
+    );
+    drawCardSurface(modal, 18.0f, alpha);
+
+    float mx = modal.left + 26.0f;
+    float mrx = modal.right - 26.0f;
+    float my = modal.top + 22.0f;
+
+    drawText("Run Task on Host", { mx, my, mrx - 40.0f, my + 26.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    UiRect closeBtn = { mrx - 26.0f, my, mrx, my + 26.0f };
+    drawButton("modal_runtask_close", closeBtn, "×", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 13.0f, [this]() {
+        showRunTaskModal_ = false;
+        focusedField_ = FocusedField::None;
+    }, fmtHeading_);
+    my += 34.0f;
+
+    drawText("Launches a program on the remote desktop. Needs remote input permission.",
+             { mx, my, mrx, my + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+    my += 26.0f;
+
+    drawText("Command line", { mx, my, mrx, my + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+    my += 18.0f;
+    drawTextField("field_runtask_cmd", FocusedField::RunTaskCommand, { mx, my, mrx, my + 34.0f },
+                  runTaskCommandInput_, "e.g. notepad.exe C:\\notes.txt", false);
+    my += 44.0f;
+
+    drawText("Working directory (optional)", { mx, my, mrx, my + 16.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+    my += 18.0f;
+    drawTextField("field_runtask_dir", FocusedField::RunTaskWorkingDir, { mx, my, mrx, my + 34.0f },
+                  runTaskWorkingDirInput_, "e.g. C:\\Users", false);
+    my += 50.0f;
+
+    float btnW = 130.0f;
+    float btnH = 34.0f;
+    drawButton("modal_runtask_cancel", { mrx - btnW * 2.0f - 10.0f, my, mrx - btnW - 10.0f, my + btnH }, "Cancel",
+               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
+                   showRunTaskModal_ = false;
+                   focusedField_ = FocusedField::None;
+               }, fmtSmall_, true, COL_BORDER);
+    drawButton("modal_runtask_run", { mrx - btnW, my, mrx, my + btnH }, "Run",
+               COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f,
+               [this]() { submitRunTask(); }, fmtSmall_);
+
+    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+}
+
+void CppDeskWindow::drawFileBrowserActionModal(float width, float height, float modalProgress) {
+    const bool anyOpen = showFileBrowserNewDirModal_ || showFileBrowserRenameModal_ || showFileBrowserDeleteModal_;
+    if (!anyOpen && modalProgress <= 0.01f) return;
+
+    float alpha = std::clamp(modalProgress, 0.0f, 1.0f);
+    fillRoundRect({ 0.0f, 0.0f, width, height }, 0.0f, rgba(28, 24, 20, 0.55f * alpha));
+
+    clickRegions_.push_back({ { 0.0f, 0.0f, width, height }, "modal_fileaction_scrim", [this]() {
+        closeFileBrowserModal();
+    }, false });
+
+    const int kind = fileBrowserModalKind_;
+    const bool isDelete = (kind == 2);
+    const bool local = (fileBrowserModalPane_ == 0);
+
+    float mw = 460.0f;
+    float mh = isDelete ? 210.0f : 232.0f;
+    UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
+    clickRegions_.push_back({ modal, "modal_fileaction_absorb", []() {}, false });
+
+    float scale = 0.90f + 0.10f * modalProgress;
+    renderTarget_->SetTransform(
+        D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(modal.centerX(), modal.centerY()))
+    );
+    drawCardSurface(modal, 18.0f, alpha);
+
+    float mx = modal.left + 26.0f;
+    float mrx = modal.right - 26.0f;
+    float my = modal.top + 22.0f;
+
+    const char* title = (kind == 0) ? "New Folder" : (kind == 1 ? "Rename" : "Delete");
+    drawText(title, { mx, my, mrx - 40.0f, my + 26.0f }, fmtHeading_, COL_TEXT_PRIMARY);
+    UiRect closeBtn = { mrx - 26.0f, my, mrx, my + 26.0f };
+    drawButton("modal_fileaction_close", closeBtn, "×", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 13.0f,
+               [this]() { closeFileBrowserModal(); }, fmtHeading_);
+    my += 36.0f;
+
+    const std::string where = local ? "This PC" : "the remote host";
+    if (kind == 0) {
+        const std::string& dir = local ? localFilePane_.currentPath : remoteFilePane_.currentPath;
+        drawText("Create in " + dir, { mx, my, mrx, my + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        my += 24.0f;
+        drawTextField("field_fileaction_newdir", FocusedField::FileBrowserNewDir, { mx, my, mrx, my + 34.0f },
+                      fileBrowserNewDirName_, "Folder name", false);
+        my += 54.0f;
+    } else if (kind == 1) {
+        drawText("Rename \"" + fileBrowserModalTargetName_ + "\" on " + where, { mx, my, mrx, my + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        my += 24.0f;
+        drawTextField("field_fileaction_rename", FocusedField::FileBrowserRename, { mx, my, mrx, my + 34.0f },
+                      fileBrowserRenameName_, "New name", false);
+        my += 54.0f;
+    } else {
+        drawText("Permanently delete \"" + fileBrowserModalTargetName_ + "\" from " + where + "?",
+                 { mx, my, mrx, my + 22.0f }, fmtBodyBold_, COL_TEXT_PRIMARY);
+        my += 26.0f;
+        drawText("This cannot be undone. A folder is deleted with everything inside it.",
+                 { mx, my, mrx, my + 18.0f }, fmtSmall_, COL_TEXT_SECONDARY);
+        my += 40.0f;
+    }
+
+    float btnW = 130.0f;
+    float btnH = 34.0f;
+    drawButton("modal_fileaction_cancel", { mrx - btnW * 2.0f - 10.0f, my, mrx - btnW - 10.0f, my + btnH }, "Cancel",
+               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() { closeFileBrowserModal(); },
+               fmtSmall_, true, COL_BORDER);
+    drawButton("modal_fileaction_confirm", { mrx - btnW, my, mrx, my + btnH }, isDelete ? "Delete" : (kind == 1 ? "Rename" : "Create"),
+               isDelete ? COL_DANGER : COL_PRIMARY_ACCENT, isDelete ? COL_DANGER_HV : COL_PRIMARY_ACCENT_HV,
+               COL_TEXT_ON_ACCENT, 8.0f, [this]() { submitFileBrowserModal(); }, fmtSmall_);
+
+    renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+}
+
 // ---------------- Mandatory Update Modal (v3.0.0) ----------------
 
 void CppDeskWindow::drawUpdateRequiredModal(float width, float height, float modalProgress) {
@@ -8445,6 +8876,7 @@ bool CppDeskWindow::anyModalActive() const {
            addressBookModalAnimT_ > 0.004f || totpModalAnimT_ > 0.004f || omnibarModalAnimT_ > 0.004f ||
            recordingPlayerModalAnimT_ > 0.004f || updateModalAnimT_ > 0.004f ||
            rebootModalAnimT_ > 0.004f || hwAccelModalAnimT_ > 0.004f || showPeerMismatchModal_ ||
+           runTaskModalAnimT_ > 0.004f || fileBrowserModalAnimT_ > 0.004f ||
            showUpdateRequiredModal_;
 }
 
@@ -8858,6 +9290,11 @@ void CppDeskWindow::onMouseWheel(int delta) {
                 syncDiffScrollOffset_ += (delta > 0 ? -1.0f : 1.0f);
                 if (syncDiffScrollOffset_ < 0.0f) syncDiffScrollOffset_ = 0.0f;
                 InvalidateRect(hwnd_, nullptr, FALSE);
+            } else if (drawerTab_ == DrawerTab::FileManager) {
+                // The upper bound is clamped while drawing, when the visible row count is known.
+                FileBrowserPaneState& pane = (mouseX_ < filePaneSplitX_) ? localFilePane_ : remoteFilePane_;
+                pane.scrollOffset = std::max(0.0f, pane.scrollOffset + (delta > 0 ? -3.0f : 3.0f));
+                InvalidateRect(hwnd_, nullptr, FALSE);
             }
             return;
         }
@@ -8910,6 +9347,13 @@ void CppDeskWindow::onCharInput(wchar_t ch) {
         maxLen = 256;
     } else if (focusedField_ == FocusedField::OmnibarInput) {
         maxLen = 128;
+    } else if (focusedField_ == FocusedField::FileBrowserLocalPath || focusedField_ == FocusedField::FileBrowserRemotePath ||
+               focusedField_ == FocusedField::RunTaskWorkingDir) {
+        maxLen = 260;
+    } else if (focusedField_ == FocusedField::RunTaskCommand) {
+        maxLen = 512;
+    } else if (focusedField_ == FocusedField::FileBrowserNewDir || focusedField_ == FocusedField::FileBrowserRename) {
+        maxLen = 128;
     } else if (focusedField_ == FocusedField::PrivacyBrand) {
         maxLen = 63;
     } else if (isTotp) {
@@ -8948,6 +9392,16 @@ void CppDeskWindow::onCharInput(wchar_t ch) {
                 omnibarLastOutput_ = "Executing: " + cmd.commandLine + "...";
                 omnibarHasOutput_ = true;
             }
+        } else if (focusedField_ == FocusedField::FileBrowserLocalPath) {
+            navigateFilePane(0, fileBrowserInputLocalPath_);
+        } else if (focusedField_ == FocusedField::FileBrowserRemotePath) {
+            navigateFilePane(1, fileBrowserInputRemotePath_);
+        } else if (focusedField_ == FocusedField::FileBrowserNewDir || focusedField_ == FocusedField::FileBrowserRename) {
+            submitFileBrowserModal();
+            return;
+        } else if (focusedField_ == FocusedField::RunTaskCommand || focusedField_ == FocusedField::RunTaskWorkingDir) {
+            submitRunTask();
+            return;
         } else if (focusedField_ == FocusedField::PrivacyBrand || focusedField_ == FocusedField::PrivacyNotice) {
             AppSettings ns = identity_.settings();
             ns.privacyBrandName = privacyBrandEdit_.empty() ? "CppDesk Enterprise Security" : privacyBrandEdit_;
@@ -8985,6 +9439,8 @@ void CppDeskWindow::onCharInput(wchar_t ch) {
             focusedField_ = FocusedField::TotpModalCode;
         } else if (showOmnibarModal_) {
             focusedField_ = FocusedField::OmnibarInput;
+        } else if (showRunTaskModal_) {
+            focusedField_ = (focusedField_ == FocusedField::RunTaskCommand) ? FocusedField::RunTaskWorkingDir : FocusedField::RunTaskCommand;
         } else if (focusedField_ == FocusedField::RemoteId) focusedField_ = FocusedField::RemotePassword;
         else if (focusedField_ == FocusedField::RemotePassword) focusedField_ = FocusedField::LocalPassword;
         else if (focusedField_ == FocusedField::LocalPassword) focusedField_ = FocusedField::RelayServer;
@@ -9142,6 +9598,16 @@ void CppDeskWindow::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isE
             }
             if (showAddressBookEditModal_) {
                 showAddressBookEditModal_ = false;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            }
+            if (showFileBrowserNewDirModal_ || showFileBrowserRenameModal_ || showFileBrowserDeleteModal_) {
+                closeFileBrowserModal();
+                return;
+            }
+            if (showRunTaskModal_) {
+                showRunTaskModal_ = false;
+                focusedField_ = FocusedField::None;
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 return;
             }
