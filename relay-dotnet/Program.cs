@@ -40,6 +40,14 @@ internal static class Program
     private static readonly ConcurrentDictionary<ulong, RegisteredHost> Hosts = new();
     private static readonly ConcurrentDictionary<ulong, TaskCompletionSource<TcpClient>> PendingBridges = new();
     private static readonly SemaphoreSlim ClientSlots = new(256, 256);
+
+    // A client must send its first frame within this time, or the connection is dropped (slowloris guard).
+    private static TimeSpan _firstFrameTimeout = TimeSpan.FromSeconds(10);
+
+    // Concurrent connections allowed per remote IP. Each registered host holds one and each bridged session two,
+    // so this is generous for an office behind one NAT while stopping a single address from taking every slot.
+    private static int _maxConnectionsPerIp = 64;
+    private static readonly Dictionary<IPAddress, int> ConnectionsPerIp = new();
     private static long _totalLookups;
     private static long _activeBridges;
 
@@ -78,7 +86,7 @@ internal static class Program
         if (selfTest)
         {
             _ = Task.Run(() => AcceptLoopAsync(listener, cts.Token));
-            bool ok = await RunSelfTestAsync(boundPort);
+            bool ok = await RunSelfTestAsync(boundPort) && await RunHardeningSelfTestAsync(boundPort);
             cts.Cancel();
             listener.Stop();
             return ok ? 0 : 1;
@@ -97,20 +105,36 @@ internal static class Program
             {
                 TcpClient client = await listener.AcceptTcpClientAsync(ct);
                 client.NoDelay = true;
+                EnableKeepAlive(client);
+
+                IPAddress? remoteIp = (client.Client.RemoteEndPoint as IPEndPoint)?.Address;
+                if (remoteIp is not null && !TryAcquireIp(remoteIp))
+                {
+                    client.Dispose();
+                    continue;
+                }
+
                 _ = Task.Run(async () =>
                 {
-                    if (!await ClientSlots.WaitAsync(100, ct))
-                    {
-                        client.Dispose();
-                        return;
-                    }
                     try
                     {
-                        await HandleClientAsync(client, ct);
+                        if (!await ClientSlots.WaitAsync(100, ct))
+                        {
+                            client.Dispose();
+                            return;
+                        }
+                        try
+                        {
+                            await HandleClientAsync(client, ct);
+                        }
+                        finally
+                        {
+                            ClientSlots.Release();
+                        }
                     }
                     finally
                     {
-                        ClientSlots.Release();
+                        if (remoteIp is not null) ReleaseIp(remoteIp);
                     }
                 }, ct);
             }
@@ -125,13 +149,53 @@ internal static class Program
         }
     }
 
+    private static bool TryAcquireIp(IPAddress ip)
+    {
+        lock (ConnectionsPerIp)
+        {
+            ConnectionsPerIp.TryGetValue(ip, out int n);
+            if (n >= _maxConnectionsPerIp) return false;
+            ConnectionsPerIp[ip] = n + 1;
+            return true;
+        }
+    }
+
+    private static void ReleaseIp(IPAddress ip)
+    {
+        lock (ConnectionsPerIp)
+        {
+            if (!ConnectionsPerIp.TryGetValue(ip, out int n)) return;
+            if (n <= 1) ConnectionsPerIp.Remove(ip);
+            else ConnectionsPerIp[ip] = n - 1;
+        }
+    }
+
+    // Detect peers that vanished without closing (bridged sessions have no other idle timeout).
+    private static void EnableKeepAlive(TcpClient client)
+    {
+        try
+        {
+            Socket sock = client.Client;
+            sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+            sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 60);
+            sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 15);
+            sock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 4);
+        }
+        catch (Exception)
+        {
+            // Not supported on this platform: keep the default behaviour.
+        }
+    }
+
     private static async Task HandleClientAsync(TcpClient client, CancellationToken ct)
     {
         bool keepAlive = false;
         try
         {
             NetworkStream stream = client.GetStream();
-            var (ok, type, _, payload) = await ReadFrameAsync(stream, ct);
+            using var firstFrameCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            firstFrameCts.CancelAfter(_firstFrameTimeout);
+            var (ok, type, _, payload) = await ReadFrameAsync(stream, firstFrameCts.Token);
             if (!ok) return;
 
             switch (type)
@@ -454,6 +518,94 @@ internal static class Program
     private static void Log(string msg)
     {
         Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {msg}");
+    }
+
+    // True when the server closed the connection (EOF or reset); false if it is still open after `wait`.
+    private static async Task<bool> IsClosedByServerAsync(TcpClient client, TimeSpan wait)
+    {
+        using var cts = new CancellationTokenSource(wait);
+        try
+        {
+            byte[] buf = new byte[1];
+            return await client.GetStream().ReadAsync(buf, cts.Token) == 0;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
+        {
+            return true;
+        }
+    }
+
+    private static async Task<bool> RunHardeningSelfTestAsync(int port)
+    {
+        TimeSpan savedTimeout = _firstFrameTimeout;
+        int savedMax = _maxConnectionsPerIp;
+        var open = new List<TcpClient>();
+        try
+        {
+            // 1. A client that never sends its first frame is dropped after the timeout.
+            _firstFrameTimeout = TimeSpan.FromMilliseconds(400);
+            using (var silent = new TcpClient())
+            {
+                await silent.ConnectAsync(IPAddress.Loopback, port);
+                if (!await IsClosedByServerAsync(silent, TimeSpan.FromSeconds(3)))
+                {
+                    Log("Self-test FAILED: silent connection was not dropped");
+                    return false;
+                }
+            }
+
+            // 2. One IP cannot exceed the per-IP limit, and capacity returns when connections close.
+            _firstFrameTimeout = TimeSpan.FromSeconds(30);
+            _maxConnectionsPerIp = 3;
+            await Task.Delay(300); // let the connections from the earlier self-test release their slots
+            for (int i = 0; i < 3; i++)
+            {
+                var c = new TcpClient();
+                open.Add(c);
+                await c.ConnectAsync(IPAddress.Loopback, port);
+            }
+
+            using (var extra = new TcpClient())
+            {
+                await extra.ConnectAsync(IPAddress.Loopback, port);
+                if (!await IsClosedByServerAsync(extra, TimeSpan.FromSeconds(2)))
+                {
+                    Log("Self-test FAILED: connection over the per-IP limit was accepted");
+                    return false;
+                }
+            }
+            if (await IsClosedByServerAsync(open[0], TimeSpan.FromMilliseconds(300)))
+            {
+                Log("Self-test FAILED: a connection within the limit was dropped");
+                return false;
+            }
+
+            foreach (var c in open) c.Dispose();
+            open.Clear();
+            await Task.Delay(500);
+            using (var again = new TcpClient())
+            {
+                await again.ConnectAsync(IPAddress.Loopback, port);
+                if (await IsClosedByServerAsync(again, TimeSpan.FromMilliseconds(500)))
+                {
+                    Log("Self-test FAILED: per-IP capacity was not released");
+                    return false;
+                }
+            }
+
+            Log("Self-test verified: first-frame timeout and per-IP limit");
+            return true;
+        }
+        finally
+        {
+            foreach (var c in open) c.Dispose();
+            _firstFrameTimeout = savedTimeout;
+            _maxConnectionsPerIp = savedMax;
+        }
     }
 
     private static async Task<bool> RunSelfTestAsync(int port)
