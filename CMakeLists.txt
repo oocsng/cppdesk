@@ -33,6 +33,7 @@ set(CORE_SOURCES
     src/media/voice_intercom.cpp
     src/ui/notification_manager.cpp
     src/ui/ui_platform.cpp
+    src/ui/recording_canvas.cpp
 )
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)

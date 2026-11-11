@@ -9,6 +9,7 @@
 #include "../src/net/connection_limiter.hpp"
 #include "../src/net/relay_owner.hpp"
 #include "../src/core/win_compat.hpp"
+#include "../src/ui/recording_canvas.hpp"
 #include "../src/ui/notification_manager.hpp"
 #include "../src/media/session_recorder.hpp"
 #include "../src/media/session_recording_player.hpp"
@@ -7659,6 +7660,80 @@ void testRelayDeskOwnership() {
     relay.stop();
 }
 
+void testCanvasTypes() {
+    std::cout << "[TEST 66] Platform-neutral canvas types (color, transform)..." << std::endl;
+    TEST_ASSERT(ui::withAlpha(ui::rgba(255, 0, 0, 0.8f), 2.0f).a == 1.0f);   // the multiplier clamps
+    TEST_ASSERT(std::abs(ui::lerpColor(ui::rgba(0, 0, 0), ui::rgba(255, 255, 255), 0.5f).r - 0.5f) < 1e-4f);
+    TEST_ASSERT(ui::lerpColor(ui::rgba(0, 0, 0), ui::rgba(255, 255, 255), 2.0f).r == 1.0f);   // t clamps
+    auto t = ui::Transform2D::translation(10, 0) * ui::Transform2D::scale(2, 2, 0, 0);
+    // (1,1): translate first -> (11,1), then scale -> (22,2)
+    TEST_ASSERT(std::abs(1 * t.m11 + 1 * t.m21 + t.dx - 22.0f) < 1e-4f);
+    TEST_ASSERT(std::abs(1 * t.m12 + 1 * t.m22 + t.dy - 2.0f) < 1e-4f);
+    auto r = ui::Transform2D::rotation(90.0f, 0, 0);
+    // (1,0) rotated 90 degrees clockwise in screen space -> (0,1)
+    TEST_ASSERT(std::abs(1 * r.m11 + r.dx) < 1e-4f && std::abs(1 * r.m12 + r.dy - 1.0f) < 1e-4f);
+    auto s = ui::Transform2D::scale(2, 2, 10, 10);   // scaling about (10,10) leaves it in place
+    TEST_ASSERT(std::abs(10 * s.m11 + 10 * s.m21 + s.dx - 10.0f) < 1e-4f);
+}
+
+void testRecordingCanvas() {
+    std::cout << "[TEST 67] Recording canvas (text round trip, balance reset)..." << std::endl;
+
+    // Text round trip: non-ASCII and text over 512 bytes are recorded byte for byte.
+    {
+        ui::RecordingCanvas rc;
+        rc.beginFrame(800, 600, ui::rgba(0, 0, 0));
+        std::string cjk = "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E \xF0\x9F\x96\xA5";
+        std::string longText(700, 'x');
+        rc.drawText(cjk, {0, 0, 100, 20}, ui::FontRole::Body, ui::rgba(1, 2, 3), ui::HAlign::Leading, ui::VAlign::Center);
+        rc.drawText(longText, {0, 0, 100, 20}, ui::FontRole::Mono, ui::rgba(1, 2, 3), ui::HAlign::Center, ui::VAlign::Top);
+        std::string out = rc.serialize();
+        TEST_ASSERT(out.find(cjk) != std::string::npos);
+        TEST_ASSERT(out.find(longText) != std::string::npos);
+        TEST_ASSERT(rc.ops().size() == 3);
+    }
+
+    // Balance: unpopped state is reported, and a new frame starts clean.
+    {
+        ui::RecordingCanvas rc;
+        rc.beginFrame(800, 600, ui::rgba(0, 0, 0));
+        rc.pushClip({0, 0, 10, 10});
+        rc.pushOpacity(0.5f);
+        rc.setTransform(ui::Transform2D::scale(2, 2, 0, 0));
+        TEST_ASSERT(!rc.frameBalanced());
+        rc.popOpacity();
+        rc.popClip();
+        TEST_ASSERT(rc.frameBalanced());
+        rc.pushClip({0, 0, 10, 10});
+        rc.beginFrame(800, 600, ui::rgba(0, 0, 0));
+        TEST_ASSERT(rc.frameBalanced());
+        TEST_ASSERT(rc.transform().m11 == 1.0f && rc.transform().dx == 0.0f);
+        TEST_ASSERT(rc.ops().size() == 1);   // only the begin op
+    }
+
+    // The same calls serialize to the same text (goldens rely on this).
+    {
+        auto draw = [](ui::RecordingCanvas& c) {
+            c.beginFrame(320, 200, ui::rgba(10, 20, 30));
+            c.fillRoundRect({1.234f, 2, 30, 40}, 4, ui::rgba(255, 0, 0, 0.5f));
+            ui::Path p;
+            p.moveTo(0, 0);
+            p.lineTo(10, 0);
+            p.arcTo(10, 10, 5, true, false);
+            p.close();
+            c.fillPath(p, ui::rgba(0, 255, 0));
+            ui::ImageId img = c.createImage(4, 4);
+            c.drawImage(img, {0, 0, 4, 4}, 1.0f);
+            c.endFrame();
+        };
+        ui::RecordingCanvas a, b;
+        draw(a);
+        draw(b);
+        TEST_ASSERT(!a.serialize().empty() && a.serialize() == b.serialize());
+        TEST_ASSERT(a.serialize().find("1.23") != std::string::npos);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -7744,6 +7819,8 @@ int main() {
         testBoundAuthResponse(); std::cout << "Test 63 done\n" << std::flush;
         testConnectionLimiter(); std::cout << "Test 64 done\n" << std::flush;
         testRelayDeskOwnership(); std::cout << "Test 65 done\n" << std::flush;
+        testCanvasTypes(); std::cout << "Test 66 done\n" << std::flush;
+        testRecordingCanvas(); std::cout << "Test 67 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
