@@ -183,9 +183,9 @@ std::string ShortcutManager::parseStartupConnectTarget(const std::wstring& cmdLi
     }
     std::vector<std::wstring> args;
 #if defined(_WIN32)
-    int argc = 0;
-    LPWSTR* argv = CommandLineToArgvW(cmdLine.c_str(), &argc);
-    if (!argv || argc <= 0) {
+    int winArgc = 0;
+    LPWSTR* argv = CommandLineToArgvW(cmdLine.c_str(), &winArgc);
+    if (!argv || winArgc <= 0) {
         if (argv) {
             LocalFree(argv);
         }
