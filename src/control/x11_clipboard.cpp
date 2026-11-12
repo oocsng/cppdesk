@@ -55,8 +55,10 @@ bool X11Clipboard::setText(const std::string& utf8) {
 
 std::optional<std::string> X11Clipboard::getText(int timeoutMs) {
     if (!dpy_) return std::nullopt;
+    // Ask the server: our SelectionClear may not have been handled yet when another app has just copied.
+    const bool ownedNow = XGetSelectionOwner(dpy_, clip_) == win_;
     std::unique_lock<std::mutex> lock(m_);
-    if (owned_) return ours_;
+    if (ownedNow && owned_) return ours_;
     replied_ = false;
     reply_.reset();
     XConvertSelection(dpy_, clip_, utf8_, prop_, win_, CurrentTime);
