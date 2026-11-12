@@ -151,7 +151,7 @@ If you hit a bug, connection failure, or want to suggest an improvement:
 
 Include the following in your report to help diagnose the issue:
 - Operating system and version (for example, Windows 11 23H2 x64, macOS 14.5, Ubuntu 24.04 X11)
-- CppDesk version (for example, v3.9.2)
+- CppDesk version (for example, v3.9.3)
 - Connection type (Direct LAN, STUN NAT traversal, or Relay)
 - Steps to reproduce, along with relevant log lines or status messages
 

@@ -68,7 +68,7 @@ drawText 30.00 426.00 216.00 464.00 Small CC c0.15,0.14,0.13,1.00 |System & Serv
 fillRoundRect 30.00 470.00 216.00 508.00 r8.00 c0.85,0.47,0.34,1.00
 fillRoundRect 33.20 470.80 212.80 471.80 r0.50 c1.00,1.00,1.00,0.16
 drawText 30.00 470.00 216.00 508.00 Small CC c1.00,1.00,1.00,1.00 |About & Data
-drawText 30.00 754.00 216.00 772.00 Small CC c0.41,0.38,0.35,1.00 |v3.9.2
+drawText 30.00 754.00 216.00 772.00 Small CC c0.41,0.38,0.35,1.00 |v3.9.3
 fillRoundRect 239.50 77.60 1264.50 788.60 r18.50 c0.15,0.12,0.08,0.01
 fillRoundRect 241.00 76.60 1263.00 784.60 r17.00 c0.15,0.12,0.08,0.01
 fillRoundRect 242.00 76.10 1262.00 782.10 r16.00 c0.15,0.12,0.08,0.01
@@ -92,7 +92,7 @@ strokeRoundRect 266.00 142.10 1238.00 208.10 r12.00 c0.89,0.87,0.83,1.00 w1.00
 fillRoundRect 280.00 142.90 1224.00 143.90 r0.50 c1.00,1.00,1.00,0.75
 fillRoundRect 282.00 155.10 322.00 195.10 r10.00 c0.85,0.47,0.34,1.00
 drawText 282.00 155.10 322.00 195.10 Subheading CC c1.00,1.00,1.00,1.00 |CD
-drawText 336.00 154.10 938.00 176.10 Subheading LC c0.15,0.14,0.13,1.00 |CppDesk v3.9.2  •  Fast, secure remote desktop for Windows
+drawText 336.00 154.10 938.00 176.10 Subheading LC c0.15,0.14,0.13,1.00 |CppDesk v3.9.3  •  Fast, secure remote desktop for Windows
 fillEllipse 341.00 187.10 8.91 8.91 c0.66,0.36,0.07,0.07
 fillEllipse 341.00 187.10 6.91 6.91 c0.66,0.36,0.07,0.14
 fillEllipse 341.00 187.10 3.80 3.80 c0.66,0.36,0.07,1.00
@@ -115,7 +115,7 @@ fillRoundRect 1078.00 238.10 1146.00 264.10 r6.00 c0.94,0.92,0.88,1.00
 fillRoundRect 1080.40 238.90 1143.60 239.90 r0.50 c1.00,1.00,1.00,0.16
 strokeRoundRect 1078.00 238.10 1146.00 264.10 r6.00 c0.89,0.87,0.83,1.00 w1.00
 drawText 1078.00 238.10 1146.00 264.10 Small CC c0.15,0.14,0.13,1.00 |GitHub
-drawText 282.00 250.10 1066.00 270.10 Small LC c0.33,0.31,0.27,1.00 |CppDesk v3.9.2 • Free & Open Source
+drawText 282.00 250.10 1066.00 270.10 Small LC c0.33,0.31,0.27,1.00 |CppDesk v3.9.3 • Free & Open Source
 fillRoundRect 266.00 294.10 1238.00 372.10 r12.00 c0.95,0.93,0.90,1.00
 strokeRoundRect 266.00 294.10 1238.00 372.10 r12.00 c0.89,0.87,0.83,1.00 w1.00
 drawText 282.00 302.10 1222.00 316.10 Small LC c0.63,0.27,0.15,1.00 |DATA & MAINTENANCE
