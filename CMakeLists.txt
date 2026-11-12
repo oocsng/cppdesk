@@ -172,6 +172,7 @@ if(UNIX AND NOT APPLE)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.png)
     set(LINUX_UI_SOURCES
         src/ui/ui_window_linux.cpp
+        src/ui/x11_dnd.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/generated/app_icon_png.cpp
     )
 endif()

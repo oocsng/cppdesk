@@ -7,6 +7,7 @@
 #include "../core/spawn.hpp"
 #include "../net/network_engine.hpp"
 #include "../core/crypto_identity.hpp"
+#include "x11_dnd.hpp"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -116,6 +117,7 @@ struct CppDeskWindowLinuxImpl {
     cairo_surface_t* surface = nullptr;
     ui::CairoCanvas canvas;
 
+    std::unique_ptr<XdndTarget> dnd;
     std::unique_ptr<LinuxShell> shell;
     std::unique_ptr<AppUi> app;
 
@@ -491,10 +493,16 @@ void CppDeskWindowLinuxImpl::handleEvent(XEvent& ev) {
             }
             break;
         }
+        case SelectionNotify:
+            if (auto dropped = dnd ? dnd->handleSelectionNotify(ev) : std::nullopt) {
+                app->onFilesDropped(dropped->paths, dropped->x / scale, dropped->y / scale);
+            }
+            break;
         case MappingNotify:
             XRefreshKeyboardMapping(&ev.xmapping);
             break;
         case ClientMessage:
+            if (dnd && dnd->handleClientMessage(ev)) break;
             if (ev.xclient.message_type == wmProtocols && static_cast<Atom>(ev.xclient.data.l[0]) == wmDelete) {
                 requestClose();
             }
@@ -684,6 +692,7 @@ bool CppDeskWindow::create(void* displayContext, int /*showCommand*/) {
     for (int i = 0; i < 5; ++i) w.cursors[i] = XCreateFontCursor(w.dpy, shapes[i]);
     XDefineCursor(w.dpy, w.win, w.cursors[0]);
 
+    w.dnd = std::make_unique<XdndTarget>(w.dpy, w.win);
     w.gc = XCreateGC(w.dpy, w.win, 0, nullptr);
     w.allocateBackBuffer(widthPx, heightPx);
 

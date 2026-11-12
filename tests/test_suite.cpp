@@ -8342,6 +8342,121 @@ void testX11Clipboard() {
 }
 #endif
 
+#if defined(__linux__)
+// Plays a file manager dragging one file onto the window over the XDND protocol.
+void testXdndDrop() {
+    std::cout << "[TEST 77] Files dropped from another app reach the screens (XDND)..." << std::endl;
+    Display* peer = XOpenDisplay(nullptr);
+    if (!peer) {
+        std::cout << "  SKIP: no X display\n";
+        return;
+    }
+    IdentityManager id(4249);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    {
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        const Window target = w.nativeWindow();
+        TEST_ASSERT(pumpUntil(w, [&] {
+            XWindowAttributes a{};
+            return XGetWindowAttributes(peer, target, &a) && a.map_state == IsViewable;
+        }));
+
+        auto atom = [&](const char* name) { return XInternAtom(peer, name, False); };
+        const Atom aware = atom("XdndAware"), enter = atom("XdndEnter"), position = atom("XdndPosition"),
+                   status = atom("XdndStatus"), drop = atom("XdndDrop"), finished = atom("XdndFinished"),
+                   selection = atom("XdndSelection"), uriList = atom("text/uri-list"), copy = atom("XdndActionCopy");
+
+        // The window advertises XDND version 5.
+        Atom type = 0;
+        int format = 0;
+        unsigned long count = 0, after = 0;
+        unsigned char* data = nullptr;
+        XGetWindowProperty(peer, target, aware, 0, 1, False, XA_ATOM, &type, &format, &count, &after, &data);
+        TEST_ASSERT(data && count == 1 && *reinterpret_cast<Atom*>(data) == 5);
+        if (data) XFree(data);
+
+        const Window source = XCreateSimpleWindow(peer, DefaultRootWindow(peer), 0, 0, 1, 1, 0, 0, 0);
+        XSetSelectionOwner(peer, selection, source, CurrentTime);
+        auto send = [&](Atom msg, long l1, long l2, long l3, long l4) {
+            XEvent ev{};
+            ev.xclient.type = ClientMessage;
+            ev.xclient.window = target;
+            ev.xclient.message_type = msg;
+            ev.xclient.format = 32;
+            ev.xclient.data.l[0] = static_cast<long>(source);
+            ev.xclient.data.l[1] = l1;
+            ev.xclient.data.l[2] = l2;
+            ev.xclient.data.l[3] = l3;
+            ev.xclient.data.l[4] = l4;
+            XSendEvent(peer, target, False, NoEventMask, &ev);
+            XFlush(peer);
+        };
+        int rootX = 0, rootY = 0;
+        Window child = 0;
+        XTranslateCoordinates(peer, target, DefaultRootWindow(peer), 400, 300, &rootX, &rootY, &child);
+
+        bool accepted = false, done = false, doneOk = false;
+        const std::string uris = "file:///tmp/cppdesk-drop-test.txt\r\n";
+        auto serveSource = [&] {
+            while (XPending(peer) > 0) {
+                XEvent ev;
+                XNextEvent(peer, &ev);
+                if (ev.type == ClientMessage && ev.xclient.message_type == status) {
+                    accepted = (ev.xclient.data.l[1] & 1) != 0;
+                } else if (ev.type == ClientMessage && ev.xclient.message_type == finished) {
+                    done = true;
+                    doneOk = (ev.xclient.data.l[1] & 1) != 0;
+                } else if (ev.type == SelectionRequest) {
+                    XSelectionRequestEvent& req = ev.xselectionrequest;
+                    XEvent reply{};
+                    reply.xselection.type = SelectionNotify;
+                    reply.xselection.requestor = req.requestor;
+                    reply.xselection.selection = req.selection;
+                    reply.xselection.target = req.target;
+                    reply.xselection.time = req.time;
+                    reply.xselection.property = None;
+                    if (req.target == uriList) {
+                        XChangeProperty(peer, req.requestor, req.property, uriList, 8, PropModeReplace,
+                                        reinterpret_cast<const unsigned char*>(uris.data()), static_cast<int>(uris.size()));
+                        reply.xselection.property = req.property;
+                    }
+                    XSendEvent(peer, req.requestor, False, NoEventMask, &reply);
+                    XFlush(peer);
+                }
+            }
+        };
+        auto exchange = [&](auto cond) {
+            const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!cond() && std::chrono::steady_clock::now() < end) {
+                w.processEvents(10);
+                serveSource();
+            }
+            return cond();
+        };
+
+        send(enter, 5L << 24, static_cast<long>(uriList), 0, 0);
+        send(position, 0, (static_cast<long>(rootX) << 16) | rootY, CurrentTime, static_cast<long>(copy));
+        TEST_ASSERT(exchange([&] { return accepted; }));
+        send(drop, 0, CurrentTime, 0, 0);
+        TEST_ASSERT(exchange([&] { return done; }));
+        TEST_ASSERT(doneOk);
+        // With no session, the screens answer a drop by asking to connect first.
+        TEST_ASSERT(pumpUntil(w, [&] {
+            ui::RecordingCanvas rc;
+            w.app().render(rc, 1220, 760, 0.0);
+            return rc.serialize().find("Connect to a remote desk first") != std::string::npos;
+        }));
+        XDestroyWindow(peer, source);
+    }
+    XCloseDisplay(peer);
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+#endif
+
 // A PlatformShell for headless screen tests: no window, a fixed clock, and switchable capabilities.
 class FakeShell : public ui::PlatformShell {
 public:
@@ -8513,6 +8628,16 @@ void testLinuxInputHelpers() {
     TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi(nullptr) == 1.0f);
     TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("abc") == 1.0f);
     TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("0") == 1.0f);
+
+    auto paths = UiPlatform::parseFileUriList("file:///home/a/b%20c.txt\r\n# comment\r\nhttps://example.com/x\r\n"
+                                              "file://host/tmp/x\r\nfile:///tmp/%E2%82%AC\n");
+    TEST_ASSERT(paths.size() == 3);
+    if (paths.size() == 3) {
+        TEST_ASSERT(paths[0] == "/home/a/b c.txt");
+        TEST_ASSERT(paths[1] == "/tmp/x");
+        TEST_ASSERT(paths[2] == "/tmp/\xE2\x82\xAC");
+    }
+    TEST_ASSERT(UiPlatform::parseFileUriList("").empty());
 }
 
 // Every screen's draw calls must match the committed goldens, so shared screen code cannot change how Windows
@@ -8665,6 +8790,7 @@ int main() {
 #if defined(__linux__)
         testLinuxWindow(); std::cout << "Test 75 done\n" << std::flush;
         testX11Clipboard(); std::cout << "Test 76 done\n" << std::flush;
+        testXdndDrop(); std::cout << "Test 77 done\n" << std::flush;
 #endif
 #if defined(_WIN32)
         testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;
