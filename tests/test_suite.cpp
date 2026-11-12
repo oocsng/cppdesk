@@ -13,6 +13,9 @@
 #include "../src/ui/app_ui.hpp"
 #include "../src/ui/vk_codes.hpp"
 #include "../src/ui/platform_shell.hpp"
+#if defined(__APPLE__)
+#include "../src/ui/canvas_cg.hpp"
+#endif
 #if defined(__linux__)
 #include "../src/ui/canvas_cairo.hpp"
 #include "../src/ui/ui_window.hpp"
@@ -7894,38 +7897,16 @@ void testD2DCanvas() {
 }
 #endif
 
-#if defined(__linux__)
-// Offscreen Cairo image surface the canvas draws into and the test reads back.
-struct CairoTarget {
-    cairo_surface_t* surface = nullptr;
-    int w = 0, h = 0;
-    CairoTarget(int width, int height) : w(width), h(height) {
-        surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
-    }
-    ~CairoTarget() { cairo_surface_destroy(surface); }
-    // Returns {b, g, r, a} at (x, y).
-    std::array<uint8_t, 4> pixel(int x, int y) const {
-        std::array<uint8_t, 4> out{};
-        cairo_surface_flush(surface);
-        const uint8_t* data = cairo_image_surface_get_data(surface);
-        std::memcpy(out.data(), data + y * cairo_image_surface_get_stride(surface) + x * 4, 4);
-        return out;
-    }
-    bool anyBrighter(int l, int t, int r, int b, int threshold) const {
-        for (int y = t; y < b; ++y)
-            for (int x = l; x < r; ++x)
-                if (pixel(x, y)[2] > threshold) return true;
-        return false;
-    }
-};
-
-void testCairoCanvas() {
-    std::cout << "[TEST 73] Cairo canvas backend (scene, images, state, arcs, text, speed)..." << std::endl;
+#if defined(__linux__) || defined(__APPLE__)
+// The checks every Canvas backend must pass. TargetT(w, h) owns an offscreen BGRA surface: handle() is what
+// CanvasT::attach takes, pixel(x, y) returns {b, g, r, a}, anyBrighter(l, t, r, b, threshold) tests the red channel.
+template <class CanvasT, class TargetT>
+void checkCanvasBackend() {
 
     {   // Scene: shapes, text and background land where expected.
-        CairoTarget target(200, 100);
-        ui::CairoCanvas canvas;
-        canvas.attach(target.surface, 1.0f);
+        TargetT target(200, 100);
+        CanvasT canvas;
+        canvas.attach(target.handle(), 1.0f);
         canvas.beginFrame(200, 100, ui::rgba(0, 0, 0));
         canvas.fillRoundRect({10, 10, 60, 60}, 4, ui::rgba(255, 0, 0));
         canvas.drawText("Hi", {100, 10, 190, 40}, ui::FontRole::Heading, ui::rgba(255, 255, 255), ui::HAlign::Leading, ui::VAlign::Center);
@@ -7938,9 +7919,9 @@ void testCairoCanvas() {
     }
 
     {   // Image resize and dirty-rectangle update.
-        CairoTarget target(64, 64);
-        ui::CairoCanvas canvas;
-        canvas.attach(target.surface, 1.0f);
+        TargetT target(64, 64);
+        CanvasT canvas;
+        canvas.attach(target.handle(), 1.0f);
         std::vector<uint8_t> red(16 * 16 * 4), green(32 * 8 * 4), blue(32 * 8 * 4);
         for (size_t i = 0; i < red.size(); i += 4) { red[i] = 0; red[i + 1] = 0; red[i + 2] = 255; red[i + 3] = 255; }
         for (size_t i = 0; i < green.size(); i += 4) { green[i] = 0; green[i + 1] = 255; green[i + 2] = 0; green[i + 3] = 255; }
@@ -7967,16 +7948,16 @@ void testCairoCanvas() {
     }
 
     {   // Detach/attach: stale images draw nothing and leftover state does not leak into the next frame.
-        CairoTarget first(32, 32), second(32, 32);
-        ui::CairoCanvas canvas;
-        canvas.attach(first.surface, 1.0f);
+        TargetT first(32, 32), second(32, 32);
+        CanvasT canvas;
+        canvas.attach(first.handle(), 1.0f);
         ui::ImageId stale = canvas.createImage(4, 4);
         canvas.beginFrame(32, 32, ui::rgba(0, 0, 0));
         canvas.pushClip({0, 0, 4, 4});
         canvas.setTransform(ui::Transform2D::scale(4, 4, 0, 0));
         canvas.endFrame();
         canvas.detach();
-        canvas.attach(second.surface, 1.0f);
+        canvas.attach(second.handle(), 1.0f);
         canvas.beginFrame(32, 32, ui::rgba(0, 0, 0));
         canvas.drawImage(stale, {0, 0, 32, 32}, 1.0f);
         canvas.fillRect({0, 0, 32, 32}, ui::rgba(255, 0, 0));
@@ -7987,9 +7968,9 @@ void testCairoCanvas() {
     }
 
     {   // A transform set inside a clip survives the clip's pop (as in Direct2D); opacity layers blend.
-        CairoTarget target(64, 64);
-        ui::CairoCanvas canvas;
-        canvas.attach(target.surface, 1.0f);
+        TargetT target(64, 64);
+        CanvasT canvas;
+        canvas.attach(target.handle(), 1.0f);
         canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
         canvas.pushClip({0, 0, 16, 16});
         canvas.setTransform(ui::Transform2D::scale(2, 2, 0, 0));
@@ -8009,9 +7990,9 @@ void testCairoCanvas() {
     }
 
     {   // A clockwise arc bulges up on a y-down screen.
-        CairoTarget target(60, 60);
-        ui::CairoCanvas canvas;
-        canvas.attach(target.surface, 1.0f);
+        TargetT target(60, 60);
+        CanvasT canvas;
+        canvas.attach(target.handle(), 1.0f);
         ui::Path p;
         p.moveTo(10, 30);
         p.arcTo(50, 30, 20, true, false);
@@ -8025,7 +8006,7 @@ void testCairoCanvas() {
     }
 
     {   // Text measurement, including CJK and emoji, and wrapping only where the role wraps.
-        ui::CairoCanvas canvas;
+        CanvasT canvas;
         const float w = canvas.measureTextWidth("Settings", ui::FontRole::Body);
         TEST_ASSERT(w > 40.0f && w < 70.0f);
         TEST_ASSERT(canvas.measureTextWidth("\xE6\xBC\xA2\xE5\xAD\x97\xF0\x9F\x98\x80", ui::FontRole::Body) > 0.0f);
@@ -8038,9 +8019,9 @@ void testCairoCanvas() {
 
     {   // At 2x, a label drawn in a rect exactly as wide as measured loses nothing (no clipped last glyph).
         auto ink = [](float rectWidth) {
-            CairoTarget target(400, 100);
-            ui::CairoCanvas canvas;
-            canvas.attach(target.surface, 2.0f);
+            TargetT target(400, 100);
+            CanvasT canvas;
+            canvas.attach(target.handle(), 2.0f);
             canvas.beginFrame(200, 50, ui::rgba(0, 0, 0));
             canvas.drawText("Settings", {10, 10, 10 + rectWidth, 40}, ui::FontRole::Body, ui::rgba(255, 255, 255),
                             ui::HAlign::Leading, ui::VAlign::Center);
@@ -8051,17 +8032,17 @@ void testCairoCanvas() {
             canvas.detach();
             return sum;
         };
-        CairoTarget probe(1, 1);
-        ui::CairoCanvas measurer;
-        measurer.attach(probe.surface, 2.0f);
+        TargetT probe(1, 1);
+        CanvasT measurer;
+        measurer.attach(probe.handle(), 2.0f);
         const float w = measurer.measureTextWidth("Settings", ui::FontRole::Body);
         TEST_ASSERT(ink(w) == ink(150.0f));
     }
 
     {   // A 1920x1080 remote frame updates and scales into a 1280x720 view well inside a 30 fps frame.
-        CairoTarget target(1280, 720);
-        ui::CairoCanvas canvas;
-        canvas.attach(target.surface, 1.0f);
+        TargetT target(1280, 720);
+        CanvasT canvas;
+        canvas.attach(target.handle(), 1.0f);
         std::vector<uint8_t> frame(1920 * 1080 * 4, 0x80);
         ui::ImageId id = canvas.createImage(1920, 1080, true);
         constexpr int kIters = 20;
@@ -8078,6 +8059,72 @@ void testCairoCanvas() {
         TEST_ASSERT(target.pixel(640, 360)[2] > 100);
         canvas.detach();
     }
+}
+#endif
+
+#if defined(__linux__)
+// Offscreen Cairo image surface the canvas draws into and the test reads back.
+struct CairoTarget {
+    cairo_surface_t* surface = nullptr;
+    int w = 0, h = 0;
+    CairoTarget(int width, int height) : w(width), h(height) {
+        surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    }
+    ~CairoTarget() { cairo_surface_destroy(surface); }
+    cairo_surface_t* handle() const { return surface; }
+    // Returns {b, g, r, a} at (x, y).
+    std::array<uint8_t, 4> pixel(int x, int y) const {
+        std::array<uint8_t, 4> out{};
+        cairo_surface_flush(surface);
+        const uint8_t* data = cairo_image_surface_get_data(surface);
+        std::memcpy(out.data(), data + y * cairo_image_surface_get_stride(surface) + x * 4, 4);
+        return out;
+    }
+    bool anyBrighter(int l, int t, int r, int b, int threshold) const {
+        for (int y = t; y < b; ++y)
+            for (int x = l; x < r; ++x)
+                if (pixel(x, y)[2] > threshold) return true;
+        return false;
+    }
+};
+
+void testCairoCanvas() {
+    std::cout << "[TEST 73] Cairo canvas backend (scene, images, state, arcs, text, speed)..." << std::endl;
+    checkCanvasBackend<ui::CairoCanvas, CairoTarget>();
+}
+#endif
+
+#if defined(__APPLE__)
+// Offscreen BGRA bitmap context the Core Graphics canvas draws into and the test reads back.
+struct CgTarget {
+    std::vector<uint8_t> data;
+    CGContextRef ctx = nullptr;
+    int w = 0, h = 0;
+    CgTarget(int width, int height) : data(static_cast<size_t>(width) * height * 4, 0), w(width), h(height) {
+        CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+        ctx = CGBitmapContextCreate(data.data(), w, h, 8, static_cast<size_t>(w) * 4, space,
+                                    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+        CGColorSpaceRelease(space);
+    }
+    ~CgTarget() { CGContextRelease(ctx); }
+    CGContextRef handle() const { return ctx; }
+    // Returns {b, g, r, a} at (x, y).
+    std::array<uint8_t, 4> pixel(int x, int y) const {
+        std::array<uint8_t, 4> out{};
+        std::memcpy(out.data(), data.data() + (static_cast<size_t>(y) * w + x) * 4, 4);
+        return out;
+    }
+    bool anyBrighter(int l, int t, int r, int b, int threshold) const {
+        for (int y = t; y < b; ++y)
+            for (int x = l; x < r; ++x)
+                if (pixel(x, y)[2] > threshold) return true;
+        return false;
+    }
+};
+
+void testCgCanvas() {
+    std::cout << "[TEST 80] Core Graphics canvas backend (scene, images, state, arcs, text, speed)..." << std::endl;
+    checkCanvasBackend<ui::CGCanvas, CgTarget>();
 }
 #endif
 
@@ -9113,6 +9160,9 @@ int main() {
         testUiGoldens(); std::cout << "Test 72 done\n" << std::flush;
 #if defined(__linux__)
         testCairoCanvas(); std::cout << "Test 73 done\n" << std::flush;
+#endif
+#if defined(__APPLE__)
+        testCgCanvas(); std::cout << "Test 80 done\n" << std::flush;
 #endif
         testLinuxInputHelpers(); std::cout << "Test 74 done\n" << std::flush;
 #if defined(__linux__)

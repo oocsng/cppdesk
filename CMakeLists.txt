@@ -85,6 +85,7 @@ elseif(APPLE)
 
     list(APPEND CORE_SOURCES
         src/simd/simd_fallback.cpp
+        src/ui/canvas_cg.cpp
     )
 
     find_library(LIB_ZSTD zstd REQUIRED)
@@ -98,6 +99,7 @@ elseif(APPLE)
     find_library(METAL_FRAMEWORK Metal REQUIRED)
     find_library(QUARTZ_CORE QuartzCore REQUIRED)
     find_library(CORE_GRAPHICS CoreGraphics REQUIRED)
+    find_library(CORE_TEXT CoreText REQUIRED)
     find_library(APP_SERVICES ApplicationServices REQUIRED)
     find_library(AUDIO_TOOLBOX AudioToolbox REQUIRED)
     find_library(SECURITY_FRAMEWORK Security REQUIRED)
@@ -106,6 +108,7 @@ elseif(APPLE)
 
     set(PLATFORM_LIBS
         ${CORE_GRAPHICS}
+        ${CORE_TEXT}
         ${APP_SERVICES}
         ${AUDIO_TOOLBOX}
         ${SECURITY_FRAMEWORK}
