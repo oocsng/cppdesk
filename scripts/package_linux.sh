@@ -31,12 +31,16 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 APPDIR="$WORK/AppDir"
 DESTDIR="$APPDIR" cmake --install "$BUILD" --prefix /usr
+# linuxdeploy leaves out libraries it assumes every desktop has. Pango needs FriBidi, which a minimal system
+# lacks, so carry it too.
+FRIBIDI=$(ldconfig -p | awk '/libfribidi\.so\.0 /{print $NF; exit}')
 (
     cd "$WORK"
     PATH="$TOOLS:$PATH" OUTPUT="CppDesk-x86_64.AppImage" "$TOOLS/linuxdeploy-x86_64.AppImage" \
         --appdir "$APPDIR" \
         --desktop-file "$APPDIR/usr/share/applications/cppdesk.desktop" \
         --icon-file "$APPDIR/usr/share/icons/hicolor/256x256/apps/cppdesk.png" \
+        ${FRIBIDI:+--library "$FRIBIDI"} \
         --output appimage
     mv CppDesk-x86_64.AppImage "$OUT/"
 )
