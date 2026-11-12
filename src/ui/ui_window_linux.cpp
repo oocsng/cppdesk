@@ -424,14 +424,17 @@ public:
     // worker thread with a posted result if that bothers anyone.
     std::optional<std::string> chooseOpenFile(const std::string& title, const std::string& filterName,
                                               const std::string& filterPattern) override {
-        if (auto r = spawn::output({ "zenity", "--file-selection", "--title=" + title,
-                                     "--file-filter=" + filterName + " | " + filterPattern, "--file-filter=All files | *" })) {
-            return r;
+        // Pick the tool up front: a cancelled zenity must not be followed by a second, kdialog dialog.
+        if (spawn::onPath("zenity")) {
+            return spawn::output({ "zenity", "--file-selection", "--title=" + title,
+                                   "--file-filter=" + filterName + " | " + filterPattern, "--file-filter=All files | *" });
         }
         return spawn::output({ "kdialog", "--title", title, "--getopenfilename", ".", filterPattern + "|" + filterName });
     }
     std::optional<std::string> chooseFolder(const std::string& title) override {
-        if (auto r = spawn::output({ "zenity", "--file-selection", "--directory", "--title=" + title })) return r;
+        if (spawn::onPath("zenity")) {
+            return spawn::output({ "zenity", "--file-selection", "--directory", "--title=" + title });
+        }
         return spawn::output({ "kdialog", "--title", title, "--getexistingdirectory", "." });
     }
     void openUrl(const std::string& url) override { spawn::detached({ "xdg-open", url }); }

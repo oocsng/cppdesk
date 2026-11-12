@@ -56,6 +56,9 @@ void CairoCanvas::attach(cairo_surface_t* target, float dpiScale) {
     detach();
     target_ = target;
     scale_ = dpiScale > 0.0f ? dpiScale : 1.0f;
+    // Measure at the scale text is drawn at, so hinting matches.
+    cairo_identity_matrix(measureCr_);
+    cairo_scale(measureCr_, scale_, scale_);
 }
 
 void CairoCanvas::detach() {
@@ -223,6 +226,13 @@ void CairoCanvas::strokePath(const Path& p, Color c, float width) {
 
 PangoLayout* CairoCanvas::layout(cairo_t* cr, std::string_view utf8, FontRole font) const {
     PangoLayout* l = pango_cairo_create_layout(cr);
+    // Metric hinting rounds advances per device pixel, so widths differ between scales; turn it off so a width
+    // measured for layout is the width drawn.
+    cairo_font_options_t* opts = cairo_font_options_create();
+    cairo_font_options_set_hint_metrics(opts, CAIRO_HINT_METRICS_OFF);
+    pango_cairo_context_set_font_options(pango_layout_get_context(l), opts);
+    cairo_font_options_destroy(opts);
+    pango_layout_context_changed(l);
     pango_layout_set_font_description(l, fonts_[static_cast<size_t>(font)]);
     pango_layout_set_text(l, utf8.data(), static_cast<int>(utf8.size()));
     return l;

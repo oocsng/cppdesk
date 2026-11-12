@@ -33,6 +33,7 @@ private:
     unsigned long win_ = 0;
     unsigned long clip_ = 0, utf8_ = 0, targets_ = 0, text_ = 0, incr_ = 0, prop_ = 0;
 
+    std::mutex getMutex_;   // serializes getText
     std::mutex m_;
     std::condition_variable cv_;
     std::string ours_;

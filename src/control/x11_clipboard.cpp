@@ -10,6 +10,31 @@
 
 namespace cppdesk {
 
+namespace {
+
+// UTF-8 to Latin-1; characters outside Latin-1 (and malformed bytes) become '?'.
+std::string toLatin1(const std::string& utf8) {
+    std::string out;
+    for (size_t i = 0; i < utf8.size();) {
+        const unsigned char c = static_cast<unsigned char>(utf8[i]);
+        if (c < 0x80) {
+            out.push_back(static_cast<char>(c));
+            ++i;
+        } else if ((c & 0xE0) == 0xC0 && i + 1 < utf8.size()) {
+            const unsigned cp = ((c & 0x1Fu) << 6) | (static_cast<unsigned char>(utf8[i + 1]) & 0x3Fu);
+            out.push_back(cp < 0x100 ? static_cast<char>(cp) : '?');
+            i += 2;
+        } else {
+            out.push_back('?');
+            const size_t len = (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 1;
+            i += len;
+        }
+    }
+    return out;
+}
+
+} // namespace
+
 X11Clipboard& X11Clipboard::instance() {
     static X11Clipboard clipboard;
     return clipboard;
@@ -55,6 +80,8 @@ bool X11Clipboard::setText(const std::string& utf8) {
 
 std::optional<std::string> X11Clipboard::getText(int timeoutMs) {
     if (!dpy_) return std::nullopt;
+    // One request at a time: replies share one property and one reply slot.
+    std::lock_guard<std::mutex> one(getMutex_);
     // Ask the server: our SelectionClear may not have been handled yet when another app has just copied.
     const bool ownedNow = XGetSelectionOwner(dpy_, clip_) == win_;
     std::unique_lock<std::mutex> lock(m_);
@@ -103,6 +130,7 @@ void X11Clipboard::run() {
                                 reinterpret_cast<const unsigned char*>(offered), 4);
                 reply.xselection.property = property;
             } else if (own && fits && (req.target == utf8_ || req.target == text_ || req.target == XA_STRING)) {
+                if (req.target == XA_STRING) text = toLatin1(text);   // STRING is Latin-1 by definition
                 XChangeProperty(dpy_, req.requestor, property, req.target == XA_STRING ? XA_STRING : utf8_, 8,
                                 PropModeReplace, reinterpret_cast<const unsigned char*>(text.data()),
                                 static_cast<int>(text.size()));

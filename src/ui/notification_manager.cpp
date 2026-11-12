@@ -177,7 +177,8 @@ void NotificationManager::notify(
 #if defined(__linux__)
     // The desktop's notification service, through its standard command-line client (silently absent if missing).
     if (settings.enablePushNotifications) {
-        spawn::detached({ "notify-send", "-a", "CppDesk", title.empty() ? appTitle_ : title, message });
+        // "--": a title or message from a peer that starts with '-' is text, not an option.
+        spawn::detached({ "notify-send", "-a", "CppDesk", "--", title.empty() ? appTitle_ : title, message });
     }
 #else
     (void)title;

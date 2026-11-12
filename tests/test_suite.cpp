@@ -8022,6 +8022,28 @@ void testCairoCanvas() {
                     canvas.measureTextBlock("Hi", ui::FontRole::Body, 120).y * 1.5f);
     }
 
+    {   // At 2x, a label drawn in a rect exactly as wide as measured loses nothing (no clipped last glyph).
+        auto ink = [](float rectWidth) {
+            CairoTarget target(400, 100);
+            ui::CairoCanvas canvas;
+            canvas.attach(target.surface, 2.0f);
+            canvas.beginFrame(200, 50, ui::rgba(0, 0, 0));
+            canvas.drawText("Settings", {10, 10, 10 + rectWidth, 40}, ui::FontRole::Body, ui::rgba(255, 255, 255),
+                            ui::HAlign::Leading, ui::VAlign::Center);
+            canvas.endFrame();
+            long sum = 0;
+            for (int y = 0; y < 100; ++y)
+                for (int x = 0; x < 400; ++x) sum += target.pixel(x, y)[2];
+            canvas.detach();
+            return sum;
+        };
+        CairoTarget probe(1, 1);
+        ui::CairoCanvas measurer;
+        measurer.attach(probe.surface, 2.0f);
+        const float w = measurer.measureTextWidth("Settings", ui::FontRole::Body);
+        TEST_ASSERT(ink(w) == ink(150.0f));
+    }
+
     {   // A 1920x1080 remote frame updates and scales into a 1280x720 view well inside a 30 fps frame.
         CairoTarget target(1280, 720);
         ui::CairoCanvas canvas;
@@ -8358,8 +8380,25 @@ void testX11Clipboard() {
         }
     });
     TEST_ASSERT(ClipboardManager::getClipboardUtf8() == "from another app");
+    // A UI paste and a clipboard-sync poll can read at the same time; each must get the text.
+    {
+        std::atomic<int> wrong{0};
+        auto reader = [&] {
+            for (int i = 0; i < 20; ++i) {
+                if (ClipboardManager::getClipboardUtf8() != "from another app") ++wrong;
+            }
+        };
+        std::thread a(reader), b(reader);
+        a.join();
+        b.join();
+        TEST_ASSERT(wrong.load() == 0);
+    }
     stop = true;
     server.join();
+
+    // Old apps asking for STRING get Latin-1, as the X spec defines it.
+    TEST_ASSERT(ClipboardManager::setClipboardUtf8("\xC3\xA9"));
+    TEST_ASSERT(requestClipboard(peer, pw, XA_STRING) == std::string("\xE9"));
 
     XDestroyWindow(peer, pw);
     XCloseDisplay(peer);
@@ -8684,7 +8723,12 @@ void testLinuxNotifications() {
     AppSettings s{};
     s.enablePushNotifications = true;
     n.notify(NotificationType::IncomingConnection, "Connection Request", "Desk 123 wants to connect", s);
-    TEST_ASSERT(readLog(2000) == "-a\nCppDesk\nConnection Request\nDesk 123 wants to connect\n");
+    TEST_ASSERT(readLog(2000) == "-a\nCppDesk\n--\nConnection Request\nDesk 123 wants to connect\n");
+
+    // A title or message from a peer that starts with '-' is shown as text, not read as an option.
+    fs::remove(log, ec);
+    n.notify(NotificationType::ChatMessage, "-oops", "-x", s);
+    TEST_ASSERT(readLog(2000) == "-a\nCppDesk\n--\n-oops\n-x\n");
 
     fs::remove(log, ec);
     n.setMuted(true);
