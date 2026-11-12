@@ -312,7 +312,18 @@ struct CppDeskWindowMacImpl {
         }
         return;
     }
-    [self interpretKeyEvents:@[ event ]];   // text arrives through insertText: and doCommandBySelector: below
+    if (!marked_.length) {
+        // Return, Delete, Tab and Escape are commands to AppKit's text system; Windows' WM_CHAR gives them as
+        // characters, which is what the screens expect. (While an input method is composing it gets them instead.)
+        switch (event.keyCode) {
+            case 0x24: case 0x4C: impl_->app->onText("\r"); return;
+            case 0x33: impl_->app->onText("\b"); return;
+            case 0x30: impl_->app->onText("\t"); return;
+            case 0x35: impl_->app->onText("\x1b"); return;
+            default: break;
+        }
+    }
+    [self interpretKeyEvents:@[ event ]];   // typed text arrives through insertText: below
 }
 
 - (void)keyUp:(NSEvent*)event {
@@ -343,15 +354,8 @@ struct CppDeskWindowMacImpl {
     impl_->app->onKey(cppdesk::KeyEvent{ vk, 0, down, InputInjector::isExtendedVk(vk) });
 }
 
-// Return, Delete and the like are commands to AppKit; Windows' WM_CHAR gives them as characters, which is what
-// the screens expect.
-- (void)doCommandBySelector:(SEL)selector {
-    if (!impl_ || !impl_->app) return;
-    if (selector == @selector(insertNewline:)) impl_->app->onText("\r");
-    else if (selector == @selector(deleteBackward:)) impl_->app->onText("\b");
-    else if (selector == @selector(insertTab:)) impl_->app->onText("\t");
-    else if (selector == @selector(cancelOperation:)) impl_->app->onText("\x1b");
-}
+// Cursor movement and the like reach the screens as key events; swallow the commands so AppKit does not beep.
+- (void)doCommandBySelector:(SEL)selector {}
 
 // NSTextInputClient. Composition (marked text) is tracked so input methods work, but only the committed text is
 // drawn: the screens have no preedit display.
