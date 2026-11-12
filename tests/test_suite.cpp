@@ -8250,6 +8250,98 @@ void testLinuxWindow() {
 }
 #endif
 
+#if defined(__linux__)
+// Asks the CLIPBOARD owner for `target` the way another X app does; nullopt if it refused or never answered.
+std::optional<std::string> requestClipboard(Display* d, Window requestor, Atom target) {
+    const Atom clip = XInternAtom(d, "CLIPBOARD", False), prop = XInternAtom(d, "CPPDESK_TEST_PROP", False);
+    XConvertSelection(d, clip, target, prop, requestor, CurrentTime);
+    XFlush(d);
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    XEvent ev;
+    while (std::chrono::steady_clock::now() < end) {
+        if (!XCheckTypedWindowEvent(d, requestor, SelectionNotify, &ev)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+        if (ev.xselection.property == None) return std::nullopt;
+        Atom type = 0;
+        int format = 0;
+        unsigned long count = 0, after = 0;
+        unsigned char* data = nullptr;
+        XGetWindowProperty(d, requestor, prop, 0, 1 << 20, True, AnyPropertyType, &type, &format, &count, &after, &data);
+        std::string out;
+        if (data) out.assign(reinterpret_cast<char*>(data), count * static_cast<unsigned long>(format / 8));
+        if (data) XFree(data);
+        return out;
+    }
+    return std::nullopt;
+}
+
+void testX11Clipboard() {
+    std::cout << "[TEST 76] Clipboard text goes through the X11 CLIPBOARD selection..." << std::endl;
+    Display* peer = XOpenDisplay(nullptr);
+    if (!peer) {
+        std::cout << "  SKIP: no X display\n";
+        return;
+    }
+    const Window pw = XCreateSimpleWindow(peer, DefaultRootWindow(peer), 0, 0, 1, 1, 0, 0, 0);
+    const Atom utf8 = XInternAtom(peer, "UTF8_STRING", False), targets = XInternAtom(peer, "TARGETS", False);
+    const Atom clip = XInternAtom(peer, "CLIPBOARD", False);
+
+    // Copying in CppDesk reaches other apps.
+    const std::string copied = "Z\xC3\xA9\xF0\x9F\x98\x80 copy";
+    TEST_ASSERT(ClipboardManager::setClipboardUtf8(copied));
+    TEST_ASSERT(requestClipboard(peer, pw, utf8) == copied);
+    auto offered = requestClipboard(peer, pw, targets);
+    TEST_ASSERT(offered.has_value());
+    if (offered) {
+        bool hasUtf8 = false;
+        for (size_t i = 0; i + sizeof(Atom) <= offered->size(); i += sizeof(Atom)) {
+            Atom a;
+            std::memcpy(&a, offered->data() + i, sizeof(Atom));
+            hasUtf8 = hasUtf8 || a == utf8;
+        }
+        TEST_ASSERT(hasUtf8);
+    }
+
+    // Another app copies; CppDesk reads its text.
+    XSetSelectionOwner(peer, clip, pw, CurrentTime);
+    XFlush(peer);
+    std::atomic<bool> stop{false};
+    std::thread server([&] {
+        const std::string theirs = "from another app";
+        while (!stop.load()) {
+            XEvent ev;
+            if (!XCheckTypedWindowEvent(peer, pw, SelectionRequest, &ev)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            XSelectionRequestEvent& req = ev.xselectionrequest;
+            XEvent reply{};
+            reply.xselection.type = SelectionNotify;
+            reply.xselection.requestor = req.requestor;
+            reply.xselection.selection = req.selection;
+            reply.xselection.target = req.target;
+            reply.xselection.time = req.time;
+            reply.xselection.property = None;
+            if (req.target == utf8) {
+                XChangeProperty(peer, req.requestor, req.property, utf8, 8, PropModeReplace,
+                                reinterpret_cast<const unsigned char*>(theirs.data()), static_cast<int>(theirs.size()));
+                reply.xselection.property = req.property;
+            }
+            XSendEvent(peer, req.requestor, False, NoEventMask, &reply);
+            XFlush(peer);
+        }
+    });
+    TEST_ASSERT(ClipboardManager::getClipboardUtf8() == "from another app");
+    stop = true;
+    server.join();
+
+    XDestroyWindow(peer, pw);
+    XCloseDisplay(peer);
+}
+#endif
+
 // A PlatformShell for headless screen tests: no window, a fixed clock, and switchable capabilities.
 class FakeShell : public ui::PlatformShell {
 public:
@@ -8572,6 +8664,7 @@ int main() {
         testLinuxInputHelpers(); std::cout << "Test 74 done\n" << std::flush;
 #if defined(__linux__)
         testLinuxWindow(); std::cout << "Test 75 done\n" << std::flush;
+        testX11Clipboard(); std::cout << "Test 76 done\n" << std::flush;
 #endif
 #if defined(_WIN32)
         testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;

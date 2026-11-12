@@ -125,6 +125,7 @@ elseif(UNIX AND NOT APPLE)
 
     list(APPEND CORE_SOURCES
         src/ui/canvas_cairo.cpp
+        src/control/x11_clipboard.cpp
     )
 
     set(PLATFORM_LIBS

@@ -17,6 +17,7 @@
 #else
 #include <unistd.h>
 #include <cstdlib>
+#include "x11_clipboard.hpp"
 #endif
 
 #include <filesystem>
@@ -503,11 +504,17 @@ static std::string g_posixClipboardText;
 static std::mutex g_posixClipboardMutex;
 
 std::string ClipboardManager::getClipboardUtf8() {
+#if defined(__linux__)
+    if (X11Clipboard::instance().available()) return X11Clipboard::instance().getText().value_or("");
+#endif
     std::lock_guard<std::mutex> lock(g_posixClipboardMutex);
     return g_posixClipboardText;
 }
 
 bool ClipboardManager::setClipboardUtf8(const std::string& utf8Text) {
+#if defined(__linux__)
+    if (X11Clipboard::instance().available()) return X11Clipboard::instance().setText(utf8Text);
+#endif
     std::lock_guard<std::mutex> lock(g_posixClipboardMutex);
     g_posixClipboardText = utf8Text;
     return true;
