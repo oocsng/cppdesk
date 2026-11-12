@@ -611,7 +611,9 @@ void testAppSettingsAndAdaptiveFps() {
 
 void testAvx2SimdAssemblyKernels() {
     std::cout << "[TEST 7] x86-64 AVX2 Assembly SIMD Kernels (Tile Diff, Tile Hash & Stream Cipher)...\n";
-    TEST_ASSERT(SimdKernels::hasAvx2());
+#if defined(__x86_64__) || defined(_M_X64)
+    TEST_ASSERT(SimdKernels::hasAvx2());   // ARM (Apple Silicon) has none: the kernels below run their scalar fallbacks
+#endif
 
     const int W = 64;
     const int H = 64;

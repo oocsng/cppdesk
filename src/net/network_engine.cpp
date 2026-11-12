@@ -38,6 +38,11 @@
 #if !defined(_WIN32)
 #include <csignal>
 #include <sys/statvfs.h>
+#if defined(__APPLE__)
+#include <libproc.h>
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#endif
 #include <sys/types.h>
 #include <unistd.h>
 #include <cctype>
@@ -5991,7 +5996,7 @@ void NetworkEngine::hostTunnelProxyLoop() {
 
 // ---------------- Remote Hardware Diagnostics & Live Process Telemetry ----------------
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__APPLE__)
 namespace {
 
 // Reads the host's real numbers from /proc and statvfs. Anything that cannot be read stays zero or empty.
@@ -6093,6 +6098,110 @@ void sampleLinuxDiagnostics(SystemDiagnosticsPayload& diag) {
         std::ifstream up("/proc/uptime");
         double seconds = 0;
         if (up >> seconds) diag.uptimeSeconds = static_cast<uint64_t>(seconds);
+    }
+}
+
+} // namespace
+#elif defined(__APPLE__)
+namespace {
+
+std::string macSysctlString(const char* name) {
+    size_t len = 0;
+    if (sysctlbyname(name, nullptr, &len, nullptr, 0) != 0 || len == 0) return {};
+    std::string out(len, ' ');
+    if (sysctlbyname(name, out.data(), &len, nullptr, 0) != 0) return {};
+    out.resize(strnlen(out.c_str(), len));
+    return out;
+}
+
+// The host's real numbers from sysctl, Mach and libproc. Anything that cannot be read stays zero or empty.
+void sampleMacDiagnostics(SystemDiagnosticsPayload& diag) {
+    // CPU: share of non-idle ticks since the previous sample (zero on the first call).
+    {
+        static std::mutex s_mutex;
+        static uint64_t s_prevTotal = 0, s_prevIdle = 0;
+        host_cpu_load_info_data_t load{};
+        mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
+        if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, reinterpret_cast<host_info_t>(&load), &count) == KERN_SUCCESS) {
+            const uint64_t idle = load.cpu_ticks[CPU_STATE_IDLE];
+            const uint64_t total = static_cast<uint64_t>(load.cpu_ticks[CPU_STATE_USER]) + load.cpu_ticks[CPU_STATE_SYSTEM] +
+                                   load.cpu_ticks[CPU_STATE_NICE] + idle;
+            std::lock_guard<std::mutex> lock(s_mutex);
+            if (s_prevTotal != 0 && total > s_prevTotal) {
+                const double busy = static_cast<double>((total - s_prevTotal) - (idle - s_prevIdle));
+                diag.cpuUsagePercent = static_cast<float>(std::clamp(100.0 * busy / static_cast<double>(total - s_prevTotal), 0.0, 100.0));
+            }
+            s_prevTotal = total;
+            s_prevIdle = idle;
+        }
+    }
+
+    // Memory: used = total minus free, inactive and speculative pages.
+    {
+        uint64_t total = 0;
+        size_t len = sizeof(total);
+        sysctlbyname("hw.memsize", &total, &len, nullptr, 0);
+        diag.ramTotalBytes = total;
+        vm_statistics64_data_t vm{};
+        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+        if (total != 0 && host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm), &count) == KERN_SUCCESS) {
+            const uint64_t availableBytes = (static_cast<uint64_t>(vm.free_count) + vm.inactive_count + vm.speculative_count) * vm_page_size;
+            diag.ramUsedBytes = total > availableBytes ? total - availableBytes : 0;
+        }
+    }
+
+    // Disk: the root filesystem
+    {
+        struct statvfs fs{};
+        if (statvfs("/", &fs) == 0) {
+            diag.diskTotalBytes = static_cast<uint64_t>(fs.f_blocks) * fs.f_frsize;
+            const uint64_t freeBytes = static_cast<uint64_t>(fs.f_bfree) * fs.f_frsize;
+            diag.diskUsedBytes = diag.diskTotalBytes >= freeBytes ? diag.diskTotalBytes - freeBytes : 0;
+        }
+    }
+
+    // Processes by resident memory (libproc lists the ones this user may inspect)
+    {
+        std::vector<pid_t> pids(2048);
+        const int bytes = proc_listallpids(pids.data(), static_cast<int>(pids.size() * sizeof(pid_t)));
+        const int n = bytes > 0 ? bytes / static_cast<int>(sizeof(pid_t)) : 0;
+        std::vector<ProcessTelemetryItem> candidates;
+        for (int i = 0; i < n; ++i) {
+            if (pids[i] <= 0) continue;
+            proc_taskinfo info{};
+            if (proc_pidinfo(pids[i], PROC_PIDTASKINFO, 0, &info, sizeof(info)) != static_cast<int>(sizeof(info))) continue;
+            ProcessTelemetryItem item;
+            item.pid = static_cast<uint32_t>(pids[i]);
+            char name[256] = {};
+            if (proc_name(pids[i], name, sizeof(name)) > 0) item.name = name;
+            if (item.name.empty()) item.name = "Unknown";
+            item.workingSetBytes = info.pti_resident_size;
+            candidates.push_back(std::move(item));
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const ProcessTelemetryItem& a, const ProcessTelemetryItem& b) {
+            return a.workingSetBytes > b.workingSetBytes;
+        });
+        diag.processes.assign(candidates.begin(), candidates.begin() + std::min<size_t>(candidates.size(), 60));
+    }
+
+    // Hardware and OS
+    {
+        diag.cpuModel = macSysctlString("machdep.cpu.brand_string");
+        int cores = 0;
+        size_t len = sizeof(cores);
+        sysctlbyname("hw.logicalcpu", &cores, &len, nullptr, 0);
+        diag.cpuCores = cores > 0 ? static_cast<uint32_t>(cores) : static_cast<uint32_t>(std::max(1u, std::thread::hardware_concurrency()));
+        const std::string os = macSysctlString("kern.osproductversion");
+        diag.osVersion = os.empty() ? "macOS" : "macOS " + os;
+        // shortcut: no GPU probe off Windows, so the sheet says so instead of guessing.
+        diag.gpuModel = "Not detected";
+        struct timeval boot{};
+        len = sizeof(boot);
+        int mib[2] = { CTL_KERN, KERN_BOOTTIME };
+        if (sysctl(mib, 2, &boot, &len, nullptr, 0) == 0 && boot.tv_sec > 0) {
+            const time_t now = std::time(nullptr);
+            diag.uptimeSeconds = now > boot.tv_sec ? static_cast<uint64_t>(now - boot.tv_sec) : 0;
+        }
     }
 }
 
@@ -6311,6 +6420,8 @@ SystemDiagnosticsPayload NetworkEngine::sampleHostDiagnostics() {
     }
 
     diag.uptimeSeconds = GetTickCount64() / 1000;
+#elif defined(__APPLE__)
+    sampleMacDiagnostics(diag);
 #else
     sampleLinuxDiagnostics(diag);
 #endif

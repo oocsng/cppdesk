@@ -13,6 +13,7 @@
 #if __has_include(<CoreGraphics/CoreGraphics.h>)
 #include <CoreGraphics/CoreGraphics.h>
 #include <ApplicationServices/ApplicationServices.h>
+#include <ImageIO/ImageIO.h>
 #else
 typedef uint32_t CGDirectDisplayID;
 typedef struct CGImage* CGImageRef;
@@ -465,6 +466,92 @@ bool TileCodec::decodeJpegIntoCanvas(
 
     jpeg_finish_decompress(&cinfo);
     jpeg_destroy_decompress(&cinfo);
+    return true;
+}
+
+#elif defined(__APPLE__) && __has_include(<ImageIO/ImageIO.h>)
+
+// JPEG through ImageIO, so macOS needs no libjpeg. Pixels are BGRA like everywhere else (32-bit little-endian,
+// alpha first); decoded images are forced opaque.
+std::vector<uint8_t> TileCodec::encodeJpeg(const uint8_t* bgra, int width, int height, int quality) {
+    if (!bgra || width <= 0 || height <= 0) return {};
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGDataProviderRef provider = CGDataProviderCreateWithData(nullptr, bgra, static_cast<size_t>(width) * height * 4, nullptr);
+    CGImageRef image = CGImageCreate(width, height, 8, 32, static_cast<size_t>(width) * 4, space,
+                                     kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little, provider, nullptr,
+                                     false, kCGRenderingIntentDefault);
+    std::vector<uint8_t> out;
+    if (image) {
+        CFMutableDataRef data = CFDataCreateMutable(kCFAllocatorDefault, 0);
+        CGImageDestinationRef dest = CGImageDestinationCreateWithData(data, CFSTR("public.jpeg"), 1, nullptr);
+        if (dest) {
+            const float q = std::clamp(quality, 1, 100) / 100.0f;
+            CFNumberRef qn = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloat32Type, &q);
+            const void* keys[] = { kCGImageDestinationLossyCompressionQuality };
+            const void* values[] = { qn };
+            CFDictionaryRef props = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1,
+                                                       &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            CGImageDestinationAddImage(dest, image, props);
+            if (CGImageDestinationFinalize(dest)) {
+                const uint8_t* p = CFDataGetBytePtr(data);
+                out.assign(p, p + CFDataGetLength(data));
+            }
+            CFRelease(props);
+            CFRelease(qn);
+            CFRelease(dest);
+        }
+        CFRelease(data);
+        CGImageRelease(image);
+    }
+    CGDataProviderRelease(provider);
+    CGColorSpaceRelease(space);
+    return out;
+}
+
+bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<uint8_t>& outBgra, int& outW, int& outH) {
+    if (!jpegData || jpegLen == 0) return false;
+    CFDataRef data = CFDataCreate(kCFAllocatorDefault, jpegData, static_cast<CFIndex>(jpegLen));
+    CGImageSourceRef source = CGImageSourceCreateWithData(data, nullptr);
+    CGImageRef image = source ? CGImageSourceCreateImageAtIndex(source, 0, nullptr) : nullptr;
+    bool ok = false;
+    if (image) {
+        const int w = static_cast<int>(CGImageGetWidth(image)), h = static_cast<int>(CGImageGetHeight(image));
+        if (w > 0 && h > 0) {
+            outBgra.assign(static_cast<size_t>(w) * h * 4, 0);
+            CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+            CGContextRef ctx = CGBitmapContextCreate(outBgra.data(), w, h, 8, static_cast<size_t>(w) * 4, space,
+                                                     kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+            if (ctx) {
+                CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), image);
+                CGContextRelease(ctx);
+                for (size_t i = 3; i < outBgra.size(); i += 4) outBgra[i] = 0xFF;
+                outW = w;
+                outH = h;
+                ok = true;
+            }
+            CGColorSpaceRelease(space);
+        }
+        CGImageRelease(image);
+    }
+    if (source) CFRelease(source);
+    CFRelease(data);
+    return ok;
+}
+
+bool TileCodec::decodeJpegIntoCanvas(
+    const uint8_t* jpegData, size_t jpegLen,
+    uint8_t* canvasBgra, int canvasW, int canvasH,
+    uint16_t x, uint16_t y, uint16_t width, uint16_t height)
+{
+    if (!jpegData || jpegLen == 0 || !canvasBgra || width == 0 || height == 0) return false;
+    if (static_cast<int>(x) + width > canvasW || static_cast<int>(y) + height > canvasH) return false;
+    std::vector<uint8_t> tile;
+    int w = 0, h = 0;
+    if (!decodeJpeg(jpegData, jpegLen, tile, w, h) || w != width || h != height) return false;
+    for (int r = 0; r < height; ++r) {
+        uint8_t* dstRow = canvasBgra + (static_cast<size_t>(y + r) * canvasW + x) * 4;
+        SimdKernels::blitRowBgraOpaque(dstRow, tile.data() + static_cast<size_t>(r) * width * 4, width);
+    }
     return true;
 }
 
