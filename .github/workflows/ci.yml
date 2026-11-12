@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, macos-ui]
   pull_request:
 
 jobs:
