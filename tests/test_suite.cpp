@@ -15,6 +15,8 @@
 #include "../src/ui/platform_shell.hpp"
 #if defined(__APPLE__)
 #include "../src/ui/canvas_cg.hpp"
+#include "mac_test_driver.hpp"
+#include "../src/ui/ui_window.hpp"
 #endif
 #if defined(__linux__)
 #include "../src/ui/canvas_cairo.hpp"
@@ -8128,7 +8130,7 @@ void testCgCanvas() {
 }
 #endif
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 // Pumps the window's loop until cond() holds or timeoutMs passes.
 template <typename Cond>
 bool pumpUntil(CppDeskWindow& w, Cond cond, int timeoutMs = 2000) {
@@ -8165,6 +8167,9 @@ bool textInField(AppUi& app, float wDip, float hDip, const std::string& text, co
     return r && r->top < field.bottom && r->bottom > field.top && r->left < field.right && r->right > field.left;
 }
 
+#endif
+
+#if defined(__linux__)
 void sendButton(Display* d, Window win, int x, int y) {
     for (int type : { ButtonPress, ButtonRelease }) {
         XEvent ev{};
@@ -8346,6 +8351,56 @@ void testLinuxWindow() {
     std::filesystem::remove(id.configFilePath(), ec);
 }
 #endif
+
+#if defined(__APPLE__)
+void testMacWindow() {
+    std::cout << "[TEST 81] macOS window drives the screens..." << std::endl;
+    IdentityManager id(4249);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    const float wDip = 1220.0f, hDip = 760.0f;
+    {
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        TEST_ASSERT(w.nativeWindow() != nullptr);
+        pump(w, 300);
+        TEST_ASSERT(macWindowDrewVariedPixels(w.nativeWindow()));
+
+        // Click the desk search box and type into it: once each, not twice (keyDown and the text input client).
+        auto field = findTextRect(w.app(), wDip, hDip, "Search desks...");
+        TEST_ASSERT(field.has_value());
+        if (field) {
+            macClick(w.nativeWindow(), (field->left + field->right) / 2, (field->top + field->bottom) / 2);
+            pump(w, 100);
+            macType(w.nativeWindow(), "z", 0x06);
+            macType(w.nativeWindow(), "q", 0x0C);
+            TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wDip, hDip, "zq", *field); }));
+            macType(w.nativeWindow(), "", 0x33);   // Delete (Backspace)
+            TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wDip, hDip, "z", *field); }));
+        }
+
+        // A post from another thread wakes the loop at once.
+        std::atomic<bool> ran{false};
+        std::thread poster([&] { w.post([&] { ran = true; }); });
+        poster.join();
+        w.processEvents(1000);
+        TEST_ASSERT(ran.load());
+
+        // Closing ends the loop, and work posted after that is dropped, not run.
+        w.requestQuit();
+        TEST_ASSERT(pumpUntil(w, [] { return false; }, 1000) == false);
+        TEST_ASSERT(!w.processEvents(0));
+        w.close();
+        bool lateRan = false;
+        w.post([&] { lateRan = true; });
+        w.processEvents(0);
+        TEST_ASSERT(!lateRan);
+    }
+}
+#endif
+
 
 #if defined(__linux__)
 // Asks the CLIPBOARD owner for `target` the way another X app does; nullopt if it refused or never answered.
@@ -9013,6 +9068,25 @@ void testLinuxInputHelpers() {
         TEST_ASSERT(paths[2] == "/tmp/\xE2\x82\xAC");
     }
     TEST_ASSERT(UiPlatform::parseFileUriList("").empty());
+    // macOS key codes: letters and editing keys map back to the Windows key; every Command and Control key is
+    // Ctrl, so the shortcuts the screens know (K, V, A, C) work with the Mac's Command key.
+    TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(0x00) == 0x41);   // A
+    TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(0x28) == 0x4B);   // K
+    TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(0x24) == 0x0D);   // Return
+    TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(0x33) == 0x08);   // Delete (Backspace)
+    TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(0x38) == 0x10);   // Shift -> generic VK_SHIFT
+    TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(0x3C) == 0x10);   // right Shift
+    TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(0x3A) == 0x12);   // Option -> VK_MENU
+    TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(0x3B) == 0x11);   // Control -> VK_CONTROL
+    TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(0x37) == 0x11);   // Command -> VK_CONTROL
+    TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(0x36) == 0x11);   // right Command
+    TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(0xFF) == 0);      // no such key
+    {
+        const uint16_t roundTrip[] = { 0x08, 0x09, 0x0D, 0x1B, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2E };
+        for (uint16_t vk : roundTrip) TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(InputInjector::mapVkToMacKeyCode(vk)) == vk);
+        for (uint16_t vk = 0x30; vk <= 0x39; ++vk) TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(InputInjector::mapVkToMacKeyCode(vk)) == vk);
+        for (uint16_t vk = 0x41; vk <= 0x5A; ++vk) TEST_ASSERT(InputInjector::mapMacKeyCodeToVk(InputInjector::mapVkToMacKeyCode(vk)) == vk);
+    }
 }
 
 // Every screen's draw calls must match the committed goldens, so shared screen code cannot change how Windows
@@ -9171,6 +9245,9 @@ int main() {
         testXdndDrop(); std::cout << "Test 77 done\n" << std::flush;
         testLinuxTray(); std::cout << "Test 78 done\n" << std::flush;
         testLinuxNotifications(); std::cout << "Test 79 done\n" << std::flush;
+#endif
+#if defined(__APPLE__)
+        testMacWindow(); std::cout << "Test 81 done\n" << std::flush;
 #endif
 #if defined(_WIN32)
         testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;
