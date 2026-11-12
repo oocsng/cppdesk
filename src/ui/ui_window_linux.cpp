@@ -483,6 +483,7 @@ public:
 
     bool has(ui::Capability c) const override {
         if (c == ui::Capability::TrayIcon) return w_ && w_->trayDocked();
+        if (c == ui::Capability::NativeNotifications) return spawn::onPath("notify-send");
         return false;   // the Windows-only controls stay hidden
     }
 

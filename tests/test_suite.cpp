@@ -8626,6 +8626,62 @@ void testLinuxTray() {
 }
 #endif
 
+#if defined(__linux__)
+void testLinuxNotifications() {
+    std::cout << "[TEST 79] Notifications go to the desktop through notify-send..." << std::endl;
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "cppdesk-notify-test";
+    const fs::path log = dir / "calls.txt";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    {
+        std::ofstream script(dir / "notify-send");
+        script << "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '" << log.string() << "'\n";
+    }
+    fs::permissions(dir / "notify-send", fs::perms::owner_all);
+    const std::string oldPath = std::getenv("PATH") ? std::getenv("PATH") : "";
+    setenv("PATH", (dir.string() + ":" + oldPath).c_str(), 1);
+
+    auto readLog = [&](int waitMs) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMs);
+        std::string text;
+        do {
+            std::ifstream in(log);
+            text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            if (!text.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        } while (std::chrono::steady_clock::now() < end);
+        return text;
+    };
+
+    NotificationManager n;
+    n.init(nullptr, nullptr, "CppDesk");
+    AppSettings s{};
+    s.enablePushNotifications = true;
+    n.notify(NotificationType::IncomingConnection, "Connection Request", "Desk 123 wants to connect", s);
+    TEST_ASSERT(readLog(2000) == "-a\nCppDesk\nConnection Request\nDesk 123 wants to connect\n");
+
+    fs::remove(log, ec);
+    n.setMuted(true);
+    n.notify(NotificationType::ChatMessage, "Muted", "nothing", s);
+    TEST_ASSERT(readLog(300).empty());
+    n.setMuted(false);
+    s.enablePushNotifications = false;
+    n.notify(NotificationType::ChatMessage, "Off", "nothing", s);
+    TEST_ASSERT(readLog(300).empty());
+
+    // Without notify-send nothing happens and nothing breaks.
+    setenv("PATH", "/nonexistent", 1);
+    s.enablePushNotifications = true;
+    n.notify(NotificationType::ChatMessage, "Missing", "tool", s);
+    TEST_ASSERT(readLog(300).empty());
+
+    setenv("PATH", oldPath.c_str(), 1);
+    fs::remove_all(dir, ec);
+}
+#endif
+
 // A PlatformShell for headless screen tests: no window, a fixed clock, and switchable capabilities.
 class FakeShell : public ui::PlatformShell {
 public:
@@ -8961,6 +9017,7 @@ int main() {
         testX11Clipboard(); std::cout << "Test 76 done\n" << std::flush;
         testXdndDrop(); std::cout << "Test 77 done\n" << std::flush;
         testLinuxTray(); std::cout << "Test 78 done\n" << std::flush;
+        testLinuxNotifications(); std::cout << "Test 79 done\n" << std::flush;
 #endif
 #if defined(_WIN32)
         testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;

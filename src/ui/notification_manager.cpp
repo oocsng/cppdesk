@@ -1,4 +1,5 @@
 #include "notification_manager.hpp"
+#include "../core/spawn.hpp"
 
 #include <vector>
 
@@ -167,11 +168,22 @@ void NotificationManager::shutdown() {}
 
 void NotificationManager::notify(
     NotificationType type,
-    const std::string& /*title*/,
-    const std::string& /*message*/,
-    const AppSettings& /*settings*/)
+    const std::string& title,
+    const std::string& message,
+    const AppSettings& settings)
 {
     lastType_.store(type);
+    if (muted_.load()) return;
+#if defined(__linux__)
+    // The desktop's notification service, through its standard command-line client (silently absent if missing).
+    if (settings.enablePushNotifications) {
+        spawn::detached({ "notify-send", "-a", "CppDesk", title.empty() ? appTitle_ : title, message });
+    }
+#else
+    (void)title;
+    (void)message;
+    (void)settings;
+#endif
 }
 
 void NotificationManager::flashTaskbar(bool /*flash*/) {}
