@@ -3225,14 +3225,26 @@ void testScatterGatherFrameSendAndSocketBuffers() {
     socklen_t optLen = sizeof(sndBuf);
     int res = getsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&sndBuf), &optLen);
     TEST_ASSERT(res == 0);
-    // On Windows, requested 2MB buffer should scale well above default 64KB (at least 1MB)
-    TEST_ASSERT(sndBuf >= 1048576);
+    // The requested 2MB buffer should scale well above the default (at least 1MB). Linux caps a socket buffer at
+    // the system limit, which is low on some machines; there the buffer must reach that limit.
+    auto expectedAtLeast = [](const char* sysctlPath) {
+        int limit = 1048576;
+#if defined(__linux__)
+        std::ifstream in(sysctlPath);
+        int systemMax = 0;
+        if (in >> systemMax && systemMax > 0) limit = std::min(limit, systemMax);
+#else
+        (void)sysctlPath;
+#endif
+        return limit;
+    };
+    TEST_ASSERT(sndBuf >= expectedAtLeast("/proc/sys/net/core/wmem_max"));
 
     int rcvBuf = 0;
     optLen = sizeof(rcvBuf);
     res = getsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char*>(&rcvBuf), &optLen);
     TEST_ASSERT(res == 0);
-    TEST_ASSERT(rcvBuf >= 1048576);
+    TEST_ASSERT(rcvBuf >= expectedAtLeast("/proc/sys/net/core/rmem_max"));
     closesocket(s);
 
     // 2. Setup Loopback Sockets for I/O
