@@ -173,6 +173,7 @@ if(UNIX AND NOT APPLE)
     set(LINUX_UI_SOURCES
         src/ui/ui_window_linux.cpp
         src/ui/x11_dnd.cpp
+        src/ui/x11_tray.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/generated/app_icon_png.cpp
     )
 endif()

@@ -8457,6 +8457,175 @@ void testXdndDrop() {
 }
 #endif
 
+#if defined(__linux__)
+bool windowViewable(Display* d, Window win) {
+    XWindowAttributes a{};
+    return XGetWindowAttributes(d, win, &a) && a.map_state == IsViewable;
+}
+
+void sendClose(Display* d, Window win) {
+    XEvent close{};
+    close.xclient.type = ClientMessage;
+    close.xclient.window = win;
+    close.xclient.message_type = XInternAtom(d, "WM_PROTOCOLS", False);
+    close.xclient.format = 32;
+    close.xclient.data.l[0] = static_cast<long>(XInternAtom(d, "WM_DELETE_WINDOW", False));
+    XSendEvent(d, win, False, NoEventMask, &close);
+    XFlush(d);
+}
+
+void sendClick(Display* d, Window win, int x, int y, unsigned button) {
+    XEvent ev{};
+    ev.xbutton.type = ButtonPress;
+    ev.xbutton.display = d;
+    ev.xbutton.window = win;
+    ev.xbutton.root = DefaultRootWindow(d);
+    ev.xbutton.x = x;
+    ev.xbutton.y = y;
+    ev.xbutton.button = button;
+    ev.xbutton.same_screen = True;
+    XSendEvent(d, win, True, ButtonPressMask, &ev);
+    ev.xbutton.type = ButtonRelease;
+    XSendEvent(d, win, True, ButtonReleaseMask, &ev);
+    XFlush(d);
+}
+
+// The first mapped override-redirect window named `name` (the tray menu popup).
+Window findPopup(Display* d, const char* name) {
+    Window root = 0, parent = 0, *kids = nullptr;
+    unsigned int n = 0;
+    Window found = 0;
+    if (XQueryTree(d, DefaultRootWindow(d), &root, &parent, &kids, &n)) {
+        for (unsigned int i = 0; i < n && !found; ++i) {
+            char* wname = nullptr;
+            if (XFetchName(d, kids[i], &wname) && wname) {
+                if (std::strcmp(wname, name) == 0 && windowViewable(d, kids[i])) found = kids[i];
+                XFree(wname);
+            }
+        }
+        if (kids) XFree(kids);
+    }
+    return found;
+}
+
+void testLinuxTray() {
+    std::cout << "[TEST 78] Tray icon: dock, hide to tray, restore, menu, no tray..." << std::endl;
+    Display* peer = XOpenDisplay(nullptr);
+    if (!peer) {
+        std::cout << "  SKIP: no X display\n";
+        return;
+    }
+    // Querying a window the app has already destroyed must fail the assertion, not kill the test run.
+    auto previousHandler = XSetErrorHandler([](Display*, XErrorEvent*) { return 0; });
+    IdentityManager id(4250);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+    id.loadOrCreate();
+    {
+        AppSettings s = id.settings();
+        s.minimizeToTray = true;
+        id.updateSettings(s);
+    }
+    NetworkEngine net(id);
+    auto settingsShowTrayToggle = [&](CppDeskWindow& w) {
+        w.app().applySnapshotState("settings_system");
+        ui::RecordingCanvas rc;
+        for (int i = 0; i < 30; ++i) w.app().render(rc, 1220, 760, 1.0 / 60.0);
+        return rc.serialize().find("Minimize window to system tray") != std::string::npos;
+    };
+
+    // No tray: the toggle is hidden and closing quits instead of hiding the window for good.
+    {
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        TEST_ASSERT(pumpUntil(w, [&] { return windowViewable(peer, w.nativeWindow()); }));
+        TEST_ASSERT(!settingsShowTrayToggle(w));
+        sendClose(peer, w.nativeWindow());
+        pump(w, 300);
+        TEST_ASSERT(!w.processEvents(0));
+    }
+
+    // A tray manager (a panel) owns _NET_SYSTEM_TRAY_S0.
+    const Window manager = XCreateSimpleWindow(peer, DefaultRootWindow(peer), 0, 0, 1, 1, 0, 0, 0);
+    const Atom traySel = XInternAtom(peer, "_NET_SYSTEM_TRAY_S0", False);
+    const Atom opcode = XInternAtom(peer, "_NET_SYSTEM_TRAY_OPCODE", False);
+    XSetSelectionOwner(peer, traySel, manager, CurrentTime);
+    XSync(peer, False);
+    {
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        const Window win = w.nativeWindow();
+        TEST_ASSERT(pumpUntil(w, [&] { return windowViewable(peer, win); }));
+
+        // The icon asked to dock.
+        Window icon = 0;
+        TEST_ASSERT(pumpUntil(w, [&] {
+            while (XPending(peer) > 0) {
+                XEvent ev;
+                XNextEvent(peer, &ev);
+                if (ev.type == ClientMessage && ev.xclient.message_type == opcode && ev.xclient.data.l[1] == 0) {
+                    icon = static_cast<Window>(ev.xclient.data.l[2]);
+                }
+            }
+            return icon != 0;
+        }));
+        TEST_ASSERT(settingsShowTrayToggle(w));
+        w.app().applySnapshotState("dashboard_light");
+
+        // Close hides to the tray; the app keeps running.
+        sendClose(peer, win);
+        TEST_ASSERT(pumpUntil(w, [&] { return !windowViewable(peer, win); }));
+        TEST_ASSERT(w.processEvents(0));
+
+        // Left click on the icon brings the window back.
+        if (icon) sendClick(peer, icon, 10, 10, Button1);
+        TEST_ASSERT(pumpUntil(w, [&] { return windowViewable(peer, win); }));
+
+        // Hidden again, then the panel goes away: the window must come back.
+        sendClose(peer, win);
+        TEST_ASSERT(pumpUntil(w, [&] { return !windowViewable(peer, win); }));
+        XDestroyWindow(peer, manager);
+        XSync(peer, False);
+        TEST_ASSERT(pumpUntil(w, [&] { return windowViewable(peer, win); }));
+        TEST_ASSERT(w.processEvents(0));
+    }
+
+    // Right click opens the menu; its last item quits.
+    const Window manager2 = XCreateSimpleWindow(peer, DefaultRootWindow(peer), 0, 0, 1, 1, 0, 0, 0);
+    XSetSelectionOwner(peer, traySel, manager2, CurrentTime);
+    XSync(peer, False);
+    {
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        Window icon = 0;
+        TEST_ASSERT(pumpUntil(w, [&] {
+            while (XPending(peer) > 0) {
+                XEvent ev;
+                XNextEvent(peer, &ev);
+                if (ev.type == ClientMessage && ev.xclient.message_type == opcode && ev.xclient.data.l[1] == 0) {
+                    icon = static_cast<Window>(ev.xclient.data.l[2]);
+                }
+            }
+            return icon != 0;
+        }));
+        if (icon) sendClick(peer, icon, 10, 10, Button3);
+        Window menu = 0;
+        TEST_ASSERT(pumpUntil(w, [&] { return (menu = findPopup(peer, "CppDesk tray menu")) != 0; }));
+        if (menu) {
+            XWindowAttributes a{};
+            XGetWindowAttributes(peer, menu, &a);
+            sendClick(peer, menu, a.width / 2, a.height - 12, Button1);
+        }
+        pump(w, 300);
+        TEST_ASSERT(!w.processEvents(0));
+    }
+    XDestroyWindow(peer, manager2);
+    XCloseDisplay(peer);
+    XSetErrorHandler(previousHandler);
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+#endif
+
 // A PlatformShell for headless screen tests: no window, a fixed clock, and switchable capabilities.
 class FakeShell : public ui::PlatformShell {
 public:
@@ -8791,6 +8960,7 @@ int main() {
         testLinuxWindow(); std::cout << "Test 75 done\n" << std::flush;
         testX11Clipboard(); std::cout << "Test 76 done\n" << std::flush;
         testXdndDrop(); std::cout << "Test 77 done\n" << std::flush;
+        testLinuxTray(); std::cout << "Test 78 done\n" << std::flush;
 #endif
 #if defined(_WIN32)
         testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;

@@ -8,6 +8,7 @@
 #include "../net/network_engine.hpp"
 #include "../core/crypto_identity.hpp"
 #include "x11_dnd.hpp"
+#include "x11_tray.hpp"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -118,6 +119,10 @@ struct CppDeskWindowLinuxImpl {
     ui::CairoCanvas canvas;
 
     std::unique_ptr<XdndTarget> dnd;
+    std::unique_ptr<X11Tray> tray;
+    bool hiddenInTray = false;
+    std::string trayTooltip;
+    Atom wmState = 0;
     std::unique_ptr<LinuxShell> shell;
     std::unique_ptr<AppUi> app;
 
@@ -280,6 +285,7 @@ struct CppDeskWindowLinuxImpl {
         closed = true;
         if (!dpy || !win) return;   // never created
         if (app) app->onWindowDestroyed();
+        tray.reset();
         freeBackBuffer();
         XDestroyWindow(dpy, win);
         XFlush(dpy);
@@ -288,6 +294,60 @@ struct CppDeskWindowLinuxImpl {
     void requestClose() {
         if (app) app->onCloseRequested();
         destroyWindow();
+    }
+
+    bool trayDocked() const { return tray && tray->docked(); }
+
+    // Close or minimize with "minimize to tray" on: withdraw the window; only when a tray can bring it back.
+    bool hideToTrayIfWanted() {
+        if (!identity.settings().minimizeToTray || !trayDocked()) return false;
+        XWithdrawWindow(dpy, win, screen);
+        XFlush(dpy);
+        hiddenInTray = true;
+        return true;
+    }
+
+    void restoreFromTray() {
+        hiddenInTray = false;
+        XMapRaised(dpy, win);
+        sendWmMessage(netActiveWindow, 1, CurrentTime, 0, 0);
+        NotificationManager* notif = app ? app->notifications() : nullptr;
+        if (app) app->restoreFromTray(notif ? notif->lastNotificationType() : NotificationType::GeneralInfo);
+        if (notif) notif->clearLastNotificationType();
+    }
+
+    bool iconified() {
+        Atom type = 0;
+        int format = 0;
+        unsigned long count = 0, after = 0;
+        unsigned char* data = nullptr;
+        bool iconic = false;
+        if (XGetWindowProperty(dpy, win, wmState, 0, 2, False, wmState, &type, &format, &count, &after, &data) ==
+                Success && data && count >= 1) {
+            iconic = *reinterpret_cast<long*>(data) == IconicState;
+        }
+        if (data) XFree(data);
+        return iconic;
+    }
+
+    // Tray icon, panel and menu events; true when the event belonged to the tray.
+    bool handleTrayEvent(const XEvent& ev) {
+        if (!tray) return false;
+        X11Tray::MenuInfo info;
+        if (ev.type == ButtonPress && app) {   // the menu opens on a press; only then are its labels needed
+            info.status = app->trayStatusText();
+            info.muted = app->notifications() && app->notifications()->isMuted();
+        }
+        bool consumed = false, lost = false;
+        const X11Tray::Action action = tray->handleEvent(ev, info, consumed, lost);
+        if (lost && hiddenInTray) restoreFromTray();   // the panel went away: never leave the window unreachable
+        switch (action) {
+            case X11Tray::Action::Restore: restoreFromTray(); break;
+            case X11Tray::Action::ToggleMute: if (app) app->toggleNotificationsMuted(); break;
+            case X11Tray::Action::Quit: destroyWindow(); break;
+            case X11Tray::Action::Nothing: break;
+        }
+        return consumed;
     }
 
     std::string lookupText(XKeyEvent& kev) {
@@ -421,8 +481,10 @@ public:
     void showNotification(const std::string&, const std::string&) override {}
     void setTrayStatus(const std::string&) override {}
 
-    // Windows-only controls stay hidden; tray and notifications arrive with their own tasks.
-    bool has(ui::Capability) const override { return false; }
+    bool has(ui::Capability c) const override {
+        if (c == ui::Capability::TrayIcon) return w_ && w_->trayDocked();
+        return false;   // the Windows-only controls stay hidden
+    }
 
 private:
     bool live() const { return w_ && w_->dpy && w_->win && !w_->closed; }
@@ -433,6 +495,12 @@ private:
 
 void CppDeskWindowLinuxImpl::handleEvent(XEvent& ev) {
     if (!app) return;
+    if (ev.type == MappingNotify) {
+        XRefreshKeyboardMapping(&ev.xmapping);
+        return;
+    }
+    if (handleTrayEvent(ev)) return;
+    if (ev.xany.window != win) return;   // root and other windows' events (selected by the tray)
     switch (ev.type) {
         case Expose:
             if (ev.xexpose.count == 0) needsPaint = true;
@@ -498,13 +566,13 @@ void CppDeskWindowLinuxImpl::handleEvent(XEvent& ev) {
                 app->onFilesDropped(dropped->paths, dropped->x / scale, dropped->y / scale);
             }
             break;
-        case MappingNotify:
-            XRefreshKeyboardMapping(&ev.xmapping);
+        case PropertyNotify:
+            if (ev.xproperty.atom == wmState && iconified()) hideToTrayIfWanted();
             break;
         case ClientMessage:
             if (dnd && dnd->handleClientMessage(ev)) break;
             if (ev.xclient.message_type == wmProtocols && static_cast<Atom>(ev.xclient.data.l[0]) == wmDelete) {
-                requestClose();
+                if (!hideToTrayIfWanted()) requestClose();
             }
             break;
         default:
@@ -547,6 +615,10 @@ bool CppDeskWindowLinuxImpl::processEvents(int timeoutMs) {
     if (!closed && app && now >= nextTick) {
         app->onTick();
         nextTick = now + std::chrono::milliseconds(frameIntervalMs);
+        if (tray) {
+            const std::string status = app->trayStatusText();
+            if (status != trayTooltip) tray->setTooltip(trayTooltip = status);
+        }
     }
     if (!closed && needsPaint && now >= lastPaint + std::chrono::milliseconds(kMinFrameGapMs)) paint();
     return !closed;
@@ -693,6 +765,13 @@ bool CppDeskWindow::create(void* displayContext, int /*showCommand*/) {
     XDefineCursor(w.dpy, w.win, w.cursors[0]);
 
     w.dnd = std::make_unique<XdndTarget>(w.dpy, w.win);
+    w.wmState = XInternAtom(w.dpy, "WM_STATE", False);
+    {
+        std::vector<uint8_t> bgra;
+        int iw = 0, ih = 0;
+        decodeAppIcon(bgra, iw, ih);
+        w.tray = std::make_unique<X11Tray>(w.dpy, w.screen, w.scale, std::move(bgra), iw, ih);
+    }
     w.gc = XCreateGC(w.dpy, w.win, 0, nullptr);
     w.allocateBackBuffer(widthPx, heightPx);
 
