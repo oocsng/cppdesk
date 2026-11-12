@@ -3,10 +3,12 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+// The x86 intrinsic headers exist only on x86 (not on Apple Silicon or ARM Linux).
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #include <immintrin.h>
-
 #if defined(__GNUC__) || defined(__clang__)
 #include <cpuid.h>
+#endif
 #endif
 
 namespace cppdesk {
