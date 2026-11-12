@@ -32,6 +32,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -119,6 +121,9 @@ struct CppDeskWindowLinuxImpl {
     ui::CairoCanvas canvas;
 
     std::unique_ptr<XdndTarget> dnd;
+    // Cleared before teardown so late background callbacks (the update check) find no window.
+    std::shared_ptr<std::atomic<CppDeskWindowLinuxImpl*>> liveToken =
+        std::make_shared<std::atomic<CppDeskWindowLinuxImpl*>>(this);
     std::unique_ptr<X11Tray> tray;
     bool hiddenInTray = false;
     std::string trayTooltip;
@@ -131,7 +136,7 @@ struct CppDeskWindowLinuxImpl {
     std::vector<std::function<void()>> posted;
 
     bool closed = false;
-    bool needsPaint = true;
+    std::atomic<bool> needsPaint{true};   // set from network threads through invalidate()
     bool focused = false;
     bool mapped = false;
     bool relaunch = false;
@@ -141,10 +146,7 @@ struct CppDeskWindowLinuxImpl {
     std::bitset<256> keys;
 
     CppDeskWindowLinuxImpl(IdentityManager& id, NetworkEngine& net) : identity(id), network(net) {
-        if (pipe(wakeFds) == 0) {
-            fcntl(wakeFds[0], F_SETFL, O_NONBLOCK);
-            fcntl(wakeFds[1], F_SETFL, O_NONBLOCK);
-        }
+        if (pipe2(wakeFds, O_CLOEXEC | O_NONBLOCK) != 0) wakeFds[0] = wakeFds[1] = -1;
     }
 
     void wake() {
@@ -273,7 +275,15 @@ struct CppDeskWindowLinuxImpl {
         lastPaint = now;
         needsPaint = false;
         app->render(canvas, widthPx / scale, heightPx / scale, dt);
-        if (useShm) XShmPutImage(dpy, win, gc, image, 0, 0, 0, 0, widthPx, heightPx, False);
+        if (useShm) {
+            // Ask for a completion event and wait for it, so the next frame never draws into memory the server is
+            // still reading (tearing).
+            XShmPutImage(dpy, win, gc, image, 0, 0, 0, 0, widthPx, heightPx, True);
+            XEvent done;
+            XIfEvent(dpy, &done, [](Display* d, XEvent* e, XPointer) {
+                return static_cast<Bool>(e->type == XShmGetEventBase(d) + ShmCompletion);
+            }, nullptr);
+        }
         else XPutImage(dpy, win, gc, image, 0, 0, 0, 0, widthPx, heightPx);
         XFlush(dpy);
         if (app->wantsAnimationFrame()) needsPaint = true;
@@ -365,8 +375,17 @@ struct CppDeskWindowLinuxImpl {
                 text.assign(buf, static_cast<size_t>(std::max(0, n)));
             }
         } else {
+            // No input context: XLookupString gives Latin-1 bytes; the screens take UTF-8.
             int n = XLookupString(&kev, buf, sizeof(buf), &ks, nullptr);
-            text.assign(buf, static_cast<size_t>(std::max(0, n)));
+            for (int i = 0; i < n; ++i) {
+                const unsigned char c = static_cast<unsigned char>(buf[i]);
+                if (c < 0x80) {
+                    text.push_back(static_cast<char>(c));
+                } else {
+                    text.push_back(static_cast<char>(0xC0 | (c >> 6)));
+                    text.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+                }
+            }
         }
         // X gives Delete a DEL character; Windows' WM_CHAR gives none, and the screens expect that.
         text.erase(std::remove(text.begin(), text.end(), '\x7f'), text.end());
@@ -462,8 +481,11 @@ public:
 
     void checkForUpdates(bool manual) override {
         if (!w_) return;
-        CppDeskWindowLinuxImpl* w = w_;
-        AutoUpdater::checkForUpdatesAsync([w, manual](const UpdateInfo& info) {
+        // The check can finish after the window is gone; the token is cleared before teardown.
+        std::shared_ptr<std::atomic<CppDeskWindowLinuxImpl*>> token = w_->liveToken;
+        AutoUpdater::checkForUpdatesAsync([token, manual](const UpdateInfo& info) {
+            CppDeskWindowLinuxImpl* w = token->load();
+            if (!w) return;
             std::lock_guard<std::mutex> lock(w->postMutex);
             w->posted.push_back([w, info, manual] {
                 if (w->app) w->app->onUpdateCheckDone(info, manual);
@@ -554,7 +576,8 @@ void CppDeskWindowLinuxImpl::handleEvent(XEvent& ev) {
         case KeyRelease: {
             const bool down = ev.type == KeyPress;
             const uint16_t vk = InputInjector::mapX11KeySymToVk(static_cast<uint32_t>(XLookupKeysym(&ev.xkey, 0)));
-            if (vk != 0) {
+            // A release whose press the input method consumed never reached the screens; drop it too.
+            if (vk != 0 && (down || keys[vk])) {
                 keys[vk] = down;
                 app->onKey(KeyEvent{ vk, 0, down, InputInjector::isExtendedVk(vk) });
             }
@@ -654,6 +677,7 @@ CppDeskWindow::CppDeskWindow(IdentityManager& identity, NetworkEngine& network, 
 }
 
 CppDeskWindow::~CppDeskWindow() {
+    pImpl_->liveToken->store(nullptr);
     network_.setOnScratchpadUpdateCallback(nullptr);
     network_.setOnCommandPaletteOutputCallback(nullptr);
     network_.setOnFrameDecodedCallback(nullptr);
@@ -756,7 +780,16 @@ bool CppDeskWindow::create(void* displayContext, int /*showCommand*/) {
         w.xim = XOpenIM(w.dpy, nullptr, nullptr, nullptr);
     }
     if (w.xim) {
-        w.xic = XCreateIC(w.xim, XNInputStyle, XIMPreeditNothing | XIMStatusNothing, XNClientWindow, w.win,
+        // Only the "nothing" preedit/status style is drawn here; use the IC only if the input method offers it.
+        XIMStyles* styles = nullptr;
+        bool styleOk = false;
+        if (!XGetIMValues(w.xim, XNQueryInputStyle, &styles, nullptr) && styles) {
+            for (unsigned short i = 0; i < styles->count_styles; ++i) {
+                styleOk = styleOk || styles->supported_styles[i] == (XIMPreeditNothing | XIMStatusNothing);
+            }
+            XFree(styles);
+        }
+        if (styleOk) w.xic = XCreateIC(w.xim, XNInputStyle, XIMPreeditNothing | XIMStatusNothing, XNClientWindow, w.win,
                           XNFocusWindow, w.win, nullptr);
         long imEvents = 0;
         if (w.xic && !XGetICValues(w.xic, XNFilterEvents, &imEvents, nullptr)) {

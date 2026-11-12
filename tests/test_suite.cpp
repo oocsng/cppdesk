@@ -8896,6 +8896,8 @@ void testLinuxInputHelpers() {
     TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi(nullptr) == 1.0f);
     TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("abc") == 1.0f);
     TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("0") == 1.0f);
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("960") == 4.0f);   // a bogus value must not make a 9000 px window
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("48") == 1.0f);
 
     auto paths = UiPlatform::parseFileUriList("file:///home/a/b%20c.txt\r\n# comment\r\nhttps://example.com/x\r\n"
                                               "file://host/tmp/x\r\nfile:///tmp/%E2%82%AC\n");

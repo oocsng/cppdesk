@@ -331,7 +331,7 @@ float UiPlatform::dpiScaleFromXftDpi(const char* value) {
     char* end = nullptr;
     const double dpi = std::strtod(value, &end);
     if (end == value || dpi <= 0.0) return 1.0f;
-    return static_cast<float>(dpi / 96.0);
+    return static_cast<float>(std::clamp(dpi / 96.0, 1.0, 4.0));
 }
 
 std::vector<std::string> UiPlatform::parseFileUriList(const std::string& uriList) {
