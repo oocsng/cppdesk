@@ -20,6 +20,10 @@ public:
     static void releaseAllModifiers();
     static uint16_t mapVkToMacKeyCode(uint16_t vk);
     static uint32_t mapVkToX11KeySym(uint16_t vk);
+    // Inverse of mapVkToX11KeySym (generic VK_SHIFT/VK_CONTROL/VK_MENU for modifiers, as WM_KEYDOWN reports); 0 if unmapped.
+    static uint16_t mapX11KeySymToVk(uint32_t keysym);
+    // Keys Windows flags as extended (arrows, Home/End, PgUp/PgDn, Insert/Delete, right Ctrl/Alt).
+    static bool isExtendedVk(uint16_t vk);
 
     // Option 5A: Windows UAC & Desktop Elevation helpers
     static bool syncToInputDesktop();

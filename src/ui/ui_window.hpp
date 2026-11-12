@@ -147,6 +147,20 @@ public:
     // Needs no X display.
     static int runUiSnapshots(IdentityManager& identity, NetworkEngine& network, const std::string& outDir);
 
+    // One loop iteration: waits up to timeoutMs for X events, posted work, the tick or a due frame, and handles
+    // them. messageLoop() calls it until it returns false (the window closed).
+    bool processEvents(int timeoutMs);
+    // Thread-safe: runs fn on the UI thread, waking the loop.
+    void post(std::function<void()> fn);
+    // Thread-safe: closes the window as if the user had (Ctrl+C or SIGTERM in a terminal).
+    void requestQuit();
+    // The screens this window hosts.
+    AppUi& app();
+    // The X window id (0 before create()).
+    unsigned long nativeWindow() const;
+    // The user asked to restart; main re-executes the app after the loop.
+    bool relaunchRequested() const;
+
 private:
     IdentityManager& identity_;
     NetworkEngine& network_;

@@ -1,5 +1,7 @@
 #include "ui_platform.hpp"
 
+#include <cstdlib>
+
 namespace cppdesk {
 
 ViewportGeometry UiPlatform::calculateViewportGeometry(float viewWidth, float viewHeight, uint32_t frameWidth, uint32_t frameHeight, ScaleMode scaleMode) {
@@ -320,6 +322,14 @@ UiPlatformRect UiPlatform::computeSpringRect(const UiPlatformRect& base, float h
     float dy = std::max(base.height() * scaleDelta * 0.5f, 0.9f * hT - 1.5f * pT);
     float liftY = (-1.8f * hT) + (1.6f * pT);
     return base.inflate(dx, dy).offset(0.0f, liftY);
+}
+
+float UiPlatform::dpiScaleFromXftDpi(const char* value) {
+    if (!value) return 1.0f;
+    char* end = nullptr;
+    const double dpi = std::strtod(value, &end);
+    if (end == value || dpi <= 0.0) return 1.0f;
+    return static_cast<float>(dpi / 96.0);
 }
 
 } // namespace cppdesk

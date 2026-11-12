@@ -322,13 +322,31 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+#if defined(__linux__)
+    // The signal handler only sets a flag; close the window from here so Ctrl+C and SIGTERM end the app.
+    std::atomic<bool> loopDone{false};
+    std::thread signalWatcher([&] {
+        while (!loopDone.load()) {
+            if (g_shutdownRequested.exchange(false)) window.requestQuit();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
     int exitCode = window.messageLoop();
+    loopDone = true;
+    signalWatcher.join();
+#else
+    int exitCode = window.messageLoop();
+#endif
     network.stop();
 
     flock(lockFd, LOCK_UN);
     close(lockFd);
     unlink(lockPath.c_str());
 
+#if defined(__linux__)
+    // Restart in place once the single-instance lock is released (a copy started earlier would see it held).
+    if (window.relaunchRequested()) execv("/proc/self/exe", argv);
+#endif
     return exitCode;
 }
 

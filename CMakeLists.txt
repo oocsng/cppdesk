@@ -112,7 +112,7 @@ elseif(UNIX AND NOT APPLE)
         src/simd/simd_fallback.cpp
     )
 
-    find_package(X11 QUIET)
+    find_package(X11 REQUIRED)
     find_package(JPEG QUIET)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(CAIRO REQUIRED IMPORTED_TARGET cairo)
@@ -185,6 +185,7 @@ if(WIN32)
 elseif(UNIX AND NOT APPLE)
     add_executable(CppDeskTests
         ${CORE_SOURCES}
+        ${LINUX_UI_SOURCES}
         tests/test_suite.cpp
     )
     target_link_libraries(CppDeskTests PRIVATE ${PLATFORM_LIBS})

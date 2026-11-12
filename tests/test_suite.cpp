@@ -15,7 +15,14 @@
 #include "../src/ui/platform_shell.hpp"
 #if defined(__linux__)
 #include "../src/ui/canvas_cairo.hpp"
+#include "../src/ui/ui_window.hpp"
 #include <cairo.h>
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+#include <X11/Xutil.h>
+#include <X11/keysym.h>
+#undef CursorShape   // X.h's query-shape constant collides with ui::CursorShape
+#undef Success       // ...and its status code with VirtualDisplayStatusCode::Success
 #endif
 #if defined(_WIN32)
 #include "../src/ui/canvas_d2d.hpp"
@@ -8037,6 +8044,212 @@ void testCairoCanvas() {
 }
 #endif
 
+#if defined(__linux__)
+// Pumps the window's loop until cond() holds or timeoutMs passes.
+template <typename Cond>
+bool pumpUntil(CppDeskWindow& w, Cond cond, int timeoutMs = 2000) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < end) {
+        if (cond()) return true;
+        if (!w.processEvents(20)) return cond();
+    }
+    return cond();
+}
+
+void pump(CppDeskWindow& w, int ms) {
+    pumpUntil(w, [] { return false; }, ms);
+}
+
+// The rect (DIPs) of the first drawText showing exactly `label` (a focused field adds a caret '|'), from a fresh
+// recording of the screens.
+std::optional<ui::Rect> findTextRect(AppUi& app, float wDip, float hDip, const std::string& label) {
+    ui::RecordingCanvas rc;
+    app.render(rc, wDip, hDip, 0.0);
+    std::istringstream in(rc.serialize());
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("drawText ", 0) != 0 || !(line.ends_with("|" + label) || line.ends_with("|" + label + "|"))) continue;
+        ui::Rect r{};
+        if (std::sscanf(line.c_str(), "drawText %f %f %f %f", &r.left, &r.top, &r.right, &r.bottom) == 4) return r;
+    }
+    return std::nullopt;
+}
+
+// True when `text` is drawn inside `field`, i.e. typing reached the field that was clicked.
+bool textInField(AppUi& app, float wDip, float hDip, const std::string& text, const ui::Rect& field) {
+    auto r = findTextRect(app, wDip, hDip, text);
+    return r && r->top < field.bottom && r->bottom > field.top && r->left < field.right && r->right > field.left;
+}
+
+void sendButton(Display* d, Window win, int x, int y) {
+    for (int type : { ButtonPress, ButtonRelease }) {
+        XEvent ev{};
+        ev.xbutton.type = type;
+        ev.xbutton.display = d;
+        ev.xbutton.window = win;
+        ev.xbutton.root = DefaultRootWindow(d);
+        ev.xbutton.x = x;
+        ev.xbutton.y = y;
+        ev.xbutton.button = Button1;
+        ev.xbutton.same_screen = True;
+        XSendEvent(d, win, True, type == ButtonPress ? ButtonPressMask : ButtonReleaseMask, &ev);
+    }
+    XFlush(d);
+}
+
+void sendKey(Display* d, Window win, KeySym sym) {
+    const KeyCode code = XKeysymToKeycode(d, sym);
+    for (int type : { KeyPress, KeyRelease }) {
+        XEvent ev{};
+        ev.xkey.type = type;
+        ev.xkey.display = d;
+        ev.xkey.window = win;
+        ev.xkey.root = DefaultRootWindow(d);
+        ev.xkey.keycode = code;
+        ev.xkey.same_screen = True;
+        XSendEvent(d, win, True, type == KeyPress ? KeyPressMask : KeyReleaseMask, &ev);
+    }
+    XFlush(d);
+}
+
+void testLinuxWindow() {
+    std::cout << "[TEST 75] Linux X11 window drives the screens..." << std::endl;
+    Display* peer = XOpenDisplay(nullptr);
+    if (!peer) {
+        std::cout << "  SKIP: no X display\n";
+        return;
+    }
+    IdentityManager id(4248);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    const float wDip = 1220.0f, hDip = 760.0f;
+
+    {
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        const Window win = w.nativeWindow();
+        XWindowAttributes attrs{};
+        TEST_ASSERT(pumpUntil(w, [&] {
+            return XGetWindowAttributes(peer, win, &attrs) && attrs.map_state == IsViewable;
+        }));
+        pump(w, 200);
+
+        // It drew: the frame is neither the black window background nor one flat colour.
+        XGetWindowAttributes(peer, win, &attrs);
+        XImage* img = XGetImage(peer, win, 0, 0, attrs.width, attrs.height, AllPlanes, ZPixmap);
+        TEST_ASSERT(img != nullptr);
+        if (img) {
+            const unsigned long corner = XGetPixel(img, 5, 5);
+            bool varied = false;
+            for (int y = 0; y < attrs.height && !varied; y += 7)
+                for (int x = 0; x < attrs.width && !varied; x += 7)
+                    varied = XGetPixel(img, x, y) != corner;
+            TEST_ASSERT((corner & 0xFFFFFF) != 0);
+            TEST_ASSERT(varied);
+            XDestroyImage(img);
+        }
+
+        // Click the desk search box and type into it.
+        auto field = findTextRect(w.app(), wDip, hDip, "Search desks...");
+        TEST_ASSERT(field.has_value());
+        if (field) {
+            sendButton(peer, win, static_cast<int>((field->left + field->right) / 2),
+                       static_cast<int>((field->top + field->bottom) / 2));
+            pump(w, 100);
+            sendKey(peer, win, XK_z);
+            sendKey(peer, win, XK_q);
+            TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wDip, hDip, "zq", *field); }));
+
+            // Non-ASCII through the keyboard map: a spare keycode becomes é.
+            int minCode = 0, maxCode = 0, perCode = 0;
+            XDisplayKeycodes(peer, &minCode, &maxCode);
+            KeySym* map = XGetKeyboardMapping(peer, static_cast<KeyCode>(minCode), maxCode - minCode + 1, &perCode);
+            int spare = 0;
+            for (int code = maxCode; code >= minCode && !spare; --code) {
+                bool empty = true;
+                for (int i = 0; i < perCode; ++i) empty = empty && map[(code - minCode) * perCode + i] == NoSymbol;
+                if (empty) spare = code;
+            }
+            XFree(map);
+            TEST_ASSERT(spare != 0);
+            if (spare) {
+                KeySym eacute = XK_eacute;
+                XChangeKeyboardMapping(peer, spare, 1, &eacute, 1);
+                XSync(peer, False);
+                pump(w, 100);   // MappingNotify reaches the window
+                sendKey(peer, win, XK_eacute);
+                TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wDip, hDip, "zq\xC3\xA9", *field); }));
+                KeySym none = NoSymbol;
+                XChangeKeyboardMapping(peer, spare, 1, &none, 1);
+                XSync(peer, False);
+                pump(w, 50);
+            }
+
+            sendKey(peer, win, XK_BackSpace);
+            TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wDip, hDip, "zq", *field); }));
+        }
+
+        // A post from another thread wakes the loop at once.
+        std::atomic<bool> ran{false};
+        const auto t0 = std::chrono::steady_clock::now();
+        std::thread poster([&] { w.post([&] { ran = true; }); });
+        poster.join();
+        w.processEvents(1000);
+        TEST_ASSERT(ran.load());
+        TEST_ASSERT(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(900));
+
+        // The window manager's close button ends the loop.
+        XEvent close{};
+        close.xclient.type = ClientMessage;
+        close.xclient.window = win;
+        close.xclient.message_type = XInternAtom(peer, "WM_PROTOCOLS", False);
+        close.xclient.format = 32;
+        close.xclient.data.l[0] = static_cast<long>(XInternAtom(peer, "WM_DELETE_WINDOW", False));
+        XSendEvent(peer, win, False, NoEventMask, &close);
+        XFlush(peer);
+        TEST_ASSERT(pumpUntil(w, [] { return false; }, 1000) == false);
+        TEST_ASSERT(!w.processEvents(0));
+    }
+
+    // HiDPI: with Xft.dpi 192 the window draws at 2x and clicks map back to DIPs.
+    {
+        const Atom rm = XInternAtom(peer, "RESOURCE_MANAGER", False);
+        const char* res = "Xft.dpi:\t192\n";
+        XChangeProperty(peer, DefaultRootWindow(peer), rm, XA_STRING, 8, PropModeReplace,
+                        reinterpret_cast<const unsigned char*>(res), static_cast<int>(std::strlen(res)));
+        XSync(peer, False);
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        const Window win = w.nativeWindow();
+        XWindowAttributes attrs{};
+        TEST_ASSERT(pumpUntil(w, [&] {
+            return XGetWindowAttributes(peer, win, &attrs) && attrs.map_state == IsViewable;
+        }));
+        TEST_ASSERT(attrs.width >= 2 * 900);   // at least the 900-DIP minimum, doubled
+        const float wd = attrs.width / 2.0f, hd = attrs.height / 2.0f;
+        auto field = findTextRect(w.app(), wd, hd, "Search desks...");
+        TEST_ASSERT(field.has_value());
+        if (field) {
+            sendButton(peer, win, static_cast<int>(field->left + field->right), static_cast<int>(field->top + field->bottom));
+            pump(w, 100);
+            sendKey(peer, win, XK_x);
+            TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wd, hd, "x", *field); }));
+        }
+        // Ctrl+C / SIGTERM path: a quit requested from another thread closes the window.
+        std::thread([&] { w.requestQuit(); }).join();
+        pump(w, 300);
+        TEST_ASSERT(!w.processEvents(0));
+        XDeleteProperty(peer, DefaultRootWindow(peer), rm);
+        XSync(peer, False);
+    }
+
+    XCloseDisplay(peer);
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+#endif
+
 // A PlatformShell for headless screen tests: no window, a fixed clock, and switchable capabilities.
 class FakeShell : public ui::PlatformShell {
 public:
@@ -8178,6 +8391,36 @@ void testAppUiPublicInputApi() {
     TEST_ASSERT(rc.frameBalanced());
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
+}
+
+// Portable helpers the Linux window uses to translate X input.
+void testLinuxInputHelpers() {
+    std::cout << "[TEST 74] X keysym, DPI and URI-list helpers..." << std::endl;
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0x61) == 0x41);     // a
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0x41) == 0x41);     // A
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0xFF0D) == 0x0D);   // Return
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0xFFFF) == 0x2E);   // Delete
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0xFFE1) == 0x10);   // Shift_L -> generic VK_SHIFT, as WM_KEYDOWN
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0xFFE3) == 0x11);   // Control_L -> VK_CONTROL
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0xFFBE) == 0x70);   // F1
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0x003B) == 0xBA);   // semicolon
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0x12345) == 0);
+    for (int vk = 1; vk < 255; ++vk) {
+        const uint32_t sym = InputInjector::mapVkToX11KeySym(static_cast<uint16_t>(vk));
+        if (sym == 0) continue;   // unmapped
+        const uint16_t back = InputInjector::mapX11KeySymToVk(sym);
+        TEST_ASSERT(back != 0 && InputInjector::mapVkToX11KeySym(back) == sym);
+    }
+    for (uint16_t vk : { 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x21, 0x22, 0x23, 0x24, 0xA3, 0xA5 })
+        TEST_ASSERT(InputInjector::isExtendedVk(vk));
+    TEST_ASSERT(!InputInjector::isExtendedVk(0x41) && !InputInjector::isExtendedVk(0x0D));
+
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("96") == 1.0f);
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("144") == 1.5f);
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("192") == 2.0f);
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi(nullptr) == 1.0f);
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("abc") == 1.0f);
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("0") == 1.0f);
 }
 
 // Every screen's draw calls must match the committed goldens, so shared screen code cannot change how Windows
@@ -8325,6 +8568,10 @@ int main() {
         testUiGoldens(); std::cout << "Test 72 done\n" << std::flush;
 #if defined(__linux__)
         testCairoCanvas(); std::cout << "Test 73 done\n" << std::flush;
+#endif
+        testLinuxInputHelpers(); std::cout << "Test 74 done\n" << std::flush;
+#if defined(__linux__)
+        testLinuxWindow(); std::cout << "Test 75 done\n" << std::flush;
 #endif
 #if defined(_WIN32)
         testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;
