@@ -28,29 +28,101 @@ CGFloat ctWeight(int dwWeight) {
     return 0.0;
 }
 
+// The weight trait Core Text reports for a font, from -1 (thin) to 1 (black); 0 is regular.
+CGFloat reportedWeight(CTFontRef f) {
+    CGFloat w = 0.0;
+    CFDictionaryRef traits = CTFontCopyTraits(f);
+    if (traits) {
+        CFNumberRef n = static_cast<CFNumberRef>(CFDictionaryGetValue(traits, kCTFontWeightTrait));
+        if (n) CFNumberGetValue(n, kCFNumberCGFloatType, &w);
+        CFRelease(traits);
+    }
+    return w;
+}
+
+CFDictionaryRef traitsAttribute(CGFloat weight) {
+    CFNumberRef wn = CFNumberCreate(kCFAllocatorDefault, kCFNumberCGFloatType, &weight);
+    const void* tk[] = { kCTFontWeightTrait };
+    const void* tv[] = { wn };
+    CFDictionaryRef traits = CFDictionaryCreate(kCFAllocatorDefault, tk, tv, 1, &kCFTypeDictionaryKeyCallBacks,
+                                                &kCFTypeDictionaryValueCallBacks);
+    const void* ak[] = { kCTFontTraitsAttribute };
+    const void* av[] = { traits };
+    CFDictionaryRef attrs = CFDictionaryCreate(kCFAllocatorDefault, ak, av, 1, &kCFTypeDictionaryKeyCallBacks,
+                                               &kCFTypeDictionaryValueCallBacks);
+    CFRelease(traits);
+    CFRelease(wn);
+    return attrs;
+}
+
+// The system UI font at a weight. How to ask for a weight differs between macOS versions, so try the ways in turn and
+// keep the first whose reported weight is close to the one wanted.
+CTFontRef systemFont(float size, int dwWeight) {
+    const CGFloat want = ctWeight(dwWeight);
+    CTFontRef base = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, size, nullptr);
+    if (want == 0.0 || !base) return base;
+    auto close = [&](CTFontRef f) { return f && std::fabs(reportedWeight(f) - want) < 0.08; };
+
+    CTFontRef f = nullptr;
+    {   // A copy of the system font with the weight trait.
+        CFDictionaryRef attrs = traitsAttribute(want);
+        CTFontDescriptorRef desc = CTFontDescriptorCreateWithAttributes(attrs);
+        f = CTFontCreateCopyWithAttributes(base, size, nullptr, desc);
+        CFRelease(desc);
+        CFRelease(attrs);
+    }
+    if (close(f)) { CFRelease(base); return f; }
+    if (f) CFRelease(f);
+
+    {   // The system font by name plus the weight trait.
+        CFDictionaryRef traitsOnly = traitsAttribute(want);
+        const void* ak[] = { kCTFontNameAttribute, kCTFontTraitsAttribute };
+        const void* av[] = { CFSTR(".AppleSystemUIFont"), CFDictionaryGetValue(traitsOnly, kCTFontTraitsAttribute) };
+        CFDictionaryRef attrs = CFDictionaryCreate(kCFAllocatorDefault, ak, av, 2, &kCFTypeDictionaryKeyCallBacks,
+                                                   &kCFTypeDictionaryValueCallBacks);
+        CTFontDescriptorRef desc = CTFontDescriptorCreateWithAttributes(attrs);
+        f = CTFontCreateWithFontDescriptor(desc, size, nullptr);
+        CFRelease(desc);
+        CFRelease(attrs);
+        CFRelease(traitsOnly);
+    }
+    if (close(f)) { CFRelease(base); return f; }
+    if (f) CFRelease(f);
+
+    {   // The weight axis of the variable system font (tag 'wght').
+        const int32_t tag = 0x77676874;
+        const double value = dwWeight;
+        CFNumberRef key = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &tag);
+        CFNumberRef val = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &value);
+        CFDictionaryRef axes = CFDictionaryCreate(kCFAllocatorDefault, reinterpret_cast<const void**>(&key),
+                                                  reinterpret_cast<const void**>(&val), 1, &kCFTypeDictionaryKeyCallBacks,
+                                                  &kCFTypeDictionaryValueCallBacks);
+        const void* ak[] = { kCTFontVariationAttribute };
+        const void* av[] = { axes };
+        CFDictionaryRef attrs = CFDictionaryCreate(kCFAllocatorDefault, ak, av, 1, &kCFTypeDictionaryKeyCallBacks,
+                                                   &kCFTypeDictionaryValueCallBacks);
+        CTFontDescriptorRef desc = CTFontDescriptorCreateWithAttributes(attrs);
+        f = CTFontCreateCopyWithAttributes(base, size, nullptr, desc);
+        CFRelease(desc);
+        CFRelease(attrs);
+        CFRelease(axes);
+        CFRelease(val);
+        CFRelease(key);
+    }
+    if (close(f)) { CFRelease(base); return f; }
+    if (f) CFRelease(f);
+
+    // Last resort: the bold system font for anything from semi-bold up.
+    CFRelease(base);
+    return CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem, size, nullptr);
+}
+
 CTFontRef makeFont(float size, int weight, bool mono) {
     if (mono) {
         CTFontRef f = CTFontCreateWithName(weight >= 600 ? CFSTR("Menlo-Bold") : CFSTR("Menlo-Regular"), size, nullptr);
         if (f) return f;
     }
-    // The system UI font at the requested weight (the same family SF Pro apps use).
-    const CGFloat w = ctWeight(weight);
-    CFNumberRef wn = CFNumberCreate(kCFAllocatorDefault, kCFNumberCGFloatType, &w);
-    const void* tk[] = { kCTFontWeightTrait };
-    const void* tv[] = { wn };
-    CFDictionaryRef traits = CFDictionaryCreate(kCFAllocatorDefault, tk, tv, 1, &kCFTypeDictionaryKeyCallBacks,
-                                                &kCFTypeDictionaryValueCallBacks);
-    const void* ak[] = { kCTFontNameAttribute, kCTFontTraitsAttribute };
-    const void* av[] = { CFSTR(".AppleSystemUIFont"), traits };
-    CFDictionaryRef attrs = CFDictionaryCreate(kCFAllocatorDefault, ak, av, 2, &kCFTypeDictionaryKeyCallBacks,
-                                               &kCFTypeDictionaryValueCallBacks);
-    CTFontDescriptorRef desc = CTFontDescriptorCreateWithAttributes(attrs);
-    CTFontRef f = desc ? CTFontCreateWithFontDescriptor(desc, size, nullptr) : nullptr;
-    if (desc) CFRelease(desc);
-    CFRelease(attrs);
-    CFRelease(traits);
-    CFRelease(wn);
-    return f ? f : CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, size, nullptr);
+    return systemFont(size, weight);
 }
 
 } // namespace

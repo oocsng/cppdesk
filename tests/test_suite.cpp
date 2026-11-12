@@ -8041,6 +8041,26 @@ void checkCanvasBackend() {
         TEST_ASSERT(ink(w) == ink(150.0f));
     }
 
+    {   // The bold role is visibly heavier than the regular one (a backend that ignores weights draws both alike).
+        auto ink = [](ui::FontRole role) {
+            TargetT target(300, 40);
+            CanvasT canvas;
+            canvas.attach(target.handle(), 1.0f);
+            canvas.beginFrame(300, 40, ui::rgba(0, 0, 0));
+            canvas.drawText("Weights and measures", {4, 4, 296, 36}, role, ui::rgba(255, 255, 255), ui::HAlign::Leading,
+                            ui::VAlign::Center);
+            canvas.endFrame();
+            long sum = 0;
+            for (int y = 0; y < 40; ++y)
+                for (int x = 0; x < 300; ++x) sum += target.pixel(x, y)[2];
+            canvas.detach();
+            return sum;
+        };
+        const long regular = ink(ui::FontRole::Body), bold = ink(ui::FontRole::BodyBold);
+        std::cout << "  ink regular " << regular << ", semi-bold " << bold << "\n";
+        TEST_ASSERT(bold > regular * 105 / 100);
+    }
+
     {   // A 1920x1080 remote frame updates and scales into a 1280x720 view well inside a 30 fps frame.
         TargetT target(1280, 720);
         CanvasT canvas;
