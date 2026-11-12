@@ -42,10 +42,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: brew install zstd
+        run: brew install zstd openssl@3
       - name: Build
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
           cmake --build build --target CppDeskTests -j 4 2>&1 | tail -150
           test -x build/CppDeskTests
       - name: Run the test suite

@@ -88,6 +88,11 @@ elseif(APPLE)
     )
 
     find_library(LIB_ZSTD zstd REQUIRED)
+    find_path(ZSTD_INCLUDE_DIR zstd.h REQUIRED)   # Homebrew keeps headers outside the default search path
+    include_directories(${ZSTD_INCLUDE_DIR})
+    # Static, so the app has no Homebrew runtime dependency (macOS has no public AES-GCM, see crypto_identity.cpp).
+    set(OPENSSL_USE_STATIC_LIBS ON)
+    find_package(OpenSSL REQUIRED)
     find_library(COCOA_FRAMEWORK Cocoa REQUIRED)
     find_library(APPKIT_FRAMEWORK AppKit REQUIRED)
     find_library(METAL_FRAMEWORK Metal REQUIRED)
@@ -107,6 +112,7 @@ elseif(APPLE)
         ${CORE_FOUNDATION}
         ${IMAGE_IO}
         ${LIB_ZSTD}
+        OpenSSL::Crypto
         pthread
     )
 elseif(UNIX AND NOT APPLE)
