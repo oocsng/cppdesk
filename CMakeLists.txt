@@ -166,6 +166,10 @@ elseif(UNIX AND NOT APPLE)
     )
     target_link_libraries(CppDeskTests PRIVATE ${PLATFORM_LIBS})
 endif()
+if(TARGET CppDeskTests)
+    # The UI goldens live in the source tree; CMake builds run the tests from the build directory.
+    target_compile_definitions(CppDeskTests PRIVATE CPPDESK_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
 
 # Application executable
 if(WIN32)

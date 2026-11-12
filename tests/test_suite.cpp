@@ -52,6 +52,7 @@
 
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <filesystem>
 #include <chrono>
 #include <thread>
@@ -8006,6 +8007,60 @@ void testAppUiPublicInputApi() {
     std::filesystem::remove(id.configFilePath(), ec);
 }
 
+// Every screen's draw calls must match the committed goldens, so shared screen code cannot change how Windows
+// (or any platform) draws without the golden files changing in the same commit.
+// CPPDESK_UPDATE_UI_GOLDENS=1 rewrites them.
+void testUiGoldens() {
+    std::cout << "[TEST 72] Every screen draws exactly what the goldens record..." << std::endl;
+#if defined(CPPDESK_SOURCE_DIR)
+    std::filesystem::path dir = std::filesystem::path(CPPDESK_SOURCE_DIR) / "tests" / "ui_goldens";
+#else
+    std::filesystem::path dir = std::filesystem::path("tests") / "ui_goldens";
+#endif
+    const bool update = std::getenv("CPPDESK_UPDATE_UI_GOLDENS") != nullptr;
+
+    // The same fixed identity as the app's --ui-snapshot mode.
+    IdentityManager id(4247);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+    {
+        std::ofstream cfg(id.configFilePath(), std::ios::trunc);
+        cfg << "desk_id=482910375\n" << "totp_secret=JBSWY3DPEHPK3PXP\n";
+    }
+    id.loadOrCreate();
+    id.setSessionCode("k7m2qp");
+    NetworkEngine net(id);
+    FakeShell shell;
+    shell.elevation = false;   // an elevated CI runner must not change the dashboard
+
+    if (update) std::filesystem::create_directories(dir, ec);
+    for (const auto& name : AppUi::snapshotStateNames()) {
+        AppUi app(id, net, shell, "");
+        ui::RecordingCanvas rc;
+        app.applySnapshotState(name);
+        for (int i = 0; i < 150; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);
+        const std::string got = rc.serialize();
+        const std::filesystem::path file = dir / (name + ".ops.txt");
+        if (update) {
+            std::ofstream(file, std::ios::binary | std::ios::trunc) << got;
+            continue;
+        }
+        std::ifstream in(file, std::ios::binary);
+        std::string want((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        TEST_ASSERT(in.good() || !want.empty());
+        if (got != want) {
+            std::istringstream a(want), b(got);
+            std::string la, lb;
+            int line = 1;
+            while (std::getline(a, la) && std::getline(b, lb) && la == lb) ++line;
+            std::cout << "  golden mismatch: " << name << " line " << line << "\n    want: " << la
+                      << "\n    got:  " << lb << "\n";
+        }
+        TEST_ASSERT(got == want);
+    }
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
 } // namespace
 
 int main() {
@@ -8094,6 +8149,7 @@ int main() {
         testShellCapabilityGating(); std::cout << "Test 69 done\n" << std::flush;
         testAppUiRendersEveryScreenHeadless(); std::cout << "Test 70 done\n" << std::flush;
         testAppUiPublicInputApi(); std::cout << "Test 71 done\n" << std::flush;
+        testUiGoldens(); std::cout << "Test 72 done\n" << std::flush;
 #if defined(_WIN32)
         testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;
 #endif
