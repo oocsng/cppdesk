@@ -235,4 +235,21 @@ elseif(UNIX AND NOT APPLE)
         src/main.cpp
     )
     target_link_libraries(CppDesk PRIVATE ${PLATFORM_LIBS})
+
+    # Installed layout, shared by the .deb (CPack) and the AppImage (scripts/package_linux.sh).
+    install(PROGRAMS $<TARGET_FILE:CppDesk> DESTINATION bin RENAME cppdesk)
+    install(FILES platform/linux/cppdesk.desktop DESTINATION share/applications)
+    install(FILES assets/icon.png DESTINATION share/icons/hicolor/256x256/apps RENAME cppdesk.png)
+
+    set(CPACK_GENERATOR DEB)
+    set(CPACK_PACKAGE_NAME cppdesk)
+    set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+    set(CPACK_PACKAGE_CONTACT "oocsng")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Fast, secure remote desktop")
+    set(CPACK_PACKAGING_INSTALL_PREFIX /usr)
+    set(CPACK_DEBIAN_PACKAGE_SECTION net)
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+    set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "zenity | kdialog, xdg-utils, libnotify-bin, fonts-noto-cjk, fonts-noto-color-emoji")
+    set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+    include(CPack)
 endif()

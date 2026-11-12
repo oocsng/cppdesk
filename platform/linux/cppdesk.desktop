@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CppDesk
+Comment=Remote desktop
+Exec=cppdesk %u
+Icon=cppdesk
+Terminal=false
+Categories=Network;RemoteAccess;
+MimeType=x-scheme-handler/cppdesk;

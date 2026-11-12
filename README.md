@@ -52,14 +52,19 @@ Hosts and clients identify each other with a 9-digit desk ID (`XXX XXX XXX`). Ac
 ## Quick start
 
 ### 1. Download and run
-Grab `CppDesk.exe` (Windows) or the platform binary from the latest release. No installation needed.
+From the latest release:
+- **Windows:** `CppDesk.exe`. No installation needed; double-click it.
+- **Linux, any distro:** `CppDesk-x86_64.AppImage`. Allow it to run once (file properties → "Allow executing file as
+  program", or `chmod +x CppDesk-x86_64.AppImage`), then double-click it.
+- **Ubuntu / Debian:** `cppdesk_<version>_amd64.deb`. Double-click to install, or `sudo apt install ./cppdesk_*.deb`;
+  CppDesk then appears in the app menu.
 
 ```powershell
 # Windows
 .\CppDesk.exe
 
 # Linux
-./CppDesk
+./CppDesk-x86_64.AppImage
 ```
 
 To test connections locally on a single machine, open two isolated instances:
