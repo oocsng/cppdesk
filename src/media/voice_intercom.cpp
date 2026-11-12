@@ -707,7 +707,8 @@ bool VoiceIntercom::startPlayback(uint32_t sampleRate, uint8_t channels) {
     return true;
 }
 
-void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes) {
+void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes, uint8_t sourceChannels) {
+    (void)sourceChannels;   // shortcut: macOS plays mono as received, no stereo up-mix; revisit with macOS audio in step 5
     bytes = (bytes / sizeof(int16_t)) * sizeof(int16_t);
     if (!pcm || bytes < sizeof(int16_t) || bytes > 192000) return;
     std::lock_guard<std::mutex> lk(playbackMutex_);

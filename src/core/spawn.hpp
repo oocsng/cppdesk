@@ -28,7 +28,25 @@ inline std::vector<char*> argvOf(const std::vector<std::string>& args) {
 // The child keeps only stdin, stdout and stderr: a helper such as a browser started by xdg-open can outlive
 // CppDesk, and must not hold on to its sockets or its single-instance lock.
 inline void closeInheritedFds(posix_spawn_file_actions_t* actions) {
+#if defined(__APPLE__)
+    // No closefrom on macOS: spawnp() below closes everything by default; keep the three standard streams.
+    for (int fd = 0; fd < 3; ++fd) posix_spawn_file_actions_addinherit_np(actions, fd);
+#else
     posix_spawn_file_actions_addclosefrom_np(actions, 3);
+#endif
+}
+
+inline int spawnp(pid_t* pid, const char* file, const posix_spawn_file_actions_t* actions, char* const argv[]) {
+#if defined(__APPLE__)
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+    const int rc = posix_spawnp(pid, file, actions, &attr, argv, environ);
+    posix_spawnattr_destroy(&attr);
+    return rc;
+#else
+    return posix_spawnp(pid, file, actions, nullptr, argv, environ);
+#endif
 }
 
 // Starts the program found on PATH and reaps it in the background. False if it could not start.
@@ -39,7 +57,7 @@ inline bool detached(const std::vector<std::string>& args) {
     posix_spawn_file_actions_init(&actions);
     closeInheritedFds(&actions);
     pid_t pid = 0;
-    const int rc = posix_spawnp(&pid, argv[0], &actions, nullptr, argv.data(), environ);
+    const int rc = spawnp(&pid, argv[0], &actions, argv.data());
     posix_spawn_file_actions_destroy(&actions);
     if (rc != 0) return false;
     std::thread([pid] { int status = 0; waitpid(pid, &status, 0); }).detach();
@@ -58,7 +76,7 @@ inline std::optional<std::string> output(const std::vector<std::string>& args) {
     closeInheritedFds(&actions);   // after the dup2, so the pipe ends above 2 close too
     std::vector<char*> argv = argvOf(args);
     pid_t pid = 0;
-    const int rc = posix_spawnp(&pid, argv[0], &actions, nullptr, argv.data(), environ);
+    const int rc = spawnp(&pid, argv[0], &actions, argv.data());
     posix_spawn_file_actions_destroy(&actions);
     close(fds[1]);
     if (rc != 0) {
