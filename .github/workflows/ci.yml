@@ -50,3 +50,14 @@ jobs:
           test -x build/CppDeskTests
       - name: Run the test suite
         run: cd build && ./CppDeskTests
+      - name: Draw every screen
+        # Offscreen through Core Graphics; the PNGs are what a Mac would show, for comparing with Windows and Linux.
+        run: |
+          cmake --build build --target CppDesk -j 4
+          build/CppDesk.app/Contents/MacOS/CppDesk --ui-snapshot "$RUNNER_TEMP/snap"
+          test "$(ls "$RUNNER_TEMP"/snap/*.png | wc -l)" -eq 26
+          cp -R "$RUNNER_TEMP/snap" macos-ui-snapshots
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-ui-snapshots
+          path: macos-ui-snapshots

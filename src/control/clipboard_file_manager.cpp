@@ -14,6 +14,7 @@
 #include <CommonCrypto/CommonDigest.h>
 #include <unistd.h>
 #include <cstdlib>
+#include "mac_clipboard.hpp"
 #else
 #include <unistd.h>
 #include <cstdlib>
@@ -506,6 +507,8 @@ static std::mutex g_posixClipboardMutex;
 std::string ClipboardManager::getClipboardUtf8() {
 #if defined(__linux__)
     if (X11Clipboard::instance().available()) return X11Clipboard::instance().getText().value_or("");
+#elif defined(__APPLE__)
+    if (std::string text; macClipboardGetText(text)) return text;
 #endif
     std::lock_guard<std::mutex> lock(g_posixClipboardMutex);
     return g_posixClipboardText;
@@ -514,6 +517,8 @@ std::string ClipboardManager::getClipboardUtf8() {
 bool ClipboardManager::setClipboardUtf8(const std::string& utf8Text) {
 #if defined(__linux__)
     if (X11Clipboard::instance().available()) return X11Clipboard::instance().setText(utf8Text);
+#elif defined(__APPLE__)
+    if (macClipboardSetText(utf8Text)) return true;
 #endif
     std::lock_guard<std::mutex> lock(g_posixClipboardMutex);
     g_posixClipboardText = utf8Text;

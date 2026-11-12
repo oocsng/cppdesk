@@ -22,6 +22,10 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <climits>
+#include <mach-o/dyld.h>
+#endif
 #include <iostream>
 #endif
 
@@ -268,7 +272,7 @@ int main(int argc, char* argv[]) {
         if (!parsed.empty()) connectTarget = parsed;
     }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     if (!uiSnapshotDir.empty()) {
         constexpr int kSnapshotInstance = 4243;
         cppdesk::IdentityManager snapIdentity(kSnapshotInstance);
@@ -338,7 +342,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     // The signal handler only sets a flag; close the window from here so Ctrl+C and SIGTERM end the app.
     std::atomic<bool> loopDone{false};
     std::thread signalWatcher([&] {
@@ -362,6 +366,12 @@ int main(int argc, char* argv[]) {
 #if defined(__linux__)
     // Restart in place once the single-instance lock is released (a copy started earlier would see it held).
     if (window.relaunchRequested()) execv("/proc/self/exe", argv);
+#elif defined(__APPLE__)
+    if (window.relaunchRequested()) {
+        char self[PATH_MAX] = {};
+        uint32_t size = sizeof(self);
+        if (_NSGetExecutablePath(self, &size) == 0) execv(self, argv);
+    }
 #endif
     return exitCode;
 }

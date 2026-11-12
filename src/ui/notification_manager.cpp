@@ -180,6 +180,13 @@ void NotificationManager::notify(
         // "--": a title or message from a peer that starts with '-' is text, not an option.
         spawn::detached({ "notify-send", "-a", "CppDesk", "--", title.empty() ? appTitle_ : title, message });
     }
+#elif defined(__APPLE__)
+    // The title and text travel as script arguments (argv), never spliced into the script: they come from peers.
+    if (settings.enablePushNotifications) {
+        spawn::detached({ "osascript", "-e", "on run argv", "-e",
+                          "display notification (item 2 of argv) with title (item 1 of argv)", "-e", "end run", "--",
+                          title.empty() ? appTitle_ : title, message });
+    }
 #else
     (void)title;
     (void)message;

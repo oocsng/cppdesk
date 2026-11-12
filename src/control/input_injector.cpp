@@ -226,6 +226,15 @@ uint32_t InputInjector::mapVkToX11KeySym(uint16_t vk) {
     }
 }
 
+uint16_t InputInjector::mapMacKeyCodeToVk(uint16_t macKeyCode) {
+    if (macKeyCode == 0xFFFF) return 0;   // the "unmapped" marker of mapVkToMacKeyCode
+    if (macKeyCode == 0x37 || macKeyCode == 0x36) return 0x11;   // Command acts as Ctrl
+    for (uint16_t vk = 1; vk < 255; ++vk) {   // lowest vk wins: generic modifiers before left/right ones
+        if (mapVkToMacKeyCode(vk) == macKeyCode) return vk;
+    }
+    return 0;
+}
+
 uint16_t InputInjector::mapX11KeySymToVk(uint32_t keysym) {
     if (keysym >= 'A' && keysym <= 'Z') keysym += 'a' - 'A';   // the table maps letters to lowercase keysyms
     if (keysym == 0) return 0;

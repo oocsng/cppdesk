@@ -86,6 +86,7 @@ elseif(APPLE)
     list(APPEND CORE_SOURCES
         src/simd/simd_fallback.cpp
         src/ui/canvas_cg.cpp
+        src/control/mac_clipboard.mm
     )
 
     find_library(LIB_ZSTD zstd REQUIRED)
@@ -173,20 +174,28 @@ else()
     )
 endif()
 
-# The Linux window and its embedded app icon (assets/icon.png as a byte array).
-if(UNIX AND NOT APPLE)
+# The app icon embedded in the window code of Linux and macOS (assets/icon.png as a byte array).
+if(UNIX)
     file(READ ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.png ICON_HEX HEX)
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," ICON_BYTES "${ICON_HEX}")
     file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/app_icon_png.cpp
         "#include <cstddef>\nextern const unsigned char kAppIconPng[] = {${ICON_BYTES}};\n"
         "extern const std::size_t kAppIconPngSize = sizeof(kAppIconPng);\n")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.png)
-    set(LINUX_UI_SOURCES
-        src/ui/ui_window_linux.cpp
-        src/ui/x11_dnd.cpp
-        src/ui/x11_tray.cpp
-        ${CMAKE_CURRENT_BINARY_DIR}/generated/app_icon_png.cpp
-    )
+    set(APP_ICON_CPP ${CMAKE_CURRENT_BINARY_DIR}/generated/app_icon_png.cpp)
+    if(NOT APPLE)
+        set(LINUX_UI_SOURCES
+            src/ui/ui_window_linux.cpp
+            src/ui/x11_dnd.cpp
+            src/ui/x11_tray.cpp
+            ${APP_ICON_CPP}
+        )
+    endif()
+endif()
+if(APPLE)
+    # AppKit code is written for ARC.
+    set_source_files_properties(src/ui/ui_window_mac.mm src/control/mac_clipboard.mm tests/mac_test_driver.mm
+        PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
 # Automated test suite target
@@ -199,6 +208,9 @@ if(WIN32)
 elseif(APPLE)
     add_executable(CppDeskTests
         ${CORE_SOURCES}
+        src/ui/ui_window_mac.mm
+        ${APP_ICON_CPP}
+        tests/mac_test_driver.mm
         tests/test_suite.cpp
     )
     target_link_libraries(CppDeskTests PRIVATE ${PLATFORM_LIBS} ${COCOA_FRAMEWORK} ${APPKIT_FRAMEWORK} ${QUARTZ_CORE})
@@ -229,6 +241,7 @@ elseif(APPLE)
     add_executable(CppDesk MACOSX_BUNDLE
         ${CORE_SOURCES}
         src/ui/ui_window_mac.mm
+        ${APP_ICON_CPP}
         src/main.cpp
     )
     set_target_properties(CppDesk PROPERTIES

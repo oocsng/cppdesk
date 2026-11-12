@@ -123,6 +123,23 @@ public:
     bool create(void* displayContext = nullptr, int showCommand = 1);
     int messageLoop();
     void close();
+    // Renders every fixed UI state offscreen to <outDir>/<state>.png and returns how many were written.
+    // Needs no window server.
+    static int runUiSnapshots(IdentityManager& identity, NetworkEngine& network, const std::string& outDir);
+
+    // One loop iteration: waits up to timeoutMs for events, posted work, the tick or a due frame, and handles
+    // them. messageLoop() calls it until it returns false (the window closed).
+    bool processEvents(int timeoutMs);
+    // Thread-safe: runs fn on the UI thread, waking the loop.
+    void post(std::function<void()> fn);
+    // Thread-safe: closes the window as if the user had (Ctrl+C or SIGTERM in a terminal, Quit in the menu).
+    void requestQuit();
+    // The screens this window hosts.
+    AppUi& app();
+    // The NSWindow (nullptr before create()).
+    void* nativeWindow() const;
+    // The user asked to restart; main re-executes the app after the loop.
+    bool relaunchRequested() const;
 
 private:
     IdentityManager& identity_;
