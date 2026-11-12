@@ -13,6 +13,10 @@
 #include "../src/ui/app_ui.hpp"
 #include "../src/ui/vk_codes.hpp"
 #include "../src/ui/platform_shell.hpp"
+#if defined(__linux__)
+#include "../src/ui/canvas_cairo.hpp"
+#include <cairo.h>
+#endif
 #if defined(_WIN32)
 #include "../src/ui/canvas_d2d.hpp"
 #include <wincodec.h>
@@ -7868,6 +7872,171 @@ void testD2DCanvas() {
 }
 #endif
 
+#if defined(__linux__)
+// Offscreen Cairo image surface the canvas draws into and the test reads back.
+struct CairoTarget {
+    cairo_surface_t* surface = nullptr;
+    int w = 0, h = 0;
+    CairoTarget(int width, int height) : w(width), h(height) {
+        surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    }
+    ~CairoTarget() { cairo_surface_destroy(surface); }
+    // Returns {b, g, r, a} at (x, y).
+    std::array<uint8_t, 4> pixel(int x, int y) const {
+        std::array<uint8_t, 4> out{};
+        cairo_surface_flush(surface);
+        const uint8_t* data = cairo_image_surface_get_data(surface);
+        std::memcpy(out.data(), data + y * cairo_image_surface_get_stride(surface) + x * 4, 4);
+        return out;
+    }
+    bool anyBrighter(int l, int t, int r, int b, int threshold) const {
+        for (int y = t; y < b; ++y)
+            for (int x = l; x < r; ++x)
+                if (pixel(x, y)[2] > threshold) return true;
+        return false;
+    }
+};
+
+void testCairoCanvas() {
+    std::cout << "[TEST 73] Cairo canvas backend (scene, images, state, arcs, text, speed)..." << std::endl;
+
+    {   // Scene: shapes, text and background land where expected.
+        CairoTarget target(200, 100);
+        ui::CairoCanvas canvas;
+        canvas.attach(target.surface, 1.0f);
+        canvas.beginFrame(200, 100, ui::rgba(0, 0, 0));
+        canvas.fillRoundRect({10, 10, 60, 60}, 4, ui::rgba(255, 0, 0));
+        canvas.drawText("Hi", {100, 10, 190, 40}, ui::FontRole::Heading, ui::rgba(255, 255, 255), ui::HAlign::Leading, ui::VAlign::Center);
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(35, 35)[2] > 200 && target.pixel(35, 35)[1] < 40);
+        TEST_ASSERT(target.anyBrighter(100, 10, 190, 40, 128));
+        TEST_ASSERT(target.pixel(150, 80)[2] < 10);
+        TEST_ASSERT(canvas.frameBalanced());
+        canvas.detach();
+    }
+
+    {   // Image resize and dirty-rectangle update.
+        CairoTarget target(64, 64);
+        ui::CairoCanvas canvas;
+        canvas.attach(target.surface, 1.0f);
+        std::vector<uint8_t> red(16 * 16 * 4), green(32 * 8 * 4), blue(32 * 8 * 4);
+        for (size_t i = 0; i < red.size(); i += 4) { red[i] = 0; red[i + 1] = 0; red[i + 2] = 255; red[i + 3] = 255; }
+        for (size_t i = 0; i < green.size(); i += 4) { green[i] = 0; green[i + 1] = 255; green[i + 2] = 0; green[i + 3] = 255; }
+        for (size_t i = 0; i < blue.size(); i += 4) { blue[i] = 255; blue[i + 1] = 0; blue[i + 2] = 0; blue[i + 3] = 255; }
+        canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
+        ui::ImageId id = canvas.createImage(16, 16);
+        canvas.updateImage(id, red.data(), 16 * 4, {0, 0, 16, 16});
+        canvas.drawImage(id, {0, 0, 16, 16}, 1.0f);
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(8, 8)[2] > 200);
+        canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
+        canvas.destroyImage(id);
+        id = canvas.createImage(32, 8);
+        canvas.updateImage(id, green.data(), 32 * 4, {0, 0, 32, 8});
+        canvas.drawImage(id, {0, 0, 32, 8}, 1.0f);
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(20, 4)[1] > 200 && target.pixel(20, 4)[2] < 40);
+        canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
+        canvas.updateImage(id, blue.data(), 32 * 4, {0, 0, 8, 8});
+        canvas.drawImage(id, {0, 0, 32, 8}, 1.0f);
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(4, 4)[0] > 200 && target.pixel(20, 4)[1] > 200);
+        canvas.detach();
+    }
+
+    {   // Detach/attach: stale images draw nothing and leftover state does not leak into the next frame.
+        CairoTarget first(32, 32), second(32, 32);
+        ui::CairoCanvas canvas;
+        canvas.attach(first.surface, 1.0f);
+        ui::ImageId stale = canvas.createImage(4, 4);
+        canvas.beginFrame(32, 32, ui::rgba(0, 0, 0));
+        canvas.pushClip({0, 0, 4, 4});
+        canvas.setTransform(ui::Transform2D::scale(4, 4, 0, 0));
+        canvas.endFrame();
+        canvas.detach();
+        canvas.attach(second.surface, 1.0f);
+        canvas.beginFrame(32, 32, ui::rgba(0, 0, 0));
+        canvas.drawImage(stale, {0, 0, 32, 32}, 1.0f);
+        canvas.fillRect({0, 0, 32, 32}, ui::rgba(255, 0, 0));
+        canvas.endFrame();
+        TEST_ASSERT(second.pixel(30, 30)[2] > 200);
+        TEST_ASSERT(canvas.frameBalanced());
+        canvas.detach();
+    }
+
+    {   // A transform set inside a clip survives the clip's pop (as in Direct2D); opacity layers blend.
+        CairoTarget target(64, 64);
+        ui::CairoCanvas canvas;
+        canvas.attach(target.surface, 1.0f);
+        canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
+        canvas.pushClip({0, 0, 16, 16});
+        canvas.setTransform(ui::Transform2D::scale(2, 2, 0, 0));
+        canvas.popClip();
+        canvas.fillRect({0, 0, 32, 32}, ui::rgba(255, 0, 0));
+        canvas.setTransform(ui::Transform2D::identity());
+        TEST_ASSERT(canvas.frameBalanced());
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(60, 60)[2] > 200);
+        canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
+        canvas.pushOpacity(0.5f);
+        canvas.fillRect({0, 0, 64, 64}, ui::rgba(255, 255, 255));
+        canvas.popOpacity();
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(10, 10)[2] >= 120 && target.pixel(10, 10)[2] <= 135);
+        canvas.detach();
+    }
+
+    {   // A clockwise arc bulges up on a y-down screen.
+        CairoTarget target(60, 60);
+        ui::CairoCanvas canvas;
+        canvas.attach(target.surface, 1.0f);
+        ui::Path p;
+        p.moveTo(10, 30);
+        p.arcTo(50, 30, 20, true, false);
+        p.close();
+        canvas.beginFrame(60, 60, ui::rgba(0, 0, 0));
+        canvas.fillPath(p, ui::rgba(255, 0, 0));
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(30, 20)[2] > 200);
+        TEST_ASSERT(target.pixel(30, 40)[2] < 10);
+        canvas.detach();
+    }
+
+    {   // Text measurement, including CJK and emoji, and wrapping only where the role wraps.
+        ui::CairoCanvas canvas;
+        const float w = canvas.measureTextWidth("Settings", ui::FontRole::Body);
+        TEST_ASSERT(w > 40.0f && w < 70.0f);
+        TEST_ASSERT(canvas.measureTextWidth("\xE6\xBC\xA2\xE5\xAD\x97\xF0\x9F\x98\x80", ui::FontRole::Body) > 0.0f);
+        const char* sentence = "This sentence is long enough that it must wrap inside a narrow tooltip.";
+        const float oneLine = canvas.measureTextBlock("Hi", ui::FontRole::Tooltip, 120).y;
+        TEST_ASSERT(canvas.measureTextBlock(sentence, ui::FontRole::Tooltip, 120).y > oneLine * 1.5f);
+        TEST_ASSERT(canvas.measureTextBlock(sentence, ui::FontRole::Body, 120).y <
+                    canvas.measureTextBlock("Hi", ui::FontRole::Body, 120).y * 1.5f);
+    }
+
+    {   // A 1920x1080 remote frame updates and scales into a 1280x720 view well inside a 30 fps frame.
+        CairoTarget target(1280, 720);
+        ui::CairoCanvas canvas;
+        canvas.attach(target.surface, 1.0f);
+        std::vector<uint8_t> frame(1920 * 1080 * 4, 0x80);
+        ui::ImageId id = canvas.createImage(1920, 1080, true);
+        constexpr int kIters = 20;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kIters; ++i) {
+            canvas.beginFrame(1280, 720, ui::rgba(0, 0, 0));
+            canvas.updateImage(id, frame.data(), 1920 * 4, {0, 0, 1920, 1080});
+            canvas.drawImage(id, {0, 0, 1280, 720}, 1.0f);
+            canvas.endFrame();
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / kIters;
+        std::cout << "  remote frame 1920x1080 -> 1280x720: " << ms << " ms\n";
+        TEST_ASSERT(ms < 33.0);
+        TEST_ASSERT(target.pixel(640, 360)[2] > 100);
+        canvas.detach();
+    }
+}
+#endif
+
 // A PlatformShell for headless screen tests: no window, a fixed clock, and switchable capabilities.
 class FakeShell : public ui::PlatformShell {
 public:
@@ -8150,6 +8319,9 @@ int main() {
         testAppUiRendersEveryScreenHeadless(); std::cout << "Test 70 done\n" << std::flush;
         testAppUiPublicInputApi(); std::cout << "Test 71 done\n" << std::flush;
         testUiGoldens(); std::cout << "Test 72 done\n" << std::flush;
+#if defined(__linux__)
+        testCairoCanvas(); std::cout << "Test 73 done\n" << std::flush;
+#endif
 #if defined(_WIN32)
         testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;
 #endif

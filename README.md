@@ -88,7 +88,7 @@ Headless Linux host / service mode:
 
 On Linux (Debian / Ubuntu / derivatives):
 ```bash
-sudo apt install build-essential cmake libx11-dev libxext-dev libxtst-dev libxrandr-dev libzstd-dev libjpeg-turbo8-dev libssl-dev
+sudo apt install build-essential cmake libx11-dev libxext-dev libxtst-dev libxrandr-dev libzstd-dev libjpeg-turbo8-dev libssl-dev libcairo2-dev libpango1.0-dev pkg-config
 ```
 
 ### Build commands

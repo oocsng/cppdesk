@@ -114,15 +114,24 @@ elseif(UNIX AND NOT APPLE)
 
     find_package(X11 QUIET)
     find_package(JPEG QUIET)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(CAIRO REQUIRED IMPORTED_TARGET cairo)
+    pkg_check_modules(PANGOCAIRO REQUIRED IMPORTED_TARGET pangocairo)
     find_package(OpenSSL REQUIRED)
     find_library(LIB_ZSTD zstd REQUIRED)
     find_library(LIB_XTST Xtst)
     find_library(LIB_XRANDR Xrandr)
     find_library(LIB_XEXT Xext)
 
+    list(APPEND CORE_SOURCES
+        src/ui/canvas_cairo.cpp
+    )
+
     set(PLATFORM_LIBS
         ${LIB_ZSTD}
         OpenSSL::Crypto
+        PkgConfig::CAIRO
+        PkgConfig::PANGOCAIRO
         pthread
         dl
     )
