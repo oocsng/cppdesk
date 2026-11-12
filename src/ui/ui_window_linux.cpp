@@ -121,9 +121,13 @@ struct CppDeskWindowLinuxImpl {
     ui::CairoCanvas canvas;
 
     std::unique_ptr<XdndTarget> dnd;
-    // Cleared before teardown so late background callbacks (the update check) find no window.
-    std::shared_ptr<std::atomic<CppDeskWindowLinuxImpl*>> liveToken =
-        std::make_shared<std::atomic<CppDeskWindowLinuxImpl*>>(this);
+    // Shared with background callbacks (the update check), which can finish after the window is gone. They use
+    // the window only while holding the lock; the destructor clears it under the same lock.
+    struct LiveToken {
+        std::mutex m;
+        CppDeskWindowLinuxImpl* w = nullptr;
+    };
+    std::shared_ptr<LiveToken> liveToken = std::make_shared<LiveToken>();
     std::unique_ptr<X11Tray> tray;
     bool hiddenInTray = false;
     std::string trayTooltip;
@@ -147,6 +151,7 @@ struct CppDeskWindowLinuxImpl {
 
     CppDeskWindowLinuxImpl(IdentityManager& id, NetworkEngine& net) : identity(id), network(net) {
         if (pipe2(wakeFds, O_CLOEXEC | O_NONBLOCK) != 0) wakeFds[0] = wakeFds[1] = -1;
+        liveToken->w = this;
     }
 
     void wake() {
@@ -276,13 +281,11 @@ struct CppDeskWindowLinuxImpl {
         needsPaint = false;
         app->render(canvas, widthPx / scale, heightPx / scale, dt);
         if (useShm) {
-            // Ask for a completion event and wait for it, so the next frame never draws into memory the server is
-            // still reading (tearing).
-            XShmPutImage(dpy, win, gc, image, 0, 0, 0, 0, widthPx, heightPx, True);
-            XEvent done;
-            XIfEvent(dpy, &done, [](Display* d, XEvent* e, XPointer) {
-                return static_cast<Bool>(e->type == XShmGetEventBase(d) + ShmCompletion);
-            }, nullptr);
+            // The server copies the image while it handles the request, so a round trip means it has finished
+            // reading our memory before the next frame draws into it (no tearing). Unlike waiting for a completion
+            // event, this also returns if the request failed.
+            XShmPutImage(dpy, win, gc, image, 0, 0, 0, 0, widthPx, heightPx, False);
+            XSync(dpy, False);
         }
         else XPutImage(dpy, win, gc, image, 0, 0, 0, 0, widthPx, heightPx);
         XFlush(dpy);
@@ -485,9 +488,10 @@ public:
     void checkForUpdates(bool manual) override {
         if (!w_) return;
         // The check can finish after the window is gone; the token is cleared before teardown.
-        std::shared_ptr<std::atomic<CppDeskWindowLinuxImpl*>> token = w_->liveToken;
+        std::shared_ptr<CppDeskWindowLinuxImpl::LiveToken> token = w_->liveToken;
         AutoUpdater::checkForUpdatesAsync([token, manual](const UpdateInfo& info) {
-            CppDeskWindowLinuxImpl* w = token->load();
+            std::lock_guard<std::mutex> alive(token->m);
+            CppDeskWindowLinuxImpl* w = token->w;
             if (!w) return;
             std::lock_guard<std::mutex> lock(w->postMutex);
             w->posted.push_back([w, info, manual] {
@@ -680,7 +684,10 @@ CppDeskWindow::CppDeskWindow(IdentityManager& identity, NetworkEngine& network, 
 }
 
 CppDeskWindow::~CppDeskWindow() {
-    pImpl_->liveToken->store(nullptr);
+    {
+        std::lock_guard<std::mutex> alive(pImpl_->liveToken->m);
+        pImpl_->liveToken->w = nullptr;
+    }
     network_.setOnScratchpadUpdateCallback(nullptr);
     network_.setOnCommandPaletteOutputCallback(nullptr);
     network_.setOnFrameDecodedCallback(nullptr);

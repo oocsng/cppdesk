@@ -252,6 +252,22 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // One parser for every way of naming the desk to connect to, as on Windows: --connect, -c, --connect=, and
+    // the cppdesk:// links the desktop file hands over ("cppdesk %u").
+    {
+        std::wstring cmdLine;
+        for (int i = 0; i < argc; ++i) {
+            const std::string a = argv[i];
+            const bool quote = a.find(' ') != std::string::npos;
+            if (i > 0) cmdLine += L' ';
+            if (quote) cmdLine += L'"';
+            cmdLine.append(a.begin(), a.end());
+            if (quote) cmdLine += L'"';
+        }
+        const std::string parsed = cppdesk::ShortcutManager::parseStartupConnectTarget(cmdLine);
+        if (!parsed.empty()) connectTarget = parsed;
+    }
+
 #if defined(__linux__)
     if (!uiSnapshotDir.empty()) {
         constexpr int kSnapshotInstance = 4243;
