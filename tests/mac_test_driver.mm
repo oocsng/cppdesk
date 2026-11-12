@@ -2,6 +2,7 @@
 
 #include "mac_test_driver.hpp"
 #include <cstring>
+#include <initializer_list>
 
 #import <Cocoa/Cocoa.h>
 

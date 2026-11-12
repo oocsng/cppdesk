@@ -228,7 +228,13 @@ uint32_t InputInjector::mapVkToX11KeySym(uint16_t vk) {
 
 uint16_t InputInjector::mapMacKeyCodeToVk(uint16_t macKeyCode) {
     if (macKeyCode == 0xFFFF) return 0;   // the "unmapped" marker of mapVkToMacKeyCode
-    if (macKeyCode == 0x37 || macKeyCode == 0x36) return 0x11;   // Command acts as Ctrl
+    switch (macKeyCode) {   // the right-hand modifiers are the generic ones too, as WM_KEYDOWN reports them
+        case 0x3C: return 0x10;   // right Shift
+        case 0x3E: return 0x11;   // right Control
+        case 0x3D: return 0x12;   // right Option
+        case 0x37: case 0x36: return 0x11;   // Command acts as Ctrl
+        default: break;
+    }
     for (uint16_t vk = 1; vk < 255; ++vk) {   // lowest vk wins: generic modifiers before left/right ones
         if (mapVkToMacKeyCode(vk) == macKeyCode) return vk;
     }
