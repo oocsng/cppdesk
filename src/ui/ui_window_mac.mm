@@ -87,9 +87,13 @@ NSString* toNs(const std::string& utf8) {
     return s ? s : @"";
 }
 
-std::string fromNs(NSString* s) { return s ? std::string([s UTF8String]) : std::string(); }
-
 } // namespace
+
+// Declared outside the anonymous namespace: the Objective-C classes below use it too.
+std::string fromNs(NSString* s) {
+    const char* bytes = s ? [s UTF8String] : nullptr;   // NULL for text UTF-8 cannot hold
+    return bytes ? std::string(bytes) : std::string();
+}
 
 class MacShell;
 
@@ -98,6 +102,7 @@ class MacShell;
 @class CppDeskView;
 @class CppDeskWindowDelegate;
 @class CppDeskMenuTarget;
+@class CppDeskAppDelegate;
 
 namespace cppdesk {
 
@@ -109,6 +114,7 @@ struct CppDeskWindowMacImpl {
     CppDeskView* view = nil;
     CppDeskWindowDelegate* delegate = nil;
     CppDeskMenuTarget* menuTarget = nil;
+    CppDeskAppDelegate* appDelegate = nil;
     NSStatusItem* statusItem = nil;
     NSMenuItem* statusLine = nil;
     NSMenuItem* muteItem = nil;
@@ -305,11 +311,11 @@ struct CppDeskWindowMacImpl {
     if (event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) {
         // A shortcut, not typing. Windows delivers Ctrl+letter as a control character (Ctrl+A is 1, C is 3).
         NSString* c = event.charactersIgnoringModifiers;
-        if (c.length == 1) {
-            unichar ch = [c characterAtIndex:0];
-            if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
-            if (ch >= 'a' && ch <= 'z') impl_->app->onText(std::string(1, static_cast<char>(ch - 'a' + 1)));
-        }
+        unichar ch = c.length == 1 ? [c characterAtIndex:0] : 0;
+        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+        // On a non-Latin layout (Cyrillic, Greek, Hebrew ...) the key types another letter: its position decides.
+        if (!(ch >= 'a' && ch <= 'z') && vk >= 'A' && vk <= 'Z') ch = static_cast<unichar>(vk - 'A' + 'a');
+        if (ch >= 'a' && ch <= 'z') impl_->app->onText(std::string(1, static_cast<char>(ch - 'a' + 1)));
         return;
     }
     if (!marked_.length) {
@@ -362,7 +368,7 @@ struct CppDeskWindowMacImpl {
 - (void)insertText:(id)string replacementRange:(NSRange)range {
     NSString* s = [string isKindOfClass:[NSAttributedString class]] ? [(NSAttributedString*)string string] : (NSString*)string;
     marked_ = @"";
-    if (impl_ && impl_->app && s.length) impl_->app->onText(std::string([s UTF8String]));
+    if (impl_ && impl_->app && s.length) impl_->app->onText(cppdesk::fromNs(s));
 }
 - (void)setMarkedText:(id)string selectedRange:(NSRange)selected replacementRange:(NSRange)range {
     marked_ = [string isKindOfClass:[NSAttributedString class]] ? [(NSAttributedString*)string string] : (NSString*)string;
@@ -385,7 +391,7 @@ struct CppDeskWindowMacImpl {
     NSArray* urls = [[sender draggingPasteboard] readObjectsForClasses:@[ [NSURL class] ]
                                                                options:@{ NSPasteboardURLReadingFileURLsOnlyKey: @YES }];
     std::vector<std::string> paths;
-    for (NSURL* url in urls) paths.push_back(std::string(url.path.UTF8String));
+    for (NSURL* url in urls) paths.push_back(cppdesk::fromNs(url.path));
     if (paths.empty()) return NO;
     NSPoint p = [self convertPoint:sender.draggingLocation fromView:nil];
     impl_->app->onFilesDropped(paths, static_cast<float>(p.x), static_cast<float>(self.bounds.size.height - p.y));
@@ -435,6 +441,21 @@ struct CppDeskWindowMacImpl {
 - (void)restore:(id)sender { if (impl_) impl_->restoreFromTray(); }
 - (void)toggleMute:(id)sender { if (impl_ && impl_->app) impl_->app->toggleNotificationsMuted(); }
 - (void)quit:(id)sender { if (impl_) impl_->requestClose(); }
+@end
+
+// Quit from the Dock, logout, restart and shutdown arrive as terminate:, which would call exit() and skip the
+// cleanup (recordings finalised, network stopped). Close the window instead and let the loop end.
+@interface CppDeskAppDelegate : NSObject <NSApplicationDelegate> {
+@public
+    cppdesk::CppDeskWindowMacImpl* impl_;
+}
+@end
+
+@implementation CppDeskAppDelegate
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
+    if (impl_) impl_->requestClose();
+    return NSTerminateCancel;
+}
 @end
 
 namespace cppdesk {
@@ -729,6 +750,9 @@ bool CppDeskWindowMacImpl::processEvents(int timeoutMs) {
                                            dequeue:YES];
         while (ev && !closed) {
             [NSApp sendEvent:ev];
+            // AppKit never sends the key-up of a Command shortcut to the view; deliver it here (keyUp: ignores a
+            // key that is not held, so a key-up AppKit did deliver is not reported twice).
+            if (ev.type == NSEventTypeKeyUp && (ev.modifierFlags & NSEventModifierFlagCommand)) [view keyUp:ev];
             ev = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:[NSDate distantPast]
                                        inMode:NSDefaultRunLoopMode dequeue:YES];
         }
@@ -813,6 +837,9 @@ bool CppDeskWindow::create(void* /*displayContext*/, int /*showCommand*/) {
             [NSApp finishLaunching];
         }
 
+        w.appDelegate = [[CppDeskAppDelegate alloc] init];
+        w.appDelegate->impl_ = &w;
+        NSApp.delegate = w.appDelegate;   // weak in NSApp: the window owns it
         w.menuTarget = [[CppDeskMenuTarget alloc] init];
         w.menuTarget->impl_ = &w;
         {   // The application menu: only Quit, which ends the loop the way the close button does.
@@ -918,10 +945,19 @@ void CppDeskWindow::close() {
         CGContextRelease(w.bitmap);
         w.bitmap = nullptr;
     }
+    // Nothing may call back into the window once it is gone.
+    if (w.view) w.view->impl_ = nullptr;
+    if (w.delegate) w.delegate->impl_ = nullptr;
+    if (w.menuTarget) w.menuTarget->impl_ = nullptr;
+    if (w.appDelegate) {
+        w.appDelegate->impl_ = nullptr;
+        if (NSApp.delegate == w.appDelegate) NSApp.delegate = nil;
+    }
     w.view = nil;
     w.window = nil;
     w.delegate = nil;
     w.menuTarget = nil;
+    w.appDelegate = nil;
 }
 
 int CppDeskWindow::runUiSnapshots(IdentityManager& identity, NetworkEngine& network, const std::string& outDir) {

@@ -9,8 +9,9 @@ namespace cppdesk {
 bool macClipboardGetText(std::string& utf8) {
     @autoreleasepool {
         NSString* text = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
-        if (!text) return false;
-        utf8 = std::string([text UTF8String]);
+        const char* bytes = text ? [text UTF8String] : nullptr;   // NULL for text UTF-8 cannot hold (a lone surrogate)
+        if (!bytes) return false;
+        utf8 = bytes;
         return true;
     }
 }

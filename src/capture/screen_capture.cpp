@@ -508,15 +508,25 @@ std::vector<uint8_t> TileCodec::encodeJpeg(const uint8_t* bgra, int width, int h
     return out;
 }
 
-bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<uint8_t>& outBgra, int& outW, int& outH) {
+namespace {
+
+// Decodes a JPEG to opaque BGRA. Bytes come from peers: only real JPEG data goes to ImageIO (not its TIFF, HEIC,
+// PSD ... parsers), and an image of another size than expectW x expectH (when given), or an absurd one, is refused
+// from its header, before any pixel memory is allocated.
+bool decodeJpegImageIO(const uint8_t* jpegData, size_t jpegLen, std::vector<uint8_t>& outBgra, int& outW, int& outH,
+                       int expectW, int expectH) {
+    constexpr size_t kMaxPixels = 100u * 1000 * 1000;
     if (!jpegData || jpegLen == 0) return false;
     CFDataRef data = CFDataCreate(kCFAllocatorDefault, jpegData, static_cast<CFIndex>(jpegLen));
     CGImageSourceRef source = CGImageSourceCreateWithData(data, nullptr);
-    CGImageRef image = source ? CGImageSourceCreateImageAtIndex(source, 0, nullptr) : nullptr;
+    CFStringRef type = source ? CGImageSourceGetType(source) : nullptr;
+    CGImageRef image = (type && CFEqual(type, CFSTR("public.jpeg"))) ? CGImageSourceCreateImageAtIndex(source, 0, nullptr) : nullptr;
     bool ok = false;
     if (image) {
         const int w = static_cast<int>(CGImageGetWidth(image)), h = static_cast<int>(CGImageGetHeight(image));
-        if (w > 0 && h > 0) {
+        const bool sizeOk = w > 0 && h > 0 && static_cast<size_t>(w) * static_cast<size_t>(h) <= kMaxPixels &&
+                            (expectW == 0 || w == expectW) && (expectH == 0 || h == expectH);
+        if (sizeOk) {
             outBgra.assign(static_cast<size_t>(w) * h * 4, 0);
             CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
             CGContextRef ctx = CGBitmapContextCreate(outBgra.data(), w, h, 8, static_cast<size_t>(w) * 4, space,
@@ -538,6 +548,12 @@ bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<
     return ok;
 }
 
+} // namespace
+
+bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<uint8_t>& outBgra, int& outW, int& outH) {
+    return decodeJpegImageIO(jpegData, jpegLen, outBgra, outW, outH, 0, 0);
+}
+
 bool TileCodec::decodeJpegIntoCanvas(
     const uint8_t* jpegData, size_t jpegLen,
     uint8_t* canvasBgra, int canvasW, int canvasH,
@@ -547,7 +563,7 @@ bool TileCodec::decodeJpegIntoCanvas(
     if (static_cast<int>(x) + width > canvasW || static_cast<int>(y) + height > canvasH) return false;
     std::vector<uint8_t> tile;
     int w = 0, h = 0;
-    if (!decodeJpeg(jpegData, jpegLen, tile, w, h) || w != width || h != height) return false;
+    if (!decodeJpegImageIO(jpegData, jpegLen, tile, w, h, width, height)) return false;
     for (int r = 0; r < height; ++r) {
         uint8_t* dstRow = canvasBgra + (static_cast<size_t>(y + r) * canvasW + x) * 4;
         SimdKernels::blitRowBgraOpaque(dstRow, tile.data() + static_cast<size_t>(r) * width * 4, width);
