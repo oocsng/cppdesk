@@ -161,6 +161,20 @@ else()
     )
 endif()
 
+# The Linux window and its embedded app icon (assets/icon.png as a byte array).
+if(UNIX AND NOT APPLE)
+    file(READ ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.png ICON_HEX HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," ICON_BYTES "${ICON_HEX}")
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/app_icon_png.cpp
+        "#include <cstddef>\nextern const unsigned char kAppIconPng[] = {${ICON_BYTES}};\n"
+        "extern const std::size_t kAppIconPngSize = sizeof(kAppIconPng);\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.png)
+    set(LINUX_UI_SOURCES
+        src/ui/ui_window_linux.cpp
+        ${CMAKE_CURRENT_BINARY_DIR}/generated/app_icon_png.cpp
+    )
+endif()
+
 # Automated test suite target
 if(WIN32)
     add_executable(CppDeskTests
@@ -213,7 +227,7 @@ elseif(APPLE)
 elseif(UNIX AND NOT APPLE)
     add_executable(CppDesk
         ${CORE_SOURCES}
-        src/ui/ui_window_linux.cpp
+        ${LINUX_UI_SOURCES}
         src/main.cpp
     )
     target_link_libraries(CppDesk PRIVATE ${PLATFORM_LIBS})

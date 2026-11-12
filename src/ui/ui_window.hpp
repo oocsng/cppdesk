@@ -143,6 +143,9 @@ public:
     bool create(void* displayContext = nullptr, int showCommand = 1);
     int messageLoop();
     void close();
+    // Renders every fixed UI state offscreen to <outDir>/<state>.png and returns how many were written.
+    // Needs no X display.
+    static int runUiSnapshots(IdentityManager& identity, NetworkEngine& network, const std::string& outDir);
 
 private:
     IdentityManager& identity_;

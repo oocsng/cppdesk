@@ -32,6 +32,18 @@
 #include <thread>
 #include <atomic>
 
+// A fixed identity so every --ui-snapshot run draws the same screens: a known desk ID and session code.
+static void prepareSnapshotIdentity(cppdesk::IdentityManager& id) {
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+    {
+        std::ofstream cfg(id.configFilePath(), std::ios::trunc);
+        cfg << "desk_id=482910375\n" << "totp_secret=JBSWY3DPEHPK3PXP\n";
+    }
+    id.loadOrCreate();
+    id.setSessionCode("k7m2qp");
+}
+
 #if defined(_WIN32)
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpCmdLine*/, int nCmdShow) {
@@ -122,14 +134,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
         // Fixed identity so every run draws the same pixels: its own instance, a known desk ID and session code.
         constexpr int kSnapshotInstance = 4243;
         cppdesk::IdentityManager snapIdentity(kSnapshotInstance);
-        {
-            std::error_code ec;
-            std::filesystem::remove(snapIdentity.configFilePath(), ec);
-            std::ofstream cfg(snapIdentity.configFilePath(), std::ios::trunc);
-            cfg << "desk_id=482910375\n" << "totp_secret=JBSWY3DPEHPK3PXP\n";
-        }
-        snapIdentity.loadOrCreate();
-        snapIdentity.setSessionCode("k7m2qp");
+        prepareSnapshotIdentity(snapIdentity);
         cppdesk::NetworkEngine snapNetwork(snapIdentity);
         int written = cppdesk::CppDeskWindow::runUiSnapshots(snapIdentity, snapNetwork, uiSnapshotDir, uiSnapshotRecord);
         std::error_code ec;
@@ -219,10 +224,13 @@ int main(int argc, char* argv[]) {
     bool headlessHostOnly = false;
     uint16_t relayPort = cppdesk::DEFAULT_RELAY_PORT;
     std::string connectTarget;
+    std::string uiSnapshotDir;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--instance" && i + 1 < argc) {
+        if (arg == "--ui-snapshot" && i + 1 < argc) {
+            uiSnapshotDir = argv[++i];
+        } else if (arg == "--instance" && i + 1 < argc) {
             try {
                 instanceId = std::stoi(argv[++i]);
             } catch (...) {}
@@ -243,6 +251,19 @@ int main(int argc, char* argv[]) {
             }
         }
     }
+
+#if defined(__linux__)
+    if (!uiSnapshotDir.empty()) {
+        constexpr int kSnapshotInstance = 4243;
+        cppdesk::IdentityManager snapIdentity(kSnapshotInstance);
+        prepareSnapshotIdentity(snapIdentity);
+        cppdesk::NetworkEngine snapNetwork(snapIdentity);
+        int written = cppdesk::CppDeskWindow::runUiSnapshots(snapIdentity, snapNetwork, uiSnapshotDir);
+        std::error_code ec;
+        std::filesystem::remove(snapIdentity.configFilePath(), ec);
+        return written > 0 ? 0 : 1;
+    }
+#endif
 
     if (headlessRelayOnly) {
         cppdesk::RelayServer server;

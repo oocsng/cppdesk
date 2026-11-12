@@ -8115,6 +8115,10 @@ void testShellCapabilityGating() {
     TEST_ASSERT(sysNone.find("Windows Action Center push toasts") == std::string::npos);
     TEST_ASSERT(sysNone.find("Minimize window to system tray") == std::string::npos);
     TEST_ASSERT(dashNone.find("|Elevate Admin") == std::string::npos);
+    // No Windows wording where the platform is not Windows.
+    TEST_ASSERT(sysNone.find("Windows") == std::string::npos);
+    TEST_ASSERT(renderAppState(id, net, none, "settings_about").find("for Windows") == std::string::npos);
+    TEST_ASSERT(renderAppState(id, net, all, "settings_about").find("for Windows") != std::string::npos);
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
 }

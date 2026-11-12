@@ -3510,7 +3510,8 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
     else if (settingsSection_ == SettingsSection::SystemService) {
         drawText("System Service & Integration", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
-        drawText("Manage the elevated Windows service daemon, desktop shortcuts, and Action Center notifications.",
+        drawText(onWindowsShell() ? "Manage the elevated Windows service daemon, desktop shortcuts, and Action Center notifications."
+                                  : "Manage notifications, the tray icon, and cppdesk:// links.",
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
@@ -3635,7 +3636,8 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                              AppSettings ns = identity_.settings();
                              ns.enableTaskbarFlash = !ns.enableTaskbarFlash;
                              identity_.updateSettings(ns);
-                         }, "Flash the Windows taskbar icon when background connection requests arrive.");
+                         }, onWindowsShell() ? "Flash the Windows taskbar icon when background connection requests arrive."
+                                             : "Flash the taskbar entry when background connection requests arrive.");
         ny += 25.0f;
 
         drawToggleSwitch("sett_notif_sound", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
@@ -3652,7 +3654,8 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                                  AppSettings ns = identity_.settings();
                                  ns.minimizeToTray = !ns.minimizeToTray;
                                  identity_.updateSettings(ns);
-                             }, "Minimize application window to the Windows system notification tray area.");
+                             }, onWindowsShell() ? "Minimize application window to the Windows system notification tray area."
+                                                 : "Minimize application window to the system tray.");
             ny += 25.0f;
         }
 
@@ -3661,7 +3664,8 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                          isUriReg, "Register cppdesk:// URL Protocol Handler", [this, isUriReg]() {
                              ShortcutManager::setUriProtocolRegistered(!isUriReg);
                              showToast(!isUriReg ? "Registered cppdesk:// URL protocol" : "Unregistered cppdesk:// URL protocol");
-                         }, "Register custom cppdesk:// URL scheme in Windows Registry for one-click browser links.");
+                         }, onWindowsShell() ? "Register custom cppdesk:// URL scheme in Windows Registry for one-click browser links."
+                                             : "Register the custom cppdesk:// URL scheme for one-click browser links.");
 
         cy = notifBox.bottom + 12.0f;
     }
@@ -3691,7 +3695,8 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
 
         float infoX = iconBadge.right + 14.0f;
         UiRect titleRect = { infoX, updateBanner.top + 12.0f, updateBanner.right - 300.0f, updateBanner.top + 34.0f };
-        drawText("CppDesk v" + std::string(CPP_DESK_VERSION) + "  •  Fast, secure remote desktop for Windows",
+        drawText("CppDesk v" + std::string(CPP_DESK_VERSION) +
+                     (onWindowsShell() ? "  •  Fast, secure remote desktop for Windows" : "  •  Fast, secure remote desktop"),
                  titleRect, ui::FontRole::Subheading, COL_TEXT_PRIMARY, ui::HAlign::Leading);
 
         float dotX = infoX + 5.0f;
