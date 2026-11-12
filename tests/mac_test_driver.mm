@@ -28,6 +28,33 @@ void macType(void* nsWindow, const char* characters, uint16_t macKeyCode) {
     }
 }
 
+static NSEvent* keyEvent(NSEventType type, NSWindow* window, const char* characters, uint16_t keyCode, NSEventModifierFlags flags) {
+    NSString* chars = [NSString stringWithUTF8String:characters];
+    return [NSEvent keyEventWithType:type location:NSZeroPoint modifierFlags:flags timestamp:0
+                        windowNumber:window.windowNumber context:nil characters:chars
+         charactersIgnoringModifiers:chars isARepeat:NO keyCode:keyCode];
+}
+
+void macTypeWithCommand(void* nsWindow, const char* characters, uint16_t macKeyCode) {
+    NSWindow* window = (__bridge NSWindow*)nsWindow;
+    for (NSEventType type : { NSEventTypeKeyDown, NSEventTypeKeyUp }) {
+        [window sendEvent:keyEvent(type, window, characters, macKeyCode, NSEventModifierFlagCommand)];
+    }
+}
+
+void macPostCommandKey(const char* characters, uint16_t macKeyCode) {
+    NSWindow* window = NSApp.keyWindow ? NSApp.keyWindow : NSApp.windows.firstObject;
+    for (NSEventType type : { NSEventTypeKeyDown, NSEventTypeKeyUp }) {
+        [NSApp postEvent:keyEvent(type, window, characters, macKeyCode, NSEventModifierFlagCommand) atStart:NO];
+    }
+}
+
+bool macRequestTerminate() {
+    id<NSApplicationDelegate> d = NSApp.delegate;
+    if (!d || ![d respondsToSelector:@selector(applicationShouldTerminate:)]) return false;
+    return [d applicationShouldTerminate:NSApp] == NSTerminateCancel;
+}
+
 bool macWindowDrewVariedPixels(void* nsWindow) {
     NSWindow* window = (__bridge NSWindow*)nsWindow;
     NSView* view = window.contentView;

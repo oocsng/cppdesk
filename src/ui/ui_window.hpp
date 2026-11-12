@@ -140,6 +140,8 @@ public:
     void* nativeWindow() const;
     // The user asked to restart; main re-executes the app after the loop.
     bool relaunchRequested() const;
+    // Whether the window thinks a key (Windows virtual-key code) or mouse button is held; for tests.
+    bool isKeyDown(uint16_t vk) const;
 
 private:
     IdentityManager& identity_;

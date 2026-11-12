@@ -230,6 +230,19 @@ void testTileCodecRoundTrip() {
     int jw = 0, jh = 0;
     TEST_ASSERT(TileCodec::decodeJpeg(jpegBytes.data(), jpegBytes.size(), decodedJpeg, jw, jh));
     TEST_ASSERT(jw == W && jh == H);
+
+    // A tile whose header claims a huge image is refused before any pixel memory is allocated (a peer sends these).
+    {
+        std::vector<uint8_t> bomb = jpegBytes;
+        for (size_t i = 0; i + 8 < bomb.size(); ++i) {
+            if (bomb[i] == 0xFF && (bomb[i + 1] == 0xC0 || bomb[i + 1] == 0xC2)) {   // SOF: height, width
+                bomb[i + 5] = bomb[i + 6] = bomb[i + 7] = bomb[i + 8] = 0xFF;
+                break;
+            }
+        }
+        std::vector<uint8_t> canvas(static_cast<size_t>(W) * H * 4, 0);
+        TEST_ASSERT(!TileCodec::decodeJpegIntoCanvas(bomb.data(), bomb.size(), canvas.data(), W, H, 0, 0, W, H));
+    }
 }
 
 void testScreenCapturer() {
@@ -8399,7 +8412,17 @@ void testMacWindow() {
             TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wDip, hDip, "zq", *field); }));
             macType(w.nativeWindow(), "", 0x33);   // Delete (Backspace)
             TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wDip, hDip, "z", *field); }));
+
+            // Command+A on a Russian layout (the key types a Cyrillic letter) still selects all: the field clears.
+            macTypeWithCommand(w.nativeWindow(), "\xD1\x84", 0x00);
+            TEST_ASSERT(pumpUntil(w, [&] { return !findTextRect(w.app(), wDip, hDip, "z").has_value(); }));
         }
+
+        // Command+C arriving through the application's event queue: AppKit drops the key-up of a Command shortcut,
+        // so the window must still release the key (else it stays pressed on the remote machine).
+        macPostCommandKey("c", 0x08);
+        pump(w, 200);
+        TEST_ASSERT(!w.isKeyDown(0x43));
 
         // A post from another thread wakes the loop at once.
         std::atomic<bool> ran{false};
@@ -8417,6 +8440,15 @@ void testMacWindow() {
         w.post([&] { lateRan = true; });
         w.processEvents(0);
         TEST_ASSERT(!lateRan);
+    }
+
+    // Quit from the Dock, logout or shutdown must end in an orderly close (recordings finalised, network stopped),
+    // not AppKit's exit().
+    {
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        TEST_ASSERT(macRequestTerminate());
+        TEST_ASSERT(!w.processEvents(0));
     }
 }
 #endif
