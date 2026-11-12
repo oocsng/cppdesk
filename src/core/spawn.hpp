@@ -25,12 +25,23 @@ inline std::vector<char*> argvOf(const std::vector<std::string>& args) {
     return argv;
 }
 
+// The child keeps only stdin, stdout and stderr: a helper such as a browser started by xdg-open can outlive
+// CppDesk, and must not hold on to its sockets or its single-instance lock.
+inline void closeInheritedFds(posix_spawn_file_actions_t* actions) {
+    posix_spawn_file_actions_addclosefrom_np(actions, 3);
+}
+
 // Starts the program found on PATH and reaps it in the background. False if it could not start.
 inline bool detached(const std::vector<std::string>& args) {
     if (args.empty()) return false;
     std::vector<char*> argv = argvOf(args);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    closeInheritedFds(&actions);
     pid_t pid = 0;
-    if (posix_spawnp(&pid, argv[0], nullptr, nullptr, argv.data(), environ) != 0) return false;
+    const int rc = posix_spawnp(&pid, argv[0], &actions, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0) return false;
     std::thread([pid] { int status = 0; waitpid(pid, &status, 0); }).detach();
     return true;
 }
@@ -44,7 +55,7 @@ inline std::optional<std::string> output(const std::vector<std::string>& args) {
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addclose(&actions, fds[0]);
+    closeInheritedFds(&actions);   // after the dup2, so the pipe ends above 2 close too
     std::vector<char*> argv = argvOf(args);
     pid_t pid = 0;
     const int rc = posix_spawnp(&pid, argv[0], &actions, nullptr, argv.data(), environ);

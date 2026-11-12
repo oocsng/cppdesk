@@ -524,6 +524,8 @@ void CppDeskWindowLinuxImpl::handleEvent(XEvent& ev) {
             if (ev.xfocus.detail == NotifyPointer) break;
             focused = ev.type == FocusIn;
             if (!focused) keys.reset();
+            // XIM servers (IBus, fcitx) only compose for a focused input context.
+            if (xic) focused ? XSetICFocus(xic) : XUnsetICFocus(xic);
             app->onFocusChanged(focused);
             break;
         case MotionNotify:
@@ -642,11 +644,12 @@ CppDeskWindow::CppDeskWindow(IdentityManager& identity, NetworkEngine& network, 
     network_.setOnFrameDecodedCallback([this, w] {
         if (w->app->claimFrameRedraw()) post([w] { w->app->onFrameReady(); });
     });
-    network_.setOnVersionMismatchCallback([w](const std::string& hostVer, const std::string& viewerVer) {
-        w->app->onPeerVersionMismatch(hostVer, viewerVer);
+    network_.setOnVersionMismatchCallback([this](const std::string& hostVer, const std::string& viewerVer) {
+        post([this, hostVer, viewerVer] { pImpl_->app->onPeerVersionMismatch(hostVer, viewerVer); });
     });
-    network_.setOnVersionUpgradeNoticeCallback([w](const VersionUpgradeNoticePayload& notice) {
-        w->app->onVersionUpgradeNotice(notice.senderVersion);
+    network_.setOnVersionUpgradeNoticeCallback([this](const VersionUpgradeNoticePayload& notice) {
+        std::string version = notice.senderVersion;
+        post([this, version] { pImpl_->app->onVersionUpgradeNotice(version); });
     });
 }
 

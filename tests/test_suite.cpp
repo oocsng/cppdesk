@@ -16,6 +16,7 @@
 #if defined(__linux__)
 #include "../src/ui/canvas_cairo.hpp"
 #include "../src/ui/ui_window.hpp"
+#include "../src/core/spawn.hpp"
 #include <cairo.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
@@ -8181,6 +8182,19 @@ void testLinuxWindow() {
                 pump(w, 100);   // MappingNotify reaches the window
                 sendKey(peer, win, XK_eacute);
                 TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wDip, hDip, "zq\xC3\xA9", *field); }));
+
+                // A dead key composes through the input method once the window has focus: ´ then e gives é.
+                KeySym dead = XK_dead_acute;
+                XChangeKeyboardMapping(peer, spare, 1, &dead, 1);
+                XSetInputFocus(peer, win, RevertToParent, CurrentTime);
+                XSync(peer, False);
+                pump(w, 100);
+                sendKey(peer, win, XK_dead_acute);
+                sendKey(peer, win, XK_e);
+                TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wDip, hDip, "zq\xC3\xA9\xC3\xA9", *field); }));
+                sendKey(peer, win, XK_BackSpace);
+                pump(w, 100);
+
                 KeySym none = NoSymbol;
                 XChangeKeyboardMapping(peer, spare, 1, &none, 1);
                 XSync(peer, False);
@@ -8302,6 +8316,16 @@ void testX11Clipboard() {
             hasUtf8 = hasUtf8 || a == utf8;
         }
         TEST_ASSERT(hasUtf8);
+    }
+
+    // A requester that vanishes before the answer (a short-lived `xclip -o`) must not take CppDesk down.
+    {
+        const Window gone = XCreateSimpleWindow(peer, DefaultRootWindow(peer), 0, 0, 1, 1, 0, 0, 0);
+        XConvertSelection(peer, clip, utf8, XInternAtom(peer, "CPPDESK_TEST_PROP", False), gone, CurrentTime);
+        XDestroyWindow(peer, gone);
+        XSync(peer, False);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        TEST_ASSERT(requestClipboard(peer, pw, utf8) == copied);   // still alive and serving
     }
 
     // Another app copies; CppDesk reads its text.
@@ -8679,6 +8703,25 @@ void testLinuxNotifications() {
 
     setenv("PATH", oldPath.c_str(), 1);
     fs::remove_all(dir, ec);
+
+    // Helpers (a browser started by xdg-open can outlive CppDesk) must not inherit our sockets or lock file.
+    int raw[2] = { -1, -1 };
+    TEST_ASSERT(pipe(raw) == 0);
+    // High numbers, so they cannot be mistaken for the fd `ls` opens on /proc/self/fd itself.
+    int leak[2] = { dup2(raw[0], 200), dup2(raw[1], 201) };
+    close(raw[0]);
+    close(raw[1]);
+    auto fds = spawn::output({ "sh", "-c", "ls /proc/self/fd" });
+    TEST_ASSERT(fds.has_value());
+    if (fds) {
+        std::istringstream in(*fds);
+        std::string fd;
+        bool inherited = false;
+        while (in >> fd) inherited = inherited || fd == std::to_string(leak[0]) || fd == std::to_string(leak[1]);
+        TEST_ASSERT(!inherited);
+    }
+    close(leak[0]);
+    close(leak[1]);
 }
 #endif
 
