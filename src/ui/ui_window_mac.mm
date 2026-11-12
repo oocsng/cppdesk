@@ -906,6 +906,8 @@ void* CppDeskWindow::nativeWindow() const {
 
 bool CppDeskWindow::relaunchRequested() const { return pImpl_ && pImpl_->relaunch; }
 
+bool CppDeskWindow::isKeyDown(uint16_t vk) const { return pImpl_ && vk < 256 && pImpl_->keys[vk]; }
+
 void CppDeskWindow::close() {
     if (!pImpl_) return;
     CppDeskWindowMacImpl& w = *pImpl_;
