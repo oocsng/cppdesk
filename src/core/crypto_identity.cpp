@@ -1578,8 +1578,20 @@ constexpr size_t kEccBlobLen = 8 + 32 + 32;
 bool EcdhKeyExchange::initialize() {
     reset();
 
-    EVP_PKEY* key = EVP_EC_gen("P-256");
-    if (!key) return false;
+    // The explicit keygen API instead of the EVP_EC_gen() convenience macro, which fails on some OpenSSL 3.0.x
+    // builds (Ubuntu 22.04's 3.0.2).
+    EVP_PKEY* key = nullptr;
+    EVP_PKEY_CTX* gen = EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr);
+    char group[] = "P-256";
+    const OSSL_PARAM genParams[] = { OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, group, 0),
+                                     OSSL_PARAM_construct_end() };
+    const bool generated = gen && EVP_PKEY_keygen_init(gen) == 1 && EVP_PKEY_CTX_set_params(gen, genParams) == 1 &&
+                           EVP_PKEY_generate(gen, &key) == 1;
+    EVP_PKEY_CTX_free(gen);
+    if (!generated || !key) {
+        EVP_PKEY_free(key);
+        return false;
+    }
 
     uint8_t point[65];
     size_t pointLen = 0;
