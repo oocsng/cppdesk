@@ -91,6 +91,16 @@ On Linux (Debian / Ubuntu / derivatives):
 sudo apt install build-essential cmake libx11-dev libxext-dev libxtst-dev libxrandr-dev libzstd-dev libjpeg-turbo8-dev libssl-dev libcairo2-dev libpango1.0-dev pkg-config
 ```
 
+The Linux app is the full interface on X11 (XWayland sessions included), drawn with Cairo and Pango. It uses these
+programs when they are installed and works without them:
+- `zenity` or `kdialog` for open-file and choose-folder dialogs
+- `xdg-open` for links and "show in folder"
+- `notify-send` for desktop notifications
+- `fonts-noto-cjk` and `fonts-noto-color-emoji` to show Chinese, Japanese, Korean and emoji text
+
+The tray icon needs a panel with a system tray. GNOME has none without the AppIndicator extension; there the
+"minimize to tray" option is hidden and closing the window quits.
+
 ### Build commands
 
 ```powershell
@@ -121,7 +131,7 @@ cmake --build build --config Release
 │   ├── media/                    # Voice intercom, session recorder, and player
 │   ├── net/                      # Socket engine, NAT traversal, and auto-updater
 │   ├── simd/                     # Vectorized image conversion and diffing (AVX2 & scalar fallback)
-│   └── ui/                       # Direct2D (Windows), Cocoa/Metal (macOS), and X11 (Linux) interface
+│   └── ui/                       # Shared screens with Direct2D (Windows) and Cairo/X11 (Linux) backends; Cocoa (macOS)
 ├── relay-dotnet/                 # Optional self-hosted relay server (.NET 10)
 ├── scripts/                      # Verification and benchmark utilities
 └── tests/                        # Automated unit and integration test suite (52 suites)
