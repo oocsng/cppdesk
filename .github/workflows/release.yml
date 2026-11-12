@@ -5,6 +5,7 @@ name: Release
 on:
   push:
     tags: ['v*']
+    branches: [linux-release]   # TEMPORARY dry run before the first release; removed before merge
   workflow_dispatch:
 
 permissions:
