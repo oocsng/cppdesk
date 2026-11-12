@@ -96,6 +96,17 @@ On Linux (Debian / Ubuntu / derivatives):
 sudo apt install build-essential cmake libx11-dev libxext-dev libxtst-dev libxrandr-dev libzstd-dev libjpeg-turbo8-dev libssl-dev libcairo2-dev libpango1.0-dev pkg-config
 ```
 
+On macOS (Homebrew):
+```bash
+brew install cmake zstd openssl@3
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+cmake --build build
+```
+
+The macOS interface is built and tested on every push (and its screens are drawn offscreen and checked), but it has not
+been run on a real Mac yet and is not among the downloads. Screen sharing and control from a Mac host, and the
+Screen Recording and Accessibility permission prompts, come next.
+
 The Linux app is the full interface on X11 (XWayland sessions included), drawn with Cairo and Pango. It uses these
 programs when they are installed and works without them:
 - `zenity` or `kdialog` for open-file and choose-folder dialogs
