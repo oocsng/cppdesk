@@ -112,17 +112,27 @@ elseif(UNIX AND NOT APPLE)
         src/simd/simd_fallback.cpp
     )
 
-    find_package(X11 QUIET)
+    find_package(X11 REQUIRED)
     find_package(JPEG QUIET)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(CAIRO REQUIRED IMPORTED_TARGET cairo)
+    pkg_check_modules(PANGOCAIRO REQUIRED IMPORTED_TARGET pangocairo)
     find_package(OpenSSL REQUIRED)
     find_library(LIB_ZSTD zstd REQUIRED)
     find_library(LIB_XTST Xtst)
     find_library(LIB_XRANDR Xrandr)
     find_library(LIB_XEXT Xext)
 
+    list(APPEND CORE_SOURCES
+        src/ui/canvas_cairo.cpp
+        src/control/x11_clipboard.cpp
+    )
+
     set(PLATFORM_LIBS
         ${LIB_ZSTD}
         OpenSSL::Crypto
+        PkgConfig::CAIRO
+        PkgConfig::PANGOCAIRO
         pthread
         dl
     )
@@ -152,6 +162,22 @@ else()
     )
 endif()
 
+# The Linux window and its embedded app icon (assets/icon.png as a byte array).
+if(UNIX AND NOT APPLE)
+    file(READ ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.png ICON_HEX HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," ICON_BYTES "${ICON_HEX}")
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/app_icon_png.cpp
+        "#include <cstddef>\nextern const unsigned char kAppIconPng[] = {${ICON_BYTES}};\n"
+        "extern const std::size_t kAppIconPngSize = sizeof(kAppIconPng);\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.png)
+    set(LINUX_UI_SOURCES
+        src/ui/ui_window_linux.cpp
+        src/ui/x11_dnd.cpp
+        src/ui/x11_tray.cpp
+        ${CMAKE_CURRENT_BINARY_DIR}/generated/app_icon_png.cpp
+    )
+endif()
+
 # Automated test suite target
 if(WIN32)
     add_executable(CppDeskTests
@@ -162,9 +188,14 @@ if(WIN32)
 elseif(UNIX AND NOT APPLE)
     add_executable(CppDeskTests
         ${CORE_SOURCES}
+        ${LINUX_UI_SOURCES}
         tests/test_suite.cpp
     )
     target_link_libraries(CppDeskTests PRIVATE ${PLATFORM_LIBS})
+endif()
+if(TARGET CppDeskTests)
+    # The UI goldens live in the source tree; CMake builds run the tests from the build directory.
+    target_compile_definitions(CppDeskTests PRIVATE CPPDESK_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
 # Application executable
@@ -200,7 +231,7 @@ elseif(APPLE)
 elseif(UNIX AND NOT APPLE)
     add_executable(CppDesk
         ${CORE_SOURCES}
-        src/ui/ui_window_linux.cpp
+        ${LINUX_UI_SOURCES}
         src/main.cpp
     )
     target_link_libraries(CppDesk PRIVATE ${PLATFORM_LIBS})

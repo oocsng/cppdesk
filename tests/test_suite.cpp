@@ -13,6 +13,18 @@
 #include "../src/ui/app_ui.hpp"
 #include "../src/ui/vk_codes.hpp"
 #include "../src/ui/platform_shell.hpp"
+#if defined(__linux__)
+#include "../src/ui/canvas_cairo.hpp"
+#include "../src/ui/ui_window.hpp"
+#include "../src/core/spawn.hpp"
+#include <cairo.h>
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+#include <X11/Xutil.h>
+#include <X11/keysym.h>
+#undef CursorShape   // X.h's query-shape constant collides with ui::CursorShape
+#undef Success       // ...and its status code with VirtualDisplayStatusCode::Success
+#endif
 #if defined(_WIN32)
 #include "../src/ui/canvas_d2d.hpp"
 #include <wincodec.h>
@@ -52,6 +64,7 @@
 
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <filesystem>
 #include <chrono>
 #include <thread>
@@ -7867,6 +7880,851 @@ void testD2DCanvas() {
 }
 #endif
 
+#if defined(__linux__)
+// Offscreen Cairo image surface the canvas draws into and the test reads back.
+struct CairoTarget {
+    cairo_surface_t* surface = nullptr;
+    int w = 0, h = 0;
+    CairoTarget(int width, int height) : w(width), h(height) {
+        surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    }
+    ~CairoTarget() { cairo_surface_destroy(surface); }
+    // Returns {b, g, r, a} at (x, y).
+    std::array<uint8_t, 4> pixel(int x, int y) const {
+        std::array<uint8_t, 4> out{};
+        cairo_surface_flush(surface);
+        const uint8_t* data = cairo_image_surface_get_data(surface);
+        std::memcpy(out.data(), data + y * cairo_image_surface_get_stride(surface) + x * 4, 4);
+        return out;
+    }
+    bool anyBrighter(int l, int t, int r, int b, int threshold) const {
+        for (int y = t; y < b; ++y)
+            for (int x = l; x < r; ++x)
+                if (pixel(x, y)[2] > threshold) return true;
+        return false;
+    }
+};
+
+void testCairoCanvas() {
+    std::cout << "[TEST 73] Cairo canvas backend (scene, images, state, arcs, text, speed)..." << std::endl;
+
+    {   // Scene: shapes, text and background land where expected.
+        CairoTarget target(200, 100);
+        ui::CairoCanvas canvas;
+        canvas.attach(target.surface, 1.0f);
+        canvas.beginFrame(200, 100, ui::rgba(0, 0, 0));
+        canvas.fillRoundRect({10, 10, 60, 60}, 4, ui::rgba(255, 0, 0));
+        canvas.drawText("Hi", {100, 10, 190, 40}, ui::FontRole::Heading, ui::rgba(255, 255, 255), ui::HAlign::Leading, ui::VAlign::Center);
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(35, 35)[2] > 200 && target.pixel(35, 35)[1] < 40);
+        TEST_ASSERT(target.anyBrighter(100, 10, 190, 40, 128));
+        TEST_ASSERT(target.pixel(150, 80)[2] < 10);
+        TEST_ASSERT(canvas.frameBalanced());
+        canvas.detach();
+    }
+
+    {   // Image resize and dirty-rectangle update.
+        CairoTarget target(64, 64);
+        ui::CairoCanvas canvas;
+        canvas.attach(target.surface, 1.0f);
+        std::vector<uint8_t> red(16 * 16 * 4), green(32 * 8 * 4), blue(32 * 8 * 4);
+        for (size_t i = 0; i < red.size(); i += 4) { red[i] = 0; red[i + 1] = 0; red[i + 2] = 255; red[i + 3] = 255; }
+        for (size_t i = 0; i < green.size(); i += 4) { green[i] = 0; green[i + 1] = 255; green[i + 2] = 0; green[i + 3] = 255; }
+        for (size_t i = 0; i < blue.size(); i += 4) { blue[i] = 255; blue[i + 1] = 0; blue[i + 2] = 0; blue[i + 3] = 255; }
+        canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
+        ui::ImageId id = canvas.createImage(16, 16);
+        canvas.updateImage(id, red.data(), 16 * 4, {0, 0, 16, 16});
+        canvas.drawImage(id, {0, 0, 16, 16}, 1.0f);
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(8, 8)[2] > 200);
+        canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
+        canvas.destroyImage(id);
+        id = canvas.createImage(32, 8);
+        canvas.updateImage(id, green.data(), 32 * 4, {0, 0, 32, 8});
+        canvas.drawImage(id, {0, 0, 32, 8}, 1.0f);
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(20, 4)[1] > 200 && target.pixel(20, 4)[2] < 40);
+        canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
+        canvas.updateImage(id, blue.data(), 32 * 4, {0, 0, 8, 8});
+        canvas.drawImage(id, {0, 0, 32, 8}, 1.0f);
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(4, 4)[0] > 200 && target.pixel(20, 4)[1] > 200);
+        canvas.detach();
+    }
+
+    {   // Detach/attach: stale images draw nothing and leftover state does not leak into the next frame.
+        CairoTarget first(32, 32), second(32, 32);
+        ui::CairoCanvas canvas;
+        canvas.attach(first.surface, 1.0f);
+        ui::ImageId stale = canvas.createImage(4, 4);
+        canvas.beginFrame(32, 32, ui::rgba(0, 0, 0));
+        canvas.pushClip({0, 0, 4, 4});
+        canvas.setTransform(ui::Transform2D::scale(4, 4, 0, 0));
+        canvas.endFrame();
+        canvas.detach();
+        canvas.attach(second.surface, 1.0f);
+        canvas.beginFrame(32, 32, ui::rgba(0, 0, 0));
+        canvas.drawImage(stale, {0, 0, 32, 32}, 1.0f);
+        canvas.fillRect({0, 0, 32, 32}, ui::rgba(255, 0, 0));
+        canvas.endFrame();
+        TEST_ASSERT(second.pixel(30, 30)[2] > 200);
+        TEST_ASSERT(canvas.frameBalanced());
+        canvas.detach();
+    }
+
+    {   // A transform set inside a clip survives the clip's pop (as in Direct2D); opacity layers blend.
+        CairoTarget target(64, 64);
+        ui::CairoCanvas canvas;
+        canvas.attach(target.surface, 1.0f);
+        canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
+        canvas.pushClip({0, 0, 16, 16});
+        canvas.setTransform(ui::Transform2D::scale(2, 2, 0, 0));
+        canvas.popClip();
+        canvas.fillRect({0, 0, 32, 32}, ui::rgba(255, 0, 0));
+        canvas.setTransform(ui::Transform2D::identity());
+        TEST_ASSERT(canvas.frameBalanced());
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(60, 60)[2] > 200);
+        canvas.beginFrame(64, 64, ui::rgba(0, 0, 0));
+        canvas.pushOpacity(0.5f);
+        canvas.fillRect({0, 0, 64, 64}, ui::rgba(255, 255, 255));
+        canvas.popOpacity();
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(10, 10)[2] >= 120 && target.pixel(10, 10)[2] <= 135);
+        canvas.detach();
+    }
+
+    {   // A clockwise arc bulges up on a y-down screen.
+        CairoTarget target(60, 60);
+        ui::CairoCanvas canvas;
+        canvas.attach(target.surface, 1.0f);
+        ui::Path p;
+        p.moveTo(10, 30);
+        p.arcTo(50, 30, 20, true, false);
+        p.close();
+        canvas.beginFrame(60, 60, ui::rgba(0, 0, 0));
+        canvas.fillPath(p, ui::rgba(255, 0, 0));
+        canvas.endFrame();
+        TEST_ASSERT(target.pixel(30, 20)[2] > 200);
+        TEST_ASSERT(target.pixel(30, 40)[2] < 10);
+        canvas.detach();
+    }
+
+    {   // Text measurement, including CJK and emoji, and wrapping only where the role wraps.
+        ui::CairoCanvas canvas;
+        const float w = canvas.measureTextWidth("Settings", ui::FontRole::Body);
+        TEST_ASSERT(w > 40.0f && w < 70.0f);
+        TEST_ASSERT(canvas.measureTextWidth("\xE6\xBC\xA2\xE5\xAD\x97\xF0\x9F\x98\x80", ui::FontRole::Body) > 0.0f);
+        const char* sentence = "This sentence is long enough that it must wrap inside a narrow tooltip.";
+        const float oneLine = canvas.measureTextBlock("Hi", ui::FontRole::Tooltip, 120).y;
+        TEST_ASSERT(canvas.measureTextBlock(sentence, ui::FontRole::Tooltip, 120).y > oneLine * 1.5f);
+        TEST_ASSERT(canvas.measureTextBlock(sentence, ui::FontRole::Body, 120).y <
+                    canvas.measureTextBlock("Hi", ui::FontRole::Body, 120).y * 1.5f);
+    }
+
+    {   // A 1920x1080 remote frame updates and scales into a 1280x720 view well inside a 30 fps frame.
+        CairoTarget target(1280, 720);
+        ui::CairoCanvas canvas;
+        canvas.attach(target.surface, 1.0f);
+        std::vector<uint8_t> frame(1920 * 1080 * 4, 0x80);
+        ui::ImageId id = canvas.createImage(1920, 1080, true);
+        constexpr int kIters = 20;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kIters; ++i) {
+            canvas.beginFrame(1280, 720, ui::rgba(0, 0, 0));
+            canvas.updateImage(id, frame.data(), 1920 * 4, {0, 0, 1920, 1080});
+            canvas.drawImage(id, {0, 0, 1280, 720}, 1.0f);
+            canvas.endFrame();
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / kIters;
+        std::cout << "  remote frame 1920x1080 -> 1280x720: " << ms << " ms\n";
+        TEST_ASSERT(ms < 33.0);
+        TEST_ASSERT(target.pixel(640, 360)[2] > 100);
+        canvas.detach();
+    }
+}
+#endif
+
+#if defined(__linux__)
+// Pumps the window's loop until cond() holds or timeoutMs passes.
+template <typename Cond>
+bool pumpUntil(CppDeskWindow& w, Cond cond, int timeoutMs = 2000) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < end) {
+        if (cond()) return true;
+        if (!w.processEvents(20)) return cond();
+    }
+    return cond();
+}
+
+void pump(CppDeskWindow& w, int ms) {
+    pumpUntil(w, [] { return false; }, ms);
+}
+
+// The rect (DIPs) of the first drawText showing exactly `label` (a focused field adds a caret '|'), from a fresh
+// recording of the screens.
+std::optional<ui::Rect> findTextRect(AppUi& app, float wDip, float hDip, const std::string& label) {
+    ui::RecordingCanvas rc;
+    app.render(rc, wDip, hDip, 0.0);
+    std::istringstream in(rc.serialize());
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("drawText ", 0) != 0 || !(line.ends_with("|" + label) || line.ends_with("|" + label + "|"))) continue;
+        ui::Rect r{};
+        if (std::sscanf(line.c_str(), "drawText %f %f %f %f", &r.left, &r.top, &r.right, &r.bottom) == 4) return r;
+    }
+    return std::nullopt;
+}
+
+// True when `text` is drawn inside `field`, i.e. typing reached the field that was clicked.
+bool textInField(AppUi& app, float wDip, float hDip, const std::string& text, const ui::Rect& field) {
+    auto r = findTextRect(app, wDip, hDip, text);
+    return r && r->top < field.bottom && r->bottom > field.top && r->left < field.right && r->right > field.left;
+}
+
+void sendButton(Display* d, Window win, int x, int y) {
+    for (int type : { ButtonPress, ButtonRelease }) {
+        XEvent ev{};
+        ev.xbutton.type = type;
+        ev.xbutton.display = d;
+        ev.xbutton.window = win;
+        ev.xbutton.root = DefaultRootWindow(d);
+        ev.xbutton.x = x;
+        ev.xbutton.y = y;
+        ev.xbutton.button = Button1;
+        ev.xbutton.same_screen = True;
+        XSendEvent(d, win, True, type == ButtonPress ? ButtonPressMask : ButtonReleaseMask, &ev);
+    }
+    XFlush(d);
+}
+
+void sendKey(Display* d, Window win, KeySym sym) {
+    const KeyCode code = XKeysymToKeycode(d, sym);
+    for (int type : { KeyPress, KeyRelease }) {
+        XEvent ev{};
+        ev.xkey.type = type;
+        ev.xkey.display = d;
+        ev.xkey.window = win;
+        ev.xkey.root = DefaultRootWindow(d);
+        ev.xkey.keycode = code;
+        ev.xkey.same_screen = True;
+        XSendEvent(d, win, True, type == KeyPress ? KeyPressMask : KeyReleaseMask, &ev);
+    }
+    XFlush(d);
+}
+
+void testLinuxWindow() {
+    std::cout << "[TEST 75] Linux X11 window drives the screens..." << std::endl;
+    Display* peer = XOpenDisplay(nullptr);
+    if (!peer) {
+        std::cout << "  SKIP: no X display\n";
+        return;
+    }
+    IdentityManager id(4248);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    const float wDip = 1220.0f, hDip = 760.0f;
+
+    {
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        const Window win = w.nativeWindow();
+        XWindowAttributes attrs{};
+        TEST_ASSERT(pumpUntil(w, [&] {
+            return XGetWindowAttributes(peer, win, &attrs) && attrs.map_state == IsViewable;
+        }));
+        pump(w, 200);
+
+        // It drew: the frame is neither the black window background nor one flat colour.
+        XGetWindowAttributes(peer, win, &attrs);
+        XImage* img = XGetImage(peer, win, 0, 0, attrs.width, attrs.height, AllPlanes, ZPixmap);
+        TEST_ASSERT(img != nullptr);
+        if (img) {
+            const unsigned long corner = XGetPixel(img, 5, 5);
+            bool varied = false;
+            for (int y = 0; y < attrs.height && !varied; y += 7)
+                for (int x = 0; x < attrs.width && !varied; x += 7)
+                    varied = XGetPixel(img, x, y) != corner;
+            TEST_ASSERT((corner & 0xFFFFFF) != 0);
+            TEST_ASSERT(varied);
+            XDestroyImage(img);
+        }
+
+        // Click the desk search box and type into it.
+        auto field = findTextRect(w.app(), wDip, hDip, "Search desks...");
+        TEST_ASSERT(field.has_value());
+        if (field) {
+            sendButton(peer, win, static_cast<int>((field->left + field->right) / 2),
+                       static_cast<int>((field->top + field->bottom) / 2));
+            pump(w, 100);
+            sendKey(peer, win, XK_z);
+            sendKey(peer, win, XK_q);
+            TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wDip, hDip, "zq", *field); }));
+
+            // Non-ASCII through the keyboard map: a spare keycode becomes é.
+            int minCode = 0, maxCode = 0, perCode = 0;
+            XDisplayKeycodes(peer, &minCode, &maxCode);
+            KeySym* map = XGetKeyboardMapping(peer, static_cast<KeyCode>(minCode), maxCode - minCode + 1, &perCode);
+            int spare = 0;
+            for (int code = maxCode; code >= minCode && !spare; --code) {
+                bool empty = true;
+                for (int i = 0; i < perCode; ++i) empty = empty && map[(code - minCode) * perCode + i] == NoSymbol;
+                if (empty) spare = code;
+            }
+            XFree(map);
+            TEST_ASSERT(spare != 0);
+            if (spare) {
+                KeySym eacute = XK_eacute;
+                XChangeKeyboardMapping(peer, spare, 1, &eacute, 1);
+                XSync(peer, False);
+                pump(w, 100);   // MappingNotify reaches the window
+                sendKey(peer, win, XK_eacute);
+                TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wDip, hDip, "zq\xC3\xA9", *field); }));
+
+                // A dead key composes through the input method once the window has focus: ´ then e gives é.
+                KeySym dead = XK_dead_acute;
+                XChangeKeyboardMapping(peer, spare, 1, &dead, 1);
+                XSetInputFocus(peer, win, RevertToParent, CurrentTime);
+                XSync(peer, False);
+                pump(w, 100);
+                sendKey(peer, win, XK_dead_acute);
+                sendKey(peer, win, XK_e);
+                TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wDip, hDip, "zq\xC3\xA9\xC3\xA9", *field); }));
+                sendKey(peer, win, XK_BackSpace);
+                pump(w, 100);
+
+                KeySym none = NoSymbol;
+                XChangeKeyboardMapping(peer, spare, 1, &none, 1);
+                XSync(peer, False);
+                pump(w, 50);
+            }
+
+            sendKey(peer, win, XK_BackSpace);
+            TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wDip, hDip, "zq", *field); }));
+        }
+
+        // A post from another thread wakes the loop at once.
+        std::atomic<bool> ran{false};
+        const auto t0 = std::chrono::steady_clock::now();
+        std::thread poster([&] { w.post([&] { ran = true; }); });
+        poster.join();
+        w.processEvents(1000);
+        TEST_ASSERT(ran.load());
+        TEST_ASSERT(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(900));
+
+        // The window manager's close button ends the loop.
+        XEvent close{};
+        close.xclient.type = ClientMessage;
+        close.xclient.window = win;
+        close.xclient.message_type = XInternAtom(peer, "WM_PROTOCOLS", False);
+        close.xclient.format = 32;
+        close.xclient.data.l[0] = static_cast<long>(XInternAtom(peer, "WM_DELETE_WINDOW", False));
+        XSendEvent(peer, win, False, NoEventMask, &close);
+        XFlush(peer);
+        TEST_ASSERT(pumpUntil(w, [] { return false; }, 1000) == false);
+        TEST_ASSERT(!w.processEvents(0));
+    }
+
+    // HiDPI: with Xft.dpi 192 the window draws at 2x and clicks map back to DIPs.
+    {
+        const Atom rm = XInternAtom(peer, "RESOURCE_MANAGER", False);
+        const char* res = "Xft.dpi:\t192\n";
+        XChangeProperty(peer, DefaultRootWindow(peer), rm, XA_STRING, 8, PropModeReplace,
+                        reinterpret_cast<const unsigned char*>(res), static_cast<int>(std::strlen(res)));
+        XSync(peer, False);
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        const Window win = w.nativeWindow();
+        XWindowAttributes attrs{};
+        TEST_ASSERT(pumpUntil(w, [&] {
+            return XGetWindowAttributes(peer, win, &attrs) && attrs.map_state == IsViewable;
+        }));
+        TEST_ASSERT(attrs.width >= 2 * 900);   // at least the 900-DIP minimum, doubled
+        const float wd = attrs.width / 2.0f, hd = attrs.height / 2.0f;
+        auto field = findTextRect(w.app(), wd, hd, "Search desks...");
+        TEST_ASSERT(field.has_value());
+        if (field) {
+            sendButton(peer, win, static_cast<int>(field->left + field->right), static_cast<int>(field->top + field->bottom));
+            pump(w, 100);
+            sendKey(peer, win, XK_x);
+            TEST_ASSERT(pumpUntil(w, [&] { return textInField(w.app(), wd, hd, "x", *field); }));
+        }
+        // Ctrl+C / SIGTERM path: a quit requested from another thread closes the window.
+        std::thread([&] { w.requestQuit(); }).join();
+        pump(w, 300);
+        TEST_ASSERT(!w.processEvents(0));
+        XDeleteProperty(peer, DefaultRootWindow(peer), rm);
+        XSync(peer, False);
+    }
+
+    XCloseDisplay(peer);
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+#endif
+
+#if defined(__linux__)
+// Asks the CLIPBOARD owner for `target` the way another X app does; nullopt if it refused or never answered.
+std::optional<std::string> requestClipboard(Display* d, Window requestor, Atom target) {
+    const Atom clip = XInternAtom(d, "CLIPBOARD", False), prop = XInternAtom(d, "CPPDESK_TEST_PROP", False);
+    XConvertSelection(d, clip, target, prop, requestor, CurrentTime);
+    XFlush(d);
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    XEvent ev;
+    while (std::chrono::steady_clock::now() < end) {
+        if (!XCheckTypedWindowEvent(d, requestor, SelectionNotify, &ev)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+        if (ev.xselection.property == None) return std::nullopt;
+        Atom type = 0;
+        int format = 0;
+        unsigned long count = 0, after = 0;
+        unsigned char* data = nullptr;
+        XGetWindowProperty(d, requestor, prop, 0, 1 << 20, True, AnyPropertyType, &type, &format, &count, &after, &data);
+        std::string out;
+        if (data) out.assign(reinterpret_cast<char*>(data), count * static_cast<unsigned long>(format / 8));
+        if (data) XFree(data);
+        return out;
+    }
+    return std::nullopt;
+}
+
+void testX11Clipboard() {
+    std::cout << "[TEST 76] Clipboard text goes through the X11 CLIPBOARD selection..." << std::endl;
+    Display* peer = XOpenDisplay(nullptr);
+    if (!peer) {
+        std::cout << "  SKIP: no X display\n";
+        return;
+    }
+    const Window pw = XCreateSimpleWindow(peer, DefaultRootWindow(peer), 0, 0, 1, 1, 0, 0, 0);
+    const Atom utf8 = XInternAtom(peer, "UTF8_STRING", False), targets = XInternAtom(peer, "TARGETS", False);
+    const Atom clip = XInternAtom(peer, "CLIPBOARD", False);
+
+    // Copying in CppDesk reaches other apps.
+    const std::string copied = "Z\xC3\xA9\xF0\x9F\x98\x80 copy";
+    TEST_ASSERT(ClipboardManager::setClipboardUtf8(copied));
+    TEST_ASSERT(requestClipboard(peer, pw, utf8) == copied);
+    auto offered = requestClipboard(peer, pw, targets);
+    TEST_ASSERT(offered.has_value());
+    if (offered) {
+        bool hasUtf8 = false;
+        for (size_t i = 0; i + sizeof(Atom) <= offered->size(); i += sizeof(Atom)) {
+            Atom a;
+            std::memcpy(&a, offered->data() + i, sizeof(Atom));
+            hasUtf8 = hasUtf8 || a == utf8;
+        }
+        TEST_ASSERT(hasUtf8);
+    }
+
+    // A requester that vanishes before the answer (a short-lived `xclip -o`) must not take CppDesk down.
+    {
+        const Window gone = XCreateSimpleWindow(peer, DefaultRootWindow(peer), 0, 0, 1, 1, 0, 0, 0);
+        XConvertSelection(peer, clip, utf8, XInternAtom(peer, "CPPDESK_TEST_PROP", False), gone, CurrentTime);
+        XDestroyWindow(peer, gone);
+        XSync(peer, False);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        TEST_ASSERT(requestClipboard(peer, pw, utf8) == copied);   // still alive and serving
+    }
+
+    // Another app copies; CppDesk reads its text.
+    XSetSelectionOwner(peer, clip, pw, CurrentTime);
+    XFlush(peer);
+    std::atomic<bool> stop{false};
+    std::thread server([&] {
+        const std::string theirs = "from another app";
+        while (!stop.load()) {
+            XEvent ev;
+            if (!XCheckTypedWindowEvent(peer, pw, SelectionRequest, &ev)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            XSelectionRequestEvent& req = ev.xselectionrequest;
+            XEvent reply{};
+            reply.xselection.type = SelectionNotify;
+            reply.xselection.requestor = req.requestor;
+            reply.xselection.selection = req.selection;
+            reply.xselection.target = req.target;
+            reply.xselection.time = req.time;
+            reply.xselection.property = None;
+            if (req.target == utf8) {
+                XChangeProperty(peer, req.requestor, req.property, utf8, 8, PropModeReplace,
+                                reinterpret_cast<const unsigned char*>(theirs.data()), static_cast<int>(theirs.size()));
+                reply.xselection.property = req.property;
+            }
+            XSendEvent(peer, req.requestor, False, NoEventMask, &reply);
+            XFlush(peer);
+        }
+    });
+    TEST_ASSERT(ClipboardManager::getClipboardUtf8() == "from another app");
+    stop = true;
+    server.join();
+
+    XDestroyWindow(peer, pw);
+    XCloseDisplay(peer);
+}
+#endif
+
+#if defined(__linux__)
+// Plays a file manager dragging one file onto the window over the XDND protocol.
+void testXdndDrop() {
+    std::cout << "[TEST 77] Files dropped from another app reach the screens (XDND)..." << std::endl;
+    Display* peer = XOpenDisplay(nullptr);
+    if (!peer) {
+        std::cout << "  SKIP: no X display\n";
+        return;
+    }
+    IdentityManager id(4249);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    {
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        const Window target = w.nativeWindow();
+        TEST_ASSERT(pumpUntil(w, [&] {
+            XWindowAttributes a{};
+            return XGetWindowAttributes(peer, target, &a) && a.map_state == IsViewable;
+        }));
+
+        auto atom = [&](const char* name) { return XInternAtom(peer, name, False); };
+        const Atom aware = atom("XdndAware"), enter = atom("XdndEnter"), position = atom("XdndPosition"),
+                   status = atom("XdndStatus"), drop = atom("XdndDrop"), finished = atom("XdndFinished"),
+                   selection = atom("XdndSelection"), uriList = atom("text/uri-list"), copy = atom("XdndActionCopy");
+
+        // The window advertises XDND version 5.
+        Atom type = 0;
+        int format = 0;
+        unsigned long count = 0, after = 0;
+        unsigned char* data = nullptr;
+        XGetWindowProperty(peer, target, aware, 0, 1, False, XA_ATOM, &type, &format, &count, &after, &data);
+        TEST_ASSERT(data && count == 1 && *reinterpret_cast<Atom*>(data) == 5);
+        if (data) XFree(data);
+
+        const Window source = XCreateSimpleWindow(peer, DefaultRootWindow(peer), 0, 0, 1, 1, 0, 0, 0);
+        XSetSelectionOwner(peer, selection, source, CurrentTime);
+        auto send = [&](Atom msg, long l1, long l2, long l3, long l4) {
+            XEvent ev{};
+            ev.xclient.type = ClientMessage;
+            ev.xclient.window = target;
+            ev.xclient.message_type = msg;
+            ev.xclient.format = 32;
+            ev.xclient.data.l[0] = static_cast<long>(source);
+            ev.xclient.data.l[1] = l1;
+            ev.xclient.data.l[2] = l2;
+            ev.xclient.data.l[3] = l3;
+            ev.xclient.data.l[4] = l4;
+            XSendEvent(peer, target, False, NoEventMask, &ev);
+            XFlush(peer);
+        };
+        int rootX = 0, rootY = 0;
+        Window child = 0;
+        XTranslateCoordinates(peer, target, DefaultRootWindow(peer), 400, 300, &rootX, &rootY, &child);
+
+        bool accepted = false, done = false, doneOk = false;
+        const std::string uris = "file:///tmp/cppdesk-drop-test.txt\r\n";
+        auto serveSource = [&] {
+            while (XPending(peer) > 0) {
+                XEvent ev;
+                XNextEvent(peer, &ev);
+                if (ev.type == ClientMessage && ev.xclient.message_type == status) {
+                    accepted = (ev.xclient.data.l[1] & 1) != 0;
+                } else if (ev.type == ClientMessage && ev.xclient.message_type == finished) {
+                    done = true;
+                    doneOk = (ev.xclient.data.l[1] & 1) != 0;
+                } else if (ev.type == SelectionRequest) {
+                    XSelectionRequestEvent& req = ev.xselectionrequest;
+                    XEvent reply{};
+                    reply.xselection.type = SelectionNotify;
+                    reply.xselection.requestor = req.requestor;
+                    reply.xselection.selection = req.selection;
+                    reply.xselection.target = req.target;
+                    reply.xselection.time = req.time;
+                    reply.xselection.property = None;
+                    if (req.target == uriList) {
+                        XChangeProperty(peer, req.requestor, req.property, uriList, 8, PropModeReplace,
+                                        reinterpret_cast<const unsigned char*>(uris.data()), static_cast<int>(uris.size()));
+                        reply.xselection.property = req.property;
+                    }
+                    XSendEvent(peer, req.requestor, False, NoEventMask, &reply);
+                    XFlush(peer);
+                }
+            }
+        };
+        auto exchange = [&](auto cond) {
+            const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!cond() && std::chrono::steady_clock::now() < end) {
+                w.processEvents(10);
+                serveSource();
+            }
+            return cond();
+        };
+
+        send(enter, 5L << 24, static_cast<long>(uriList), 0, 0);
+        send(position, 0, (static_cast<long>(rootX) << 16) | rootY, CurrentTime, static_cast<long>(copy));
+        TEST_ASSERT(exchange([&] { return accepted; }));
+        send(drop, 0, CurrentTime, 0, 0);
+        TEST_ASSERT(exchange([&] { return done; }));
+        TEST_ASSERT(doneOk);
+        // With no session, the screens answer a drop by asking to connect first.
+        TEST_ASSERT(pumpUntil(w, [&] {
+            ui::RecordingCanvas rc;
+            w.app().render(rc, 1220, 760, 0.0);
+            return rc.serialize().find("Connect to a remote desk first") != std::string::npos;
+        }));
+        XDestroyWindow(peer, source);
+    }
+    XCloseDisplay(peer);
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+#endif
+
+#if defined(__linux__)
+bool windowViewable(Display* d, Window win) {
+    XWindowAttributes a{};
+    return XGetWindowAttributes(d, win, &a) && a.map_state == IsViewable;
+}
+
+void sendClose(Display* d, Window win) {
+    XEvent close{};
+    close.xclient.type = ClientMessage;
+    close.xclient.window = win;
+    close.xclient.message_type = XInternAtom(d, "WM_PROTOCOLS", False);
+    close.xclient.format = 32;
+    close.xclient.data.l[0] = static_cast<long>(XInternAtom(d, "WM_DELETE_WINDOW", False));
+    XSendEvent(d, win, False, NoEventMask, &close);
+    XFlush(d);
+}
+
+void sendClick(Display* d, Window win, int x, int y, unsigned button) {
+    XEvent ev{};
+    ev.xbutton.type = ButtonPress;
+    ev.xbutton.display = d;
+    ev.xbutton.window = win;
+    ev.xbutton.root = DefaultRootWindow(d);
+    ev.xbutton.x = x;
+    ev.xbutton.y = y;
+    ev.xbutton.button = button;
+    ev.xbutton.same_screen = True;
+    XSendEvent(d, win, True, ButtonPressMask, &ev);
+    ev.xbutton.type = ButtonRelease;
+    XSendEvent(d, win, True, ButtonReleaseMask, &ev);
+    XFlush(d);
+}
+
+// The first mapped override-redirect window named `name` (the tray menu popup).
+Window findPopup(Display* d, const char* name) {
+    Window root = 0, parent = 0, *kids = nullptr;
+    unsigned int n = 0;
+    Window found = 0;
+    if (XQueryTree(d, DefaultRootWindow(d), &root, &parent, &kids, &n)) {
+        for (unsigned int i = 0; i < n && !found; ++i) {
+            char* wname = nullptr;
+            if (XFetchName(d, kids[i], &wname) && wname) {
+                if (std::strcmp(wname, name) == 0 && windowViewable(d, kids[i])) found = kids[i];
+                XFree(wname);
+            }
+        }
+        if (kids) XFree(kids);
+    }
+    return found;
+}
+
+void testLinuxTray() {
+    std::cout << "[TEST 78] Tray icon: dock, hide to tray, restore, menu, no tray..." << std::endl;
+    Display* peer = XOpenDisplay(nullptr);
+    if (!peer) {
+        std::cout << "  SKIP: no X display\n";
+        return;
+    }
+    // Querying a window the app has already destroyed must fail the assertion, not kill the test run.
+    auto previousHandler = XSetErrorHandler([](Display*, XErrorEvent*) { return 0; });
+    IdentityManager id(4250);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+    id.loadOrCreate();
+    {
+        AppSettings s = id.settings();
+        s.minimizeToTray = true;
+        id.updateSettings(s);
+    }
+    NetworkEngine net(id);
+    auto settingsShowTrayToggle = [&](CppDeskWindow& w) {
+        w.app().applySnapshotState("settings_system");
+        ui::RecordingCanvas rc;
+        for (int i = 0; i < 30; ++i) w.app().render(rc, 1220, 760, 1.0 / 60.0);
+        return rc.serialize().find("Minimize window to system tray") != std::string::npos;
+    };
+
+    // No tray: the toggle is hidden and closing quits instead of hiding the window for good.
+    {
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        TEST_ASSERT(pumpUntil(w, [&] { return windowViewable(peer, w.nativeWindow()); }));
+        TEST_ASSERT(!settingsShowTrayToggle(w));
+        sendClose(peer, w.nativeWindow());
+        pump(w, 300);
+        TEST_ASSERT(!w.processEvents(0));
+    }
+
+    // A tray manager (a panel) owns _NET_SYSTEM_TRAY_S0.
+    const Window manager = XCreateSimpleWindow(peer, DefaultRootWindow(peer), 0, 0, 1, 1, 0, 0, 0);
+    const Atom traySel = XInternAtom(peer, "_NET_SYSTEM_TRAY_S0", False);
+    const Atom opcode = XInternAtom(peer, "_NET_SYSTEM_TRAY_OPCODE", False);
+    XSetSelectionOwner(peer, traySel, manager, CurrentTime);
+    XSync(peer, False);
+    {
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        const Window win = w.nativeWindow();
+        TEST_ASSERT(pumpUntil(w, [&] { return windowViewable(peer, win); }));
+
+        // The icon asked to dock.
+        Window icon = 0;
+        TEST_ASSERT(pumpUntil(w, [&] {
+            while (XPending(peer) > 0) {
+                XEvent ev;
+                XNextEvent(peer, &ev);
+                if (ev.type == ClientMessage && ev.xclient.message_type == opcode && ev.xclient.data.l[1] == 0) {
+                    icon = static_cast<Window>(ev.xclient.data.l[2]);
+                }
+            }
+            return icon != 0;
+        }));
+        TEST_ASSERT(settingsShowTrayToggle(w));
+        w.app().applySnapshotState("dashboard_light");
+
+        // Close hides to the tray; the app keeps running.
+        sendClose(peer, win);
+        TEST_ASSERT(pumpUntil(w, [&] { return !windowViewable(peer, win); }));
+        TEST_ASSERT(w.processEvents(0));
+
+        // Left click on the icon brings the window back.
+        if (icon) sendClick(peer, icon, 10, 10, Button1);
+        TEST_ASSERT(pumpUntil(w, [&] { return windowViewable(peer, win); }));
+
+        // Hidden again, then the panel goes away: the window must come back.
+        sendClose(peer, win);
+        TEST_ASSERT(pumpUntil(w, [&] { return !windowViewable(peer, win); }));
+        XDestroyWindow(peer, manager);
+        XSync(peer, False);
+        TEST_ASSERT(pumpUntil(w, [&] { return windowViewable(peer, win); }));
+        TEST_ASSERT(w.processEvents(0));
+    }
+
+    // Right click opens the menu; its last item quits.
+    const Window manager2 = XCreateSimpleWindow(peer, DefaultRootWindow(peer), 0, 0, 1, 1, 0, 0, 0);
+    XSetSelectionOwner(peer, traySel, manager2, CurrentTime);
+    XSync(peer, False);
+    {
+        CppDeskWindow w(id, net);
+        TEST_ASSERT(w.create());
+        Window icon = 0;
+        TEST_ASSERT(pumpUntil(w, [&] {
+            while (XPending(peer) > 0) {
+                XEvent ev;
+                XNextEvent(peer, &ev);
+                if (ev.type == ClientMessage && ev.xclient.message_type == opcode && ev.xclient.data.l[1] == 0) {
+                    icon = static_cast<Window>(ev.xclient.data.l[2]);
+                }
+            }
+            return icon != 0;
+        }));
+        if (icon) sendClick(peer, icon, 10, 10, Button3);
+        Window menu = 0;
+        TEST_ASSERT(pumpUntil(w, [&] { return (menu = findPopup(peer, "CppDesk tray menu")) != 0; }));
+        if (menu) {
+            XWindowAttributes a{};
+            XGetWindowAttributes(peer, menu, &a);
+            sendClick(peer, menu, a.width / 2, a.height - 12, Button1);
+        }
+        pump(w, 300);
+        TEST_ASSERT(!w.processEvents(0));
+    }
+    XDestroyWindow(peer, manager2);
+    XCloseDisplay(peer);
+    XSetErrorHandler(previousHandler);
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+#endif
+
+#if defined(__linux__)
+void testLinuxNotifications() {
+    std::cout << "[TEST 79] Notifications go to the desktop through notify-send..." << std::endl;
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "cppdesk-notify-test";
+    const fs::path log = dir / "calls.txt";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    {
+        std::ofstream script(dir / "notify-send");
+        script << "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '" << log.string() << "'\n";
+    }
+    fs::permissions(dir / "notify-send", fs::perms::owner_all);
+    const std::string oldPath = std::getenv("PATH") ? std::getenv("PATH") : "";
+    setenv("PATH", (dir.string() + ":" + oldPath).c_str(), 1);
+
+    auto readLog = [&](int waitMs) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMs);
+        std::string text;
+        do {
+            std::ifstream in(log);
+            text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            if (!text.empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        } while (std::chrono::steady_clock::now() < end);
+        return text;
+    };
+
+    NotificationManager n;
+    n.init(nullptr, nullptr, "CppDesk");
+    AppSettings s{};
+    s.enablePushNotifications = true;
+    n.notify(NotificationType::IncomingConnection, "Connection Request", "Desk 123 wants to connect", s);
+    TEST_ASSERT(readLog(2000) == "-a\nCppDesk\nConnection Request\nDesk 123 wants to connect\n");
+
+    fs::remove(log, ec);
+    n.setMuted(true);
+    n.notify(NotificationType::ChatMessage, "Muted", "nothing", s);
+    TEST_ASSERT(readLog(300).empty());
+    n.setMuted(false);
+    s.enablePushNotifications = false;
+    n.notify(NotificationType::ChatMessage, "Off", "nothing", s);
+    TEST_ASSERT(readLog(300).empty());
+
+    // Without notify-send nothing happens and nothing breaks.
+    setenv("PATH", "/nonexistent", 1);
+    s.enablePushNotifications = true;
+    n.notify(NotificationType::ChatMessage, "Missing", "tool", s);
+    TEST_ASSERT(readLog(300).empty());
+
+    setenv("PATH", oldPath.c_str(), 1);
+    fs::remove_all(dir, ec);
+
+    // Helpers (a browser started by xdg-open can outlive CppDesk) must not inherit our sockets or lock file.
+    int raw[2] = { -1, -1 };
+    TEST_ASSERT(pipe(raw) == 0);
+    // High numbers, so they cannot be mistaken for the fd `ls` opens on /proc/self/fd itself.
+    int leak[2] = { dup2(raw[0], 200), dup2(raw[1], 201) };
+    close(raw[0]);
+    close(raw[1]);
+    auto fds = spawn::output({ "sh", "-c", "ls /proc/self/fd" });
+    TEST_ASSERT(fds.has_value());
+    if (fds) {
+        std::istringstream in(*fds);
+        std::string fd;
+        bool inherited = false;
+        while (in >> fd) inherited = inherited || fd == std::to_string(leak[0]) || fd == std::to_string(leak[1]);
+        TEST_ASSERT(!inherited);
+    }
+    close(leak[0]);
+    close(leak[1]);
+}
+#endif
+
 // A PlatformShell for headless screen tests: no window, a fixed clock, and switchable capabilities.
 class FakeShell : public ui::PlatformShell {
 public:
@@ -7945,6 +8803,10 @@ void testShellCapabilityGating() {
     TEST_ASSERT(sysNone.find("Windows Action Center push toasts") == std::string::npos);
     TEST_ASSERT(sysNone.find("Minimize window to system tray") == std::string::npos);
     TEST_ASSERT(dashNone.find("|Elevate Admin") == std::string::npos);
+    // No Windows wording where the platform is not Windows.
+    TEST_ASSERT(sysNone.find("Windows") == std::string::npos);
+    TEST_ASSERT(renderAppState(id, net, none, "settings_about").find("for Windows") == std::string::npos);
+    TEST_ASSERT(renderAppState(id, net, all, "settings_about").find("for Windows") != std::string::npos);
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
 }
@@ -8003,6 +8865,100 @@ void testAppUiPublicInputApi() {
     settle();
     TEST_ASSERT(rc.frameBalanced());
     std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
+// Portable helpers the Linux window uses to translate X input.
+void testLinuxInputHelpers() {
+    std::cout << "[TEST 74] X keysym, DPI and URI-list helpers..." << std::endl;
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0x61) == 0x41);     // a
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0x41) == 0x41);     // A
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0xFF0D) == 0x0D);   // Return
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0xFFFF) == 0x2E);   // Delete
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0xFFE1) == 0x10);   // Shift_L -> generic VK_SHIFT, as WM_KEYDOWN
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0xFFE3) == 0x11);   // Control_L -> VK_CONTROL
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0xFFBE) == 0x70);   // F1
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0x003B) == 0xBA);   // semicolon
+    TEST_ASSERT(InputInjector::mapX11KeySymToVk(0x12345) == 0);
+    for (int vk = 1; vk < 255; ++vk) {
+        const uint32_t sym = InputInjector::mapVkToX11KeySym(static_cast<uint16_t>(vk));
+        if (sym == 0) continue;   // unmapped
+        const uint16_t back = InputInjector::mapX11KeySymToVk(sym);
+        TEST_ASSERT(back != 0 && InputInjector::mapVkToX11KeySym(back) == sym);
+    }
+    for (uint16_t vk : { 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x21, 0x22, 0x23, 0x24, 0xA3, 0xA5 })
+        TEST_ASSERT(InputInjector::isExtendedVk(vk));
+    TEST_ASSERT(!InputInjector::isExtendedVk(0x41) && !InputInjector::isExtendedVk(0x0D));
+
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("96") == 1.0f);
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("144") == 1.5f);
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("192") == 2.0f);
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi(nullptr) == 1.0f);
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("abc") == 1.0f);
+    TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("0") == 1.0f);
+
+    auto paths = UiPlatform::parseFileUriList("file:///home/a/b%20c.txt\r\n# comment\r\nhttps://example.com/x\r\n"
+                                              "file://host/tmp/x\r\nfile:///tmp/%E2%82%AC\n");
+    TEST_ASSERT(paths.size() == 3);
+    if (paths.size() == 3) {
+        TEST_ASSERT(paths[0] == "/home/a/b c.txt");
+        TEST_ASSERT(paths[1] == "/tmp/x");
+        TEST_ASSERT(paths[2] == "/tmp/\xE2\x82\xAC");
+    }
+    TEST_ASSERT(UiPlatform::parseFileUriList("").empty());
+}
+
+// Every screen's draw calls must match the committed goldens, so shared screen code cannot change how Windows
+// (or any platform) draws without the golden files changing in the same commit.
+// CPPDESK_UPDATE_UI_GOLDENS=1 rewrites them.
+void testUiGoldens() {
+    std::cout << "[TEST 72] Every screen draws exactly what the goldens record..." << std::endl;
+#if defined(CPPDESK_SOURCE_DIR)
+    std::filesystem::path dir = std::filesystem::path(CPPDESK_SOURCE_DIR) / "tests" / "ui_goldens";
+#else
+    std::filesystem::path dir = std::filesystem::path("tests") / "ui_goldens";
+#endif
+    const bool update = std::getenv("CPPDESK_UPDATE_UI_GOLDENS") != nullptr;
+
+    // The same fixed identity as the app's --ui-snapshot mode.
+    IdentityManager id(4247);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+    {
+        std::ofstream cfg(id.configFilePath(), std::ios::trunc);
+        cfg << "desk_id=482910375\n" << "totp_secret=JBSWY3DPEHPK3PXP\n";
+    }
+    id.loadOrCreate();
+    id.setSessionCode("k7m2qp");
+    NetworkEngine net(id);
+    FakeShell shell;
+    shell.elevation = false;   // an elevated CI runner must not change the dashboard
+
+    if (update) std::filesystem::create_directories(dir, ec);
+    for (const auto& name : AppUi::snapshotStateNames()) {
+        AppUi app(id, net, shell, "");
+        ui::RecordingCanvas rc;
+        app.applySnapshotState(name);
+        for (int i = 0; i < 150; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);
+        const std::string got = rc.serialize();
+        const std::filesystem::path file = dir / (name + ".ops.txt");
+        if (update) {
+            std::ofstream(file, std::ios::binary | std::ios::trunc) << got;
+            continue;
+        }
+        std::ifstream in(file, std::ios::binary);
+        std::string want((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        TEST_ASSERT(in.good() || !want.empty());
+        if (got != want) {
+            std::istringstream a(want), b(got);
+            std::string la, lb;
+            int line = 1;
+            while (std::getline(a, la) && std::getline(b, lb) && la == lb) ++line;
+            std::cout << "  golden mismatch: " << name << " line " << line << "\n    want: " << la
+                      << "\n    got:  " << lb << "\n";
+        }
+        TEST_ASSERT(got == want);
+    }
     std::filesystem::remove(id.configFilePath(), ec);
 }
 
@@ -8094,6 +9050,18 @@ int main() {
         testShellCapabilityGating(); std::cout << "Test 69 done\n" << std::flush;
         testAppUiRendersEveryScreenHeadless(); std::cout << "Test 70 done\n" << std::flush;
         testAppUiPublicInputApi(); std::cout << "Test 71 done\n" << std::flush;
+        testUiGoldens(); std::cout << "Test 72 done\n" << std::flush;
+#if defined(__linux__)
+        testCairoCanvas(); std::cout << "Test 73 done\n" << std::flush;
+#endif
+        testLinuxInputHelpers(); std::cout << "Test 74 done\n" << std::flush;
+#if defined(__linux__)
+        testLinuxWindow(); std::cout << "Test 75 done\n" << std::flush;
+        testX11Clipboard(); std::cout << "Test 76 done\n" << std::flush;
+        testXdndDrop(); std::cout << "Test 77 done\n" << std::flush;
+        testLinuxTray(); std::cout << "Test 78 done\n" << std::flush;
+        testLinuxNotifications(); std::cout << "Test 79 done\n" << std::flush;
+#endif
 #if defined(_WIN32)
         testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;
 #endif

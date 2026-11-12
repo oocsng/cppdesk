@@ -1,5 +1,9 @@
 #include "ui_platform.hpp"
 
+#include <cctype>
+#include <cstdlib>
+#include <string>
+
 namespace cppdesk {
 
 ViewportGeometry UiPlatform::calculateViewportGeometry(float viewWidth, float viewHeight, uint32_t frameWidth, uint32_t frameHeight, ScaleMode scaleMode) {
@@ -320,6 +324,41 @@ UiPlatformRect UiPlatform::computeSpringRect(const UiPlatformRect& base, float h
     float dy = std::max(base.height() * scaleDelta * 0.5f, 0.9f * hT - 1.5f * pT);
     float liftY = (-1.8f * hT) + (1.6f * pT);
     return base.inflate(dx, dy).offset(0.0f, liftY);
+}
+
+float UiPlatform::dpiScaleFromXftDpi(const char* value) {
+    if (!value) return 1.0f;
+    char* end = nullptr;
+    const double dpi = std::strtod(value, &end);
+    if (end == value || dpi <= 0.0) return 1.0f;
+    return static_cast<float>(dpi / 96.0);
+}
+
+std::vector<std::string> UiPlatform::parseFileUriList(const std::string& uriList) {
+    std::vector<std::string> paths;
+    size_t start = 0;
+    while (start < uriList.size()) {
+        size_t end = uriList.find('\n', start);
+        if (end == std::string::npos) end = uriList.size();
+        std::string line = uriList.substr(start, end - start);
+        start = end + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("file://", 0) != 0) continue;   // also skips '#' comments and other schemes
+        const size_t pathStart = line.find('/', 7);       // after file://host
+        if (pathStart == std::string::npos) continue;
+        std::string path;
+        for (size_t i = pathStart; i < line.size(); ++i) {
+            if (line[i] == '%' && i + 2 < line.size() && std::isxdigit(static_cast<unsigned char>(line[i + 1])) &&
+                std::isxdigit(static_cast<unsigned char>(line[i + 2]))) {
+                path.push_back(static_cast<char>(std::stoi(line.substr(i + 1, 2), nullptr, 16)));
+                i += 2;
+            } else {
+                path.push_back(line[i]);
+            }
+        }
+        paths.push_back(std::move(path));
+    }
+    return paths;
 }
 
 } // namespace cppdesk

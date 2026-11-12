@@ -226,6 +226,19 @@ uint32_t InputInjector::mapVkToX11KeySym(uint16_t vk) {
     }
 }
 
+uint16_t InputInjector::mapX11KeySymToVk(uint32_t keysym) {
+    if (keysym >= 'A' && keysym <= 'Z') keysym += 'a' - 'A';   // the table maps letters to lowercase keysyms
+    if (keysym == 0) return 0;
+    for (uint16_t vk = 1; vk < 255; ++vk) {   // lowest vk wins: generic modifiers before left/right ones
+        if (mapVkToX11KeySym(vk) == keysym) return vk;
+    }
+    return 0;
+}
+
+bool InputInjector::isExtendedVk(uint16_t vk) {
+    return (vk >= 0x21 && vk <= 0x28) || vk == 0x2D || vk == 0x2E || vk == 0xA3 || vk == 0xA5;
+}
+
 namespace {
 
 #if defined(_WIN32)

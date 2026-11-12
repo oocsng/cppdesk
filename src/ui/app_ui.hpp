@@ -214,6 +214,8 @@ private:
 
 private:
 
+    // Windows-specific wording only where the Windows-only service capability exists.
+    bool onWindowsShell() const { return shell_->has(ui::Capability::WindowsService); }
     void applyWindowThemeAttribute();
     void switchTab(ActiveTab newTab);
 
