@@ -87,7 +87,7 @@ Headless Linux host / service mode:
 ## Building from source
 
 ### Requirements
-- Windows 10 or 11 (x64), macOS 12+, or Linux (X11 desktop)
+- Windows 10 or 11 (x64), macOS 12.3+, or Linux (X11 desktop)
 - C++20 compiler (such as MinGW-w64 from MSYS2, MSVC, Apple Clang, or GCC 11+)
 - CMake 3.20+ (for cross-platform builds)
 

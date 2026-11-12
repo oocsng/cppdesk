@@ -1,4 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
+# ScreenCaptureKit (macOS host capture) needs 12.3; must be set before project().
+set(CMAKE_OSX_DEPLOYMENT_TARGET "12.3" CACHE STRING "")
 project(CppDesk VERSION 3.9.3 LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -185,6 +187,12 @@ if(WIN32)
         tests/test_suite.cpp
     )
     target_link_libraries(CppDeskTests PRIVATE ${PLATFORM_LIBS})
+elseif(APPLE)
+    add_executable(CppDeskTests
+        ${CORE_SOURCES}
+        tests/test_suite.cpp
+    )
+    target_link_libraries(CppDeskTests PRIVATE ${PLATFORM_LIBS} ${COCOA_FRAMEWORK} ${APPKIT_FRAMEWORK} ${QUARTZ_CORE})
 elseif(UNIX AND NOT APPLE)
     add_executable(CppDeskTests
         ${CORE_SOURCES}
@@ -218,8 +226,8 @@ elseif(APPLE)
         MACOSX_BUNDLE_BUNDLE_NAME "CppDesk"
         MACOSX_BUNDLE_BUNDLE_IDENTIFIER "com.oocsng.cppdesk"
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/Info.plist"
-        MACOSX_BUNDLE_SHORT_VERSION_STRING "3.9.3"
-        MACOSX_BUNDLE_LONG_VERSION_STRING "3.9.3"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_LONG_VERSION_STRING "${PROJECT_VERSION}"
     )
     target_link_libraries(CppDesk PRIVATE
         ${PLATFORM_LIBS}

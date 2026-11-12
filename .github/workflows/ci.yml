@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, macos-ui]
   pull_request:
 
 jobs:
@@ -36,3 +36,17 @@ jobs:
         run: xvfb-run -a -s "-screen 0 1920x1080x24" ./build.sh --test
       - name: Build the app
         run: cmake --build build --target CppDesk -j 4
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install zstd
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target CppDeskTests -j 4 2>&1 | tail -150
+          test -x build/CppDeskTests
+      - name: Run the test suite
+        run: cd build && ./CppDeskTests
