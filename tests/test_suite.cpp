@@ -3,6 +3,7 @@
 #include "../src/simd/simd_kernels.hpp"
 #include "../src/capture/screen_capture.hpp"
 #include "../src/control/input_injector.hpp"
+#include "../src/control/mac_input_logic.hpp"
 #include "../src/control/clipboard_file_manager.hpp"
 #include "../src/net/network_engine.hpp"
 #include "../src/net/updater.hpp"
@@ -9141,6 +9142,70 @@ void testLinuxInputHelpers() {
     }
 }
 
+void testMacInputLogic() {
+    std::cout << "[TEST 82] Mac host input logic (drags, click counts, key and point mapping)..." << std::endl;
+    {   // A move while a button is held is a drag.
+        MacMouseTracker t;
+        TEST_ASSERT(t.onMove().kind == MacMouseKind::Move);
+        TEST_ASSERT(t.onButton(MouseButtonId::Left, true, 10, 10, 1000).kind == MacMouseKind::Down);
+        TEST_ASSERT(t.onMove().kind == MacMouseKind::Drag);
+        TEST_ASSERT(t.onButton(MouseButtonId::Left, false, 10, 10, 1050).kind == MacMouseKind::Up);
+        TEST_ASSERT(t.onMove().kind == MacMouseKind::Move);
+        t.onButton(MouseButtonId::Right, true, 10, 10, 1100);
+        TEST_ASSERT(t.onMove().kind == MacMouseKind::Drag);
+        t.reset();
+        TEST_ASSERT(t.onMove().kind == MacMouseKind::Move);
+    }
+    {   // Buttons map: Windows middle is the Mac "other" button.
+        MacMouseTracker t;
+        TEST_ASSERT(t.onButton(MouseButtonId::Left, true, 0, 0, 0).button == MacButton::Left);
+        TEST_ASSERT(t.onButton(MouseButtonId::Right, true, 0, 0, 0).button == MacButton::Right);
+        TEST_ASSERT(t.onButton(MouseButtonId::Middle, true, 0, 0, 0).button == MacButton::Other);
+    }
+    {   // Double and triple clicks need the same spot and a short gap; the up carries its down's count.
+        MacMouseTracker t;
+        TEST_ASSERT(t.onButton(MouseButtonId::Left, true, 100, 100, 1000).clickCount == 1);
+        TEST_ASSERT(t.onButton(MouseButtonId::Left, false, 100, 100, 1050).clickCount == 1);
+        TEST_ASSERT(t.onButton(MouseButtonId::Left, true, 101, 100, 1300).clickCount == 2);
+        TEST_ASSERT(t.onButton(MouseButtonId::Left, false, 101, 100, 1350).clickCount == 2);
+        TEST_ASSERT(t.onButton(MouseButtonId::Left, true, 101, 101, 1600).clickCount == 3);
+        TEST_ASSERT(t.onButton(MouseButtonId::Left, true, 101, 101, 2600).clickCount == 1);   // too slow
+        TEST_ASSERT(t.onButton(MouseButtonId::Left, true, 130, 101, 2700).clickCount == 1);   // too far
+        TEST_ASSERT(t.onButton(MouseButtonId::Right, true, 130, 101, 2750).clickCount == 1);  // another button
+        TEST_ASSERT(t.onButton(MouseButtonId::Left, true, 130, 101, 2800).clickCount == 2);   // left again, still near
+    }
+    {   // A remote Ctrl acts as Command and a remote Win key as Control.
+        TEST_ASSERT(macHostKeyCodeForVk(0x11) == 0x37);
+        TEST_ASSERT(macHostKeyCodeForVk(0xA2) == 0x37);
+        TEST_ASSERT(macHostKeyCodeForVk(0xA3) == 0x36);
+        TEST_ASSERT(macHostKeyCodeForVk(0x5B) == 0x3B);
+        TEST_ASSERT(macHostKeyCodeForVk(0x5C) == 0x3E);
+        TEST_ASSERT(macHostKeyCodeForVk(0x12) == 0x3A);   // Alt stays Option
+        TEST_ASSERT(macHostKeyCodeForVk(0x41) == 0x00);   // A
+        TEST_ASSERT(macHostKeyCodeForVk(0xFF) == 0xFFFF);
+    }
+    {   // Normalized to points: the last pixel is reachable, out-of-range input clamps, negative origins work.
+        const PointRect main{ 0, 0, 1440, 900 };
+        PointXY c = macPointForNormalized(0.5f, 0.5f, main);
+        TEST_ASSERT(c.x == 719.5 && c.y == 449.5);
+        PointXY corner = macPointForNormalized(1.0f, 1.0f, main);
+        TEST_ASSERT(corner.x == 1439.0 && corner.y == 899.0);
+        PointXY clamped = macPointForNormalized(-1.0f, 2.0f, main);
+        TEST_ASSERT(clamped.x == 0.0 && clamped.y == 899.0);
+        PointXY left = macPointForNormalized(0.0f, 0.0f, PointRect{ -1920, 0, 1920, 1080 });
+        TEST_ASSERT(left.x == -1920.0 && left.y == 0.0);
+        PointXY below = macPointForNormalized(0.0f, 1.0f, PointRect{ 0, -1080, 1920, 1080 });
+        TEST_ASSERT(below.x == 0.0 && below.y == -1.0);
+    }
+    {   // The display for a monitor index; out of range falls back to the first, an empty list to nothing.
+        const std::vector<PointRect> list{ { 0, 0, 1440, 900 }, { 1440, 0, 1920, 1080 } };
+        TEST_ASSERT(macDisplayForIndex(1, list).x == 1440.0);
+        TEST_ASSERT(macDisplayForIndex(5, list).x == 0.0);
+        TEST_ASSERT(macDisplayForIndex(-1, list).w == 1440.0);
+        TEST_ASSERT(macDisplayForIndex(0, {}).w == 0.0);
+    }
+}
+
 // Every screen's draw calls must match the committed goldens, so shared screen code cannot change how Windows
 // (or any platform) draws without the golden files changing in the same commit.
 // CPPDESK_UPDATE_UI_GOLDENS=1 rewrites them.
@@ -9291,6 +9356,7 @@ int main() {
         testCgCanvas(); std::cout << "Test 80 done\n" << std::flush;
 #endif
         testLinuxInputHelpers(); std::cout << "Test 74 done\n" << std::flush;
+        testMacInputLogic(); std::cout << "Test 82 done\n" << std::flush;
 #if defined(__linux__)
         testLinuxWindow(); std::cout << "Test 75 done\n" << std::flush;
         testX11Clipboard(); std::cout << "Test 76 done\n" << std::flush;

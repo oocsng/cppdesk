@@ -21,6 +21,7 @@ set(CORE_SOURCES
     src/capture/session_rewind_buffer.cpp
     src/capture/privacy_cloak_manager.cpp
     src/control/input_injector.cpp
+    src/control/mac_input_logic.cpp
     src/control/shell_clipboard.cpp
     src/control/clipboard_file_manager.cpp
     src/control/remote_file_browser.cpp

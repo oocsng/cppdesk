@@ -34,6 +34,7 @@ $CoreSources = @(
     "src/control/session_tab_manager.cpp",
     "src/control/windows_service_manager.cpp",
     "src/control/shortcut_manager.cpp",
+"src/control/mac_input_logic.cpp",
     "src/core/totp_manager.cpp",
     "src/core/qr_matrix.cpp",
     "src/capture/session_rewind_buffer.cpp",
