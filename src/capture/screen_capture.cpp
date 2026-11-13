@@ -946,7 +946,10 @@ ScreenCapturer::ScreenCapturer()
 
 ScreenCapturer::~ScreenCapturer() {
 #if defined(__linux__)
-    if (wayland_) wayland_->close();   // a permission dialog still open goes away with the session
+    if (wayland_) {   // let go of what the peer still held, and withdraw a permission dialog still open
+        wayland_->releaseAll();
+        wayland_->close();
+    }
 #endif
     releaseDxgi();
     releaseGdiResources();

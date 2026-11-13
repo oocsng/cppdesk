@@ -10248,8 +10248,11 @@ void testWaylandShareIntegration() {
             TEST_ASSERT(waitUntil([&] { return fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyPointerButton") == 2; }));
             TEST_ASSERT(ScreenCapturer::x11CaptureCallsForTest() == x11Capture0);
             TEST_ASSERT(InputInjector::x11InputCallsForTest() == x11Input0);
+            InputInjector::injectKeyEvent(0x41, 0, true, false);               // held down when the session ends
+            TEST_ASSERT(waitUntil([&] { return fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyKeyboardKeysym") == 3; }));
         }
         TEST_ASSERT(WaylandShare::active() == nullptr);                       // gone with the session
+        TEST_ASSERT(waitUntil([&] { return fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyKeyboardKeysym") == 4; }));   // and let go
         TEST_ASSERT(waitUntil([&] { return fake.count("org.freedesktop.portal.Session", "Close") == 1; }));
     }
     {   // Refused: nothing is captured (although an X display exists), no input goes anywhere
