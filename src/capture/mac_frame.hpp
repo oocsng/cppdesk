@@ -15,4 +15,9 @@ void copyBgraRows(const uint8_t* src, size_t srcStride, int width, int height, u
 // maxLongEdge, aspect kept, both sides even and at least 2.
 void fitCaptureSize(int width, int height, int maxLongEdge, int& outWidth, int& outHeight);
 
+// True when a running capture stream no longer matches its display: frames come at frameWidth x frameHeight, but the
+// display's pixel size now fits a different capture size (a resolution change; the stream keeps its old output size).
+// False while no frame has arrived (frame size 0).
+bool captureSizeStale(int frameWidth, int frameHeight, int displayPixelWidth, int displayPixelHeight, int maxLongEdge);
+
 } // namespace cppdesk

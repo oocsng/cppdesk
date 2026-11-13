@@ -27,4 +27,11 @@ void fitCaptureSize(int width, int height, int maxLongEdge, int& outWidth, int& 
     outHeight = static_cast<int>(std::max<int64_t>(2, h & ~int64_t{1}));
 }
 
+bool captureSizeStale(int frameWidth, int frameHeight, int displayPixelWidth, int displayPixelHeight, int maxLongEdge) {
+    if (frameWidth <= 0 || frameHeight <= 0) return false;
+    int w = 0, h = 0;
+    fitCaptureSize(displayPixelWidth, displayPixelHeight, maxLongEdge, w, h);
+    return w != frameWidth || h != frameHeight;
+}
+
 } // namespace cppdesk

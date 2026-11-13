@@ -9191,6 +9191,15 @@ void testMacFrameHelpers() {
         fitCaptureSize(1, 1, 3840, w, h);
         TEST_ASSERT(w == 2 && h == 2);
     }
+    {   // A running stream is stale when the display's pixel size no longer fits the size it was started at
+        // (a resolution change): it keeps the old output size and the picture would be letterboxed or stretched.
+        TEST_ASSERT(!captureSizeStale(2880, 1800, 2880, 1800, 3840));
+        TEST_ASSERT(captureSizeStale(2880, 1800, 2560, 1600, 3840));
+        TEST_ASSERT(captureSizeStale(1920, 1080, 2560, 1440, 3840));
+        TEST_ASSERT(!captureSizeStale(3840, 2160, 5120, 2880, 3840));   // a 5K screen is captured at 3840 either way
+        TEST_ASSERT(!captureSizeStale(1920, 1080, 1921, 1081, 3840));   // odd sizes round down to the same even size
+        TEST_ASSERT(!captureSizeStale(0, 0, 1920, 1080, 3840));         // no frame yet: nothing to compare
+    }
 }
 
 #if defined(__APPLE__)

@@ -3,6 +3,7 @@
 #include "../simd/simd_kernels.hpp"
 #if defined(__APPLE__)
 #include "mac_screen_capture.hpp"
+#include "mac_frame.hpp"
 #endif
 
 #if defined(_WIN32)
@@ -1540,8 +1541,18 @@ bool ScreenCapturer::captureViaCoreGraphics() {
     const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     if (!macStream_) macStream_ = std::make_unique<MacCaptureStream>();
+    // A resolution change leaves the running stream at its old output size (letterboxed or stretched, and clicks
+    // would land off target): start it again at the new size.
+    bool resized = false;
+    if (macStream_->state() == MacCaptureState::Running) {
+        if (CGDisplayModeRef mode = CGDisplayCopyDisplayMode(displayId)) {
+            resized = captureSizeStale(frameW_, frameH_, static_cast<int>(CGDisplayModeGetPixelWidth(mode)),
+                                       static_cast<int>(CGDisplayModeGetPixelHeight(mode)), 3840);
+            CGDisplayModeRelease(mode);
+        }
+    }
     bool justStarted = false;
-    if (macStreamDisplay_ != displayId ||
+    if (macStreamDisplay_ != displayId || resized ||
         (macStream_->state() != MacCaptureState::Running && nowMs - macLastStartMs_ >= 2000)) {
         macStreamDisplay_ = displayId;
         macLastStartMs_ = nowMs;
