@@ -23,6 +23,7 @@ set(CORE_SOURCES
     src/control/input_injector.cpp
     src/control/mac_input_logic.cpp
     src/capture/mac_frame.cpp
+    src/ui/host_permissions.cpp
     src/control/shell_clipboard.cpp
     src/control/clipboard_file_manager.cpp
     src/control/remote_file_browser.cpp
@@ -90,6 +91,7 @@ elseif(APPLE)
         src/ui/canvas_cg.cpp
         src/control/mac_clipboard.mm
         src/capture/mac_screen_capture.mm
+        src/control/mac_permissions.mm
     )
 
     find_library(LIB_ZSTD zstd REQUIRED)
@@ -203,7 +205,7 @@ if(UNIX)
 endif()
 if(APPLE)
     # AppKit code is written for ARC.
-    set_source_files_properties(src/ui/ui_window_mac.mm src/control/mac_clipboard.mm src/capture/mac_screen_capture.mm tests/mac_test_driver.mm
+    set_source_files_properties(src/ui/ui_window_mac.mm src/control/mac_clipboard.mm src/capture/mac_screen_capture.mm src/control/mac_permissions.mm tests/mac_test_driver.mm
         PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 

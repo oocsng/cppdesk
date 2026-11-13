@@ -19,6 +19,14 @@ enum class Capability {
     ActionCenterToasts,  // Windows Action Center notifications toggle
     TrayIcon,            // minimize to the tray / menu bar
     NativeNotifications, // OS notifications for incoming requests
+    HostPermissions,     // the OS asks the user to allow screen sharing and control (macOS)
+};
+
+// Permissions a host needs before it can be seen and controlled. Platforms without them report everything allowed.
+enum class HostPermission { ScreenRecording, Accessibility };
+struct HostPermissionStatus {
+    bool screenRecording = true;
+    bool accessibility = true;
 };
 
 enum class CursorShape { Arrow, Hand, IBeam, ResizeH, ResizeV };
@@ -89,6 +97,14 @@ public:
     virtual void setTrayStatus(const std::string& tooltip) = 0;
 
     virtual bool has(Capability c) const = 0;
+
+    // Host permissions (only where Capability::HostPermissions is available). The defaults suit every platform
+    // that has none.
+    virtual HostPermissionStatus hostPermissions() const { return {}; }
+    // Asks the OS to show its permission prompt (or does nothing if it cannot).
+    virtual void requestHostPermission(HostPermission) {}
+    // Opens the system settings page where the user turns the permission on.
+    virtual void openHostPermissionSettings(HostPermission) {}
 };
 
 } // namespace cppdesk::ui

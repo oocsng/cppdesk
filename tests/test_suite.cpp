@@ -15,6 +15,7 @@
 #include "../src/ui/app_ui.hpp"
 #include "../src/ui/vk_codes.hpp"
 #include "../src/ui/platform_shell.hpp"
+#include "../src/ui/host_permissions.hpp"
 #if defined(__APPLE__)
 #include "../src/ui/canvas_cg.hpp"
 #include "mac_test_driver.hpp"
@@ -8944,6 +8945,7 @@ void testLinuxNotifications() {
 class FakeShell : public ui::PlatformShell {
 public:
     bool service = true, elevation = true, shortcut = true, actionCenter = true, tray = true, notifications = true;
+    bool hostPermsCap = false;
 
     void invalidate() override {}
     void setCursor(ui::CursorShape) override {}
@@ -8982,6 +8984,7 @@ public:
             case ui::Capability::ActionCenterToasts: return actionCenter;
             case ui::Capability::TrayIcon: return tray;
             case ui::Capability::NativeNotifications: return notifications;
+            case ui::Capability::HostPermissions: return hostPermsCap;
         }
         return false;
     }
@@ -9022,6 +9025,7 @@ void testShellCapabilityGating() {
     TEST_ASSERT(sysNone.find("Windows") == std::string::npos);
     TEST_ASSERT(renderAppState(id, net, none, "settings_about").find("for Windows") == std::string::npos);
     TEST_ASSERT(renderAppState(id, net, all, "settings_about").find("for Windows") != std::string::npos);
+    TEST_ASSERT(!all.has(ui::Capability::HostPermissions));   // a Mac-only capability
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
 }
@@ -9227,6 +9231,52 @@ void testMacInjectorSurvivesPixelSizedMonitor() {
     TEST_ASSERT(true);
 }
 #endif
+
+void testHostPermissionCard() {
+    std::cout << "[TEST 86] Mac permission card: what is missing, in plain words..." << std::endl;
+    using ui::HostPermission;
+    using ui::HostPermissionStatus;
+    auto plain = [](const ui::HostPermissionCard& c) {
+        std::string all = c.title + " " + c.body + " " + c.approvalWarning;
+        for (const auto& r : c.rows) all += " " + r.label;
+        for (char& ch : all) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        return all.find("tcc") == std::string::npos && all.find("entitlement") == std::string::npos &&
+               all.find("api") == std::string::npos;
+    };
+    {   // Both allowed: nothing to show.
+        const auto c = ui::describeHostPermissions(HostPermissionStatus{ true, true }, false);
+        TEST_ASSERT(!c.visible && c.rows.empty() && c.approvalWarning.empty() && !c.needsRestart);
+        TEST_ASSERT(!ui::describeHostPermissions(HostPermissionStatus{ true, true }, true).visible);
+    }
+    {   // Both missing: two rows, a warning naming both.
+        const auto c = ui::describeHostPermissions(HostPermissionStatus{ false, false }, false);
+        TEST_ASSERT(c.visible && !c.needsRestart && c.rows.size() == 2);
+        TEST_ASSERT(!c.title.empty() && !c.body.empty());
+        TEST_ASSERT(!c.rows[0].granted && !c.rows[1].granted && c.rows[0].which != c.rows[1].which);
+        TEST_ASSERT(c.approvalWarning.find("Screen Recording") != std::string::npos);
+        TEST_ASSERT(c.approvalWarning.find("Accessibility") != std::string::npos);
+        TEST_ASSERT(plain(c));
+    }
+    {   // Only Accessibility missing: one row, and the viewer is told they can look but not touch.
+        const auto c = ui::describeHostPermissions(HostPermissionStatus{ true, false }, false);
+        TEST_ASSERT(c.visible && !c.needsRestart && c.rows.size() == 1);
+        TEST_ASSERT(c.rows[0].which == HostPermission::Accessibility && !c.rows[0].granted);
+        TEST_ASSERT(c.approvalWarning.find("Accessibility") != std::string::npos);
+        TEST_ASSERT(c.approvalWarning.find("Screen Recording") == std::string::npos);
+        TEST_ASSERT(plain(c));
+        // Returning from settings does not matter for Accessibility: macOS applies it at once.
+        TEST_ASSERT(!ui::describeHostPermissions(HostPermissionStatus{ true, false }, true).needsRestart);
+    }
+    {   // Screen Recording missing: after a trip to Settings, macOS needs the app restarted.
+        const auto before = ui::describeHostPermissions(HostPermissionStatus{ false, true }, false);
+        TEST_ASSERT(before.visible && !before.needsRestart && before.rows.size() == 1);
+        TEST_ASSERT(before.rows[0].which == HostPermission::ScreenRecording);
+        const auto after = ui::describeHostPermissions(HostPermissionStatus{ false, true }, true);
+        TEST_ASSERT(after.visible && after.needsRestart);
+        TEST_ASSERT(after.body.find("restart") != std::string::npos || after.body.find("Restart") != std::string::npos);
+        TEST_ASSERT(plain(before) && plain(after));
+    }
+}
 
 void testMacInputLogic() {
     std::cout << "[TEST 82] Mac host input logic (drags, click counts, key and point mapping)..." << std::endl;
@@ -9445,6 +9495,7 @@ int main() {
 #endif
         testLinuxInputHelpers(); std::cout << "Test 74 done\n" << std::flush;
         testMacInputLogic(); std::cout << "Test 82 done\n" << std::flush;
+        testHostPermissionCard(); std::cout << "Test 86 done\n" << std::flush;
         testMacFrameHelpers(); std::cout << "Test 84 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;

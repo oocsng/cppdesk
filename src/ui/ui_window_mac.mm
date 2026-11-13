@@ -7,6 +7,7 @@
 #include "ui_window.hpp"
 #include "canvas_cg.hpp"
 #include "../control/input_injector.hpp"
+#include "../control/mac_permissions.hpp"
 #include "../core/crypto_identity.hpp"
 #include "../net/network_engine.hpp"
 
@@ -601,8 +602,13 @@ public:
     bool has(ui::Capability c) const override {
         if (c == ui::Capability::TrayIcon) return w_ && w_->statusItem != nil;
         if (c == ui::Capability::NativeNotifications) return true;
+        if (c == ui::Capability::HostPermissions) return w_ != nullptr;   // not in snapshots: every screen looks alike
         return false;   // the Windows-only controls stay hidden
     }
+
+    ui::HostPermissionStatus hostPermissions() const override { return macPermissionsNow(); }
+    void requestHostPermission(ui::HostPermission p) override { macRequestPermission(p); }
+    void openHostPermissionSettings(ui::HostPermission p) override { macOpenPrivacyPane(p); }
 
 private:
     bool live() const { return w_ && w_->window && !w_->closed; }
