@@ -4,6 +4,7 @@
 #include "../src/capture/screen_capture.hpp"
 #include "../src/control/input_injector.hpp"
 #include "../src/control/mac_input_logic.hpp"
+#include "../src/capture/mac_frame.hpp"
 #include "../src/control/clipboard_file_manager.hpp"
 #include "../src/net/network_engine.hpp"
 #include "../src/net/updater.hpp"
@@ -17,6 +18,7 @@
 #if defined(__APPLE__)
 #include "../src/ui/canvas_cg.hpp"
 #include "mac_test_driver.hpp"
+#include "../src/capture/mac_screen_capture.hpp"
 #include "../src/ui/ui_window.hpp"
 #endif
 #if defined(__linux__)
@@ -9142,6 +9144,72 @@ void testLinuxInputHelpers() {
     }
 }
 
+void testMacFrameHelpers() {
+    std::cout << "[TEST 84] Mac capture frame helpers (row stride, capture size)..." << std::endl;
+    {   // A buffer with row padding is packed tightly and made opaque; the padding is not copied.
+        const int w = 2, h = 3;
+        const size_t stride = 20;
+        std::vector<uint8_t> src(stride * h, 0xAA);
+        for (int r = 0; r < h; ++r)
+            for (int i = 0; i < w * 4; ++i) src[r * stride + i] = static_cast<uint8_t>(r * 10 + i + 1);
+        for (int r = 0; r < h; ++r)
+            for (int c = 0; c < w; ++c) src[r * stride + c * 4 + 3] = 0x11;
+        std::vector<uint8_t> dst(w * h * 4, 0x55);
+        copyBgraRows(src.data(), stride, w, h, dst.data());
+        bool ok = true;
+        for (int r = 0; r < h; ++r)
+            for (int c = 0; c < w; ++c)
+                for (int k = 0; k < 4; ++k) {
+                    const uint8_t want = k == 3 ? 0xFF : static_cast<uint8_t>(r * 10 + c * 4 + k + 1);
+                    ok = ok && dst[(r * w + c) * 4 + k] == want;
+                }
+        TEST_ASSERT(ok);
+    }
+    {   // A big screen is scaled down to the long-edge limit with even sides; small ones stay as they are.
+        int w = 0, h = 0;
+        fitCaptureSize(5120, 2880, 3840, w, h);
+        TEST_ASSERT(w == 3840 && h == 2160);
+        fitCaptureSize(1920, 1080, 3840, w, h);
+        TEST_ASSERT(w == 1920 && h == 1080);
+        fitCaptureSize(1921, 1081, 3840, w, h);
+        TEST_ASSERT(w == 1920 && h == 1080);
+        fitCaptureSize(3001, 1999, 3000, w, h);
+        TEST_ASSERT(w == 3000 && h == 1998);
+        fitCaptureSize(2880, 5120, 3840, w, h);   // portrait
+        TEST_ASSERT(w == 2160 && h == 3840);
+        fitCaptureSize(1, 1, 3840, w, h);
+        TEST_ASSERT(w == 2 && h == 2);
+    }
+}
+
+#if defined(__APPLE__)
+void testMacCaptureStreamStart() {
+    std::cout << "[TEST 85] Mac capture stream starts or reports why not, without hanging..." << std::endl;
+    MacCaptureStream stream;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool started = stream.start(CGMainDisplayID(), 30, 3840);
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    TEST_ASSERT(elapsedMs < 12000);
+    const MacCaptureState st = stream.state();
+    std::cout << "  state " << static_cast<int>(st) << " after " << elapsedMs << " ms" << std::endl;
+    TEST_ASSERT(st == MacCaptureState::Running || st == MacCaptureState::NoPermission || st == MacCaptureState::Failed);
+    TEST_ASSERT(started == (st == MacCaptureState::Running));
+    if (st == MacCaptureState::Running) {
+        std::vector<uint8_t> frame;
+        int fw = 0, fh = 0;
+        bool isNew = false, got = false;
+        for (int i = 0; i < 100 && !got; ++i) {
+            got = stream.copyLatest(frame, fw, fh, isNew);
+            if (!got) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        TEST_ASSERT(got && fw > 0 && fh > 0 && frame.size() == static_cast<size_t>(fw) * fh * 4);
+    }
+    stream.stop();
+    stream.stop();
+    TEST_ASSERT(stream.state() == MacCaptureState::Stopped);
+}
+#endif
+
 #if defined(__APPLE__)
 void testMacInjectorSurvivesPixelSizedMonitor() {
     std::cout << "[TEST 83] Mac injector accepts a monitor descriptor sized in pixels..." << std::endl;
@@ -9377,6 +9445,10 @@ int main() {
 #endif
         testLinuxInputHelpers(); std::cout << "Test 74 done\n" << std::flush;
         testMacInputLogic(); std::cout << "Test 82 done\n" << std::flush;
+        testMacFrameHelpers(); std::cout << "Test 84 done\n" << std::flush;
+#if defined(__APPLE__)
+        testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
+#endif
 #if defined(__APPLE__)
         testMacInjectorSurvivesPixelSizedMonitor(); std::cout << "Test 83 done\n" << std::flush;
 #endif

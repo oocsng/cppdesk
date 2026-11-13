@@ -22,6 +22,7 @@ set(CORE_SOURCES
     src/capture/privacy_cloak_manager.cpp
     src/control/input_injector.cpp
     src/control/mac_input_logic.cpp
+    src/capture/mac_frame.cpp
     src/control/shell_clipboard.cpp
     src/control/clipboard_file_manager.cpp
     src/control/remote_file_browser.cpp
@@ -88,6 +89,7 @@ elseif(APPLE)
         src/simd/simd_fallback.cpp
         src/ui/canvas_cg.cpp
         src/control/mac_clipboard.mm
+        src/capture/mac_screen_capture.mm
     )
 
     find_library(LIB_ZSTD zstd REQUIRED)
@@ -102,6 +104,9 @@ elseif(APPLE)
     find_library(QUARTZ_CORE QuartzCore REQUIRED)
     find_library(CORE_GRAPHICS CoreGraphics REQUIRED)
     find_library(CORE_TEXT CoreText REQUIRED)
+    find_library(SCREEN_CAPTURE_KIT ScreenCaptureKit REQUIRED)
+    find_library(CORE_MEDIA CoreMedia REQUIRED)
+    find_library(CORE_VIDEO CoreVideo REQUIRED)
     find_library(APP_SERVICES ApplicationServices REQUIRED)
     find_library(AUDIO_TOOLBOX AudioToolbox REQUIRED)
     find_library(SECURITY_FRAMEWORK Security REQUIRED)
@@ -111,6 +116,9 @@ elseif(APPLE)
     set(PLATFORM_LIBS
         ${CORE_GRAPHICS}
         ${CORE_TEXT}
+        ${SCREEN_CAPTURE_KIT}
+        ${CORE_MEDIA}
+        ${CORE_VIDEO}
         ${APP_SERVICES}
         ${AUDIO_TOOLBOX}
         ${SECURITY_FRAMEWORK}
@@ -195,7 +203,7 @@ if(UNIX)
 endif()
 if(APPLE)
     # AppKit code is written for ARC.
-    set_source_files_properties(src/ui/ui_window_mac.mm src/control/mac_clipboard.mm tests/mac_test_driver.mm
+    set_source_files_properties(src/ui/ui_window_mac.mm src/control/mac_clipboard.mm src/capture/mac_screen_capture.mm tests/mac_test_driver.mm
         PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 

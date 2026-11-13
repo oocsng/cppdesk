@@ -1,5 +1,8 @@
 #include "screen_capture.hpp"
 #include "../simd/simd_kernels.hpp"
+#if defined(__APPLE__)
+#include "mac_screen_capture.hpp"
+#endif
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -1493,14 +1496,6 @@ bool ScreenCapturer::captureViaGdi() { return false; }
 
 bool ScreenCapturer::captureViaCoreGraphics() {
 #if defined(__APPLE__)
-    static bool checkedPermissions = false;
-    if (!checkedPermissions) {
-        checkedPermissions = true;
-        if (!CGPreflightScreenCaptureAccess()) {
-            CGRequestScreenCaptureAccess();
-        }
-    }
-
     CGDirectDisplayID displayId = kCGDirectMainDisplay;
     if (activeMonitorIdx_ >= 0 && activeMonitorIdx_ < static_cast<int>(monitors_.size())) {
         uint32_t maxDisplays = 32;
@@ -1512,53 +1507,28 @@ bool ScreenCapturer::captureViaCoreGraphics() {
         }
     }
 
-    CGImageRef image = CGDisplayCreateImage(displayId);
-    if (!image) return false;
-
-    size_t w = CGImageGetWidth(image);
-    size_t h = CGImageGetHeight(image);
-    if (w == 0 || h == 0) {
-        CFRelease(image);
-        return false;
+    // A ScreenCaptureKit stream of the display pushes frames; (re)start it for a new display, and again, at most
+    // every 2 seconds, after macOS stopped it (permission revoked, display change, sleep) or it never started.
+    const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (!macStream_) macStream_ = std::make_unique<MacCaptureStream>();
+    if (macStreamDisplay_ != displayId ||
+        (macStream_->state() != MacCaptureState::Running && nowMs - macLastStartMs_ >= 2000)) {
+        macStreamDisplay_ = displayId;
+        macLastStartMs_ = nowMs;
+        if (!macStream_->start(displayId, 60, 3840)) return false;
     }
+    if (macStream_->state() != MacCaptureState::Running) return false;
 
-    frameW_ = static_cast<int>(w);
-    frameH_ = static_cast<int>(h);
-    currentFrame_.resize(w * h * 4);
-
-    CGDataProviderRef provider = CGImageGetDataProvider(image);
-    CFDataRef rawData = provider ? CGDataProviderCopyData(provider) : nullptr;
-    if (!rawData) {
-        CFRelease(image);
-        return false;
-    }
-
-    const uint8_t* srcPixels = CFDataGetBytePtr(rawData);
-    size_t bytesPerRow = CGImageGetBytesPerRow(image);
-    size_t bpp = CGImageGetBitsPerPixel(image);
-    CGBitmapInfo info = CGImageGetBitmapInfo(image);
-
-    bool isBgra = (bpp == 32) && ((info & kCGBitmapByteOrderMask) == kCGBitmapByteOrder32Little);
-    for (size_t row = 0; row < h; ++row) {
-        const uint8_t* rowSrc = srcPixels + row * bytesPerRow;
-        uint8_t* rowDst = currentFrame_.data() + row * w * 4;
-        if (isBgra) {
-            std::memcpy(rowDst, rowSrc, w * 4);
-            for (size_t col = 0; col < w; ++col) {
-                rowDst[col * 4 + 3] = 0xFF;
-            }
-        } else {
-            for (size_t col = 0; col < w; ++col) {
-                rowDst[col * 4 + 0] = rowSrc[col * 4 + 2]; // B
-                rowDst[col * 4 + 1] = rowSrc[col * 4 + 1]; // G
-                rowDst[col * 4 + 2] = rowSrc[col * 4 + 0]; // R
-                rowDst[col * 4 + 3] = 0xFF;                // A
-            }
-        }
-    }
-
-    CFRelease(rawData);
-    CFRelease(image);
+    int w = 0, h = 0;
+    bool isNew = false;
+    if (!macStream_->copyLatest(currentFrame_, w, h, isNew)) return false;
+    // Frames are in pixels while the monitor's x, y (and the pointer) are in points; the host loop sees the pixel
+    // size here and tells the viewer, and the injector reads the display's points from CoreGraphics itself.
+    frameW_ = w;
+    frameH_ = h;
+    activeMonitor_.width = w;
+    activeMonitor_.height = h;
     hasValidFrame_ = true;
     return true;
 #else

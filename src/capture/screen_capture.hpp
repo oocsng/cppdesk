@@ -18,6 +18,9 @@
 #include <vector>
 #include <string>
 #include <memory>
+#if defined(__APPLE__)
+#include "mac_screen_capture.hpp"
+#endif
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -188,6 +191,11 @@ private:
     DxgiRecoveryState         dxgiRecoveryState_ = DxgiRecoveryState::Active;
     uint64_t                  lastDxgiAttemptTick_ = 0;
     bool                      hasValidFrame_ = false;
+#if defined(__APPLE__)
+    std::unique_ptr<MacCaptureStream> macStream_;
+    uint32_t                  macStreamDisplay_ = 0xFFFFFFFFu;
+    uint64_t                  macLastStartMs_ = 0;
+#endif
 
     // GDI handle recycling cache
 #if defined(_WIN32)
