@@ -27,6 +27,11 @@
 #include "../src/ui/canvas_cairo.hpp"
 #include "../src/ui/ui_window.hpp"
 #include "../src/core/spawn.hpp"
+#include "../src/capture/wayland_portal.hpp"
+#include "fake_portal.hpp"
+#include <gio/gio.h>
+#include <set>
+#include <unistd.h>
 #include <cairo.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
@@ -9692,6 +9697,255 @@ void testWaylandHelpers() {
     }
 }
 
+#if defined(__linux__)
+namespace {
+
+bool waitUntil(const std::function<bool()>& pred, int ms = 8000) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(ms)) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return true;
+}
+
+// A private session bus; the process's own DBUS_SESSION_BUS_ADDRESS is put back afterwards.
+struct PrivateBus {
+    GTestDBus* bus = nullptr;
+    std::string saved;
+    bool hadSaved = false;
+    PrivateBus() {
+        if (const char* old = std::getenv("DBUS_SESSION_BUS_ADDRESS")) { saved = old; hadSaved = true; }
+        bus = g_test_dbus_new(G_TEST_DBUS_NONE);
+        g_test_dbus_up(bus);
+    }
+    ~PrivateBus() {
+        g_test_dbus_down(bus);
+        g_object_unref(bus);
+        if (hadSaved) setenv("DBUS_SESSION_BUS_ADDRESS", saved.c_str(), 1);
+        else unsetenv("DBUS_SESSION_BUS_ADDRESS");
+    }
+    std::string address() const { return g_test_dbus_get_bus_address(bus); }
+};
+
+// One share against a fake portal (or none), with helpers to read what the fake saw.
+struct PortalRig {
+    PrivateBus bus;
+    std::unique_ptr<cppdesk::wayland::test::FakePortal> fake;
+    cppdesk::wayland::PortalSession session;
+
+    explicit PortalRig(const cppdesk::wayland::test::FakeScenario* scenario) {
+        if (scenario) fake = std::make_unique<cppdesk::wayland::test::FakePortal>(bus.address(), *scenario);
+    }
+    void start(const std::string& token = "", int timeoutMs = 120000) {
+        cppdesk::wayland::PortalOptions o;
+        o.busAddress = bus.address();
+        o.restoreToken = token;
+        o.startTimeoutMs = timeoutMs;
+        session.startAsync(o);
+    }
+    bool settled() {
+        return waitUntil([&] { cppdesk::wayland::PortalResult r; return session.result(r); });
+    }
+    // "RemoteDesktop.CreateSession ScreenCast.SelectSources ...", in the order the fake saw them
+    std::string sequence() const {
+        std::string out;
+        for (const auto& c : fake->calls()) {
+            std::string i = c.iface.substr(c.iface.rfind('.') + 1);
+            out += (out.empty() ? "" : " ") + i + "." + c.method;
+        }
+        return out;
+    }
+    std::string argsOf(const char* iface, const char* method) const {
+        for (const auto& c : fake->calls()) if (c.iface == iface && c.method == method) return c.args;
+        return "";
+    }
+    bool saw(const char* iface, const char* method) const { return fake->count(iface, method) > 0; }
+};
+
+const char* kRd = "org.freedesktop.portal.RemoteDesktop";
+const char* kSc = "org.freedesktop.portal.ScreenCast";
+bool has(const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; }
+
+}   // namespace
+
+void testPortalSession() {
+    std::cout << "[TEST 90] Wayland portal session against a fake desktop portal..." << std::endl;
+    using namespace cppdesk::wayland;
+    using namespace cppdesk::wayland::test;
+    gchar* daemon = g_find_program_in_path("dbus-daemon");
+    if (!daemon) { std::cout << "  skipped: no dbus-daemon on this machine" << std::endl; return; }
+    g_free(daemon);
+
+    {   // Allowed, with an old token: the whole call sequence, its arguments, the result, input and closing
+        FakeScenario sc;
+        PortalRig rig(&sc);
+        TEST_ASSERT(rig.fake->ok());
+        rig.start("token-old");
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r));
+        TEST_ASSERT(r.state == ShareState::Running && rig.session.state() == ShareState::Running);
+        TEST_ASSERT(r.streams.size() == 1 && r.streams[0].nodeId == 57 && r.streams[0].logicalW == 1440 &&
+                    r.streams[0].logicalH == 900);
+        TEST_ASSERT(r.inputGranted && r.newRestoreToken == "token-new");
+        const int fd = rig.session.pipeWireFd();
+        TEST_ASSERT(fd >= 0);
+        if (fd >= 0) ::close(fd);
+        TEST_ASSERT(rig.session.pipeWireFd() == -1);   // handed over once
+        TEST_ASSERT(rig.sequence() == "RemoteDesktop.CreateSession RemoteDesktop.SelectDevices ScreenCast.SelectSources "
+                                      "RemoteDesktop.Start ScreenCast.OpenPipeWireRemote");
+        const std::string devices = rig.argsOf(kRd, "SelectDevices");
+        TEST_ASSERT(has(devices, "persist_mode") && has(devices, "token-old") && has(devices, "restore_token"));
+        const std::string sources = rig.argsOf(kSc, "SelectSources");
+        TEST_ASSERT(has(sources, "cursor_mode") && has(sources, "'multiple': <false>"));
+        TEST_ASSERT(!has(sources, "restore_token") && !has(sources, "persist_mode"));   // tokens belong to SelectDevices
+        std::set<std::string> tokens;
+        for (const auto& c : rig.fake->calls()) if (!c.token.empty()) tokens.insert(c.token);
+        TEST_ASSERT(tokens.size() == 4);   // CreateSession, SelectDevices, SelectSources, Start: one token each
+
+        TEST_ASSERT(rig.session.pointerMotionAbsolute(57, 719.5, 449.5));
+        TEST_ASSERT(rig.session.pointerButton(0x110, true));
+        TEST_ASSERT(rig.session.pointerAxisDiscrete(0, 3));
+        TEST_ASSERT(rig.session.keyboardKeysym(0xff0d, true));
+        TEST_ASSERT(waitUntil([&] { return rig.fake->count(kRd, "NotifyKeyboardKeysym") == 1; }));
+        TEST_ASSERT(has(rig.argsOf(kRd, "NotifyPointerMotionAbsolute"), ", 57, 719.5, 449.5)"));
+        TEST_ASSERT(has(rig.argsOf(kRd, "NotifyPointerButton"), ", 272, 1)"));
+        TEST_ASSERT(has(rig.argsOf(kRd, "NotifyPointerAxisDiscrete"), ", 0, 3)"));
+        TEST_ASSERT(has(rig.argsOf(kRd, "NotifyKeyboardKeysym"), ", 65293, 1)"));
+
+        rig.session.close();
+        TEST_ASSERT(rig.session.state() == ShareState::Closed);
+        TEST_ASSERT(waitUntil([&] { return rig.fake->count("org.freedesktop.portal.Session", "Close") == 1; }));
+        TEST_ASSERT(!rig.session.pointerButton(0x110, false));   // nothing goes out once closed
+        rig.session.close();                                       // and closing again is harmless
+    }
+    {   // An older desktop (RemoteDesktop version 1): no token options anywhere
+        FakeScenario sc;
+        sc.remoteDesktopVersion = 1;
+        sc.newToken = "";
+        PortalRig rig(&sc);
+        rig.start("token-old");
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r) && r.state == ShareState::Running && r.inputGranted && r.newRestoreToken.empty());
+        const std::string devices = rig.argsOf(kRd, "SelectDevices");
+        TEST_ASSERT(!has(devices, "persist_mode") && !has(devices, "restore_token") && !has(devices, "token-old"));
+    }
+    {   // A response that goes out before the method's own reply is not lost
+        FakeScenario sc;
+        sc.immediateResponses = true;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        TEST_ASSERT(rig.session.state() == ShareState::Running);
+    }
+    {   // The person says no: nothing is shared, the video connection is never opened, the session is closed
+        FakeScenario sc;
+        sc.startResponse = 1;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r) && r.state == ShareState::Denied && r.streams.empty() && !r.inputGranted);
+        TEST_ASSERT(!rig.session.notice().reason.empty());
+        TEST_ASSERT(!rig.saw(kSc, "OpenPipeWireRemote"));
+        TEST_ASSERT(rig.session.pipeWireFd() == -1);
+        TEST_ASSERT(!rig.session.pointerMotionAbsolute(57, 1, 1));
+        TEST_ASSERT(waitUntil([&] { return rig.fake->count("org.freedesktop.portal.Session", "Close") == 1; }));
+    }
+    {   // The desktop fails
+        FakeScenario sc;
+        sc.startResponse = 2;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        TEST_ASSERT(rig.session.state() == ShareState::Failed);
+    }
+    {   // No portal on the bus at all: unavailable (no dialog exists, so falling back to X11 is allowed)
+        PortalRig rig(nullptr);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r) && r.state == ShareState::Unavailable && !r.reason.empty());
+    }
+    {   // A desktop that can share the screen but offers no remote control: view only
+        FakeScenario sc;
+        sc.remoteDesktopVersion = 0;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r) && r.state == ShareState::ViewOnly && !r.inputGranted && r.streams.size() == 1);
+        TEST_ASSERT(rig.sequence() == "ScreenCast.CreateSession ScreenCast.SelectSources ScreenCast.Start "
+                                      "ScreenCast.OpenPipeWireRemote");
+        TEST_ASSERT(!rig.session.pointerButton(0x110, true) && !rig.session.keyboardKeysym(65, true));
+    }
+    {   // The person unticked remote control in the dialog: view only too
+        FakeScenario sc;
+        sc.devices = 0;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r) && r.state == ShareState::ViewOnly && !r.inputGranted);
+        TEST_ASSERT(!rig.session.pointerMotionAbsolute(57, 1, 1));
+    }
+    {   // Only the keyboard was allowed: keys go out, the pointer does not
+        FakeScenario sc;
+        sc.devices = 1;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        TEST_ASSERT(rig.session.state() == ShareState::Running);
+        TEST_ASSERT(rig.session.keyboardKeysym(65, true));
+        TEST_ASSERT(!rig.session.pointerButton(0x110, true));
+    }
+    {   // Allowed, but with no screen in the answer
+        FakeScenario sc;
+        sc.streams.clear();
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        TEST_ASSERT(rig.session.state() == ShareState::Failed);
+        TEST_ASSERT(!rig.saw(kSc, "OpenPipeWireRemote"));
+    }
+    {   // The desktop ends the session while it runs
+        FakeScenario sc;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        TEST_ASSERT(rig.session.state() == ShareState::Running);
+        rig.fake->emitSessionClosed();
+        TEST_ASSERT(waitUntil([&] { return rig.session.state() == ShareState::Closed; }));
+        TEST_ASSERT(!rig.session.pointerButton(0x110, true));
+    }
+    {   // Nobody answers the dialog: give up, and withdraw the question and the session
+        FakeScenario sc;
+        sc.silentStart = true;
+        PortalRig rig(&sc);
+        rig.start("", 300);
+        TEST_ASSERT(rig.settled());
+        TEST_ASSERT(rig.session.state() == ShareState::Failed);
+        TEST_ASSERT(waitUntil([&] { return rig.fake->count("org.freedesktop.portal.Request", "Close") == 1 &&
+                                           rig.fake->count("org.freedesktop.portal.Session", "Close") == 1; }));
+    }
+    {   // Stopped while the dialog is open: it goes away at once
+        FakeScenario sc;
+        sc.silentStart = true;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(waitUntil([&] { return rig.fake->count(kRd, "Start") == 1; }));
+        const auto t0 = std::chrono::steady_clock::now();
+        rig.session.close();
+        TEST_ASSERT(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+        TEST_ASSERT(rig.session.state() == ShareState::Closed);
+        TEST_ASSERT(waitUntil([&] { return rig.fake->count("org.freedesktop.portal.Request", "Close") == 1 &&
+                                           rig.fake->count("org.freedesktop.portal.Session", "Close") == 1; }));
+    }
+}
+#endif
+
 } // namespace
 
 int main() {
@@ -9806,6 +10060,7 @@ int main() {
         testXdndDrop(); std::cout << "Test 77 done\n" << std::flush;
         testLinuxTray(); std::cout << "Test 78 done\n" << std::flush;
         testLinuxNotifications(); std::cout << "Test 79 done\n" << std::flush;
+        testPortalSession(); std::cout << "Test 90 done\n" << std::flush;
 #endif
 #if defined(__APPLE__)
         testMacWindow(); std::cout << "Test 81 done\n" << std::flush;

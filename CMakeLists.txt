@@ -141,6 +141,8 @@ elseif(UNIX AND NOT APPLE)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(CAIRO REQUIRED IMPORTED_TARGET cairo)
     pkg_check_modules(PANGOCAIRO REQUIRED IMPORTED_TARGET pangocairo)
+    # The desktop portals are reached over D-Bus with GDBus; gio-unix carries the file descriptor of the video connection.
+    pkg_check_modules(GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
     find_package(OpenSSL REQUIRED)
     find_library(LIB_ZSTD zstd REQUIRED)
     find_library(LIB_XTST Xtst)
@@ -150,6 +152,7 @@ elseif(UNIX AND NOT APPLE)
     list(APPEND CORE_SOURCES
         src/ui/canvas_cairo.cpp
         src/control/x11_clipboard.cpp
+        src/capture/wayland_portal.cpp
     )
 
     set(PLATFORM_LIBS
@@ -157,6 +160,7 @@ elseif(UNIX AND NOT APPLE)
         OpenSSL::Crypto
         PkgConfig::CAIRO
         PkgConfig::PANGOCAIRO
+        PkgConfig::GIO
         pthread
         dl
     )
@@ -230,6 +234,7 @@ elseif(UNIX AND NOT APPLE)
     add_executable(CppDeskTests
         ${CORE_SOURCES}
         ${LINUX_UI_SOURCES}
+        tests/fake_portal.cpp
         tests/test_suite.cpp
     )
     target_link_libraries(CppDeskTests PRIVATE ${PLATFORM_LIBS})
