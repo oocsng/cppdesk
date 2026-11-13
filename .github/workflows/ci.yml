@@ -49,6 +49,9 @@ jobs:
           cmake --build build --target CppDeskTests -j 4 2>&1 | tail -150
           test -x build/CppDeskTests
       - name: Run the test suite
+        # No Screen Recording permission on a hosted runner: the capture tests draw from a fixed test pattern.
+        env:
+          CPPDESK_CAPTURE_TEST_PATTERN: "1"
         run: cd build && ./CppDeskTests
       - name: Draw every screen
         # Offscreen through Core Graphics; the PNGs are what a Mac would show, for comparing with Windows and Linux.

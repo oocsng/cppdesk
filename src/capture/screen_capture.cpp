@@ -1,4 +1,5 @@
 #include "screen_capture.hpp"
+#include <cstdlib>
 #include "../simd/simd_kernels.hpp"
 #if defined(__APPLE__)
 #include "mac_screen_capture.hpp"
@@ -1494,6 +1495,33 @@ bool ScreenCapturer::captureViaGdi() {
 bool ScreenCapturer::captureViaGdi() { return false; }
 #endif
 
+#if defined(__APPLE__)
+namespace {
+
+// Hosted CI machines can never be given the Screen Recording permission, yet the tile pipeline's tests need frames.
+// With CPPDESK_CAPTURE_TEST_PATTERN set, a fixed gradient stands in whenever the real stream is not running. Never
+// set outside tests.
+bool fillMacTestPattern(std::vector<uint8_t>& frame, int& w, int& h) {
+    static const bool enabled = std::getenv("CPPDESK_CAPTURE_TEST_PATTERN") != nullptr;
+    if (!enabled) return false;
+    w = 1280;
+    h = 800;
+    frame.resize(static_cast<size_t>(w) * h * 4);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            uint8_t* px = frame.data() + (static_cast<size_t>(y) * w + x) * 4;
+            px[0] = static_cast<uint8_t>(x * 255 / w);
+            px[1] = static_cast<uint8_t>(y * 255 / h);
+            px[2] = static_cast<uint8_t>((x + y) & 0xFF);
+            px[3] = 0xFF;
+        }
+    }
+    return true;
+}
+
+} // namespace
+#endif
+
 bool ScreenCapturer::captureViaCoreGraphics() {
 #if defined(__APPLE__)
     CGDirectDisplayID displayId = kCGDirectMainDisplay;
@@ -1516,13 +1544,14 @@ bool ScreenCapturer::captureViaCoreGraphics() {
         (macStream_->state() != MacCaptureState::Running && nowMs - macLastStartMs_ >= 2000)) {
         macStreamDisplay_ = displayId;
         macLastStartMs_ = nowMs;
-        if (!macStream_->start(displayId, 60, 3840)) return false;
+        macStream_->start(displayId, 60, 3840);
     }
-    if (macStream_->state() != MacCaptureState::Running) return false;
 
     int w = 0, h = 0;
     bool isNew = false;
-    if (!macStream_->copyLatest(currentFrame_, w, h, isNew)) return false;
+    const bool haveFrame = macStream_->state() == MacCaptureState::Running &&
+                           macStream_->copyLatest(currentFrame_, w, h, isNew);
+    if (!haveFrame && !fillMacTestPattern(currentFrame_, w, h)) return false;
     // Frames are in pixels while the monitor's x, y (and the pointer) are in points; the host loop sees the pixel
     // size here and tells the viewer, and the injector reads the display's points from CoreGraphics itself.
     frameW_ = w;
