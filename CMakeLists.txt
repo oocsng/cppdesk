@@ -23,6 +23,7 @@ set(CORE_SOURCES
     src/control/input_injector.cpp
     src/control/mac_input_logic.cpp
     src/capture/mac_frame.cpp
+    src/capture/wayland_helpers.cpp
     src/ui/host_permissions.cpp
     src/control/shell_clipboard.cpp
     src/control/clipboard_file_manager.cpp
@@ -140,6 +141,8 @@ elseif(UNIX AND NOT APPLE)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(CAIRO REQUIRED IMPORTED_TARGET cairo)
     pkg_check_modules(PANGOCAIRO REQUIRED IMPORTED_TARGET pangocairo)
+    # The desktop portals are reached over D-Bus with GDBus; gio-unix carries the file descriptor of the video connection.
+    pkg_check_modules(GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
     find_package(OpenSSL REQUIRED)
     find_library(LIB_ZSTD zstd REQUIRED)
     find_library(LIB_XTST Xtst)
@@ -149,13 +152,25 @@ elseif(UNIX AND NOT APPLE)
     list(APPEND CORE_SOURCES
         src/ui/canvas_cairo.cpp
         src/control/x11_clipboard.cpp
+        src/capture/wayland_portal.cpp
+        src/capture/wayland_share.cpp
+        src/capture/wayland_pipewire.cpp
     )
+    # PipeWire is never linked (it is loaded at run time); only its headers are needed, and only to build the video receiver.
+    pkg_check_modules(PIPEWIRE QUIET libpipewire-0.3)
+    if(PIPEWIRE_FOUND)
+        include_directories(${PIPEWIRE_INCLUDE_DIRS})
+        add_compile_definitions(CPPDESK_WAYLAND)
+    else()
+        message(STATUS "libpipewire-0.3 headers not found: screen sharing on Wayland is built without the video receiver")
+    endif()
 
     set(PLATFORM_LIBS
         ${LIB_ZSTD}
         OpenSSL::Crypto
         PkgConfig::CAIRO
         PkgConfig::PANGOCAIRO
+        PkgConfig::GIO
         pthread
         dl
     )
@@ -229,6 +244,7 @@ elseif(UNIX AND NOT APPLE)
     add_executable(CppDeskTests
         ${CORE_SOURCES}
         ${LINUX_UI_SOURCES}
+        tests/fake_portal.cpp
         tests/test_suite.cpp
     )
     target_link_libraries(CppDeskTests PRIVATE ${PLATFORM_LIBS})

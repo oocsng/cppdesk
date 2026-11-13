@@ -18,6 +18,7 @@ public:
     static void injectMouseWheel(int32_t verticalDelta, int32_t horizontalDelta = 0);
     static void injectKeyEvent(uint16_t vkCode, uint16_t scanCode, bool isDown, bool isExtended);
     static void releaseAllModifiers();
+    static int x11InputCallsForTest();   // how often the X11 (XTest) input path was entered (tests)
     static uint16_t mapVkToMacKeyCode(uint16_t vk);
     // Inverse of mapVkToMacKeyCode for the Mac UI: generic VK_SHIFT/VK_MENU for modifiers, and both Command and
     // Control are VK_CONTROL, so the screens' Ctrl shortcuts work with Command. 0 if unmapped.

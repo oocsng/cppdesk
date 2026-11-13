@@ -6,6 +6,7 @@
 #include "../core/protocol.hpp"
 #include "../core/crypto_identity.hpp"
 #include "../capture/screen_capture.hpp"
+#include "../capture/share_hub.hpp"
 #include "../control/input_injector.hpp"
 #include "../control/clipboard_file_manager.hpp"
 #include "../control/whiteboard_manager.hpp"
@@ -241,6 +242,17 @@ public:
     bool isWaitingForTotp() const;
 
     ViewerSessionStats viewerStats() const;
+
+    // Screen sharing on a Wayland desktop. The notice says what the person should know (nothing unless something
+    // needs saying); the restore token is the desktop's remembered answer: set it from the settings at start, and
+    // save whatever takeRestoreTokenForSave hands out (once per change; empty clears it).
+    wayland::ShareNotice shareNotice() const { return shareHub_.notice(); }
+    void setWaylandRestoreToken(const std::string& token) { shareHub_.setRestoreToken(token); }
+    bool takeRestoreTokenForSave(std::string& token) { return shareHub_.takeTokenForSave(token); }
+    std::string waylandRestoreToken() const { return shareHub_.restoreToken(); }
+    // Stand-ins for what a host session publishes (tests).
+    void setShareNoticeForTest(const wayland::ShareNotice& n) { shareHub_.setNotice(n); }
+    void pushRestoreTokenForTest(const std::string& token) { shareHub_.pushToken(token); }
 
     // Copy latest decoded remote frame if frameSeq > lastSeenSeq
     bool copyLatestViewerFrame(
@@ -515,6 +527,7 @@ private:
     std::atomic<bool>           autoAcceptIncoming_{false};
     std::atomic<uint8_t>        autoAcceptPerms_{PERM_ALL};
 
+    wayland::ShareHub           shareHub_;
     mutable std::mutex          hostStatusMutex_;
     HostSessionStatus           hostStatus_;
     std::atomic<uint8_t>        hostLivePermissions_{PERM_ALL};

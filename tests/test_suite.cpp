@@ -5,6 +5,10 @@
 #include "../src/control/input_injector.hpp"
 #include "../src/control/mac_input_logic.hpp"
 #include "../src/capture/mac_frame.hpp"
+#include "../src/capture/wayland_helpers.hpp"
+#include "../src/capture/latest_frame.hpp"
+#include "../src/capture/share_hub.hpp"
+#include "../src/capture/wayland_share.hpp"
 #include "../src/control/clipboard_file_manager.hpp"
 #include "../src/net/network_engine.hpp"
 #include "../src/net/updater.hpp"
@@ -26,6 +30,15 @@
 #include "../src/ui/canvas_cairo.hpp"
 #include "../src/ui/ui_window.hpp"
 #include "../src/core/spawn.hpp"
+#include "../src/capture/wayland_portal.hpp"
+#include "../src/capture/wayland_pipewire.hpp"
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include "fake_portal.hpp"
+#include <gio/gio.h>
+#include <set>
+#include <unistd.h>
 #include <cairo.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
@@ -85,6 +98,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <map>
 
 // Counts single allocations above 256 MB so the hostile-input sweep can see a parser that
 // would honor an attacker-supplied size (the oversized request itself is refused).
@@ -9410,12 +9424,66 @@ void testHostPermissionUi() {
 
     {   // Two more snapshot states show the card on every platform.
         const auto names = AppUi::snapshotStateNames();
-        TEST_ASSERT(names.size() >= 2 && names[names.size() - 2] == "dashboard_mac_permissions" && names.back() == "dashboard_mac_restart");
+        TEST_ASSERT(names.size() >= 4 && names[names.size() - 4] == "dashboard_mac_permissions" && names[names.size() - 3] == "dashboard_mac_restart");
         FakeShell plain;
         TEST_ASSERT(renderAppState(id, net, plain, "dashboard_mac_permissions").find("|Allow screen sharing") != npos);
         const std::string restartState = renderAppState(id, net, plain, "dashboard_mac_restart");
         TEST_ASSERT(restartState.find("|Restart CppDesk") != npos);
         TEST_ASSERT(restartState.find("|Allow...") == npos || restartState.find("|Allow screen sharing") != npos);
+    }
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
+void testWaylandShareNoticeUi() {
+    std::cout << "[TEST 93] Wayland share notice in the dashboard and settings; the restore token saved by the tick..." << std::endl;
+    using namespace cppdesk::wayland;
+    IdentityManager id(4251);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    const auto npos = std::string::npos;
+    FakeShell shell;
+
+    {   // Nothing to say: nothing is drawn
+        TEST_ASSERT(renderAppState(id, net, shell, "dashboard_light").find("|Screen sharing") == npos);
+        TEST_ASSERT(renderAppState(id, net, shell, "settings_system").find("WAYLAND SCREEN SHARING") == npos);
+    }
+    {   // Refused, in a session: the dashboard's session box says so, in plain words, on every platform
+        const std::string denied = renderAppState(id, net, shell, "dashboard_wayland_denied");
+        TEST_ASSERT(denied.find("|ACTIVE SESSION") != npos && denied.find("|Screen sharing is off") != npos);
+        TEST_ASSERT(denied.find("|Disconnect") != npos);                    // the way out stays on screen
+        TEST_ASSERT(denied.find("Mac") == npos && denied.find("macOS") == npos);
+        const std::string viewOnly = renderAppState(id, net, shell, "dashboard_wayland_view_only");
+        TEST_ASSERT(viewOnly.find("|Screen shared, control is off") != npos && viewOnly.find("|Disconnect") != npos);
+    }
+    {   // Settings: the same words, labelled experimental; gone again when there is nothing to say
+        net.setShareNoticeForTest({ShareState::Denied, ""});
+        const std::string settings = renderAppState(id, net, shell, "settings_system");
+        TEST_ASSERT(settings.find("|WAYLAND SCREEN SHARING (EXPERIMENTAL)") != npos && settings.find("|Screen sharing is off") != npos);
+        net.setShareNoticeForTest({ShareState::Running, ""});
+        TEST_ASSERT(renderAppState(id, net, shell, "settings_system").find("WAYLAND SCREEN SHARING") == npos);
+        net.setShareNoticeForTest({});
+        TEST_ASSERT(renderAppState(id, net, shell, "settings_system").find("WAYLAND SCREEN SHARING") == npos);
+    }
+    {   // The restore token: loaded from the settings at start, saved by the tick once per change
+        AppSettings s = id.settings();
+        s.waylandRestoreToken = "from-settings";
+        id.updateSettings(s);
+        AppUi app(id, net, shell, "");
+        TEST_ASSERT(net.waylandRestoreToken() == "from-settings");
+        app.onTick();
+        TEST_ASSERT(id.settings().waylandRestoreToken == "from-settings");
+        net.pushRestoreTokenForTest("fresh");
+        app.onTick();
+        TEST_ASSERT(id.settings().waylandRestoreToken == "fresh");
+        net.pushRestoreTokenForTest("");           // the desktop gave none: the old one is stale
+        app.onTick();
+        TEST_ASSERT(id.settings().waylandRestoreToken.empty());
+    }
+    {   // The two new states close the list of snapshots
+        const auto names = AppUi::snapshotStateNames();
+        TEST_ASSERT(names.size() >= 2 && names[names.size() - 2] == "dashboard_wayland_denied" &&
+                    names.back() == "dashboard_wayland_view_only");
     }
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
@@ -9576,10 +9644,848 @@ void testUiGoldens() {
     std::filesystem::remove(id.configFilePath(), ec);
 }
 
+void testWaylandHelpers() {
+    std::cout << "[TEST 89] Wayland helpers: session detection, pixel packing, pointer mapping, notice text..." << std::endl;
+    using namespace cppdesk::wayland;
+    auto env = [](std::map<std::string, std::string> vars) {
+        return [vars](const char* name) -> const char* {
+            auto it = vars.find(name);
+            return it == vars.end() ? nullptr : it->second.c_str();
+        };
+    };
+    {   // Session detection
+        TEST_ASSERT(isWaylandSession(env({{"XDG_SESSION_TYPE", "wayland"}})));
+        TEST_ASSERT(isWaylandSession(env({{"XDG_SESSION_TYPE", "wayland"}, {"DISPLAY", ":0"}})));   // XWayland sets DISPLAY too
+        TEST_ASSERT(isWaylandSession(env({{"WAYLAND_DISPLAY", "wayland-0"}})));
+        TEST_ASSERT(!isWaylandSession(env({{"WAYLAND_DISPLAY", "wayland-0"}, {"DISPLAY", ":0"}, {"XDG_SESSION_TYPE", "x11"}})));
+        TEST_ASSERT(!isWaylandSession(env({{"XDG_SESSION_TYPE", "x11"}, {"DISPLAY", ":0"}})));
+        TEST_ASSERT(!isWaylandSession(env({{"XDG_SESSION_TYPE", "wayland"}, {"CPPDESK_FORCE_X11", "1"}})));
+        TEST_ASSERT(!isWaylandSession(env({})));
+    }
+    {   // convertToBgra: a 3x2 image whose rows are 20 bytes apart (padding 0xAA)
+        const int w = 3, h = 2;
+        const size_t stride = 20;
+        std::vector<uint8_t> src(stride * h, 0xAA);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                uint8_t* p = &src[y * stride + x * 4];
+                p[0] = static_cast<uint8_t>(10 + x + 3 * y);   // byte 0
+                p[1] = static_cast<uint8_t>(20 + x + 3 * y);   // byte 1
+                p[2] = static_cast<uint8_t>(30 + x + 3 * y);   // byte 2
+                p[3] = 0x77;                                    // byte 3: padding or alpha, never trusted
+            }
+        std::vector<uint8_t> dst(w * h * 4, 0);
+        // BGRx and BGRA: bytes are already B,G,R; alpha forced opaque
+        for (PixelFormat f : {PixelFormat::BGRx, PixelFormat::BGRA}) {
+            std::fill(dst.begin(), dst.end(), 0);
+            TEST_ASSERT(convertToBgra(f, src.data(), stride, w, h, dst.data()));
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    const uint8_t* d = &dst[(y * w + x) * 4];
+                    TEST_ASSERT(d[0] == 10 + x + 3 * y && d[1] == 20 + x + 3 * y && d[2] == 30 + x + 3 * y && d[3] == 0xFF);
+                }
+        }
+        // RGBx and RGBA: red and blue swap places
+        for (PixelFormat f : {PixelFormat::RGBx, PixelFormat::RGBA}) {
+            std::fill(dst.begin(), dst.end(), 0);
+            TEST_ASSERT(convertToBgra(f, src.data(), stride, w, h, dst.data()));
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    const uint8_t* d = &dst[(y * w + x) * 4];
+                    TEST_ASSERT(d[0] == 30 + x + 3 * y && d[1] == 20 + x + 3 * y && d[2] == 10 + x + 3 * y && d[3] == 0xFF);
+                }
+        }
+        std::fill(dst.begin(), dst.end(), 0x55);
+        TEST_ASSERT(!convertToBgra(PixelFormat::Unsupported, src.data(), stride, w, h, dst.data()));
+        TEST_ASSERT(dst[0] == 0x55);                                              // nothing written on refusal
+        TEST_ASSERT(!convertToBgra(PixelFormat::BGRA, src.data(), 8, w, h, dst.data()));   // stride too small for the width
+    }
+    {   // Pointer mapping uses the stream's logical size and never leaves it
+        StreamInfo s{42, 0, 0, 1440, 900};
+        auto p = pointForNormalized(0.5f, 0.5f, s, 2880, 1800);
+        TEST_ASSERT(p.nodeId == 42 && std::abs(p.x - 719.5) < 0.01 && std::abs(p.y - 449.5) < 0.01);
+        p = pointForNormalized(1.0f, 1.0f, s, 2880, 1800);
+        TEST_ASSERT(std::abs(p.x - 1439.0) < 0.01 && std::abs(p.y - 899.0) < 0.01);   // the last pixel, not one past it
+        p = pointForNormalized(0.0f, 0.0f, s, 2880, 1800);
+        TEST_ASSERT(p.x == 0.0 && p.y == 0.0);
+        p = pointForNormalized(-1.0f, 2.0f, s, 2880, 1800);
+        TEST_ASSERT(p.x == 0.0 && std::abs(p.y - 899.0) < 0.01);
+        StreamInfo offset{7, 1920, -200, 1440, 900};   // a second monitor: coordinates stay relative to the stream
+        p = pointForNormalized(1.0f, 0.0f, offset, 2880, 1800);
+        TEST_ASSERT(p.nodeId == 7 && std::abs(p.x - 1439.0) < 0.01 && p.y == 0.0);
+        StreamInfo noSize{9, 0, 0, 0, 0};              // a portal that reports no size: use the frame
+        p = pointForNormalized(1.0f, 1.0f, noSize, 2880, 1800);
+        TEST_ASSERT(std::abs(p.x - 2879.0) < 0.01 && std::abs(p.y - 1799.0) < 0.01);
+        p = pointForNormalized(0.5f, 0.5f, noSize, 0, 0);   // nothing known at all: stay at the origin
+        TEST_ASSERT(p.x == 0.0 && p.y == 0.0);
+    }
+    {   // Buttons and wheel
+        TEST_ASSERT(evdevButton(MouseButtonId::Left) == 0x110);
+        TEST_ASSERT(evdevButton(MouseButtonId::Right) == 0x111);
+        TEST_ASSERT(evdevButton(MouseButtonId::Middle) == 0x112);
+        TEST_ASSERT(wheelSteps(120) == 1 && wheelSteps(-120) == -1 && wheelSteps(240) == 2 && wheelSteps(-360) == -3);
+        TEST_ASSERT(wheelSteps(30) == 1 && wheelSteps(-30) == -1 && wheelSteps(0) == 0 && wheelSteps(200) == 1);
+    }
+    {   // Restore tokens only where RemoteDesktop knows them
+        auto none = policyForVersions(false, 0);
+        TEST_ASSERT(!none.useRemoteDesktop && !none.persist);
+        auto old = policyForVersions(true, 1);
+        TEST_ASSERT(old.useRemoteDesktop && !old.persist);
+        auto current = policyForVersions(true, 2);
+        TEST_ASSERT(current.useRemoteDesktop && current.persist);
+    }
+    {   // Notice text: only what needs saying, in plain words
+        auto text = [](ShareState st, const std::string& reason = "") { return describeShareNotice({st, reason}); };
+        TEST_ASSERT(!text(ShareState::Idle).visible && !text(ShareState::Running).visible);
+        const ShareState shown[] = {ShareState::WaitingForDialog, ShareState::ViewOnly, ShareState::Denied,
+                                    ShareState::Unavailable, ShareState::Closed, ShareState::Failed};
+        for (ShareState st : shown) {
+            NoticeText t = text(st, "the reason text");
+            TEST_ASSERT(t.visible && !t.title.empty() && !t.body.empty());
+            std::string all = t.title + " " + t.body;
+            for (auto& c : all) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (const char* jargon : {"portal", "pipewire", "d-bus", "dbus", "api"})
+                TEST_ASSERT(all.find(jargon) == std::string::npos);
+        }
+        TEST_ASSERT(text(ShareState::WaitingForDialog).body.find("ask") != std::string::npos);
+        TEST_ASSERT(text(ShareState::ViewOnly).body.find("control") != std::string::npos);
+        TEST_ASSERT(text(ShareState::ViewOnly, "this desktop does not offer remote control").body.find("does not offer remote control") != std::string::npos);
+        TEST_ASSERT(text(ShareState::ViewOnly, "this desktop does not offer remote control").body.find("was not allowed") == std::string::npos);
+        TEST_ASSERT(text(ShareState::Denied).body.find("not shared") != std::string::npos ||
+                    text(ShareState::Denied).body.find("off") != std::string::npos);
+        TEST_ASSERT(text(ShareState::Unavailable).body.find("X11") != std::string::npos ||
+                    text(ShareState::Unavailable).body.find("Xorg") != std::string::npos);
+        TEST_ASSERT(text(ShareState::Closed, "the reason text").body.find("the reason text") != std::string::npos);
+        TEST_ASSERT(text(ShareState::Failed, "the reason text").body.find("the reason text") != std::string::npos);
+    }
+}
+
+#if defined(__linux__)
+namespace {
+
+bool waitUntil(const std::function<bool()>& pred, int ms = 8000) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(ms)) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return true;
+}
+
+// A private session bus; the process's own DBUS_SESSION_BUS_ADDRESS is put back afterwards.
+struct PrivateBus {
+    GTestDBus* bus = nullptr;
+    std::string saved;
+    bool hadSaved = false;
+    PrivateBus() {
+        if (const char* old = std::getenv("DBUS_SESSION_BUS_ADDRESS")) { saved = old; hadSaved = true; }
+        bus = g_test_dbus_new(G_TEST_DBUS_NONE);
+        g_test_dbus_up(bus);
+    }
+    ~PrivateBus() {
+        g_test_dbus_down(bus);
+        g_object_unref(bus);
+        if (hadSaved) setenv("DBUS_SESSION_BUS_ADDRESS", saved.c_str(), 1);
+        else unsetenv("DBUS_SESSION_BUS_ADDRESS");
+    }
+    std::string address() const { return g_test_dbus_get_bus_address(bus); }
+};
+
+// One share against a fake portal (or none), with helpers to read what the fake saw.
+struct PortalRig {
+    PrivateBus bus;
+    std::unique_ptr<cppdesk::wayland::test::FakePortal> fake;
+    cppdesk::wayland::PortalSession session;
+
+    explicit PortalRig(const cppdesk::wayland::test::FakeScenario* scenario) {
+        if (scenario) fake = std::make_unique<cppdesk::wayland::test::FakePortal>(bus.address(), *scenario);
+    }
+    void start(const std::string& token = "", int timeoutMs = 120000) {
+        cppdesk::wayland::PortalOptions o;
+        o.busAddress = bus.address();
+        o.restoreToken = token;
+        o.startTimeoutMs = timeoutMs;
+        session.startAsync(o);
+    }
+    bool settled() {
+        return waitUntil([&] { cppdesk::wayland::PortalResult r; return session.result(r); });
+    }
+    // "RemoteDesktop.CreateSession ScreenCast.SelectSources ...", in the order the fake saw them
+    std::string sequence() const {
+        std::string out;
+        for (const auto& c : fake->calls()) {
+            std::string i = c.iface.substr(c.iface.rfind('.') + 1);
+            out += (out.empty() ? "" : " ") + i + "." + c.method;
+        }
+        return out;
+    }
+    std::string argsOf(const char* iface, const char* method) const {
+        for (const auto& c : fake->calls()) if (c.iface == iface && c.method == method) return c.args;
+        return "";
+    }
+    bool saw(const char* iface, const char* method) const { return fake->count(iface, method) > 0; }
+};
+
+const char* kRd = "org.freedesktop.portal.RemoteDesktop";
+const char* kSc = "org.freedesktop.portal.ScreenCast";
+bool has(const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; }
+
+}   // namespace
+
+void testPortalSession() {
+    std::cout << "[TEST 90] Wayland portal session against a fake desktop portal..." << std::endl;
+    using namespace cppdesk::wayland;
+    using namespace cppdesk::wayland::test;
+    gchar* daemon = g_find_program_in_path("dbus-daemon");
+    if (!daemon) { std::cout << "  skipped: no dbus-daemon on this machine" << std::endl; return; }
+    g_free(daemon);
+
+    {   // Allowed, with an old token: the whole call sequence, its arguments, the result, input and closing
+        FakeScenario sc;
+        PortalRig rig(&sc);
+        TEST_ASSERT(rig.fake->ok());
+        rig.start("token-old");
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r));
+        TEST_ASSERT(r.state == ShareState::Running && rig.session.state() == ShareState::Running);
+        TEST_ASSERT(r.streams.size() == 1 && r.streams[0].nodeId == 57 && r.streams[0].logicalW == 1440 &&
+                    r.streams[0].logicalH == 900);
+        TEST_ASSERT(r.inputGranted && r.newRestoreToken == "token-new");
+        const int fd = rig.session.pipeWireFd();
+        TEST_ASSERT(fd >= 0);
+        if (fd >= 0) ::close(fd);
+        TEST_ASSERT(rig.session.pipeWireFd() == -1);   // handed over once
+        TEST_ASSERT(rig.sequence() == "RemoteDesktop.CreateSession RemoteDesktop.SelectDevices ScreenCast.SelectSources "
+                                      "RemoteDesktop.Start ScreenCast.OpenPipeWireRemote");
+        const std::string devices = rig.argsOf(kRd, "SelectDevices");
+        TEST_ASSERT(has(devices, "persist_mode") && has(devices, "token-old") && has(devices, "restore_token"));
+        const std::string sources = rig.argsOf(kSc, "SelectSources");
+        TEST_ASSERT(has(sources, "cursor_mode") && has(sources, "'multiple': <false>"));
+        TEST_ASSERT(!has(sources, "restore_token") && !has(sources, "persist_mode"));   // tokens belong to SelectDevices
+        std::set<std::string> tokens;
+        for (const auto& c : rig.fake->calls()) if (!c.token.empty()) tokens.insert(c.token);
+        TEST_ASSERT(tokens.size() == 4);   // CreateSession, SelectDevices, SelectSources, Start: one token each
+
+        TEST_ASSERT(rig.session.pointerMotionAbsolute(57, 719.5, 449.5));
+        TEST_ASSERT(rig.session.pointerButton(0x110, true));
+        TEST_ASSERT(rig.session.pointerAxisDiscrete(0, 3));
+        TEST_ASSERT(rig.session.keyboardKeysym(0xff0d, true));
+        TEST_ASSERT(waitUntil([&] { return rig.fake->count(kRd, "NotifyKeyboardKeysym") == 1; }));
+        TEST_ASSERT(has(rig.argsOf(kRd, "NotifyPointerMotionAbsolute"), ", 57, 719.5, 449.5)"));
+        TEST_ASSERT(has(rig.argsOf(kRd, "NotifyPointerButton"), ", 272, 1)"));
+        TEST_ASSERT(has(rig.argsOf(kRd, "NotifyPointerAxisDiscrete"), ", 0, 3)"));
+        TEST_ASSERT(has(rig.argsOf(kRd, "NotifyKeyboardKeysym"), ", 65293, 1)"));
+
+        rig.session.close();
+        TEST_ASSERT(rig.session.state() == ShareState::Closed);
+        TEST_ASSERT(waitUntil([&] { return rig.fake->count("org.freedesktop.portal.Session", "Close") == 1; }));
+        TEST_ASSERT(!rig.session.pointerButton(0x110, false));   // nothing goes out once closed
+        rig.session.close();                                       // and closing again is harmless
+    }
+    {   // A token with a line break in it would corrupt the settings file: it is not kept
+        FakeScenario sc;
+        sc.newToken = std::string("bad") + char(10) + "token";
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r) && r.state == ShareState::Running && r.newRestoreToken.empty());
+    }
+    {   // A bus that accepts the connection and never answers: the share gives up, and closing it does not hang
+        const std::string path = "/tmp/cppdesk-hung-bus-" + std::to_string(getpid());
+        unlink(path.c_str());
+        const int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path.c_str());
+        TEST_ASSERT(bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 && listen(listener, 4) == 0);
+        PortalSession session;
+        PortalOptions o;
+        o.busAddress = "unix:path=" + path;
+        o.stepTimeoutMs = 300;
+        session.startAsync(o);
+        TEST_ASSERT(waitUntil([&] { PortalResult r; return session.result(r); }, 5000));
+        TEST_ASSERT(session.state() == ShareState::Unavailable || session.state() == ShareState::Failed);
+        const auto t0 = std::chrono::steady_clock::now();
+        session.close();
+        TEST_ASSERT(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(4));
+        ::close(listener);
+        unlink(path.c_str());
+    }
+    {   // An older desktop (RemoteDesktop version 1): no token options anywhere
+        FakeScenario sc;
+        sc.remoteDesktopVersion = 1;
+        sc.newToken = "";
+        PortalRig rig(&sc);
+        rig.start("token-old");
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r) && r.state == ShareState::Running && r.inputGranted && r.newRestoreToken.empty());
+        const std::string devices = rig.argsOf(kRd, "SelectDevices");
+        TEST_ASSERT(!has(devices, "persist_mode") && !has(devices, "restore_token") && !has(devices, "token-old"));
+    }
+    {   // A response that goes out before the method's own reply is not lost
+        FakeScenario sc;
+        sc.immediateResponses = true;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        TEST_ASSERT(rig.session.state() == ShareState::Running);
+    }
+    {   // The person says no: nothing is shared, the video connection is never opened, the session is closed
+        FakeScenario sc;
+        sc.startResponse = 1;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r) && r.state == ShareState::Denied && r.streams.empty() && !r.inputGranted);
+        TEST_ASSERT(!rig.session.notice().reason.empty());
+        TEST_ASSERT(!rig.saw(kSc, "OpenPipeWireRemote"));
+        TEST_ASSERT(rig.session.pipeWireFd() == -1);
+        TEST_ASSERT(!rig.session.pointerMotionAbsolute(57, 1, 1));
+        TEST_ASSERT(waitUntil([&] { return rig.fake->count("org.freedesktop.portal.Session", "Close") == 1; }));
+    }
+    {   // The desktop fails
+        FakeScenario sc;
+        sc.startResponse = 2;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        TEST_ASSERT(rig.session.state() == ShareState::Failed);
+    }
+    {   // No portal on the bus at all: unavailable (no dialog exists, so falling back to X11 is allowed)
+        PortalRig rig(nullptr);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r) && r.state == ShareState::Unavailable && !r.reason.empty());
+    }
+    {   // A desktop that can share the screen but offers no remote control: view only
+        FakeScenario sc;
+        sc.remoteDesktopVersion = 0;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r) && r.state == ShareState::ViewOnly && !r.inputGranted && r.streams.size() == 1);
+        TEST_ASSERT(rig.sequence() == "ScreenCast.CreateSession ScreenCast.SelectSources ScreenCast.Start "
+                                      "ScreenCast.OpenPipeWireRemote");
+        TEST_ASSERT(!rig.session.pointerButton(0x110, true) && !rig.session.keyboardKeysym(65, true));
+    }
+    {   // The person unticked remote control in the dialog: view only too
+        FakeScenario sc;
+        sc.devices = 0;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r) && r.state == ShareState::ViewOnly && !r.inputGranted);
+        TEST_ASSERT(!rig.session.pointerMotionAbsolute(57, 1, 1));
+    }
+    {   // Only the keyboard was allowed: keys go out, the pointer does not
+        FakeScenario sc;
+        sc.devices = 1;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        TEST_ASSERT(rig.session.state() == ShareState::Running);
+        TEST_ASSERT(rig.session.keyboardKeysym(65, true));
+        TEST_ASSERT(!rig.session.pointerButton(0x110, true));
+    }
+    {   // Allowed, but with no screen in the answer
+        FakeScenario sc;
+        sc.streams.clear();
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        TEST_ASSERT(rig.session.state() == ShareState::Failed);
+        TEST_ASSERT(!rig.saw(kSc, "OpenPipeWireRemote"));
+    }
+    {   // The desktop ends the session while it runs
+        FakeScenario sc;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        TEST_ASSERT(rig.session.state() == ShareState::Running);
+        rig.fake->emitSessionClosed();
+        TEST_ASSERT(waitUntil([&] { return rig.session.state() == ShareState::Closed; }));
+        TEST_ASSERT(!rig.session.pointerButton(0x110, true));
+    }
+    {   // Nobody answers the dialog: give up, and withdraw the question and the session
+        FakeScenario sc;
+        sc.silentStart = true;
+        PortalRig rig(&sc);
+        rig.start("", 300);
+        TEST_ASSERT(rig.settled());
+        TEST_ASSERT(rig.session.state() == ShareState::Failed);
+        TEST_ASSERT(waitUntil([&] { return rig.fake->count("org.freedesktop.portal.Request", "Close") == 1 &&
+                                           rig.fake->count("org.freedesktop.portal.Session", "Close") == 1; }));
+    }
+    {   // Stopped while the dialog is open: it goes away at once
+        FakeScenario sc;
+        sc.silentStart = true;
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(waitUntil([&] { return rig.fake->count(kRd, "Start") == 1; }));
+        const auto t0 = std::chrono::steady_clock::now();
+        rig.session.close();
+        TEST_ASSERT(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+        TEST_ASSERT(rig.session.state() == ShareState::Closed);
+        TEST_ASSERT(waitUntil([&] { return rig.fake->count("org.freedesktop.portal.Request", "Close") == 1 &&
+                                           rig.fake->count("org.freedesktop.portal.Session", "Close") == 1; }));
+    }
+}
+#endif
+
+void testLatestFrameAndPipeWireStream() {
+    std::cout << "[TEST 91] Latest-frame slot, and the PipeWire stream when PipeWire is missing..." << std::endl;
+    {   // The slot hands out the newest frame and says whether it is a new one
+        LatestFrame f;
+        std::vector<uint8_t> out;
+        int w = 0, h = 0;
+        bool isNew = false;
+        std::vector<uint8_t> px(2 * 2 * 4, 7);
+        TEST_ASSERT(!f.copy(out, w, h, isNew));
+        f.push(px.data(), 2, 2);                                   // not accepting yet: dropped
+        TEST_ASSERT(!f.copy(out, w, h, isNew));
+        f.accept(true);
+        f.push(px.data(), 2, 2);
+        TEST_ASSERT(f.copy(out, w, h, isNew) && isNew && w == 2 && h == 2 && out.size() == 16 && out[0] == 7);
+        TEST_ASSERT(f.copy(out, w, h, isNew) && !isNew);          // the same frame again
+        std::fill(px.begin(), px.end(), uint8_t(9));
+        f.push(px.data(), 2, 2);
+        TEST_ASSERT(f.copy(out, w, h, isNew) && isNew && out[0] == 9);
+        f.accept(false);                                           // a frame still in flight is dropped
+        std::vector<uint8_t> big(4 * 4 * 4, 5);
+        f.push(big.data(), 4, 4);
+        TEST_ASSERT(f.copy(out, w, h, isNew) && !isNew && w == 2 && out[0] == 9);
+        f.accept(true);
+        f.push(px.data(), 0, 2);                                   // an empty frame is not a frame
+        TEST_ASSERT(f.copy(out, w, h, isNew) && !isNew);
+        f.clear();
+        TEST_ASSERT(!f.copy(out, w, h, isNew));
+    }
+    {   // One thread writes whole frames, one reads, one switches acceptance: a read never shows a half-written frame
+        auto f = std::make_shared<LatestFrame>();
+        f->accept(true);
+        std::atomic<bool> stop{false};
+        std::atomic<int> torn{0}, reads{0};
+        std::thread producer([&] {
+            unsigned v = 0;
+            while (!stop) {
+                const int n = 1 + static_cast<int>(v % 7);
+                ++v;
+                f->write(n, n, [&](uint8_t* dst) { std::memset(dst, static_cast<int>(v & 0xFF), static_cast<size_t>(n) * n * 4); });
+            }
+        });
+        std::thread reader([&] {
+            std::vector<uint8_t> out;
+            int w = 0, h = 0;
+            bool isNew = false;
+            while (!stop) {
+                if (!f->copy(out, w, h, isNew)) continue;
+                ++reads;
+                bool ok = out.size() == static_cast<size_t>(w) * h * 4 && !out.empty();
+                for (uint8_t b : out) ok = ok && b == out[0];
+                if (!ok) ++torn;
+            }
+        });
+        for (int i = 0; i < 200; ++i) {
+            f->accept(i % 2 == 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        f->accept(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        stop = true;
+        producer.join();
+        reader.join();
+        TEST_ASSERT(torn == 0 && reads > 0);
+    }
+#if defined(__linux__)
+    {   // No PipeWire library: the stream says so, takes over (and closes) the descriptor, and stopping is safe
+        setenv("CPPDESK_PIPEWIRE_LIB", "/nonexistent/libpipewire-0.3.so.0", 1);
+        auto sink = std::make_shared<LatestFrame>();
+        cppdesk::wayland::PipeWireStream stream(sink);
+        TEST_ASSERT(stream.state() == cppdesk::wayland::PwState::Stopped);
+        TEST_ASSERT(!stream.start(-1, 1));
+        TEST_ASSERT(stream.state() == cppdesk::wayland::PwState::Unavailable);
+        int fds[2];
+        TEST_ASSERT(pipe(fds) == 0);
+        TEST_ASSERT(!stream.start(fds[0], 1));
+        TEST_ASSERT(fcntl(fds[0], F_GETFD) == -1 && errno == EBADF);   // closed by the stream
+        close(fds[1]);
+        stream.stop();
+        stream.stop();
+        TEST_ASSERT(stream.state() == cppdesk::wayland::PwState::Unavailable);
+        TEST_ASSERT(!cppdesk::wayland::PipeWireStream::available());
+        unsetenv("CPPDESK_PIPEWIRE_LIB");
+    }
+#endif
+}
+
+void testShareHub() {
+    std::cout << "[TEST 94] Share hub: the notice and the restore token handed between threads..." << std::endl;
+    using namespace cppdesk::wayland;
+    ShareHub hub;
+    TEST_ASSERT(hub.notice().state == ShareState::Idle);
+    hub.setNotice({ShareState::Denied, "no"});
+    TEST_ASSERT(hub.notice().state == ShareState::Denied && hub.notice().reason == "no");
+
+    std::string token = "untouched";
+    TEST_ASSERT(!hub.takeTokenForSave(token) && token == "untouched");   // nothing happened yet
+    hub.setRestoreToken("saved");
+    TEST_ASSERT(hub.restoreToken() == "saved");
+    hub.pushToken("saved");                                               // the same token came back: nothing to save
+    TEST_ASSERT(!hub.takeTokenForSave(token));
+    hub.pushToken("fresh");
+    TEST_ASSERT(hub.restoreToken() == "fresh");                           // the next session already uses it
+    TEST_ASSERT(hub.takeTokenForSave(token) && token == "fresh");
+    TEST_ASSERT(!hub.takeTokenForSave(token));                            // once per change
+    hub.pushToken("");                                                    // the portal gave none: the old one is stale
+    TEST_ASSERT(hub.restoreToken().empty());
+    TEST_ASSERT(hub.takeTokenForSave(token) && token.empty());
+    TEST_ASSERT(!hub.takeTokenForSave(token));
+    hub.pushToken("a");
+    hub.pushToken("b");                                                   // two changes before the save: the last one wins
+    TEST_ASSERT(hub.takeTokenForSave(token) && token == "b");
+}
+
+#if defined(__linux__)
+namespace {
+
+// A video receiver that needs no PipeWire: it fills the slot with a 1280x800 gradient as soon as it starts.
+struct SourceConfig {
+    bool available = true;      // false: the video part is missing on this machine
+    bool startOk = true;        // false: it is there but cannot connect
+    bool silent = false;        // true: it connects and never delivers a picture
+    int firstFrameMs = 15000;
+};
+
+struct GradientSource : cppdesk::wayland::WaylandShare::FrameSource {
+    std::shared_ptr<cppdesk::LatestFrame> slot = std::make_shared<cppdesk::LatestFrame>();
+    std::atomic<int>* starts = nullptr;
+    SourceConfig cfg;
+    bool available() const override { return cfg.available; }
+    bool start(int fd, uint32_t) override {
+        if (fd >= 0) ::close(fd);
+        ++*starts;
+        if (!cfg.startOk) return false;
+        slot->accept(true);
+        if (cfg.silent) return true;
+        std::vector<uint8_t> px(1280 * 800 * 4);
+        for (int y = 0; y < 800; ++y)
+            for (int x = 0; x < 1280; ++x) {
+                uint8_t* p = &px[(static_cast<size_t>(y) * 1280 + x) * 4];
+                p[0] = static_cast<uint8_t>(x); p[1] = static_cast<uint8_t>(y); p[2] = 0x40; p[3] = 0xFF;
+            }
+        slot->push(px.data(), 1280, 800);
+        return true;
+    }
+    void stop() override { slot->accept(false); }
+    std::shared_ptr<cppdesk::LatestFrame> sink() override { return slot; }
+};
+
+struct SessionEnvGuard {
+    std::map<std::string, std::string> saved;
+    SessionEnvGuard() {
+        for (const char* n : {"XDG_SESSION_TYPE", "WAYLAND_DISPLAY", "CPPDESK_FORCE_X11"})
+            if (const char* v = std::getenv(n)) saved[n] = v;
+    }
+    ~SessionEnvGuard() {
+        for (const char* n : {"XDG_SESSION_TYPE", "WAYLAND_DISPLAY", "CPPDESK_FORCE_X11"}) {
+            auto it = saved.find(n);
+            if (it == saved.end()) unsetenv(n); else setenv(n, it->second.c_str(), 1);
+        }
+        cppdesk::wayland::WaylandShare::setFactoryForTest(nullptr);
+    }
+};
+
+}   // namespace
+
+void testWaylandShareIntegration() {
+    std::cout << "[TEST 92] Wayland share through the capturer and the injector: frames, input and consent..." << std::endl;
+    using namespace cppdesk;
+    using namespace cppdesk::wayland;
+    using namespace cppdesk::wayland::test;
+    gchar* daemon = g_find_program_in_path("dbus-daemon");
+    if (!daemon) { std::cout << "  skipped: no dbus-daemon on this machine" << std::endl; return; }
+    g_free(daemon);
+
+    SessionEnvGuard env;
+    setenv("XDG_SESSION_TYPE", "wayland", 1);
+    unsetenv("WAYLAND_DISPLAY");
+    unsetenv("CPPDESK_FORCE_X11");
+    std::atomic<int> starts{0};
+    SourceConfig sourceCfg;
+    auto useBus = [&](const std::string& address) {
+        WaylandShare::setFactoryForTest([&starts, &sourceCfg, address](const std::string& token) {
+            PortalOptions o;
+            o.busAddress = address;
+            o.restoreToken = token;
+            o.firstFrameTimeoutMs = sourceCfg.firstFrameMs;
+            auto source = std::make_unique<GradientSource>();
+            source->starts = &starts;
+            source->cfg = sourceCfg;
+            return std::make_shared<WaylandShare>(o, std::move(source));
+        });
+    };
+    auto grab = [](ScreenCapturer& c, size_t& tiles, bool& keyframe, bool& cursorVisible) {
+        std::vector<EncodedTile> t;
+        CursorState cs{};
+        bool kf = false;
+        const bool ok = c.captureDirtyTiles(true, QualityPreset::Balanced, t, kf, cs);
+        tiles = t.size();
+        keyframe = kf;
+        cursorVisible = cs.visible;
+        return ok;
+    };
+    auto grabUntil = [&](ScreenCapturer& c, size_t& tiles, bool& keyframe, bool& cursorVisible) {
+        return waitUntil([&] { return grab(c, tiles, keyframe, cursorVisible); }, 8000);
+    };
+
+    {   // Allowed: first nothing, then the screen at the stream's size; input goes through the portal, never XTest
+        PrivateBus bus;
+        FakeScenario sc;
+        FakePortal fake(bus.address(), sc);
+        useBus(bus.address());
+        const int x11Capture0 = ScreenCapturer::x11CaptureCallsForTest();
+        const int x11Input0 = InputInjector::x11InputCallsForTest();
+        {
+            ScreenCapturer cap;
+            TEST_ASSERT(cap.enumerateMonitors().size() == 1);
+            cap.setRestoreToken("token-old");
+            size_t tiles = 0; bool kf = false, cursor = true;
+            TEST_ASSERT(!grab(cap, tiles, kf, cursor));                    // the dialog is open: no picture yet
+            TEST_ASSERT(grabUntil(cap, tiles, kf, cursor));
+            TEST_ASSERT(cap.frameWidth() == 1280 && cap.frameHeight() == 800);
+            TEST_ASSERT(cap.currentMonitor().width == 1280 && cap.currentMonitor().height == 800);
+            TEST_ASSERT(tiles > 0 && kf && !cursor);                       // the cursor is in the picture itself
+            TEST_ASSERT(cap.shareNotice().state == ShareState::Running);
+            TEST_ASSERT(starts == 1);
+            std::string devicesArgs;
+            for (const auto& c : fake.calls()) if (c.method == "SelectDevices") devicesArgs = c.args;
+            TEST_ASSERT(has(devicesArgs, "token-old"));                    // the stored token went to the portal
+            std::string token;
+            TEST_ASSERT(cap.takeRestoreTokenChange(token) && token == "token-new");
+            TEST_ASSERT(!cap.takeRestoreTokenChange(token));
+            TEST_ASSERT(WaylandShare::active() != nullptr);
+
+            const MonitorDesc md = cap.currentMonitor();
+            InputInjector::injectMouseMove(0.5f, 0.5f, md);
+            InputInjector::injectMouseButton(MouseButtonId::Left, true, 0.0f, 0.0f, md);
+            InputInjector::injectMouseWheel(120, 0);
+            InputInjector::injectKeyEvent(0x41, 0, true, false);
+            TEST_ASSERT(waitUntil([&] { return fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyKeyboardKeysym") == 1; }));
+            const std::string keysym = std::to_string(InputInjector::mapVkToX11KeySym(0x41));
+            std::string motion, button, axis, key;
+            for (const auto& c : fake.calls()) {
+                if (c.method == "NotifyPointerMotionAbsolute" && motion.empty()) motion = c.args;   // the first one
+                if (c.method == "NotifyPointerButton") button = c.args;
+                if (c.method == "NotifyPointerAxisDiscrete") axis = c.args;
+                if (c.method == "NotifyKeyboardKeysym") key = c.args;
+            }
+            TEST_ASSERT(has(motion, ", 57, 719.5, 449.5)"));              // the stream's own size (1440x900), not the frame's
+            TEST_ASSERT(has(button, ", 272, 1)"));
+            TEST_ASSERT(has(axis, ", 0, -1)"));                             // wheel up is negative steps for the portal
+            TEST_ASSERT(has(key, ", " + keysym + ", 1)"));
+            InputInjector::releaseAllModifiers();                           // the held key is let go
+            TEST_ASSERT(waitUntil([&] { return fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyKeyboardKeysym") == 2; }));
+            TEST_ASSERT(waitUntil([&] { return fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyPointerButton") == 2; }));
+            TEST_ASSERT(ScreenCapturer::x11CaptureCallsForTest() == x11Capture0);
+            TEST_ASSERT(InputInjector::x11InputCallsForTest() == x11Input0);
+            InputInjector::injectKeyEvent(0x41, 0, true, false);               // held down when the session ends
+            TEST_ASSERT(waitUntil([&] { return fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyKeyboardKeysym") == 3; }));
+        }
+        TEST_ASSERT(WaylandShare::active() == nullptr);                       // gone with the session
+        TEST_ASSERT(waitUntil([&] { return fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyKeyboardKeysym") == 4; }));   // and let go
+        TEST_ASSERT(waitUntil([&] { return fake.count("org.freedesktop.portal.Session", "Close") == 1; }));
+    }
+    {   // Refused: nothing is captured (although an X display exists), no input goes anywhere
+        PrivateBus bus;
+        FakeScenario sc;
+        sc.startResponse = 1;
+        FakePortal fake(bus.address(), sc);
+        useBus(bus.address());
+        const int x11Capture0 = ScreenCapturer::x11CaptureCallsForTest();
+        const int x11Input0 = InputInjector::x11InputCallsForTest();
+        ScreenCapturer cap;
+        size_t tiles = 0; bool kf = false, cursor = true;
+        TEST_ASSERT(waitUntil([&] { grab(cap, tiles, kf, cursor); return cap.shareNotice().state == ShareState::Denied; }));
+        for (int i = 0; i < 5; ++i) TEST_ASSERT(!grab(cap, tiles, kf, cursor));
+        TEST_ASSERT(ScreenCapturer::x11CaptureCallsForTest() == x11Capture0);
+        InputInjector::injectMouseMove(0.5f, 0.5f, cap.currentMonitor());
+        InputInjector::injectMouseButton(MouseButtonId::Left, true, 0.5f, 0.5f, cap.currentMonitor());
+        InputInjector::injectKeyEvent(0x41, 0, true, false);
+        InputInjector::releaseAllModifiers();
+        TEST_ASSERT(InputInjector::x11InputCallsForTest() == x11Input0);
+        TEST_ASSERT(fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyPointerMotionAbsolute") == 0);
+        TEST_ASSERT(fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyKeyboardKeysym") == 0);
+        TEST_ASSERT(starts == 1);                                             // the previous scenario only
+    }
+    {   // View only (control unticked): the picture comes, the input is dropped, not sent to XTest
+        PrivateBus bus;
+        FakeScenario sc;
+        sc.devices = 0;
+        FakePortal fake(bus.address(), sc);
+        useBus(bus.address());
+        const int x11Input0 = InputInjector::x11InputCallsForTest();
+        ScreenCapturer cap;
+        size_t tiles = 0; bool kf = false, cursor = true;
+        TEST_ASSERT(grabUntil(cap, tiles, kf, cursor));
+        TEST_ASSERT(cap.shareNotice().state == ShareState::ViewOnly);
+        InputInjector::injectMouseMove(0.5f, 0.5f, cap.currentMonitor());
+        TEST_ASSERT(InputInjector::x11InputCallsForTest() == x11Input0);
+        TEST_ASSERT(fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyPointerMotionAbsolute") == 0);
+    }
+    {   // The video part is missing: that is known before anyone is asked, so no question is shown for nothing
+        PrivateBus bus;
+        FakeScenario sc;
+        FakePortal fake(bus.address(), sc);
+        sourceCfg = SourceConfig{};
+        sourceCfg.available = false;
+        useBus(bus.address());
+        ScreenCapturer cap;
+        size_t tiles = 0; bool kf = false, cursor = true;
+        TEST_ASSERT(grabUntil(cap, tiles, kf, cursor));                      // the X11 picture
+        TEST_ASSERT(cap.shareNotice().state == ShareState::Unavailable);
+        TEST_ASSERT(fake.calls().empty());                                    // the desktop was never asked
+        sourceCfg = SourceConfig{};
+    }
+    {   // The person turned control off, then the video fails to start: no picture, and no input by any route
+        PrivateBus bus;
+        FakeScenario sc;
+        sc.devices = 0;
+        FakePortal fake(bus.address(), sc);
+        sourceCfg = SourceConfig{};
+        sourceCfg.startOk = false;
+        useBus(bus.address());
+        const int x11Capture0 = ScreenCapturer::x11CaptureCallsForTest();
+        const int x11Input0 = InputInjector::x11InputCallsForTest();
+        ScreenCapturer cap;
+        size_t tiles = 0; bool kf = false, cursor = true;
+        TEST_ASSERT(waitUntil([&] { grab(cap, tiles, kf, cursor); return cap.shareNotice().state == ShareState::Failed; }));
+        for (int i = 0; i < 3; ++i) TEST_ASSERT(!grab(cap, tiles, kf, cursor));
+        InputInjector::injectMouseMove(0.5f, 0.5f, cap.currentMonitor());
+        InputInjector::injectKeyEvent(0x41, 0, true, false);
+        TEST_ASSERT(ScreenCapturer::x11CaptureCallsForTest() == x11Capture0);
+        TEST_ASSERT(InputInjector::x11InputCallsForTest() == x11Input0);
+        TEST_ASSERT(fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyPointerMotionAbsolute") == 0);
+        sourceCfg = SourceConfig{};
+    }
+    {   // The video connects but no picture ever arrives: it ends with a reason instead of waiting for ever
+        PrivateBus bus;
+        FakeScenario sc;
+        FakePortal fake(bus.address(), sc);
+        sourceCfg = SourceConfig{};
+        sourceCfg.silent = true;
+        sourceCfg.firstFrameMs = 300;
+        useBus(bus.address());
+        ScreenCapturer cap;
+        size_t tiles = 0; bool kf = false, cursor = true;
+        TEST_ASSERT(waitUntil([&] { grab(cap, tiles, kf, cursor); return cap.shareNotice().state == ShareState::Failed; }));
+        TEST_ASSERT(!cap.shareNotice().reason.empty());
+        TEST_ASSERT(!grab(cap, tiles, kf, cursor));
+        sourceCfg = SourceConfig{};
+    }
+    {   // No portal on the bus: the old X11 way, with the reason kept for the notice; input goes to XTest again
+        PrivateBus bus;
+        useBus(bus.address());
+        const int x11Capture0 = ScreenCapturer::x11CaptureCallsForTest();
+        const int x11Input0 = InputInjector::x11InputCallsForTest();
+        ScreenCapturer cap;
+        size_t tiles = 0; bool kf = false, cursor = true;
+        TEST_ASSERT(grabUntil(cap, tiles, kf, cursor));
+        TEST_ASSERT(cap.shareNotice().state == ShareState::Unavailable && !cap.shareNotice().reason.empty());
+        TEST_ASSERT(ScreenCapturer::x11CaptureCallsForTest() > x11Capture0);
+        TEST_ASSERT(cap.frameWidth() > 0 && tiles > 0);
+        InputInjector::injectMouseMove(0.5f, 0.5f, cap.currentMonitor());
+        TEST_ASSERT(InputInjector::x11InputCallsForTest() == x11Input0 + 1);
+    }
+    {   // The peer leaves while the dialog is open: the dialog is withdrawn
+        PrivateBus bus;
+        FakeScenario sc;
+        sc.silentStart = true;
+        FakePortal fake(bus.address(), sc);
+        useBus(bus.address());
+        {
+            ScreenCapturer cap;
+            size_t tiles = 0; bool kf = false, cursor = true;
+            TEST_ASSERT(!grab(cap, tiles, kf, cursor));
+            TEST_ASSERT(waitUntil([&] { return fake.count("org.freedesktop.portal.RemoteDesktop", "Start") == 1; }));
+            TEST_ASSERT(cap.shareNotice().state == ShareState::WaitingForDialog);
+        }
+        TEST_ASSERT(waitUntil([&] { return fake.count("org.freedesktop.portal.Request", "Close") == 1 &&
+                                           fake.count("org.freedesktop.portal.Session", "Close") == 1; }));
+    }
+    {   // Not a Wayland session: the X11 path and XTest, as before; no portal is ever asked
+        unsetenv("XDG_SESSION_TYPE");
+        PrivateBus bus;
+        FakeScenario sc;
+        FakePortal fake(bus.address(), sc);
+        useBus(bus.address());
+        const int x11Input0 = InputInjector::x11InputCallsForTest();
+        ScreenCapturer cap;
+        size_t tiles = 0; bool kf = false, cursor = true;
+        TEST_ASSERT(grab(cap, tiles, kf, cursor));
+        TEST_ASSERT(cap.shareNotice().state == ShareState::Idle);
+        InputInjector::injectMouseMove(0.5f, 0.5f, cap.currentMonitor());
+        TEST_ASSERT(InputInjector::x11InputCallsForTest() == x11Input0 + 1);
+        TEST_ASSERT(fake.calls().empty());
+    }
+}
+#endif
+
+#if defined(__linux__)
+// Run by CI only (`CppDeskTests --pipewire`), against a PipeWire daemon with a test video source published as a node:
+// the stream connects the way the portal's descriptor would, and the frames must arrive as BGRA.
+void testRealPipeWire() {
+    std::cout << "[TEST 95] Real PipeWire: a test video source arrives as BGRA frames..." << std::endl;
+    const char* nodeEnv = std::getenv("CPPDESK_PIPEWIRE_TEST_NODE");
+    const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+    if (!nodeEnv || !*nodeEnv || !runtime) { std::cout << "  skipped: no PipeWire test node" << std::endl; return; }
+    const uint32_t node = static_cast<uint32_t>(std::strtoul(nodeEnv, nullptr, 10));
+    const char* remote = std::getenv("PIPEWIRE_REMOTE");
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/%s", runtime, remote && *remote ? remote : "pipewire-0");
+    const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    TEST_ASSERT(fd >= 0 && connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    auto sink = std::make_shared<LatestFrame>();
+    cppdesk::wayland::PipeWireStream stream(sink);
+    TEST_ASSERT(stream.start(fd, node));
+    std::vector<uint8_t> px;
+    int w = 0, h = 0;
+    bool isNew = false;
+    const bool got = waitUntil([&] { return sink->copy(px, w, h, isNew); }, 15000);
+    TEST_ASSERT(got);
+    if (got) {
+        const size_t c = (static_cast<size_t>(h / 2) * w + w / 2) * 4;
+        std::cout << "  frame " << w << "x" << h << ", centre pixel B" << int(px[c]) << " G" << int(px[c + 1]) << " R"
+                  << int(px[c + 2]) << " A" << int(px[c + 3]) << std::endl;
+        TEST_ASSERT(w == 320 && h == 240);
+        TEST_ASSERT(px[c] == 255 && px[c + 1] == 0 && px[c + 2] == 0 && px[c + 3] == 255);   // a solid blue source
+    }
+    TEST_ASSERT(stream.state() == cppdesk::wayland::PwState::Streaming);
+    stream.stop();
+}
+#endif
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+#if defined(__linux__)
+        if (argc > 1 && std::string(argv[1]) == "--pipewire") {   // CI only, see ci.yml
+            testRealPipeWire();
+            std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
+            return (g_failed == 0) ? 0 : 1;
+        }
+#else
+        (void)argc;
+        (void)argv;
+#endif
 #if defined(_WIN32)
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 #endif
@@ -9675,8 +10581,12 @@ int main() {
         testMacInputLogic(); std::cout << "Test 82 done\n" << std::flush;
         testHostPermissionCard(); std::cout << "Test 86 done\n" << std::flush;
         testHostPermissionUi(); std::cout << "Test 87 done\n" << std::flush;
+        testWaylandShareNoticeUi(); std::cout << "Test 93 done\n" << std::flush;
         testEcdhKnownVector(); std::cout << "Test 88 done\n" << std::flush;
         testMacFrameHelpers(); std::cout << "Test 84 done\n" << std::flush;
+        testWaylandHelpers(); std::cout << "Test 89 done\n" << std::flush;
+        testLatestFrameAndPipeWireStream(); std::cout << "Test 91 done\n" << std::flush;
+        testShareHub(); std::cout << "Test 94 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
 #endif
@@ -9689,6 +10599,8 @@ int main() {
         testXdndDrop(); std::cout << "Test 77 done\n" << std::flush;
         testLinuxTray(); std::cout << "Test 78 done\n" << std::flush;
         testLinuxNotifications(); std::cout << "Test 79 done\n" << std::flush;
+        testPortalSession(); std::cout << "Test 90 done\n" << std::flush;
+        testWaylandShareIntegration(); std::cout << "Test 92 done\n" << std::flush;
 #endif
 #if defined(__APPLE__)
         testMacWindow(); std::cout << "Test 81 done\n" << std::flush;

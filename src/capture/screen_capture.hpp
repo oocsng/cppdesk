@@ -13,6 +13,7 @@
 #include "../core/protocol.hpp"
 #include "virtual_display_manager.hpp"
 #include "privacy_cloak_manager.hpp"
+#include "wayland_helpers.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -27,6 +28,8 @@
 #include <atomic>
 
 namespace cppdesk {
+
+namespace wayland { class WaylandShare; }
 
 struct CursorState {
     float normX = 0.0f;
@@ -171,6 +174,13 @@ public:
     void setAutoHeadless(bool enable) { autoHeadless_ = enable; }
     bool autoHeadless() const { return autoHeadless_; }
 
+    // Screen sharing on a Wayland desktop (Linux): what to tell the person, and the restore token to keep for next
+    // time. The token is set before the first capture; a change is handed out once.
+    wayland::ShareNotice shareNotice() const;
+    void setRestoreToken(const std::string& token) { restoreToken_ = token; }
+    bool takeRestoreTokenChange(std::string& token);
+    static int x11CaptureCallsForTest();   // how often the X11 capture path was entered (tests)
+
     // Privacy Cloak manager
     PrivacyCloakManager& privacyCloak() { return privacyCloak_; }
     const PrivacyCloakManager& privacyCloak() const { return privacyCloak_; }
@@ -183,6 +193,7 @@ private:
     bool captureViaGdi();
     bool captureViaCoreGraphics();
     bool captureViaX11();
+    bool captureViaWayland();
     CursorState captureCursorState() const;
 
     struct DxgiImpl;
@@ -198,6 +209,10 @@ private:
 #endif
 
     // GDI handle recycling cache
+    bool                      waylandMode_ = false;   // a Wayland session: the desktop is asked, X11 is not read
+    std::shared_ptr<wayland::WaylandShare> wayland_;
+    std::string               restoreToken_;
+
 #if defined(_WIN32)
     HDC                       gdiMemDC_ = nullptr;
     HBITMAP                   gdiSection_ = nullptr;
