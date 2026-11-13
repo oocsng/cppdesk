@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, fix-ratelimit-flake]
+    branches: [main]
   pull_request:
 
 jobs:
