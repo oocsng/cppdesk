@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, wayland-host]
   pull_request:
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ xvfb libzstd-dev libssl-dev libx11-dev libxtst-dev libxext-dev libxrandr-dev libjpeg-dev libcairo2-dev libpango1.0-dev pkg-config
+          sudo apt-get install -y cmake g++ xvfb libzstd-dev libssl-dev libx11-dev libxtst-dev libxext-dev libxrandr-dev libjpeg-dev libcairo2-dev libpango1.0-dev libpipewire-0.3-dev dbus pkg-config
       - name: Build and run the test suite
         # The capture and input tests need an X server.
         run: xvfb-run -a -s "-screen 0 1920x1080x24" ./build.sh --test

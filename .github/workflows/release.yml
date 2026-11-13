@@ -25,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake g++-12 xvfb libzstd-dev libssl-dev libx11-dev libxtst-dev libxext-dev \
-            libxrandr-dev libjpeg-dev libcairo2-dev libpango1.0-dev pkg-config dpkg-dev file
+            libxrandr-dev libjpeg-dev libcairo2-dev libpango1.0-dev libpipewire-0.3-dev dbus pkg-config dpkg-dev file
       - name: Version
         run: echo "VERSION=$(grep -oP 'project\(CppDesk VERSION \K[0-9.]+' CMakeLists.txt)" >> "$GITHUB_ENV"
       - name: Check the tag matches the version
