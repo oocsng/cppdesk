@@ -27,6 +27,7 @@ public:
     // A press counts as the next click of a double or triple click when it follows the previous press of the same
     // button within 500 ms and 4 points. The release carries its press's count.
     MacMouseEvent onButton(MouseButtonId button, bool down, float x, float y, uint64_t nowMs);
+    bool isDown(MacButton button) const;
     void reset();
 
 private:

@@ -9,7 +9,10 @@
 #elif defined(__APPLE__)
 #include <ApplicationServices/ApplicationServices.h>
 #endif
+#include "mac_input_logic.hpp"
 #include <algorithm>
+#include <chrono>
+#include <vector>
 #include <cmath>
 #include <mutex>
 #include <atomic>
@@ -580,44 +583,84 @@ bool InputInjector::executeSystemAction(SystemActionType action) {
 
 #elif defined(__APPLE__)
 
-void InputInjector::injectMouseMove(float normX, float normY, const MonitorDesc& monitor) {
-    normX = std::clamp(normX, 0.0f, 1.0f);
-    normY = std::clamp(normY, 0.0f, 1.0f);
-    CGPoint pt = CGPointMake(
-        monitor.x + normX * std::max(1, monitor.width - 1),
-        monitor.y + normY * std::max(1, monitor.height - 1)
-    );
-    CGEventRef ev = CGEventCreateMouseEvent(nullptr, kCGEventMouseMoved, pt, kCGMouseButtonLeft);
-    if (ev) {
-        CGEventPost(kCGHIDEventTap, ev);
-        CFRelease(ev);
+namespace {
+
+// All injection state: events arrive from the session thread, the modifiers a peer holds, and the pointer.
+std::mutex g_macInputMutex;
+MacMouseTracker g_macMouse;
+CGEventFlags g_macHeldFlags = 0;
+
+uint64_t macNowMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// The point a normalized position lands on. The display's size comes from CoreGraphics in points, never from the
+// descriptor: the host loop replaces the descriptor's size with the captured frame's pixels, which are twice the
+// points on a Retina screen.
+CGPoint macTargetPoint(float nx, float ny, const MonitorDesc& monitor) {
+    CGDirectDisplayID ids[32];
+    uint32_t count = 0;
+    std::vector<PointRect> displays;
+    if (CGGetActiveDisplayList(32, ids, &count) == kCGErrorSuccess) {
+        for (uint32_t i = 0; i < count; ++i) {
+            const CGRect r = CGDisplayBounds(ids[i]);
+            displays.push_back(PointRect{ r.origin.x, r.origin.y, r.size.width, r.size.height });
+        }
+    }
+    const PointRect d = displays.empty()
+        ? PointRect{ static_cast<double>(monitor.x), static_cast<double>(monitor.y),
+                     static_cast<double>(monitor.width), static_cast<double>(monitor.height) }
+        : macDisplayForIndex(monitor.index, displays);
+    const PointXY p = macPointForNormalized(nx, ny, d);
+    return CGPointMake(p.x, p.y);
+}
+
+CGEventFlags macFlagForKeyCode(uint16_t macKey) {
+    switch (macKey) {
+        case 0x37: case 0x36: return kCGEventFlagMaskCommand;
+        case 0x38: case 0x3C: return kCGEventFlagMaskShift;
+        case 0x3A: case 0x3D: return kCGEventFlagMaskAlternate;
+        case 0x3B: case 0x3E: return kCGEventFlagMaskControl;
+        default: return 0;
     }
 }
 
+CGEventType macMouseType(const MacMouseEvent& ev) {
+    const bool left = ev.button == MacButton::Left, right = ev.button == MacButton::Right;
+    switch (ev.kind) {
+        case MacMouseKind::Down: return left ? kCGEventLeftMouseDown : right ? kCGEventRightMouseDown : kCGEventOtherMouseDown;
+        case MacMouseKind::Up: return left ? kCGEventLeftMouseUp : right ? kCGEventRightMouseUp : kCGEventOtherMouseUp;
+        case MacMouseKind::Drag: return left ? kCGEventLeftMouseDragged : right ? kCGEventRightMouseDragged : kCGEventOtherMouseDragged;
+        default: return kCGEventMouseMoved;
+    }
+}
+
+CGMouseButton macCgButton(MacButton b) {
+    return b == MacButton::Left ? kCGMouseButtonLeft : b == MacButton::Right ? kCGMouseButtonRight : kCGMouseButtonCenter;
+}
+
+void macPostMouse(const MacMouseEvent& ev, CGPoint pt) {
+    CGEventRef cg = CGEventCreateMouseEvent(nullptr, macMouseType(ev), pt, macCgButton(ev.button));
+    if (!cg) return;
+    CGEventSetIntegerValueField(cg, kCGMouseEventClickState, ev.clickCount);
+    CGEventSetFlags(cg, g_macHeldFlags);
+    CGEventPost(kCGHIDEventTap, cg);
+    CFRelease(cg);
+}
+
+} // namespace
+
+void InputInjector::injectMouseMove(float normX, float normY, const MonitorDesc& monitor) {
+    const CGPoint pt = macTargetPoint(normX, normY, monitor);
+    std::lock_guard<std::mutex> lock(g_macInputMutex);
+    macPostMouse(g_macMouse.onMove(), pt);
+}
+
 void InputInjector::injectMouseButton(MouseButtonId button, bool isDown, float normX, float normY, const MonitorDesc& monitor) {
-    normX = std::clamp(normX, 0.0f, 1.0f);
-    normY = std::clamp(normY, 0.0f, 1.0f);
-    CGPoint pt = CGPointMake(
-        monitor.x + normX * std::max(1, monitor.width - 1),
-        monitor.y + normY * std::max(1, monitor.height - 1)
-    );
-    CGEventType evType;
-    CGMouseButton cgBtn = kCGMouseButtonLeft;
-    if (button == MouseButtonId::Left) {
-        evType = isDown ? kCGEventLeftMouseDown : kCGEventLeftMouseUp;
-        cgBtn = kCGMouseButtonLeft;
-    } else if (button == MouseButtonId::Right) {
-        evType = isDown ? kCGEventRightMouseDown : kCGEventRightMouseUp;
-        cgBtn = kCGMouseButtonRight;
-    } else {
-        evType = isDown ? kCGEventOtherMouseDown : kCGEventOtherMouseUp;
-        cgBtn = kCGMouseButtonCenter;
-    }
-    CGEventRef ev = CGEventCreateMouseEvent(nullptr, evType, pt, cgBtn);
-    if (ev) {
-        CGEventPost(kCGHIDEventTap, ev);
-        CFRelease(ev);
-    }
+    const CGPoint pt = macTargetPoint(normX, normY, monitor);
+    std::lock_guard<std::mutex> lock(g_macInputMutex);
+    macPostMouse(g_macMouse.onButton(button, isDown, static_cast<float>(pt.x), static_cast<float>(pt.y), macNowMs()), pt);
 }
 
 void InputInjector::injectMouseWheel(int32_t verticalDelta, int32_t horizontalDelta) {
@@ -627,6 +670,10 @@ void InputInjector::injectMouseWheel(int32_t verticalDelta, int32_t horizontalDe
     if (hUnits == 0 && horizontalDelta != 0) hUnits = horizontalDelta > 0 ? 1 : -1;
     CGEventRef ev = CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 2, vUnits, hUnits);
     if (ev) {
+        {
+            std::lock_guard<std::mutex> lock(g_macInputMutex);
+            CGEventSetFlags(ev, g_macHeldFlags);
+        }
         CGEventPost(kCGHIDEventTap, ev);
         CFRelease(ev);
     }
@@ -635,21 +682,39 @@ void InputInjector::injectMouseWheel(int32_t verticalDelta, int32_t horizontalDe
 void InputInjector::injectKeyEvent(uint16_t vkCode, uint16_t scanCode, bool isDown, bool isExtended) {
     (void)scanCode;
     (void)isExtended;
-    uint16_t macKey = mapVkToMacKeyCode(vkCode);
-    if (macKey != 0xFFFF) {
-        CGEventRef ev = CGEventCreateKeyboardEvent(nullptr, static_cast<CGKeyCode>(macKey), isDown);
-        if (ev) {
-            CGEventPost(kCGHIDEventTap, ev);
-            CFRelease(ev);
-        }
+    const uint16_t macKey = macHostKeyCodeForVk(vkCode);
+    if (macKey == 0xFFFF) return;
+    std::lock_guard<std::mutex> lock(g_macInputMutex);
+    const CGEventFlags flag = macFlagForKeyCode(macKey);
+    if (flag) g_macHeldFlags = isDown ? (g_macHeldFlags | flag) : (g_macHeldFlags & ~flag);
+    CGEventRef ev = CGEventCreateKeyboardEvent(nullptr, static_cast<CGKeyCode>(macKey), isDown);
+    if (ev) {
+        CGEventSetFlags(ev, g_macHeldFlags);
+        CGEventPost(kCGHIDEventTap, ev);
+        CFRelease(ev);
     }
 }
 
 void InputInjector::releaseAllModifiers() {
-    CGKeyCode mods[] = { 0x38, 0x3B, 0x3A, 0x37 }; // Shift, Control, Option, Command
+    std::lock_guard<std::mutex> lock(g_macInputMutex);
+    // The session ended: let go of every button the peer still held, then of every modifier, so nothing stays
+    // pressed on this Mac.
+    CGEventRef here = CGEventCreate(nullptr);
+    const CGPoint pt = here ? CGEventGetLocation(here) : CGPointZero;
+    if (here) CFRelease(here);
+    const struct { MacButton button; MouseButtonId id; } buttons[] = {
+        { MacButton::Left, MouseButtonId::Left }, { MacButton::Right, MouseButtonId::Right },
+        { MacButton::Other, MouseButtonId::Middle } };
+    for (const auto& b : buttons) {
+        if (g_macMouse.isDown(b.button)) macPostMouse(g_macMouse.onButton(b.id, false, 0.0f, 0.0f, macNowMs()), pt);
+    }
+    g_macMouse.reset();
+    g_macHeldFlags = 0;
+    const CGKeyCode mods[] = { 0x38, 0x3C, 0x3B, 0x3E, 0x3A, 0x3D, 0x37, 0x36 };   // Shift, Control, Option, Command
     for (CGKeyCode m : mods) {
         CGEventRef ev = CGEventCreateKeyboardEvent(nullptr, m, false);
         if (ev) {
+            CGEventSetFlags(ev, 0);
             CGEventPost(kCGHIDEventTap, ev);
             CFRelease(ev);
         }

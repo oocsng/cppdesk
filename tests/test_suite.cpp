@@ -9142,6 +9142,24 @@ void testLinuxInputHelpers() {
     }
 }
 
+#if defined(__APPLE__)
+void testMacInjectorSurvivesPixelSizedMonitor() {
+    std::cout << "[TEST 83] Mac injector accepts a monitor descriptor sized in pixels..." << std::endl;
+    // The host loop overwrites the descriptor's size with the captured frame's pixels (2x on Retina). Without
+    // Accessibility permission the events are dropped by the system; this checks nothing crashes or hangs.
+    MonitorDesc md;
+    md.index = 0;
+    md.x = 0;
+    md.y = 0;
+    md.width = 2880;
+    md.height = 1800;
+    InputInjector::injectMouseMove(0.5f, 0.5f, md);
+    InputInjector::injectMouseMove(2.0f, -1.0f, md);
+    InputInjector::releaseAllModifiers();
+    TEST_ASSERT(true);
+}
+#endif
+
 void testMacInputLogic() {
     std::cout << "[TEST 82] Mac host input logic (drags, click counts, key and point mapping)..." << std::endl;
     {   // A move while a button is held is a drag.
@@ -9149,7 +9167,9 @@ void testMacInputLogic() {
         TEST_ASSERT(t.onMove().kind == MacMouseKind::Move);
         TEST_ASSERT(t.onButton(MouseButtonId::Left, true, 10, 10, 1000).kind == MacMouseKind::Down);
         TEST_ASSERT(t.onMove().kind == MacMouseKind::Drag);
+        TEST_ASSERT(t.isDown(MacButton::Left) && !t.isDown(MacButton::Right));
         TEST_ASSERT(t.onButton(MouseButtonId::Left, false, 10, 10, 1050).kind == MacMouseKind::Up);
+        TEST_ASSERT(!t.isDown(MacButton::Left));
         TEST_ASSERT(t.onMove().kind == MacMouseKind::Move);
         t.onButton(MouseButtonId::Right, true, 10, 10, 1100);
         TEST_ASSERT(t.onMove().kind == MacMouseKind::Drag);
@@ -9357,6 +9377,9 @@ int main() {
 #endif
         testLinuxInputHelpers(); std::cout << "Test 74 done\n" << std::flush;
         testMacInputLogic(); std::cout << "Test 82 done\n" << std::flush;
+#if defined(__APPLE__)
+        testMacInjectorSurvivesPixelSizedMonitor(); std::cout << "Test 83 done\n" << std::flush;
+#endif
 #if defined(__linux__)
         testLinuxWindow(); std::cout << "Test 75 done\n" << std::flush;
         testX11Clipboard(); std::cout << "Test 76 done\n" << std::flush;

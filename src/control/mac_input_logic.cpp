@@ -55,6 +55,10 @@ MacMouseEvent MacMouseTracker::onButton(MouseButtonId button, bool down, float x
     return ev;
 }
 
+bool MacMouseTracker::isDown(MacButton button) const {
+    return state_[button == MacButton::Left ? 0 : button == MacButton::Right ? 1 : 2].down;
+}
+
 void MacMouseTracker::reset() {
     for (State& s : state_) s = State{};
 }
