@@ -2,6 +2,7 @@
   <img src="assets/icon.png" width="96" height="96" alt="CppDesk App Icon"><br>
   <b>CppDesk</b><br>
   <span>Portable remote desktop client and host for Windows, macOS, and Linux</span><br><br>
+  <a href="https://oocsng.github.io/cppdesk/">Website</a> •
   <a href="#features">Features</a> •
   <a href="#quick-start">Quick start</a> •
   <a href="#building-from-source">Build</a> •
