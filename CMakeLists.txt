@@ -153,7 +153,16 @@ elseif(UNIX AND NOT APPLE)
         src/ui/canvas_cairo.cpp
         src/control/x11_clipboard.cpp
         src/capture/wayland_portal.cpp
+        src/capture/wayland_pipewire.cpp
     )
+    # PipeWire is never linked (it is loaded at run time); only its headers are needed, and only to build the video receiver.
+    pkg_check_modules(PIPEWIRE QUIET libpipewire-0.3)
+    if(PIPEWIRE_FOUND)
+        include_directories(${PIPEWIRE_INCLUDE_DIRS})
+        add_compile_definitions(CPPDESK_WAYLAND)
+    else()
+        message(STATUS "libpipewire-0.3 headers not found: screen sharing on Wayland is built without the video receiver")
+    endif()
 
     set(PLATFORM_LIBS
         ${LIB_ZSTD}

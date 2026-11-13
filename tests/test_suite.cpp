@@ -6,6 +6,7 @@
 #include "../src/control/mac_input_logic.hpp"
 #include "../src/capture/mac_frame.hpp"
 #include "../src/capture/wayland_helpers.hpp"
+#include "../src/capture/latest_frame.hpp"
 #include "../src/control/clipboard_file_manager.hpp"
 #include "../src/net/network_engine.hpp"
 #include "../src/net/updater.hpp"
@@ -28,6 +29,8 @@
 #include "../src/ui/ui_window.hpp"
 #include "../src/core/spawn.hpp"
 #include "../src/capture/wayland_portal.hpp"
+#include "../src/capture/wayland_pipewire.hpp"
+#include <fcntl.h>
 #include "fake_portal.hpp"
 #include <gio/gio.h>
 #include <set>
@@ -9946,6 +9949,91 @@ void testPortalSession() {
 }
 #endif
 
+void testLatestFrameAndPipeWireStream() {
+    std::cout << "[TEST 91] Latest-frame slot, and the PipeWire stream when PipeWire is missing..." << std::endl;
+    {   // The slot hands out the newest frame and says whether it is a new one
+        LatestFrame f;
+        std::vector<uint8_t> out;
+        int w = 0, h = 0;
+        bool isNew = false;
+        std::vector<uint8_t> px(2 * 2 * 4, 7);
+        TEST_ASSERT(!f.copy(out, w, h, isNew));
+        f.push(px.data(), 2, 2);                                   // not accepting yet: dropped
+        TEST_ASSERT(!f.copy(out, w, h, isNew));
+        f.accept(true);
+        f.push(px.data(), 2, 2);
+        TEST_ASSERT(f.copy(out, w, h, isNew) && isNew && w == 2 && h == 2 && out.size() == 16 && out[0] == 7);
+        TEST_ASSERT(f.copy(out, w, h, isNew) && !isNew);          // the same frame again
+        std::fill(px.begin(), px.end(), uint8_t(9));
+        f.push(px.data(), 2, 2);
+        TEST_ASSERT(f.copy(out, w, h, isNew) && isNew && out[0] == 9);
+        f.accept(false);                                           // a frame still in flight is dropped
+        std::vector<uint8_t> big(4 * 4 * 4, 5);
+        f.push(big.data(), 4, 4);
+        TEST_ASSERT(f.copy(out, w, h, isNew) && !isNew && w == 2 && out[0] == 9);
+        f.accept(true);
+        f.push(px.data(), 0, 2);                                   // an empty frame is not a frame
+        TEST_ASSERT(f.copy(out, w, h, isNew) && !isNew);
+        f.clear();
+        TEST_ASSERT(!f.copy(out, w, h, isNew));
+    }
+    {   // One thread writes whole frames, one reads, one switches acceptance: a read never shows a half-written frame
+        auto f = std::make_shared<LatestFrame>();
+        f->accept(true);
+        std::atomic<bool> stop{false};
+        std::atomic<int> torn{0}, reads{0};
+        std::thread producer([&] {
+            unsigned v = 0;
+            while (!stop) {
+                const int n = 1 + static_cast<int>(v % 7);
+                ++v;
+                f->write(n, n, [&](uint8_t* dst) { std::memset(dst, static_cast<int>(v & 0xFF), static_cast<size_t>(n) * n * 4); });
+            }
+        });
+        std::thread reader([&] {
+            std::vector<uint8_t> out;
+            int w = 0, h = 0;
+            bool isNew = false;
+            while (!stop) {
+                if (!f->copy(out, w, h, isNew)) continue;
+                ++reads;
+                bool ok = out.size() == static_cast<size_t>(w) * h * 4 && !out.empty();
+                for (uint8_t b : out) ok = ok && b == out[0];
+                if (!ok) ++torn;
+            }
+        });
+        for (int i = 0; i < 200; ++i) {
+            f->accept(i % 2 == 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        f->accept(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        stop = true;
+        producer.join();
+        reader.join();
+        TEST_ASSERT(torn == 0 && reads > 0);
+    }
+#if defined(__linux__)
+    {   // No PipeWire library: the stream says so, takes over (and closes) the descriptor, and stopping is safe
+        setenv("CPPDESK_PIPEWIRE_LIB", "/nonexistent/libpipewire-0.3.so.0", 1);
+        auto sink = std::make_shared<LatestFrame>();
+        cppdesk::wayland::PipeWireStream stream(sink);
+        TEST_ASSERT(stream.state() == cppdesk::wayland::PwState::Stopped);
+        TEST_ASSERT(!stream.start(-1, 1));
+        TEST_ASSERT(stream.state() == cppdesk::wayland::PwState::Unavailable);
+        int fds[2];
+        TEST_ASSERT(pipe(fds) == 0);
+        TEST_ASSERT(!stream.start(fds[0], 1));
+        TEST_ASSERT(fcntl(fds[0], F_GETFD) == -1 && errno == EBADF);   // closed by the stream
+        close(fds[1]);
+        stream.stop();
+        stream.stop();
+        TEST_ASSERT(stream.state() == cppdesk::wayland::PwState::Unavailable);
+        unsetenv("CPPDESK_PIPEWIRE_LIB");
+    }
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -10048,6 +10136,7 @@ int main() {
         testEcdhKnownVector(); std::cout << "Test 88 done\n" << std::flush;
         testMacFrameHelpers(); std::cout << "Test 84 done\n" << std::flush;
         testWaylandHelpers(); std::cout << "Test 89 done\n" << std::flush;
+        testLatestFrameAndPipeWireStream(); std::cout << "Test 91 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
 #endif
