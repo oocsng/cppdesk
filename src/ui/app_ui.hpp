@@ -17,6 +17,7 @@
 #include "../capture/session_rewind_buffer.hpp"
 #include "../capture/privacy_cloak_manager.hpp"
 #include "notification_manager.hpp"
+#include "host_permissions.hpp"
 #include "../net/updater.hpp"
 
 #include <string>
@@ -24,6 +25,7 @@
 #include <array>
 #include <unordered_map>
 #include <functional>
+#include <optional>
 #include <memory>
 
 #include "canvas.hpp"
@@ -210,6 +212,21 @@ private:
     float                   frameHeight_ = 800.0f;
     bool                    snapshotFrozen_ = false;    // a snapshot state holds animation time still
     std::function<void(AppUi&)> snapshotPerFrame_;      // a snapshot state's per-frame override
+
+    // Host permissions (macOS): the shell's state, refreshed once a second and when the window regains focus.
+    ui::HostPermissionStatus hostPerms_;
+    bool                    hostPermsOpenedSettings_ = false;   // the user went to a Screen Recording settings page
+    bool                    hostPermsReturned_ = false;         // ... and came back to the app
+    uint64_t                hostPermsPolledMs_ = 0;
+    std::optional<ui::HostPermissionStatus> snapshotHostPerms_; // a snapshot state's stand-in for the shell's
+    bool                    snapshotHostPermsReturned_ = false;
+    bool hostPermissionsActive() const { return snapshotHostPerms_.has_value() || shell_->has(ui::Capability::HostPermissions); }
+    ui::HostPermissionCard hostPermissionCard() const {
+        return ui::describeHostPermissions(hostPerms_, hostPermsReturned_ || snapshotHostPermsReturned_);
+    }
+    void refreshHostPermissions();
+    void openHostPermission(ui::HostPermission which);
+    void drawHostPermissionCard(const UiRect& box, const ui::HostPermissionCard& card, float alpha);
 
 
 private:

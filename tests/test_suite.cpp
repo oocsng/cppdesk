@@ -8946,17 +8946,24 @@ class FakeShell : public ui::PlatformShell {
 public:
     bool service = true, elevation = true, shortcut = true, actionCenter = true, tray = true, notifications = true;
     bool hostPermsCap = false;
+    ui::HostPermissionStatus hostPerms;
+    std::vector<ui::HostPermission> requestedPerms, openedPerms;
+    ui::HostPermissionStatus hostPermissions() const override { return hostPerms; }
+    void requestHostPermission(ui::HostPermission p) override { requestedPerms.push_back(p); }
+    void openHostPermissionSettings(ui::HostPermission p) override { openedPerms.push_back(p); }
 
     void invalidate() override {}
     void setCursor(ui::CursorShape) override {}
     float dpiScale() const override { return 1.0f; }
-    uint64_t nowMs() const override { return 10000; }
+    uint64_t clock = 10000;
+    uint64_t nowMs() const override { return clock; }
     void setTextInputActive(bool) override {}
     std::optional<std::string> chooseOpenFile(const std::string&, const std::string&, const std::string&) override { return std::nullopt; }
     std::optional<std::string> chooseFolder(const std::string&) override { return std::nullopt; }
     void openUrl(const std::string&) override {}
     void revealPath(const std::string&) override {}
-    void relaunchApp() override {}
+    int relaunches = 0;
+    void relaunchApp() override { ++relaunches; }
     void showNotification(const std::string&, const std::string&) override {}
     void setTrayStatus(const std::string&) override {}
     void setFrameIntervalMs(unsigned) override {}
@@ -9278,6 +9285,110 @@ void testHostPermissionCard() {
     }
 }
 
+void testHostPermissionUi() {
+    std::cout << "[TEST 87] Mac permission card, status rows and approval warning in the screens..." << std::endl;
+    IdentityManager id(4250);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    const auto npos = std::string::npos;
+
+    {   // Nothing is drawn where the platform has no such permissions (Windows and Linux).
+        FakeShell shell;
+        shell.hostPerms = { false, false };
+        const std::string dash = renderAppState(id, net, shell, "dashboard_light");
+        TEST_ASSERT(dash.find("|Allow screen sharing") == npos && dash.find("|Ready for connections") != npos);
+        TEST_ASSERT(renderAppState(id, net, shell, "settings_system").find("|Needs permission") == npos);
+        TEST_ASSERT(renderAppState(id, net, shell, "modal_approval").find("are off in macOS") == npos);
+    }
+    {   // Granted: no card, "Allowed" in settings, no warning.
+        FakeShell shell;
+        shell.hostPermsCap = true;
+        TEST_ASSERT(renderAppState(id, net, shell, "dashboard_light").find("|Allow screen sharing") == npos);
+        TEST_ASSERT(renderAppState(id, net, shell, "settings_system").find("|Allowed") != npos);
+        TEST_ASSERT(renderAppState(id, net, shell, "modal_approval").find("are off in macOS") == npos);
+    }
+    {   // Missing: the card replaces "Ready for connections", settings say what is off, the request dialog warns.
+        FakeShell shell;
+        shell.hostPermsCap = true;
+        shell.hostPerms = { false, false };
+        const std::string dash = renderAppState(id, net, shell, "dashboard_light");
+        TEST_ASSERT(dash.find("|Allow screen sharing") != npos && dash.find("|Ready for connections") == npos);
+        TEST_ASSERT(renderAppState(id, net, shell, "settings_system").find("|Needs permission") != npos);
+        TEST_ASSERT(renderAppState(id, net, shell, "modal_approval").find("Screen Recording and Accessibility are off in macOS") != npos);
+    }
+
+    // The buttons ask the system, open its settings, and a return with Screen Recording still off offers a restart.
+    FakeShell shell;
+    shell.hostPermsCap = true;
+    shell.hostPerms = { false, false };
+    AppUi app(id, net, shell, "");
+    ui::RecordingCanvas rc;
+    auto settle = [&] { for (int i = 0; i < 60; ++i) app.render(rc, 1280, 800, 1.0 / 60.0); };
+    auto centerOf = [&](const std::string& label, size_t nth) -> std::optional<std::pair<float, float>> {
+        std::istringstream in(rc.serialize());
+        std::string line;
+        size_t seen = 0;
+        while (std::getline(in, line)) {
+            if (line.rfind("drawText ", 0) != 0 || !line.ends_with("|" + label)) continue;
+            ui::Rect r{};
+            if (std::sscanf(line.c_str(), "drawText %f %f %f %f", &r.left, &r.top, &r.right, &r.bottom) != 4) continue;
+            if (seen++ == nth) return std::make_pair((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        }
+        return std::nullopt;
+    };
+    auto click = [&](std::pair<float, float> p) {
+        app.onMouseMove(p.first, p.second);
+        settle();
+        app.onMouseButton(MouseButtonId::Left, true, p.first, p.second);
+        settle();
+        app.onMouseButton(MouseButtonId::Left, false, p.first, p.second);
+        settle();
+    };
+    app.applySnapshotState("dashboard_light");
+    app.onMouseLeave();
+    settle();
+    auto first = centerOf("Allow...", 0);
+    auto second = centerOf("Allow...", 1);
+    TEST_ASSERT(first.has_value() && second.has_value());
+    if (first && second) {
+        click(*first);
+        TEST_ASSERT(shell.requestedPerms.size() == 1 && shell.requestedPerms[0] == ui::HostPermission::ScreenRecording);
+        TEST_ASSERT(shell.openedPerms.size() == 1 && shell.openedPerms[0] == ui::HostPermission::ScreenRecording);
+        click(*second);
+        TEST_ASSERT(shell.requestedPerms.size() == 2 && shell.requestedPerms[1] == ui::HostPermission::Accessibility);
+        TEST_ASSERT(shell.openedPerms.size() == 2 && shell.openedPerms[1] == ui::HostPermission::Accessibility);
+    }
+    TEST_ASSERT(!centerOf("Restart CppDesk", 0).has_value());
+    app.onFocusChanged(false);
+    app.onFocusChanged(true);   // back from Settings; Screen Recording is still off
+    settle();
+    auto restart = centerOf("Restart CppDesk", 0);
+    TEST_ASSERT(restart.has_value());
+    if (restart) {
+        click(*restart);
+        TEST_ASSERT(shell.relaunches == 1);
+    }
+    // The user turns both on: within a second the card is gone.
+    shell.hostPerms = { true, true };
+    shell.clock += 1500;
+    app.onTick();
+    settle();
+    TEST_ASSERT(!centerOf("Allow screen sharing", 0).has_value() && !centerOf("Restart CppDesk", 0).has_value());
+    TEST_ASSERT(centerOf("Ready for connections", 0).has_value());
+
+    {   // Two more snapshot states show the card on every platform.
+        const auto names = AppUi::snapshotStateNames();
+        TEST_ASSERT(names.size() >= 2 && names[names.size() - 2] == "dashboard_mac_permissions" && names.back() == "dashboard_mac_restart");
+        FakeShell plain;
+        TEST_ASSERT(renderAppState(id, net, plain, "dashboard_mac_permissions").find("|Allow screen sharing") != npos);
+        const std::string restartState = renderAppState(id, net, plain, "dashboard_mac_restart");
+        TEST_ASSERT(restartState.find("|Restart CppDesk") != npos);
+        TEST_ASSERT(restartState.find("|Allow...") == npos || restartState.find("|Allow screen sharing") != npos);
+    }
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
 void testMacInputLogic() {
     std::cout << "[TEST 82] Mac host input logic (drags, click counts, key and point mapping)..." << std::endl;
     {   // A move while a button is held is a drag.
@@ -9496,6 +9607,7 @@ int main() {
         testLinuxInputHelpers(); std::cout << "Test 74 done\n" << std::flush;
         testMacInputLogic(); std::cout << "Test 82 done\n" << std::flush;
         testHostPermissionCard(); std::cout << "Test 86 done\n" << std::flush;
+        testHostPermissionUi(); std::cout << "Test 87 done\n" << std::flush;
         testMacFrameHelpers(); std::cout << "Test 84 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;

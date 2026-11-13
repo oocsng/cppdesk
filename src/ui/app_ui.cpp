@@ -1277,10 +1277,15 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
                        }, ui::FontRole::Small);
         }
     } else {
-        float midY = hostBox.centerY();
-        drawPulseDot(hx + 6.0f, midY - 10.0f, 4.2f, COL_SUCCESS, alpha);
-        drawText("Ready for connections", { hx + 18.0f, midY - 22.0f, hrx, midY + 2.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
-        drawText("Your desktop is ready to share.", { hx + 18.0f, midY + 2.0f, hrx, midY + 24.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+        const ui::HostPermissionCard permCard = hostPermissionsActive() ? hostPermissionCard() : ui::HostPermissionCard{};
+        if (permCard.visible) {
+            drawHostPermissionCard(hostBox, permCard, alpha);
+        } else {
+            float midY = hostBox.centerY();
+            drawPulseDot(hx + 6.0f, midY - 10.0f, 4.2f, COL_SUCCESS, alpha);
+            drawText("Ready for connections", { hx + 18.0f, midY - 22.0f, hrx, midY + 2.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
+            drawText("Your desktop is ready to share.", { hx + 18.0f, midY + 2.0f, hrx, midY + 24.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+        }
     }
 
     // ========== RIGHT COLUMN: REMOTE DESK & SAVED/NEARBY DESKS ==========
@@ -3515,6 +3520,34 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
+        if (hostPermissionsActive()) {
+            // Mac permissions: what macOS has allowed, with a button for each one that is still off.
+            UiRect permBox = { cx, cy, crx, cy + 112.0f };
+            fillRoundRect(permBox, 12.0f, COL_BG_SUBTLE);
+            strokeRoundRect(permBox, 12.0f, COL_BORDER);
+            drawText("MAC PERMISSIONS", { permBox.left + 16.0f, permBox.top + 8.0f, permBox.right - 16.0f, permBox.top + 22.0f },
+                     ui::FontRole::Small, COL_TEXT_ACCENT);
+            struct PermRow { ui::HostPermission which; const char* name; bool granted; const char* id; };
+            const PermRow permRows[] = {
+                { ui::HostPermission::ScreenRecording, "Screen Recording", hostPerms_.screenRecording, "sett_perm_screen" },
+                { ui::HostPermission::Accessibility, "Accessibility", hostPerms_.accessibility, "sett_perm_access" },
+            };
+            float py = permBox.top + 28.0f;
+            for (const PermRow& r : permRows) {
+                drawPulseDot(permBox.left + 22.0f, py + 12.0f, 3.8f, r.granted ? COL_SUCCESS : COL_WARNING, alpha);
+                drawText(r.name, { permBox.left + 34.0f, py, permBox.left + 190.0f, py + 24.0f }, ui::FontRole::Body, COL_TEXT_PRIMARY);
+                drawText(r.granted ? "Allowed" : "Needs permission", { permBox.left + 190.0f, py, permBox.right - 112.0f, py + 24.0f },
+                         ui::FontRole::Small, r.granted ? COL_SUCCESS : COL_WARNING);
+                if (!r.granted) {
+                    drawButton(r.id, { permBox.right - 96.0f, py, permBox.right - 16.0f, py + 26.0f }, "Allow...",
+                               COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 7.0f,
+                               [this, which = r.which]() { openHostPermission(which); }, ui::FontRole::Small);
+                }
+                py += 36.0f;
+            }
+            cy = permBox.bottom + 12.0f;
+        }
+
         if (shell_->has(ui::Capability::WindowsService)) {
             // 1. Windows System Service
             UiRect svcBox = { cx, cy, crx, cy + 78.0f };
@@ -5051,8 +5084,10 @@ void AppUi::drawIncomingApprovalModal(float width, float height, float modalProg
     float alpha = std::clamp(modalProgress, 0.0f, 1.0f);
     fillRoundRect({ 0.0f, 0.0f, width, height }, 0.0f, rgba(28, 24, 20, 0.44f * alpha));
 
+    // A host whose macOS permissions are off says so before it accepts: the other person would see nothing.
+    const ui::HostPermissionCard permCard = hostPermissionsActive() ? hostPermissionCard() : ui::HostPermissionCard{};
     float mw = 440.0f;
-    float mh = 326.0f;
+    float mh = 326.0f + (permCard.approvalWarning.empty() ? 0.0f : 52.0f);
     UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
 
     float scale = 0.88f + 0.12f * modalProgress;
@@ -5074,6 +5109,12 @@ void AppUi::drawIncomingApprovalModal(float width, float height, float modalProg
     drawText("Wants to connect to your desktop.",
              { mx, my, mrx, my + 20.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 28.0f;
+
+    if (!permCard.approvalWarning.empty()) {
+        const float warnH = canvas_->measureTextBlock(permCard.approvalWarning, ui::FontRole::Tooltip, mrx - mx).y;
+        drawText(permCard.approvalWarning, { mx, my, mrx, my + warnH }, ui::FontRole::Tooltip, COL_WARNING);
+        my += warnH + 12.0f;
+    }
 
     drawToggleSwitch("modal_perm_input", { mx, my, mrx, my + 26.0f }, (modalPermissions_ & PERM_INPUT) != 0,
                      "Allow mouse and keyboard control", [this]() {
@@ -9080,6 +9121,61 @@ void AppUi::onText(const std::string& utf8) {
     }
 }
 
+void AppUi::refreshHostPermissions() {
+    hostPermsPolledMs_ = shell_->nowMs();
+    if (snapshotHostPerms_) {
+        hostPerms_ = *snapshotHostPerms_;
+        return;
+    }
+    if (!shell_->has(ui::Capability::HostPermissions)) {
+        hostPerms_ = {};
+        return;
+    }
+    hostPerms_ = shell_->hostPermissions();
+    if (hostPerms_.screenRecording) {   // granted: nothing to restart for
+        hostPermsOpenedSettings_ = false;
+        hostPermsReturned_ = false;
+    }
+}
+
+void AppUi::openHostPermission(ui::HostPermission which) {
+    shell_->requestHostPermission(which);
+    shell_->openHostPermissionSettings(which);
+    if (which == ui::HostPermission::ScreenRecording) hostPermsOpenedSettings_ = true;
+    shell_->invalidate();
+}
+
+// The "allow screen sharing" card that replaces "Ready for connections" while a macOS permission is missing.
+void AppUi::drawHostPermissionCard(const UiRect& box, const ui::HostPermissionCard& card, float alpha) {
+    const float x = box.left + 18.0f, rx = box.right - 18.0f;
+    float y = box.top + 14.0f;
+    canvas_->pushClip(box);   // a short window shows the top of the card instead of spilling out of the box
+    drawText(card.title, { x, y, rx, y + 24.0f }, ui::FontRole::Subheading, withAlpha(COL_TEXT_PRIMARY, alpha));
+    y += 28.0f;
+    const float bodyH = canvas_->measureTextBlock(card.body, ui::FontRole::Tooltip, rx - x).y;
+    drawText(card.body, { x, y, rx, y + bodyH }, ui::FontRole::Tooltip, withAlpha(COL_TEXT_SECONDARY, alpha));
+    y += bodyH + 12.0f;
+    for (const auto& row : card.rows) {
+        const size_t colon = row.label.find(": ");
+        const std::string name = colon == std::string::npos ? row.label : row.label.substr(0, colon);
+        const std::string what = colon == std::string::npos ? std::string() : row.label.substr(colon + 2);
+        const float btnW = 76.0f;
+        drawText(name, { x, y, rx - btnW - 8.0f, y + 18.0f }, ui::FontRole::BodyBold, withAlpha(COL_TEXT_PRIMARY, alpha));
+        drawText(what, { x, y + 18.0f, rx - btnW - 8.0f, y + 36.0f }, ui::FontRole::Small, withAlpha(COL_TEXT_SECONDARY, alpha));
+        drawButton(row.which == ui::HostPermission::ScreenRecording ? "btn_perm_screen" : "btn_perm_access",
+                   { rx - btnW, y + 3.0f, rx, y + 33.0f }, "Allow...",
+                   COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f,
+                   [this, which = row.which]() { openHostPermission(which); }, ui::FontRole::Small);
+        y += 42.0f;
+    }
+    if (card.needsRestart) {
+        drawButton("btn_perm_restart", { x, y + 2.0f, rx, y + 34.0f }, "Restart CppDesk",
+                   COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f,
+                   [this]() { shell_->relaunchApp(); }, ui::FontRole::Small);
+    }
+    canvas_->popClip();
+}
+
 void AppUi::onFocusChanged(bool focused) {
     if (!focused) {
         mouseLeftDown_ = false;
@@ -9091,6 +9187,11 @@ void AppUi::onFocusChanged(bool focused) {
     }
     if (notificationMgr_) {
         notificationMgr_->stopFlash();
+    }
+    if (hostPermissionsActive()) {   // back from System Settings, perhaps: look again at once
+        refreshHostPermissions();
+        if (hostPermsOpenedSettings_ && !hostPerms_.screenRecording) hostPermsReturned_ = true;
+        shell_->invalidate();
     }
     if (activeTab_ == ActiveTab::RemoteSession) {
         network_.markViewerCanvasFullDirty();
@@ -9131,6 +9232,13 @@ void AppUi::onResized() {
 
 void AppUi::onTick() {
     uint64_t tickNow = shell_->nowMs();
+    if (hostPermissionsActive() && !snapshotHostPerms_ && tickNow - hostPermsPolledMs_ >= 1000) {
+        const ui::HostPermissionStatus before = hostPerms_;
+        refreshHostPermissions();
+        if (before.screenRecording != hostPerms_.screenRecording || before.accessibility != hostPerms_.accessibility) {
+            shell_->invalidate();
+        }
+    }
     if (remoteFilePane_.expireLoading(tickNow)) {
         showToast(remoteFilePane_.statusMessage, true);
         shell_->invalidate();
@@ -9477,6 +9585,7 @@ AppUi::AppUi(IdentityManager& identity, NetworkEngine& network, ui::PlatformShel
     updateActivePalette(themeAnimT_);
     updateTotpQrMatrix();
     privacyKeywordsEdit_ = s.privacyCloakKeywords;
+    refreshHostPermissions();
 
     // Unit star (outer radius 1), scaled and translated when drawn.
     constexpr float PI = 3.14159265f;
@@ -9538,12 +9647,15 @@ std::vector<std::string> AppUi::snapshotStateNames() {
              "settings_audio", "settings_permissions", "settings_2fa", "settings_network", "settings_privacy",
              "settings_system", "settings_about", "session_view", "session_tabs_3", "drawer_file_transfer",
              "drawer_file_manager", "drawer_sync", "chat_long_text", "modal_approval", "modal_totp", "modal_run_task",
-             "modal_address_book", "modal_recording_player", "modal_omnibar", "toast", "tooltip" };
+             "modal_address_book", "modal_recording_player", "modal_omnibar", "toast", "tooltip",
+             "dashboard_mac_permissions", "dashboard_mac_restart" };
 }
 
 void AppUi::applySnapshotState(const std::string& name) {
     snapshotFrozen_ = true;
     snapshotPerFrame_ = nullptr;
+    snapshotHostPerms_.reset();
+    snapshotHostPermsReturned_ = false;
     // The audio settings page would open the microphone; snapshots must not, and a live level meter
     // would make the output differ run to run.
     voiceMonitorAttempted_ = true;
@@ -9604,6 +9716,15 @@ void AppUi::applySnapshotState(const std::string& name) {
         drawerTab_ = DrawerTab::LiveChat;
         chatInput_ = "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E \xF0\x9F\x96\xA5 " + std::string(700, 'x');
         focusedField_ = FocusedField::ChatInput;
+    } else if (name == "dashboard_mac_permissions") {
+        activeTab_ = ActiveTab::Dashboard;
+        snapshotHostPerms_ = ui::HostPermissionStatus{ false, false };
+        refreshHostPermissions();
+    } else if (name == "dashboard_mac_restart") {
+        activeTab_ = ActiveTab::Dashboard;
+        snapshotHostPerms_ = ui::HostPermissionStatus{ false, true };
+        snapshotHostPermsReturned_ = true;
+        refreshHostPermissions();
     } else if (name == "modal_approval") {
         activeTab_ = ActiveTab::Dashboard;
         snapshotPerFrame_ = [](AppUi& a) { a.modalAnimT_ = 1.0f; a.modalAnimVel_ = 0.0f; };
