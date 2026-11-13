@@ -42,12 +42,12 @@ jobs:
       - name: Smoke test the AppImage
         run: |
           ./out/CppDesk-x86_64.AppImage --appimage-extract-and-run --ui-snapshot /tmp/ai
-          test "$(ls /tmp/ai/*.png | wc -l)" -eq 28
+          test "$(ls /tmp/ai/*.png | wc -l)" -eq 30
       - name: Smoke test the .deb
         run: |
           sudo apt-get install -y "./out/cppdesk_${VERSION}_amd64.deb"
           cppdesk --ui-snapshot /tmp/deb
-          test "$(ls /tmp/deb/*.png | wc -l)" -eq 28
+          test "$(ls /tmp/deb/*.png | wc -l)" -eq 30
       - uses: actions/upload-artifact@v4
         with:
           name: linux-packages
@@ -73,12 +73,12 @@ jobs:
         run: |
           chmod +x out/CppDesk-x86_64.AppImage
           out/CppDesk-x86_64.AppImage --appimage-extract-and-run --ui-snapshot /tmp/clean
-          test "$(ls /tmp/clean/*.png | wc -l)" -eq 28
+          test "$(ls /tmp/clean/*.png | wc -l)" -eq 30
       - name: Install and run the .deb
         run: |
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ./out/cppdesk_*_amd64.deb
           cppdesk --ui-snapshot /tmp/deb
-          test "$(ls /tmp/deb/*.png | wc -l)" -eq 28
+          test "$(ls /tmp/deb/*.png | wc -l)" -eq 30
 
   upload:
     needs: [build, packages-on-clean-system]

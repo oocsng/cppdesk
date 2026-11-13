@@ -1234,7 +1234,7 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
     curY = unattBox.bottom + 16.0f;
 
     // Host Session Status Box
-    auto hStatus = network_.hostSessionStatus();
+    auto hStatus = snapshotHostStatus_ ? *snapshotHostStatus_ : network_.hostSessionStatus();
     UiRect hostBox = { lx, curY, rx, leftCol.bottom - 22.0f };
     fillRoundRect(hostBox, 13.0f, withAlpha(hStatus.active ? COL_BG_CARD_ALT : COL_BG_SUBTLE, alpha));
     strokeRoundRect(hostBox, 13.0f, withAlpha(hStatus.active ? COL_BORDER_ALT : COL_BORDER, alpha), 1.0f);
@@ -1251,25 +1251,39 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
         drawText(who, { hx, hy, hrx, hy + 24.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
         hy += 26.0f;
 
+        // Screen sharing on Wayland: what the desktop said, when there is something to say. The switches give way
+        // before the Disconnect button does.
+        const wayland::NoticeText shareText = wayland::describeShareNotice(currentShareNotice());
+        const float discTop = hostBox.bottom - 8.0f - 32.0f;
+        if (shareText.visible) {
+            drawText(shareText.title, { hx, hy, hrx, hy + 20.0f }, ui::FontRole::BodyBold, COL_WARNING);
+            hy += 22.0f;
+            const float noticeH = canvas_->measureTextBlock(shareText.body, ui::FontRole::Tooltip, hrx - hx).y;
+            drawText(shareText.body, { hx, hy, hrx, hy + noticeH }, ui::FontRole::Tooltip, COL_TEXT_SECONDARY);
+            hy += noticeH + 8.0f;
+        }
+        const auto roomForSwitch = [&]() { return !shareText.visible || hy + 24.0f <= discTop - 4.0f; };
+
         uint8_t perms = hStatus.permissions;
-        drawToggleSwitch("perm_host_input", { hx, hy, hrx, hy + 24.0f }, (perms & PERM_INPUT) != 0,
+        if (roomForSwitch()) drawToggleSwitch("perm_host_input", { hx, hy, hrx, hy + 24.0f }, (perms & PERM_INPUT) != 0,
                          "Mouse & Keyboard", [this, perms]() {
                              network_.updateHostSessionPermissions(perms ^ PERM_INPUT);
                          });
         hy += 28.0f;
-        drawToggleSwitch("perm_host_clip", { hx, hy, hrx, hy + 24.0f }, (perms & PERM_CLIPBOARD) != 0,
+        if (roomForSwitch()) drawToggleSwitch("perm_host_clip", { hx, hy, hrx, hy + 24.0f }, (perms & PERM_CLIPBOARD) != 0,
                          "Clipboard", [this, perms]() {
                              network_.updateHostSessionPermissions(perms ^ PERM_CLIPBOARD);
                          });
         hy += 28.0f;
-        drawToggleSwitch("perm_host_file", { hx, hy, hrx, hy + 24.0f }, (perms & PERM_FILE_TRANSFER) != 0,
+        if (roomForSwitch()) drawToggleSwitch("perm_host_file", { hx, hy, hrx, hy + 24.0f }, (perms & PERM_FILE_TRANSFER) != 0,
                          "File Transfer", [this, perms]() {
                              network_.updateHostSessionPermissions(perms ^ PERM_FILE_TRANSFER);
                          });
         hy += 30.0f;
 
-        if (hy + 32.0f <= hostBox.bottom - 8.0f) {
-            UiRect discHostBtn = { hx, hy, hrx, hy + 32.0f };
+        const float discY = (shareText.visible && hy + 32.0f > hostBox.bottom - 8.0f) ? discTop : hy;
+        if (discY + 32.0f <= hostBox.bottom - 8.0f) {
+            UiRect discHostBtn = { hx, discY, hrx, discY + 32.0f };
             drawButton("btn_disc_host", discHostBtn, "Disconnect",
                        COL_DANGER, COL_DANGER_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
                            network_.disconnectHostClient();
@@ -3519,6 +3533,22 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                                   : "Manage notifications, the tray icon, and cppdesk:// links.",
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
+
+        const wayland::NoticeText shareText = wayland::describeShareNotice(currentShareNotice());
+        if (shareText.visible) {
+            const float bodyH = canvas_->measureTextBlock(shareText.body, ui::FontRole::Small, crx - cx - 32.0f).y;
+            UiRect shareBox = { cx, cy, crx, cy + 62.0f + bodyH };
+            fillRoundRect(shareBox, 12.0f, COL_BG_SUBTLE);
+            strokeRoundRect(shareBox, 12.0f, COL_BORDER);
+            drawText("WAYLAND SCREEN SHARING (EXPERIMENTAL)",
+                     { shareBox.left + 16.0f, shareBox.top + 8.0f, shareBox.right - 16.0f, shareBox.top + 22.0f },
+                     ui::FontRole::Small, COL_TEXT_ACCENT);
+            drawText(shareText.title, { shareBox.left + 16.0f, shareBox.top + 28.0f, shareBox.right - 16.0f, shareBox.top + 50.0f },
+                     ui::FontRole::Body, COL_TEXT_PRIMARY);
+            drawText(shareText.body, { shareBox.left + 16.0f, shareBox.top + 52.0f, shareBox.right - 16.0f, shareBox.top + 52.0f + bodyH },
+                     ui::FontRole::Small, COL_TEXT_SECONDARY);
+            cy = shareBox.bottom + 12.0f;
+        }
 
         if (hostPermissionsActive()) {
             // Mac permissions: what macOS has allowed, with a button for each one that is still off.
@@ -9232,6 +9262,16 @@ void AppUi::onResized() {
 
 void AppUi::onTick() {
     uint64_t tickNow = shell_->nowMs();
+    if (const wayland::ShareNotice notice = currentShareNotice();
+        notice.state != shareNoticeSeen_.state || notice.reason != shareNoticeSeen_.reason) {
+        shareNoticeSeen_ = notice;
+        shell_->invalidate();
+    }
+    if (std::string token; !snapshotShareNotice_ && network_.takeRestoreTokenForSave(token)) {
+        AppSettings ns = identity_.settings();
+        ns.waylandRestoreToken = token;   // the desktop's remembered answer, kept with the other settings
+        identity_.updateSettings(ns);
+    }
     if (hostPermissionsActive() && !snapshotHostPerms_ && tickNow - hostPermsPolledMs_ >= 1000) {
         const ui::HostPermissionStatus before = hostPerms_;
         refreshHostPermissions();
@@ -9581,6 +9621,7 @@ AppUi::AppUi(IdentityManager& identity, NetworkEngine& network, ui::PlatformShel
     network_.setAudioMuted(s.audioMutedDefault);
     network_.setVoiceInputDevice(s.audioInputDeviceId);
     network_.setVoiceOutputDevice(s.audioOutputDeviceId);
+    network_.setWaylandRestoreToken(s.waylandRestoreToken);
     network_.configurePrivacyCurtain(s.privacyCustomNotice, s.privacyBrandName, s.privacyShowDeskId);
     updateActivePalette(themeAnimT_);
     updateTotpQrMatrix();
@@ -9648,7 +9689,7 @@ std::vector<std::string> AppUi::snapshotStateNames() {
              "settings_system", "settings_about", "session_view", "session_tabs_3", "drawer_file_transfer",
              "drawer_file_manager", "drawer_sync", "chat_long_text", "modal_approval", "modal_totp", "modal_run_task",
              "modal_address_book", "modal_recording_player", "modal_omnibar", "toast", "tooltip",
-             "dashboard_mac_permissions", "dashboard_mac_restart" };
+             "dashboard_mac_permissions", "dashboard_mac_restart", "dashboard_wayland_denied", "dashboard_wayland_view_only" };
 }
 
 void AppUi::applySnapshotState(const std::string& name) {
@@ -9656,6 +9697,8 @@ void AppUi::applySnapshotState(const std::string& name) {
     snapshotPerFrame_ = nullptr;
     snapshotHostPerms_.reset();
     snapshotHostPermsReturned_ = false;
+    snapshotShareNotice_.reset();
+    snapshotHostStatus_.reset();
     // The audio settings page would open the microphone; snapshots must not, and a live level meter
     // would make the output differ run to run.
     voiceMonitorAttempted_ = true;
@@ -9725,6 +9768,16 @@ void AppUi::applySnapshotState(const std::string& name) {
         snapshotHostPerms_ = ui::HostPermissionStatus{ false, true };
         snapshotHostPermsReturned_ = true;
         refreshHostPermissions();
+    } else if (name == "dashboard_wayland_denied" || name == "dashboard_wayland_view_only") {
+        activeTab_ = ActiveTab::Dashboard;
+        HostSessionStatus viewer;
+        viewer.active = true;
+        viewer.viewerDeskId = 123456789;
+        viewer.viewerHostname = "Office";
+        viewer.viewerIp = "192.168.1.20";
+        snapshotHostStatus_ = viewer;
+        snapshotShareNotice_ = wayland::ShareNotice{ name == "dashboard_wayland_denied" ? wayland::ShareState::Denied
+                                                                                        : wayland::ShareState::ViewOnly, "" };
     } else if (name == "modal_approval") {
         activeTab_ = ActiveTab::Dashboard;
         snapshotPerFrame_ = [](AppUi& a) { a.modalAnimT_ = 1.0f; a.modalAnimVel_ = 0.0f; };

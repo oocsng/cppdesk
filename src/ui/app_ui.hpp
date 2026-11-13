@@ -228,6 +228,14 @@ private:
     void openHostPermission(ui::HostPermission which);
     void drawHostPermissionCard(const UiRect& box, const ui::HostPermissionCard& card, float alpha);
 
+    // Screen sharing on a Wayland desktop: the notice the host session publishes, redrawn when it changes.
+    wayland::ShareNotice    shareNoticeSeen_;
+    std::optional<wayland::ShareNotice> snapshotShareNotice_;   // a snapshot state's stand-in for the engine's
+    std::optional<HostSessionStatus>    snapshotHostStatus_;    // ... and for a viewer being connected
+    wayland::ShareNotice currentShareNotice() const {
+        return snapshotShareNotice_ ? *snapshotShareNotice_ : network_.shareNotice();
+    }
+
 
 private:
 

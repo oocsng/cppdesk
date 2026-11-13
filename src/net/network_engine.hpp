@@ -249,6 +249,10 @@ public:
     wayland::ShareNotice shareNotice() const { return shareHub_.notice(); }
     void setWaylandRestoreToken(const std::string& token) { shareHub_.setRestoreToken(token); }
     bool takeRestoreTokenForSave(std::string& token) { return shareHub_.takeTokenForSave(token); }
+    std::string waylandRestoreToken() const { return shareHub_.restoreToken(); }
+    // Stand-ins for what a host session publishes (tests).
+    void setShareNoticeForTest(const wayland::ShareNotice& n) { shareHub_.setNotice(n); }
+    void pushRestoreTokenForTest(const std::string& token) { shareHub_.pushToken(token); }
 
     // Copy latest decoded remote frame if frameSeq > lastSeenSeq
     bool copyLatestViewerFrame(

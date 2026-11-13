@@ -9422,12 +9422,66 @@ void testHostPermissionUi() {
 
     {   // Two more snapshot states show the card on every platform.
         const auto names = AppUi::snapshotStateNames();
-        TEST_ASSERT(names.size() >= 2 && names[names.size() - 2] == "dashboard_mac_permissions" && names.back() == "dashboard_mac_restart");
+        TEST_ASSERT(names.size() >= 4 && names[names.size() - 4] == "dashboard_mac_permissions" && names[names.size() - 3] == "dashboard_mac_restart");
         FakeShell plain;
         TEST_ASSERT(renderAppState(id, net, plain, "dashboard_mac_permissions").find("|Allow screen sharing") != npos);
         const std::string restartState = renderAppState(id, net, plain, "dashboard_mac_restart");
         TEST_ASSERT(restartState.find("|Restart CppDesk") != npos);
         TEST_ASSERT(restartState.find("|Allow...") == npos || restartState.find("|Allow screen sharing") != npos);
+    }
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
+void testWaylandShareNoticeUi() {
+    std::cout << "[TEST 93] Wayland share notice in the dashboard and settings; the restore token saved by the tick..." << std::endl;
+    using namespace cppdesk::wayland;
+    IdentityManager id(4251);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    const auto npos = std::string::npos;
+    FakeShell shell;
+
+    {   // Nothing to say: nothing is drawn
+        TEST_ASSERT(renderAppState(id, net, shell, "dashboard_light").find("|Screen sharing") == npos);
+        TEST_ASSERT(renderAppState(id, net, shell, "settings_system").find("WAYLAND SCREEN SHARING") == npos);
+    }
+    {   // Refused, in a session: the dashboard's session box says so, in plain words, on every platform
+        const std::string denied = renderAppState(id, net, shell, "dashboard_wayland_denied");
+        TEST_ASSERT(denied.find("|ACTIVE SESSION") != npos && denied.find("|Screen sharing is off") != npos);
+        TEST_ASSERT(denied.find("|Disconnect") != npos);                    // the way out stays on screen
+        TEST_ASSERT(denied.find("Mac") == npos && denied.find("macOS") == npos);
+        const std::string viewOnly = renderAppState(id, net, shell, "dashboard_wayland_view_only");
+        TEST_ASSERT(viewOnly.find("|Screen shared, control is off") != npos && viewOnly.find("|Disconnect") != npos);
+    }
+    {   // Settings: the same words, labelled experimental; gone again when there is nothing to say
+        net.setShareNoticeForTest({ShareState::Denied, ""});
+        const std::string settings = renderAppState(id, net, shell, "settings_system");
+        TEST_ASSERT(settings.find("|WAYLAND SCREEN SHARING (EXPERIMENTAL)") != npos && settings.find("|Screen sharing is off") != npos);
+        net.setShareNoticeForTest({ShareState::Running, ""});
+        TEST_ASSERT(renderAppState(id, net, shell, "settings_system").find("WAYLAND SCREEN SHARING") == npos);
+        net.setShareNoticeForTest({});
+        TEST_ASSERT(renderAppState(id, net, shell, "settings_system").find("WAYLAND SCREEN SHARING") == npos);
+    }
+    {   // The restore token: loaded from the settings at start, saved by the tick once per change
+        AppSettings s = id.settings();
+        s.waylandRestoreToken = "from-settings";
+        id.updateSettings(s);
+        AppUi app(id, net, shell, "");
+        TEST_ASSERT(net.waylandRestoreToken() == "from-settings");
+        app.onTick();
+        TEST_ASSERT(id.settings().waylandRestoreToken == "from-settings");
+        net.pushRestoreTokenForTest("fresh");
+        app.onTick();
+        TEST_ASSERT(id.settings().waylandRestoreToken == "fresh");
+        net.pushRestoreTokenForTest("");           // the desktop gave none: the old one is stale
+        app.onTick();
+        TEST_ASSERT(id.settings().waylandRestoreToken.empty());
+    }
+    {   // The two new states close the list of snapshots
+        const auto names = AppUi::snapshotStateNames();
+        TEST_ASSERT(names.size() >= 2 && names[names.size() - 2] == "dashboard_wayland_denied" &&
+                    names.back() == "dashboard_wayland_view_only");
     }
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
@@ -10380,6 +10434,7 @@ int main() {
         testMacInputLogic(); std::cout << "Test 82 done\n" << std::flush;
         testHostPermissionCard(); std::cout << "Test 86 done\n" << std::flush;
         testHostPermissionUi(); std::cout << "Test 87 done\n" << std::flush;
+        testWaylandShareNoticeUi(); std::cout << "Test 93 done\n" << std::flush;
         testEcdhKnownVector(); std::cout << "Test 88 done\n" << std::flush;
         testMacFrameHelpers(); std::cout << "Test 84 done\n" << std::flush;
         testWaylandHelpers(); std::cout << "Test 89 done\n" << std::flush;
