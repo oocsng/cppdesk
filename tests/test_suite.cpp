@@ -443,11 +443,17 @@ void testEndToEndSessionAndFileTransfer() {
     std::cout << "  -> Testing Brute-Force Rate Limiting (5 bad attempts -> 60s lockout)...\n";
     hostNet.clearRateLimitRecords();
     bool sawRateLimited = false;
-    for (int attempt = 1; attempt <= 10; ++attempt) {
+    std::string attemptLog;   // what each attempt ended with, shown if the lockout is never seen
+    // An attempt that never reaches the password check (the host still tearing down the previous session answers
+    // "busy", or the connection drops) does not count towards the 5 that trigger the lockout, so allow plenty of
+    // attempts and give the host time to finish each one on a slow machine.
+    for (int attempt = 1; attempt <= 40 && !sawRateLimited; ++attempt) {
         TEST_ASSERT(viewerNet.connectToRemote(targetIdStr, "WrongPasswordAttempt"));
-        for (int w = 0; w < 60; ++w) {
+        std::string ended = "no answer";
+        for (int w = 0; w < 150; ++w) {
             auto st = viewerNet.viewerStats();
             if (st.state == ViewerConnectionState::Error) {
+                ended = st.statusMessage;
                 if (st.statusMessage.find("Too many failed") != std::string::npos ||
                     st.statusMessage.find("Locked for 60s") != std::string::npos) {
                     sawRateLimited = true;
@@ -456,10 +462,11 @@ void testEndToEndSessionAndFileTransfer() {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(30));
         }
+        attemptLog += "    attempt " + std::to_string(attempt) + ": " + ended + "\n";
         viewerNet.disconnectViewer();
-        if (sawRateLimited) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
     }
+    if (!sawRateLimited) std::cout << "  lockout never seen; the attempts ended with:\n" << attemptLog;
     TEST_ASSERT(sawRateLimited);
     hostNet.clearRateLimitRecords();
 
