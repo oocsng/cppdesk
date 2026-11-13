@@ -10,14 +10,22 @@
 #include <ApplicationServices/ApplicationServices.h>
 #endif
 #include "mac_input_logic.hpp"
+#if defined(__linux__)
+#include "../capture/wayland_share.hpp"
+#endif
 #include <algorithm>
 #include <chrono>
 #include <vector>
 #include <cmath>
 #include <mutex>
 #include <atomic>
+#include <cstdlib>
 
 namespace cppdesk {
+
+static std::atomic<int> s_x11InputCalls{0};
+
+int InputInjector::x11InputCallsForTest() { return s_x11InputCalls.load(); }
 
 uint16_t InputInjector::mapVkToMacKeyCode(uint16_t vk) {
     switch (vk) {
@@ -764,9 +772,24 @@ Display* getCachedX11Display() {
     return s_dpy;
 }
 #endif
+
+// On a Wayland desktop the input goes through the desktop's portal, or is dropped (nobody has allowed it yet, or
+// control is off): XTest would reach only X apps and would bypass the person's answer. XTest is for X11 sessions
+// and for a desktop without a portal. True when the event is dealt with here.
+template <class Send>
+bool viaWayland(Send&& send) {
+    if (auto share = wayland::WaylandShare::active()) {
+        if (share->x11FallbackAllowed()) return false;
+        send(*share);
+        return true;
+    }
+    return wayland::isWaylandSession([](const char* name) { return std::getenv(name); });
+}
 } // namespace
 
 void InputInjector::injectMouseMove(float normX, float normY, const MonitorDesc& monitor) {
+    if (viaWayland([&](wayland::WaylandShare& s) { s.pointerMove(normX, normY); })) return;
+    ++s_x11InputCalls;
 #if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
     Display* dpy = getCachedX11Display();
     if (!dpy) return;
@@ -784,6 +807,8 @@ void InputInjector::injectMouseMove(float normX, float normY, const MonitorDesc&
 }
 
 void InputInjector::injectMouseButton(MouseButtonId button, bool isDown, float normX, float normY, const MonitorDesc& monitor) {
+    if (viaWayland([&](wayland::WaylandShare& s) { s.pointerButton(button, isDown, normX, normY); })) return;
+    ++s_x11InputCalls;
 #if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
     Display* dpy = getCachedX11Display();
     if (!dpy) return;
@@ -807,6 +832,8 @@ void InputInjector::injectMouseButton(MouseButtonId button, bool isDown, float n
 }
 
 void InputInjector::injectMouseWheel(int32_t verticalDelta, int32_t horizontalDelta) {
+    if (viaWayland([&](wayland::WaylandShare& s) { s.wheel(verticalDelta, horizontalDelta); })) return;
+    ++s_x11InputCalls;
 #if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
     Display* dpy = getCachedX11Display();
     if (!dpy) return;
@@ -835,6 +862,8 @@ void InputInjector::injectMouseWheel(int32_t verticalDelta, int32_t horizontalDe
 void InputInjector::injectKeyEvent(uint16_t vkCode, uint16_t scanCode, bool isDown, bool isExtended) {
     (void)scanCode;
     (void)isExtended;
+    if (viaWayland([&](wayland::WaylandShare& s) { s.key(vkCode, isDown); })) return;
+    ++s_x11InputCalls;
 #if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
     Display* dpy = getCachedX11Display();
     if (!dpy) return;
@@ -853,6 +882,8 @@ void InputInjector::injectKeyEvent(uint16_t vkCode, uint16_t scanCode, bool isDo
 }
 
 void InputInjector::releaseAllModifiers() {
+    if (viaWayland([](wayland::WaylandShare& s) { s.releaseAll(); })) return;
+    ++s_x11InputCalls;
 #if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
     Display* dpy = getCachedX11Display();
     if (!dpy) return;

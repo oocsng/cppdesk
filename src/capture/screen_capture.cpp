@@ -1,6 +1,9 @@
 #include "screen_capture.hpp"
 #include <cstdlib>
 #include "../simd/simd_kernels.hpp"
+#if defined(__linux__)
+#include "wayland_share.hpp"
+#endif
 #if defined(__APPLE__)
 #include "mac_screen_capture.hpp"
 #include "mac_frame.hpp"
@@ -928,15 +931,23 @@ struct ScreenCapturer::DxgiImpl {
     ~DxgiImpl() { release(); }
 };
 
+static std::atomic<int> g_x11CaptureCalls{0};
+
 ScreenCapturer::ScreenCapturer()
     : dxgi_(std::make_unique<DxgiImpl>())
 {
     TileCodec::initGdiPlus();
+#if defined(__linux__)
+    waylandMode_ = wayland::isWaylandSession([](const char* name) { return std::getenv(name); });
+#endif
     enumerateMonitors();
     selectMonitor(0);
 }
 
 ScreenCapturer::~ScreenCapturer() {
+#if defined(__linux__)
+    if (wayland_) wayland_->close();   // a permission dialog still open goes away with the session
+#endif
     releaseDxgi();
     releaseGdiResources();
 }
@@ -996,6 +1007,22 @@ std::vector<MonitorDesc> ScreenCapturer::enumerateMonitors() {
         }
     }
 #elif defined(__linux__) || defined(__unix__)
+#if defined(__linux__)
+    if (waylandMode_) {   // the real size is known only once the desktop has shared a screen
+        MonitorDesc d;
+        d.index = 0;
+        d.x = 0;
+        d.y = 0;
+        d.width = 1280;
+        d.height = 720;
+        d.isPrimary = true;
+        d.name = "Screen shared through your desktop";
+        d.isVirtual = false;
+        d.virtualId = 0;
+        monitors_.push_back(d);
+        return monitors_;
+    }
+#endif
 #if __has_include(<X11/Xlib.h>)
     ensureXlibThreads();
     Display* dpy = XOpenDisplay(nullptr);
@@ -1587,6 +1614,7 @@ bool ScreenCapturer::captureViaCoreGraphics() {
 
 bool ScreenCapturer::captureViaX11() {
 #if (defined(__linux__) || defined(__unix__)) && __has_include(<X11/Xlib.h>)
+    ++g_x11CaptureCalls;
     ensureXlibThreads();
     Display* dpy = XOpenDisplay(nullptr);
     if (!dpy) return false;
@@ -1663,6 +1691,56 @@ bool ScreenCapturer::captureViaX11() {
 #endif
 }
 
+// The desktop's own screen sharing, on Wayland. The picture arrives from the desktop (PipeWire); until the person has
+// answered the desktop's question there is none, and if they refuse there never is: X11 is read only when there was
+// no desktop service to ask at all.
+bool ScreenCapturer::captureViaWayland() {
+#if defined(__linux__)
+    if (!wayland_) {
+        wayland_ = wayland::WaylandShare::make(restoreToken_);
+        wayland::WaylandShare::setActive(wayland_);
+        wayland_->begin();
+    }
+    if (wayland_->x11FallbackAllowed()) {
+        waylandMode_ = false;
+        enumerateMonitors();
+        selectMonitor(0);
+        return captureViaX11();
+    }
+    int w = 0, h = 0;
+    if (!wayland_->latestFrame(currentFrame_, w, h)) return false;
+    if (w != frameW_ || h != frameH_) {
+        frameW_ = w;
+        frameH_ = h;
+        activeMonitor_.width = w;
+        activeMonitor_.height = h;
+        prevTileHashes_.clear();
+    }
+    hasValidFrame_ = true;
+    return true;
+#else
+    return false;
+#endif
+}
+
+wayland::ShareNotice ScreenCapturer::shareNotice() const {
+#if defined(__linux__)
+    if (wayland_) return wayland_->notice();
+#endif
+    return {};
+}
+
+bool ScreenCapturer::takeRestoreTokenChange(std::string& token) {
+#if defined(__linux__)
+    if (wayland_) return wayland_->takeTokenChange(token);
+#else
+    (void)token;
+#endif
+    return false;
+}
+
+int ScreenCapturer::x11CaptureCallsForTest() { return g_x11CaptureCalls.load(); }
+
 CursorState ScreenCapturer::captureCursorState() const {
     CursorState cs;
 #if defined(_WIN32)
@@ -1702,6 +1780,12 @@ CursorState ScreenCapturer::captureCursorState() const {
         cs.normY = std::clamp(static_cast<float>(relY) / std::max(1, frameH_), 0.0f, 1.0f);
     }
 #elif defined(__linux__) || defined(__unix__)
+#if defined(__linux__)
+    if (waylandMode_) {   // the cursor is drawn into the picture the desktop shares; a second one would show twice
+        cs.visible = false;
+        return cs;
+    }
+#endif
 #if __has_include(<X11/Xlib.h>)
     ensureXlibThreads();
     Display* dpy = XOpenDisplay(nullptr);
@@ -1777,7 +1861,11 @@ bool ScreenCapturer::captureDirtyTiles(
             return false;
         }
 #elif defined(__linux__) || defined(__unix__)
-        if (!captureViaX11()) {
+        if (waylandMode_) {
+            if (!captureViaWayland()) {
+                return false;
+            }
+        } else if (!captureViaX11()) {
             return false;
         }
 #endif

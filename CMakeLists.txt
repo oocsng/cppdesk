@@ -153,6 +153,7 @@ elseif(UNIX AND NOT APPLE)
         src/ui/canvas_cairo.cpp
         src/control/x11_clipboard.cpp
         src/capture/wayland_portal.cpp
+        src/capture/wayland_share.cpp
         src/capture/wayland_pipewire.cpp
     )
     # PipeWire is never linked (it is loaded at run time); only its headers are needed, and only to build the video receiver.

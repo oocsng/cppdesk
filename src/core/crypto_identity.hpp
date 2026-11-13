@@ -56,6 +56,8 @@ struct AppSettings {
     std::string   audioOutputDeviceName = "System Default";
 
     // Virtual Multi-Display Driver & Headless Emulation
+    // Remembered answer to the Wayland desktop's screen sharing question (a restore token), kept with the other settings
+    std::string   waylandRestoreToken = "";
     bool          autoVirtualDisplay = true;             // Auto-provision virtual display for headless host
 
     // Privacy Mode Curtain Screen Custom Branding & Notice

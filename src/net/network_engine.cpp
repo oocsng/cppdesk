@@ -1934,6 +1934,11 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         // 5. Initialize ScreenCapturer & send encrypted VIDEO_CONFIG
         ScreenCapturer capturer;
         capturer.setAutoHeadless(identity_.settings().autoVirtualDisplay);
+        capturer.setRestoreToken(shareHub_.restoreToken());
+        struct ShareNoticeReset {   // the notice belongs to this session
+            wayland::ShareHub& hub;
+            ~ShareNoticeReset() { hub.setNotice({}); }
+        } shareNoticeReset{shareHub_};
         auto monitors = capturer.enumerateMonitors();
         capturer.selectMonitor(0);
 
@@ -2883,7 +2888,10 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
             bool isKf = false;
             CursorState curState{};
 
-            if (capturer.captureDirtyTiles(wantKf, preset, dirtyTiles, isKf, curState)) {
+            const bool gotFrame = capturer.captureDirtyTiles(wantKf, preset, dirtyTiles, isKf, curState);
+            shareHub_.setNotice(capturer.shareNotice());
+            if (std::string shareToken; capturer.takeRestoreTokenChange(shareToken)) shareHub_.pushToken(shareToken);
+            if (gotFrame) {
                 // Detect dynamic desktop resolution change mid-session
                 if (capturer.frameWidth() != currentMonDesc.width || capturer.frameHeight() != currentMonDesc.height) {
                     {
