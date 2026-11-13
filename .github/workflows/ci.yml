@@ -55,9 +55,11 @@ jobs:
         run: cd build && ./CppDeskTests
       - name: Crash report
         if: failure()
+        env:
+          CPPDESK_CAPTURE_TEST_PATTERN: "1"
         run: |
-          sleep 8
-          for f in ~/Library/Logs/DiagnosticReports/CppDeskTests*; do echo "== $f"; head -c 12000 "$f"; done
+          cd build
+          lldb -b -o run -o "thread backtrace all" ./CppDeskTests 2>&1 | grep -v "^Test \|^\[TEST" | tail -150
       - name: Draw every screen
         # Offscreen through Core Graphics; the PNGs are what a Mac would show, for comparing with Windows and Linux.
         run: |
