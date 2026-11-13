@@ -5,6 +5,7 @@
 #include "../src/control/input_injector.hpp"
 #include "../src/control/mac_input_logic.hpp"
 #include "../src/capture/mac_frame.hpp"
+#include "../src/capture/wayland_helpers.hpp"
 #include "../src/control/clipboard_file_manager.hpp"
 #include "../src/net/network_engine.hpp"
 #include "../src/net/updater.hpp"
@@ -85,6 +86,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <map>
 
 // Counts single allocations above 256 MB so the hostile-input sweep can see a parser that
 // would honor an attacker-supplied size (the oversized request itself is refused).
@@ -9576,6 +9578,120 @@ void testUiGoldens() {
     std::filesystem::remove(id.configFilePath(), ec);
 }
 
+void testWaylandHelpers() {
+    std::cout << "[TEST 89] Wayland helpers: session detection, pixel packing, pointer mapping, notice text..." << std::endl;
+    using namespace cppdesk::wayland;
+    auto env = [](std::map<std::string, std::string> vars) {
+        return [vars](const char* name) -> const char* {
+            auto it = vars.find(name);
+            return it == vars.end() ? nullptr : it->second.c_str();
+        };
+    };
+    {   // Session detection
+        TEST_ASSERT(isWaylandSession(env({{"XDG_SESSION_TYPE", "wayland"}})));
+        TEST_ASSERT(isWaylandSession(env({{"XDG_SESSION_TYPE", "wayland"}, {"DISPLAY", ":0"}})));   // XWayland sets DISPLAY too
+        TEST_ASSERT(isWaylandSession(env({{"WAYLAND_DISPLAY", "wayland-0"}})));
+        TEST_ASSERT(!isWaylandSession(env({{"WAYLAND_DISPLAY", "wayland-0"}, {"DISPLAY", ":0"}, {"XDG_SESSION_TYPE", "x11"}})));
+        TEST_ASSERT(!isWaylandSession(env({{"XDG_SESSION_TYPE", "x11"}, {"DISPLAY", ":0"}})));
+        TEST_ASSERT(!isWaylandSession(env({{"XDG_SESSION_TYPE", "wayland"}, {"CPPDESK_FORCE_X11", "1"}})));
+        TEST_ASSERT(!isWaylandSession(env({})));
+    }
+    {   // convertToBgra: a 3x2 image whose rows are 20 bytes apart (padding 0xAA)
+        const int w = 3, h = 2;
+        const size_t stride = 20;
+        std::vector<uint8_t> src(stride * h, 0xAA);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                uint8_t* p = &src[y * stride + x * 4];
+                p[0] = static_cast<uint8_t>(10 + x + 3 * y);   // byte 0
+                p[1] = static_cast<uint8_t>(20 + x + 3 * y);   // byte 1
+                p[2] = static_cast<uint8_t>(30 + x + 3 * y);   // byte 2
+                p[3] = 0x77;                                    // byte 3: padding or alpha, never trusted
+            }
+        std::vector<uint8_t> dst(w * h * 4, 0);
+        // BGRx and BGRA: bytes are already B,G,R; alpha forced opaque
+        for (PixelFormat f : {PixelFormat::BGRx, PixelFormat::BGRA}) {
+            std::fill(dst.begin(), dst.end(), 0);
+            TEST_ASSERT(convertToBgra(f, src.data(), stride, w, h, dst.data()));
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    const uint8_t* d = &dst[(y * w + x) * 4];
+                    TEST_ASSERT(d[0] == 10 + x + 3 * y && d[1] == 20 + x + 3 * y && d[2] == 30 + x + 3 * y && d[3] == 0xFF);
+                }
+        }
+        // RGBx and RGBA: red and blue swap places
+        for (PixelFormat f : {PixelFormat::RGBx, PixelFormat::RGBA}) {
+            std::fill(dst.begin(), dst.end(), 0);
+            TEST_ASSERT(convertToBgra(f, src.data(), stride, w, h, dst.data()));
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    const uint8_t* d = &dst[(y * w + x) * 4];
+                    TEST_ASSERT(d[0] == 30 + x + 3 * y && d[1] == 20 + x + 3 * y && d[2] == 10 + x + 3 * y && d[3] == 0xFF);
+                }
+        }
+        std::fill(dst.begin(), dst.end(), 0x55);
+        TEST_ASSERT(!convertToBgra(PixelFormat::Unsupported, src.data(), stride, w, h, dst.data()));
+        TEST_ASSERT(dst[0] == 0x55);                                              // nothing written on refusal
+        TEST_ASSERT(!convertToBgra(PixelFormat::BGRA, src.data(), 8, w, h, dst.data()));   // stride too small for the width
+    }
+    {   // Pointer mapping uses the stream's logical size and never leaves it
+        StreamInfo s{42, 0, 0, 1440, 900};
+        auto p = pointForNormalized(0.5f, 0.5f, s, 2880, 1800);
+        TEST_ASSERT(p.nodeId == 42 && std::abs(p.x - 719.5) < 0.01 && std::abs(p.y - 449.5) < 0.01);
+        p = pointForNormalized(1.0f, 1.0f, s, 2880, 1800);
+        TEST_ASSERT(std::abs(p.x - 1439.0) < 0.01 && std::abs(p.y - 899.0) < 0.01);   // the last pixel, not one past it
+        p = pointForNormalized(0.0f, 0.0f, s, 2880, 1800);
+        TEST_ASSERT(p.x == 0.0 && p.y == 0.0);
+        p = pointForNormalized(-1.0f, 2.0f, s, 2880, 1800);
+        TEST_ASSERT(p.x == 0.0 && std::abs(p.y - 899.0) < 0.01);
+        StreamInfo offset{7, 1920, -200, 1440, 900};   // a second monitor: coordinates stay relative to the stream
+        p = pointForNormalized(1.0f, 0.0f, offset, 2880, 1800);
+        TEST_ASSERT(p.nodeId == 7 && std::abs(p.x - 1439.0) < 0.01 && p.y == 0.0);
+        StreamInfo noSize{9, 0, 0, 0, 0};              // a portal that reports no size: use the frame
+        p = pointForNormalized(1.0f, 1.0f, noSize, 2880, 1800);
+        TEST_ASSERT(std::abs(p.x - 2879.0) < 0.01 && std::abs(p.y - 1799.0) < 0.01);
+        p = pointForNormalized(0.5f, 0.5f, noSize, 0, 0);   // nothing known at all: stay at the origin
+        TEST_ASSERT(p.x == 0.0 && p.y == 0.0);
+    }
+    {   // Buttons and wheel
+        TEST_ASSERT(evdevButton(MouseButtonId::Left) == 0x110);
+        TEST_ASSERT(evdevButton(MouseButtonId::Right) == 0x111);
+        TEST_ASSERT(evdevButton(MouseButtonId::Middle) == 0x112);
+        TEST_ASSERT(wheelSteps(120) == 1 && wheelSteps(-120) == -1 && wheelSteps(240) == 2 && wheelSteps(-360) == -3);
+        TEST_ASSERT(wheelSteps(30) == 1 && wheelSteps(-30) == -1 && wheelSteps(0) == 0 && wheelSteps(200) == 1);
+    }
+    {   // Restore tokens only where RemoteDesktop knows them
+        auto none = policyForVersions(false, 0);
+        TEST_ASSERT(!none.useRemoteDesktop && !none.persist);
+        auto old = policyForVersions(true, 1);
+        TEST_ASSERT(old.useRemoteDesktop && !old.persist);
+        auto current = policyForVersions(true, 2);
+        TEST_ASSERT(current.useRemoteDesktop && current.persist);
+    }
+    {   // Notice text: only what needs saying, in plain words
+        auto text = [](ShareState st, const std::string& reason = "") { return describeShareNotice({st, reason}); };
+        TEST_ASSERT(!text(ShareState::Idle).visible && !text(ShareState::Running).visible);
+        const ShareState shown[] = {ShareState::WaitingForDialog, ShareState::ViewOnly, ShareState::Denied,
+                                    ShareState::Unavailable, ShareState::Closed, ShareState::Failed};
+        for (ShareState st : shown) {
+            NoticeText t = text(st, "the reason text");
+            TEST_ASSERT(t.visible && !t.title.empty() && !t.body.empty());
+            std::string all = t.title + " " + t.body;
+            for (auto& c : all) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (const char* jargon : {"portal", "pipewire", "d-bus", "dbus", "api"})
+                TEST_ASSERT(all.find(jargon) == std::string::npos);
+        }
+        TEST_ASSERT(text(ShareState::WaitingForDialog).body.find("ask") != std::string::npos);
+        TEST_ASSERT(text(ShareState::ViewOnly).body.find("control") != std::string::npos);
+        TEST_ASSERT(text(ShareState::Denied).body.find("not shared") != std::string::npos ||
+                    text(ShareState::Denied).body.find("off") != std::string::npos);
+        TEST_ASSERT(text(ShareState::Unavailable).body.find("X11") != std::string::npos ||
+                    text(ShareState::Unavailable).body.find("Xorg") != std::string::npos);
+        TEST_ASSERT(text(ShareState::Closed, "the reason text").body.find("the reason text") != std::string::npos);
+        TEST_ASSERT(text(ShareState::Failed, "the reason text").body.find("the reason text") != std::string::npos);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -9677,6 +9793,7 @@ int main() {
         testHostPermissionUi(); std::cout << "Test 87 done\n" << std::flush;
         testEcdhKnownVector(); std::cout << "Test 88 done\n" << std::flush;
         testMacFrameHelpers(); std::cout << "Test 84 done\n" << std::flush;
+        testWaylandHelpers(); std::cout << "Test 89 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
 #endif

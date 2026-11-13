@@ -23,6 +23,7 @@ set(CORE_SOURCES
     src/control/input_injector.cpp
     src/control/mac_input_logic.cpp
     src/capture/mac_frame.cpp
+    src/capture/wayland_helpers.cpp
     src/ui/host_permissions.cpp
     src/control/shell_clipboard.cpp
     src/control/clipboard_file_manager.cpp

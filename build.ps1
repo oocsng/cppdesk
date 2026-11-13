@@ -36,6 +36,7 @@ $CoreSources = @(
     "src/control/shortcut_manager.cpp",
 "src/control/mac_input_logic.cpp",
 "src/capture/mac_frame.cpp",
+"src/capture/wayland_helpers.cpp",
 "src/ui/host_permissions.cpp",
     "src/core/totp_manager.cpp",
     "src/core/qr_matrix.cpp",
