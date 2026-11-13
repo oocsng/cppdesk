@@ -43,6 +43,22 @@ jobs:
       - name: Build the app
         run: cmake --build build --target CppDesk -j 4
 
+  linux-2204:
+    # Temporary: the release is built on 22.04, whose PipeWire (0.3.48) and GLib (2.72) are older than the runner above.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++-12 xvfb libzstd-dev libssl-dev libx11-dev libxtst-dev libxext-dev libxrandr-dev libjpeg-dev libcairo2-dev libpango1.0-dev libpipewire-0.3-dev dbus pkg-config
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-12 -DCMAKE_C_COMPILER=gcc-12
+          cmake --build build --target CppDeskTests CppDesk -j 4
+      - name: Run the test suite
+        run: xvfb-run -a -s "-screen 0 1920x1080x24" build/CppDeskTests
+
   macos:
     runs-on: macos-latest
     steps:
