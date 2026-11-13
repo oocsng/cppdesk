@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <mutex>
 
 #import <CoreGraphics/CoreGraphics.h>
@@ -28,6 +29,7 @@ struct Shared {
     int height = 0;
     uint64_t seq = 0;
     uint64_t copiedSeq = 0;
+    bool accepting = false;   // callbacks only touch the frame while this is true (guarded by `mutex`)
 
     void setState(MacCaptureState s) { state.store(static_cast<int>(s)); }
 };
@@ -40,16 +42,18 @@ MacCaptureState stateForError(NSError* error) {
 
 } // namespace cppdesk
 
+// Keeps the shared state alive for as long as macOS may still call it (it can deliver a frame or an error after
+// the stream was stopped and the owner is gone).
 @interface CppDeskStreamOutput : NSObject <SCStreamOutput, SCStreamDelegate> {
 @public
-    cppdesk::Shared* shared_;
+    std::shared_ptr<cppdesk::Shared> shared_;
 }
 @end
 
 @implementation CppDeskStreamOutput
 
 - (void)stream:(SCStream*)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
-    if (type != SCStreamOutputTypeScreen || !shared_ || !CMSampleBufferIsValid(sampleBuffer)) return;
+    if (type != SCStreamOutputTypeScreen || !CMSampleBufferIsValid(sampleBuffer)) return;
     // Only complete frames: macOS also sends "idle" (nothing changed) and "blank" notifications without pixels.
     NSArray* attachments = (__bridge NSArray*)CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
     NSDictionary* info = attachments.firstObject;
@@ -64,6 +68,10 @@ MacCaptureState stateForError(NSError* error) {
     const size_t stride = CVPixelBufferGetBytesPerRow(pixels);
     if (base && w > 0 && h > 0) {
         std::lock_guard<std::mutex> lock(shared_->mutex);
+        if (!shared_->accepting) {
+            CVPixelBufferUnlockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly);
+            return;
+        }
         shared_->frame.resize(static_cast<size_t>(w) * h * 4);
         cppdesk::copyBgraRows(base, stride, w, h, shared_->frame.data());
         shared_->width = w;
@@ -75,7 +83,8 @@ MacCaptureState stateForError(NSError* error) {
 
 // macOS ended the stream: permission revoked, display unplugged or changed, sleep.
 - (void)stream:(SCStream*)stream didStopWithError:(NSError*)error {
-    if (shared_) shared_->setState(cppdesk::stateForError(error));
+    std::lock_guard<std::mutex> lock(shared_->mutex);
+    if (shared_->accepting) shared_->setState(cppdesk::stateForError(error));
 }
 
 @end
@@ -83,7 +92,7 @@ MacCaptureState stateForError(NSError* error) {
 namespace cppdesk {
 
 struct MacCaptureStream::Impl {
-    Shared shared;
+    std::shared_ptr<Shared> shared = std::make_shared<Shared>();
     SCStream* stream = nil;
     CppDeskStreamOutput* output = nil;
     dispatch_queue_t queue = nil;
@@ -95,7 +104,7 @@ MacCaptureStream::~MacCaptureStream() { stop(); }
 
 bool MacCaptureStream::start(uint32_t displayId, int fps, int maxLongEdge) {
     stop();
-    Shared& shared = impl_->shared;
+    Shared& shared = *impl_->shared;
     @autoreleasepool {
         shared.setState(MacCaptureState::Starting);
 
@@ -141,7 +150,11 @@ bool MacCaptureStream::start(uint32_t displayId, int fps, int maxLongEdge) {
         SCContentFilter* filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
 
         impl_->output = [[CppDeskStreamOutput alloc] init];
-        impl_->output->shared_ = &shared;
+        impl_->output->shared_ = impl_->shared;
+        {
+            std::lock_guard<std::mutex> lock(shared.mutex);
+            shared.accepting = true;
+        }
         impl_->queue = dispatch_queue_create("cppdesk.capture", DISPATCH_QUEUE_SERIAL);
         impl_->stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:impl_->output];
         NSError* addError = nil;
@@ -182,23 +195,26 @@ void MacCaptureStream::stop() {
             [stream removeStreamOutput:impl_->output type:SCStreamOutputTypeScreen error:nil];
             impl_->stream = nil;
         }
-        if (impl_->output) impl_->output->shared_ = nullptr;   // a late callback must not touch freed state
+        // Let a callback that is already running finish, then refuse any later one.
+        if (impl_->queue) dispatch_sync(impl_->queue, ^{});
         impl_->output = nil;
         impl_->queue = nil;
     }
-    std::lock_guard<std::mutex> lock(impl_->shared.mutex);
-    impl_->shared.frame.clear();
-    impl_->shared.width = impl_->shared.height = 0;
-    impl_->shared.seq = impl_->shared.copiedSeq = 0;
-    impl_->shared.setState(MacCaptureState::Stopped);
+    Shared& shared = *impl_->shared;
+    std::lock_guard<std::mutex> lock(shared.mutex);
+    shared.accepting = false;
+    shared.frame.clear();
+    shared.width = shared.height = 0;
+    shared.seq = shared.copiedSeq = 0;
+    shared.setState(MacCaptureState::Stopped);
 }
 
 MacCaptureState MacCaptureStream::state() const {
-    return static_cast<MacCaptureState>(impl_->shared.state.load());
+    return static_cast<MacCaptureState>(impl_->shared->state.load());
 }
 
 bool MacCaptureStream::copyLatest(std::vector<uint8_t>& bgra, int& width, int& height, bool& isNew) {
-    Shared& shared = impl_->shared;
+    Shared& shared = *impl_->shared;
     std::lock_guard<std::mutex> lock(shared.mutex);
     if (shared.seq == 0 || shared.frame.empty()) return false;
     bgra = shared.frame;
