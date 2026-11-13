@@ -16,6 +16,7 @@ std::function<std::shared_ptr<WaylandShare>(const std::string&)> g_factory;
 class PipeWireFrameSource : public WaylandShare::FrameSource {
 public:
     PipeWireFrameSource() : slot_(std::make_shared<LatestFrame>()), stream_(slot_) {}
+    bool available() const override { return PipeWireStream::available(); }
     bool start(int fd, uint32_t nodeId) override { return stream_.start(fd, nodeId); }
     void stop() override { stream_.stop(); }
     std::shared_ptr<LatestFrame> sink() override { return slot_; }
@@ -37,6 +38,11 @@ void WaylandShare::begin() {
     std::lock_guard<std::mutex> lk(mu_);
     if (begun_ || closed_) return;
     begun_ = true;
+    if (!source_->available()) {   // known before anyone is asked: no question is shown for a picture that cannot arrive
+        override_ = ShareState::Unavailable;
+        overrideReason_ = "the video part of this desktop's screen sharing is not installed";
+        return;
+    }
     portal_.startAsync(opts_);
 }
 
@@ -83,8 +89,11 @@ bool WaylandShare::latestFrame(std::vector<uint8_t>& bgra, int& width, int& heig
         tokenChange_ = true;
         newToken_ = r.newRestoreToken;
         const int fd = portal_.pipeWireFd();
+        sourceStartedAt_ = std::chrono::steady_clock::now();
+        // The person has answered by now, so this is a failure, not "unavailable": falling back to X11 would put the
+        // peer's input on the desktop whatever they allowed.
         if (!source_->start(fd, stream_.nodeId)) {
-            fail(ShareState::Unavailable, "the video part of this desktop's screen sharing could not be used");
+            fail(ShareState::Failed, "The desktop allowed sharing, but its picture could not be received.");
             return false;
         }
     }
@@ -93,7 +102,14 @@ bool WaylandShare::latestFrame(std::vector<uint8_t>& bgra, int& width, int& heig
         return false;
     }
     bool isNew = false;
-    if (!source_->sink()->copy(bgra, width, height, isNew)) return false;
+    if (!source_->sink()->copy(bgra, width, height, isNew)) {
+        const auto waited = std::chrono::steady_clock::now() - sourceStartedAt_;
+        if (!gotFrame_ && waited > std::chrono::milliseconds(opts_.firstFrameTimeoutMs)) {
+            fail(ShareState::Failed, "The picture of your screen never arrived.");
+        }
+        return false;
+    }
+    gotFrame_ = true;
     frameW_ = width;
     frameH_ = height;
     return true;

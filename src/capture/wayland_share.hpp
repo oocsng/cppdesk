@@ -8,6 +8,7 @@
 #include "wayland_helpers.hpp"
 #include "wayland_portal.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -23,6 +24,7 @@ public:
     // Where the video goes once the desktop has allowed the share (PipeWire, or a stand-in in tests).
     struct FrameSource {
         virtual ~FrameSource() = default;
+        virtual bool available() const { return true; }    // false when the video part is missing on this machine
         virtual bool start(int fd, uint32_t nodeId) = 0;   // takes over the descriptor
         virtual void stop() = 0;
         virtual std::shared_ptr<LatestFrame> sink() = 0;
@@ -74,6 +76,8 @@ private:
     std::string overrideReason_;
     StreamInfo stream_;
     int frameW_ = 0, frameH_ = 0;
+    bool gotFrame_ = false;
+    std::chrono::steady_clock::time_point sourceStartedAt_;
     bool tokenChange_ = false;
     std::string newToken_;
     std::set<uint32_t> keysDown_, buttonsDown_;

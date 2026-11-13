@@ -15,6 +15,8 @@ struct PortalOptions {
     std::string restoreToken;        // from an earlier session; sent only where the portal supports it
     int startTimeoutMs = 120000;     // how long to wait for the person to answer the desktop's dialog
     std::string busAddress;          // tests: a private bus; empty = the user's session bus
+    int stepTimeoutMs = 15000;       // how long any step but the dialog may take
+    int firstFrameTimeoutMs = 15000; // for WaylandShare: how long after the video connects its first picture may take
 };
 
 struct PortalResult {
@@ -44,7 +46,7 @@ public:
     bool pointerAxisDiscrete(int axis /* 0 vertical, 1 horizontal; positive steps scroll down/right */, int steps);
     bool keyboardKeysym(uint32_t keysym, bool down);
 
-    void close();                                  // idempotent; a dialog still open on screen goes away
+    void close();                                  // idempotent; a dialog still open on screen goes away (one caller at a time)
 
 private:
     struct Impl;

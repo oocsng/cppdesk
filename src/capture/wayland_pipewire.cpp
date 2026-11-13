@@ -116,6 +116,7 @@ struct PipeWireStream::Impl {
         auto* self = static_cast<Impl*>(data);
         if (state == PW_STREAM_STATE_ERROR) self->state = PwState::Failed;
         else if (state == PW_STREAM_STATE_STREAMING) self->state = PwState::Streaming;
+        else if (state == PW_STREAM_STATE_UNCONNECTED && self->state.load() == PwState::Streaming) self->state = PwState::Failed;
     }
 
     static void onParam(void* data, uint32_t id, const spa_pod* param) {
@@ -218,6 +219,11 @@ PipeWireStream::PipeWireStream(std::shared_ptr<LatestFrame> sink) : impl_(new Im
 
 PipeWireStream::~PipeWireStream() { stop(); }
 
+bool PipeWireStream::available() {
+    Api api;
+    return loadApi(api);
+}
+
 bool PipeWireStream::start(int fd, uint32_t nodeId) {
     stop();
     if (!loadApi(impl_->api)) {
@@ -258,6 +264,8 @@ struct PipeWireStream::Impl {
 PipeWireStream::PipeWireStream(std::shared_ptr<LatestFrame> sink) : impl_(new Impl) { impl_->sink = std::move(sink); }
 
 PipeWireStream::~PipeWireStream() = default;
+
+bool PipeWireStream::available() { return false; }
 
 bool PipeWireStream::start(int fd, uint32_t) {
     if (fd >= 0) ::close(fd);

@@ -71,7 +71,8 @@ NoticeText describeShareNotice(const ShareNotice& n) {
                     "Your desktop will ask you to allow screen sharing. Nothing is shared until you say yes."};
         case ShareState::ViewOnly:
             return {true, "Screen shared, control is off",
-                    "The other person can see your screen but cannot control it, because remote control was not allowed."};
+                    "The other person can see your screen but cannot control it" +
+                        (why.empty() ? std::string(".") : ", because " + why + ".")};
         case ShareState::Denied:
             return {true, "Screen sharing is off",
                     "Screen sharing stays off. " + (why.empty() ? "It was not allowed when your desktop asked." : why)};

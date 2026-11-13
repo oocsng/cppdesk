@@ -22,6 +22,9 @@ public:
     // Connects to the video connection `fd` (taken over, closed on failure) and the stream `nodeId`; frames land in
     // the sink as packed BGRA. False when PipeWire is missing or the connection fails (state says which).
     // The environment variable CPPDESK_PIPEWIRE_LIB names another library file (tests).
+    // Whether PipeWire can be loaded here at all (known before anyone is asked for permission).
+    static bool available();
+
     bool start(int fd, uint32_t nodeId);
     void stop();   // idempotent
     PwState state() const;

@@ -9749,6 +9749,8 @@ void testWaylandHelpers() {
         }
         TEST_ASSERT(text(ShareState::WaitingForDialog).body.find("ask") != std::string::npos);
         TEST_ASSERT(text(ShareState::ViewOnly).body.find("control") != std::string::npos);
+        TEST_ASSERT(text(ShareState::ViewOnly, "this desktop does not offer remote control").body.find("does not offer remote control") != std::string::npos);
+        TEST_ASSERT(text(ShareState::ViewOnly, "this desktop does not offer remote control").body.find("was not allowed") == std::string::npos);
         TEST_ASSERT(text(ShareState::Denied).body.find("not shared") != std::string::npos ||
                     text(ShareState::Denied).body.find("off") != std::string::npos);
         TEST_ASSERT(text(ShareState::Unavailable).body.find("X11") != std::string::npos ||
@@ -9880,6 +9882,36 @@ void testPortalSession() {
         TEST_ASSERT(waitUntil([&] { return rig.fake->count("org.freedesktop.portal.Session", "Close") == 1; }));
         TEST_ASSERT(!rig.session.pointerButton(0x110, false));   // nothing goes out once closed
         rig.session.close();                                       // and closing again is harmless
+    }
+    {   // A token with a line break in it would corrupt the settings file: it is not kept
+        FakeScenario sc;
+        sc.newToken = std::string("bad") + char(10) + "token";
+        PortalRig rig(&sc);
+        rig.start();
+        TEST_ASSERT(rig.settled());
+        PortalResult r;
+        TEST_ASSERT(rig.session.result(r) && r.state == ShareState::Running && r.newRestoreToken.empty());
+    }
+    {   // A bus that accepts the connection and never answers: the share gives up, and closing it does not hang
+        const std::string path = "/tmp/cppdesk-hung-bus-" + std::to_string(getpid());
+        unlink(path.c_str());
+        const int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path.c_str());
+        TEST_ASSERT(bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 && listen(listener, 4) == 0);
+        PortalSession session;
+        PortalOptions o;
+        o.busAddress = "unix:path=" + path;
+        o.stepTimeoutMs = 300;
+        session.startAsync(o);
+        TEST_ASSERT(waitUntil([&] { PortalResult r; return session.result(r); }, 5000));
+        TEST_ASSERT(session.state() == ShareState::Unavailable || session.state() == ShareState::Failed);
+        const auto t0 = std::chrono::steady_clock::now();
+        session.close();
+        TEST_ASSERT(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(4));
+        ::close(listener);
+        unlink(path.c_str());
     }
     {   // An older desktop (RemoteDesktop version 1): no token options anywhere
         FakeScenario sc;
@@ -10087,6 +10119,7 @@ void testLatestFrameAndPipeWireStream() {
         stream.stop();
         stream.stop();
         TEST_ASSERT(stream.state() == cppdesk::wayland::PwState::Unavailable);
+        TEST_ASSERT(!cppdesk::wayland::PipeWireStream::available());
         unsetenv("CPPDESK_PIPEWIRE_LIB");
     }
 #endif
@@ -10123,13 +10156,24 @@ void testShareHub() {
 namespace {
 
 // A video receiver that needs no PipeWire: it fills the slot with a 1280x800 gradient as soon as it starts.
+struct SourceConfig {
+    bool available = true;      // false: the video part is missing on this machine
+    bool startOk = true;        // false: it is there but cannot connect
+    bool silent = false;        // true: it connects and never delivers a picture
+    int firstFrameMs = 15000;
+};
+
 struct GradientSource : cppdesk::wayland::WaylandShare::FrameSource {
     std::shared_ptr<cppdesk::LatestFrame> slot = std::make_shared<cppdesk::LatestFrame>();
     std::atomic<int>* starts = nullptr;
+    SourceConfig cfg;
+    bool available() const override { return cfg.available; }
     bool start(int fd, uint32_t) override {
         if (fd >= 0) ::close(fd);
         ++*starts;
+        if (!cfg.startOk) return false;
         slot->accept(true);
+        if (cfg.silent) return true;
         std::vector<uint8_t> px(1280 * 800 * 4);
         for (int y = 0; y < 800; ++y)
             for (int x = 0; x < 1280; ++x) {
@@ -10174,13 +10218,16 @@ void testWaylandShareIntegration() {
     unsetenv("WAYLAND_DISPLAY");
     unsetenv("CPPDESK_FORCE_X11");
     std::atomic<int> starts{0};
+    SourceConfig sourceCfg;
     auto useBus = [&](const std::string& address) {
-        WaylandShare::setFactoryForTest([&starts, address](const std::string& token) {
+        WaylandShare::setFactoryForTest([&starts, &sourceCfg, address](const std::string& token) {
             PortalOptions o;
             o.busAddress = address;
             o.restoreToken = token;
+            o.firstFrameTimeoutMs = sourceCfg.firstFrameMs;
             auto source = std::make_unique<GradientSource>();
             source->starts = &starts;
+            source->cfg = sourceCfg;
             return std::make_shared<WaylandShare>(o, std::move(source));
         });
     };
@@ -10291,6 +10338,56 @@ void testWaylandShareIntegration() {
         InputInjector::injectMouseMove(0.5f, 0.5f, cap.currentMonitor());
         TEST_ASSERT(InputInjector::x11InputCallsForTest() == x11Input0);
         TEST_ASSERT(fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyPointerMotionAbsolute") == 0);
+    }
+    {   // The video part is missing: that is known before anyone is asked, so no question is shown for nothing
+        PrivateBus bus;
+        FakeScenario sc;
+        FakePortal fake(bus.address(), sc);
+        sourceCfg = SourceConfig{};
+        sourceCfg.available = false;
+        useBus(bus.address());
+        ScreenCapturer cap;
+        size_t tiles = 0; bool kf = false, cursor = true;
+        TEST_ASSERT(grabUntil(cap, tiles, kf, cursor));                      // the X11 picture
+        TEST_ASSERT(cap.shareNotice().state == ShareState::Unavailable);
+        TEST_ASSERT(fake.calls().empty());                                    // the desktop was never asked
+        sourceCfg = SourceConfig{};
+    }
+    {   // The person turned control off, then the video fails to start: no picture, and no input by any route
+        PrivateBus bus;
+        FakeScenario sc;
+        sc.devices = 0;
+        FakePortal fake(bus.address(), sc);
+        sourceCfg = SourceConfig{};
+        sourceCfg.startOk = false;
+        useBus(bus.address());
+        const int x11Capture0 = ScreenCapturer::x11CaptureCallsForTest();
+        const int x11Input0 = InputInjector::x11InputCallsForTest();
+        ScreenCapturer cap;
+        size_t tiles = 0; bool kf = false, cursor = true;
+        TEST_ASSERT(waitUntil([&] { grab(cap, tiles, kf, cursor); return cap.shareNotice().state == ShareState::Failed; }));
+        for (int i = 0; i < 3; ++i) TEST_ASSERT(!grab(cap, tiles, kf, cursor));
+        InputInjector::injectMouseMove(0.5f, 0.5f, cap.currentMonitor());
+        InputInjector::injectKeyEvent(0x41, 0, true, false);
+        TEST_ASSERT(ScreenCapturer::x11CaptureCallsForTest() == x11Capture0);
+        TEST_ASSERT(InputInjector::x11InputCallsForTest() == x11Input0);
+        TEST_ASSERT(fake.count("org.freedesktop.portal.RemoteDesktop", "NotifyPointerMotionAbsolute") == 0);
+        sourceCfg = SourceConfig{};
+    }
+    {   // The video connects but no picture ever arrives: it ends with a reason instead of waiting for ever
+        PrivateBus bus;
+        FakeScenario sc;
+        FakePortal fake(bus.address(), sc);
+        sourceCfg = SourceConfig{};
+        sourceCfg.silent = true;
+        sourceCfg.firstFrameMs = 300;
+        useBus(bus.address());
+        ScreenCapturer cap;
+        size_t tiles = 0; bool kf = false, cursor = true;
+        TEST_ASSERT(waitUntil([&] { grab(cap, tiles, kf, cursor); return cap.shareNotice().state == ShareState::Failed; }));
+        TEST_ASSERT(!cap.shareNotice().reason.empty());
+        TEST_ASSERT(!grab(cap, tiles, kf, cursor));
+        sourceCfg = SourceConfig{};
     }
     {   // No portal on the bus: the old X11 way, with the reason kept for the notice; input goes to XTest again
         PrivateBus bus;

@@ -129,7 +129,8 @@ Wayland session the host therefore uses the desktop's own screen-sharing permiss
 PipeWire. When a viewer connects, the desktop asks once whether to share the screen and allow remote control; nothing is
 shared until you say yes, and saying no ends it (the dashboard says so, and mouse and keyboard from the viewer do
 nothing). Untick remote control in that question and the viewer can see the screen but not control it. A desktop with a
-newer portal remembers the answer, so later sessions do not ask again.
+newer portal remembers the answer, so later sessions do not ask again (the desktop lists remembered permissions in its
+own privacy settings, where they can be revoked; a viewer still has to pass CppDesk's own password or approval).
 
 This has **not been run on a real Wayland desktop yet**: it is tested against a stand-in for the desktop's service, not
 on GNOME or KDE. What to check by hand is in [docs/wayland-host-test-checklist.md](docs/wayland-host-test-checklist.md).

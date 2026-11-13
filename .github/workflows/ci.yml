@@ -35,8 +35,7 @@ jobs:
         # The capture and input tests need an X server.
         run: xvfb-run -a -s "-screen 0 1920x1080x24" ./build.sh --test
       - name: Real PipeWire check
-        # The video receiver against a live PipeWire with a test source. Not a gate yet (continue-on-error).
-        continue-on-error: true
+        # The video receiver against a live PipeWire with a test source (a solid blue 320x240 picture must arrive).
         run: |
           sudo apt-get install -y pipewire pipewire-bin wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-base jq
           dbus-run-session -- bash scripts/ci_pipewire_check.sh
@@ -44,7 +43,7 @@ jobs:
         run: cmake --build build --target CppDesk -j 4
 
   linux-2204:
-    # Temporary: the release is built on 22.04, whose PipeWire (0.3.48) and GLib (2.72) are older than the runner above.
+    # The release is built on 22.04, whose PipeWire (0.3.48) and GLib (2.72) are older than the runner above.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4

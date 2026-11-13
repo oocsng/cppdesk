@@ -19,10 +19,16 @@ constexpr const char* kRemoteDesktop = "org.freedesktop.portal.RemoteDesktop";
 constexpr const char* kScreenCast = "org.freedesktop.portal.ScreenCast";
 constexpr const char* kRequest = "org.freedesktop.portal.Request";
 constexpr const char* kSession = "org.freedesktop.portal.Session";
-constexpr int kStepTimeoutMs = 15000;   // every step but the dialog answers at once
 
 constexpr uint32_t kDeviceKeyboard = 1;
 constexpr uint32_t kDevicePointer = 2;
+
+bool validToken(const char* token) {
+    size_t n = 0;
+    for (const char* p = token; *p; ++p, ++n)
+        if (static_cast<unsigned char>(*p) < 0x21 || static_cast<unsigned char>(*p) > 0x7E) return false;
+    return n > 0 && n <= 256;
+}
 
 GVariant* emptyOptions() { return g_variant_new_array(G_VARIANT_TYPE("{sv}"), nullptr, 0); }
 
@@ -95,13 +101,13 @@ struct PortalSession::Impl {
     }
 
     // Waits, running the thread's own main context, until done() holds, the share is stopped or closed, or the time is up.
-    bool waitFor(const std::function<bool()>& done, int timeoutMs) {
+    bool waitFor(const std::function<bool()>& done, int timeoutMs, bool ignoreStop = false) {
         bool timedOut = false;
         GSource* timer = g_timeout_source_new(static_cast<guint>(timeoutMs));
         g_source_set_callback(timer, [](gpointer p) -> gboolean { *static_cast<bool*>(p) = true; return G_SOURCE_REMOVE; },
                               &timedOut, nullptr);
         g_source_attach(timer, ctx);
-        while (!done() && !abort.load() && !sessionClosed && !timedOut) g_main_context_iteration(ctx, TRUE);
+        while (!done() && (ignoreStop || (!abort.load() && !sessionClosed)) && !timedOut) g_main_context_iteration(ctx, TRUE);
         g_source_destroy(timer);
         g_source_unref(timer);
         return done();
@@ -112,7 +118,7 @@ struct PortalSession::Impl {
         auto state = std::make_shared<CallState>();
         auto* holder = new std::shared_ptr<CallState>(state);
         g_dbus_connection_call_with_unix_fd_list(
-            wconn, kDest, kPath, iface, method, params, nullptr, G_DBUS_CALL_FLAGS_NONE, kStepTimeoutMs, nullptr, nullptr,
+            wconn, kDest, kPath, iface, method, params, nullptr, G_DBUS_CALL_FLAGS_NONE, opts.stepTimeoutMs, nullptr, nullptr,
             [](GObject* src, GAsyncResult* res, gpointer data) {
                 auto* h = static_cast<std::shared_ptr<CallState>*>(data);
                 CallState& c = **h;
@@ -121,7 +127,7 @@ struct PortalSession::Impl {
                 delete h;
             },
             holder);
-        waitFor([&] { return state->done; }, kStepTimeoutMs + 1000);
+        waitFor([&] { return state->done; }, opts.stepTimeoutMs + 1000);
         return state;
     }
 
@@ -196,20 +202,41 @@ struct PortalSession::Impl {
             gchar* a = g_dbus_address_get_for_bus_sync(G_BUS_TYPE_SESSION, nullptr, &err);
             if (a) { address = a; g_free(a); }
         }
-        if (!address.empty())
-            wconn = g_dbus_connection_new_for_address_sync(
-                address.c_str(),
-                static_cast<GDBusConnectionFlags>(G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT |
-                                                  G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION),
-                nullptr, nullptr, &err);
         if (err) g_error_free(err);
+        if (address.empty()) return false;
+        struct Pending {
+            bool done = false;
+            GDBusConnection* conn = nullptr;
+        };
+        auto pending = std::make_shared<Pending>();
+        auto* holder = new std::shared_ptr<Pending>(pending);
+        g_dbus_connection_new_for_address(
+            address.c_str(),
+            static_cast<GDBusConnectionFlags>(G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT |
+                                              G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION),
+            nullptr, nullptr,
+            [](GObject*, GAsyncResult* res, gpointer data) {
+                auto* h = static_cast<std::shared_ptr<Pending>*>(data);
+                GError* e = nullptr;
+                (*h)->conn = g_dbus_connection_new_for_address_finish(res, &e);
+                if (e) g_error_free(e);
+                (*h)->done = true;
+                delete h;
+            },
+            holder);
+        waitFor([&] { return pending->done; }, opts.stepTimeoutMs);
+        if (pending->done) wconn = pending->conn;
         return wconn != nullptr;
     }
 
     // Everything up to a running share. On any other outcome the state is already published.
     bool setup() {
         publish(ShareState::WaitingForDialog, "");
-        if (!connect()) { publish(ShareState::Unavailable, "no desktop message bus was found"); return false; }
+        if (!connect()) {
+            if (abort.load()) publish(ShareState::Closed, "Screen sharing was stopped.");
+            else publish(ShareState::Unavailable, "no desktop message bus was found");
+            return false;
+        }
 
         uint32_t screenCastVersion = 0;
         if (!getVersion(kScreenCast, screenCastVersion)) {
@@ -230,7 +257,7 @@ struct PortalSession::Impl {
             g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
             g_variant_builder_add(&b, "{sv}", "session_handle_token", g_variant_new_string(nextToken().c_str()));
             if (!request(sessionIface, "CreateSession", [](GVariant* o) { return g_variant_new("(@a{sv})", o); }, &b,
-                         kStepTimeoutMs, r, failure)) {
+                         opts.stepTimeoutMs, r, failure)) {
                 bailUnanswered(failure, false);
                 return false;
             }
@@ -258,7 +285,7 @@ struct PortalSession::Impl {
                              return isStart ? g_variant_new("(os@a{sv})", session.c_str(), "", o)
                                             : g_variant_new("(o@a{sv})", session.c_str(), o);
                          },
-                         b, isStart ? opts.startTimeoutMs : kStepTimeoutMs, r, failure)) {
+                         b, isStart ? opts.startTimeoutMs : opts.stepTimeoutMs, r, failure)) {
                 bailUnanswered(failure, isStart);
                 return false;
             }
@@ -300,7 +327,8 @@ struct PortalSession::Impl {
         if (policy.useRemoteDesktop) g_variant_lookup(r.results, "devices", "u", &granted);
         if (r.results) {
             const char* token = nullptr;
-            if (g_variant_lookup(r.results, "restore_token", "&s", &token) && token) out.newRestoreToken = token;
+            // The token ends up in the settings file: only plain printable characters, and not unreasonably long.
+            if (g_variant_lookup(r.results, "restore_token", "&s", &token) && token && validToken(token)) out.newRestoreToken = token;
             GVariant* streams = g_variant_lookup_value(r.results, "streams", G_VARIANT_TYPE("a(ua{sv})"));
             if (streams) {
                 const gsize n = g_variant_n_children(streams);
@@ -378,8 +406,25 @@ struct PortalSession::Impl {
                 g_dbus_connection_call(wconn, kDest, sessionPath.c_str(), kSession, "Close", nullptr, nullptr,
                                        G_DBUS_CALL_FLAGS_NONE, -1, nullptr, nullptr, nullptr);
             if (closedSub) g_dbus_connection_signal_unsubscribe(wconn, closedSub);
-            g_dbus_connection_flush_sync(wconn, nullptr, nullptr);
-            g_dbus_connection_close_sync(wconn, nullptr, nullptr);
+            // Both with a deadline: a bus that has stopped answering must not hold the thread that closes the share.
+            auto flushed = std::make_shared<bool>(false);
+            g_dbus_connection_flush(wconn, nullptr,
+                                    [](GObject*, GAsyncResult*, gpointer d) {
+                                        auto* h = static_cast<std::shared_ptr<bool>*>(d);
+                                        **h = true;
+                                        delete h;
+                                    },
+                                    new std::shared_ptr<bool>(flushed));
+            waitFor([&] { return *flushed; }, 1500, true);
+            auto closed = std::make_shared<bool>(false);
+            g_dbus_connection_close(wconn, nullptr,
+                                    [](GObject*, GAsyncResult*, gpointer d) {
+                                        auto* h = static_cast<std::shared_ptr<bool>*>(d);
+                                        **h = true;
+                                        delete h;
+                                    },
+                                    new std::shared_ptr<bool>(closed));
+            waitFor([&] { return *closed; }, 1500, true);
             g_object_unref(wconn);
             wconn = nullptr;
         }
