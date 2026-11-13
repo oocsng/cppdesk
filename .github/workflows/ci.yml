@@ -71,3 +71,13 @@ jobs:
         with:
           name: macos-ui-snapshots
           path: macos-ui-snapshots
+      - name: Package the app for testers
+        # Ad-hoc signed with a fixed bundle id. Not a release: macOS ties the Screen Recording and Accessibility
+        # permissions to the signature, so a tester grants them again after every new build.
+        run: |
+          codesign --force --deep -s - -i com.oocsng.cppdesk build/CppDesk.app
+          ditto -c -k --keepParent build/CppDesk.app CppDesk-mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CppDesk-mac-untested
+          path: CppDesk-mac.zip

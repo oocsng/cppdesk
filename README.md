@@ -103,9 +103,14 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR="$(brew --prefix op
 cmake --build build
 ```
 
-The macOS interface is built and tested on every push (and its screens are drawn offscreen and checked), but it has not
-been run on a real Mac yet and is not among the downloads. Screen sharing and control from a Mac host, and the
-Screen Recording and Accessibility permission prompts, come next.
+The macOS app is built and tested on every push, its screens are drawn offscreen and checked, and a Mac can now be
+viewed and controlled as well as view others: it captures the screen with ScreenCaptureKit and takes mouse and keyboard
+through CGEvent. It has **not been run on a real Mac yet** and there is no Mac download. To try it, open the latest
+successful run of the CI workflow on GitHub, download the `CppDesk-mac-untested` artifact, unzip it, run
+`xattr -dr com.apple.quarantine CppDesk.app`, open the app, and turn on Screen Recording and Accessibility when the
+card on the dashboard asks. macOS asks again after every new build, because the build is only ad-hoc signed. A remote Ctrl
+key acts as Command on the Mac (so Ctrl+C from a Windows machine copies) and the Windows key as Control; a Mac viewer
+cannot send a real Control key. What to check by hand is in [docs/mac-host-test-checklist.md](docs/mac-host-test-checklist.md).
 
 The Linux app is the full interface on X11 (XWayland sessions included), drawn with Cairo and Pango. It uses these
 programs when they are installed and works without them:
