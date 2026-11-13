@@ -45,4 +45,9 @@ struct NoticeText { bool visible = false; std::string title, body; };
 // What to tell the person, in plain words; invisible while there is nothing to say (Idle, Running).
 NoticeText describeShareNotice(const ShareNotice& n);
 
+// A share that was refused or has ended: the host ends the session instead of leaving the viewer on a blank picture.
+bool isShareEnd(ShareState s);
+// What the viewer is told when the host ends the session for that reason ("" for any other state).
+std::string endMessageForViewer(ShareState s);
+
 } // namespace cppdesk::wayland

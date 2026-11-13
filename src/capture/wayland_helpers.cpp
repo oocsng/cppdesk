@@ -91,4 +91,17 @@ NoticeText describeShareNotice(const ShareNotice& n) {
     return {};
 }
 
+bool isShareEnd(ShareState s) {
+    return s == ShareState::Denied || s == ShareState::Failed || s == ShareState::Closed;
+}
+
+std::string endMessageForViewer(ShareState s) {
+    switch (s) {
+        case ShareState::Denied: return "The host did not allow screen sharing.";
+        case ShareState::Failed: return "Screen sharing on the host stopped working.";
+        case ShareState::Closed: return "The host stopped sharing the screen.";
+        default: return "";
+    }
+}
+
 } // namespace cppdesk::wayland

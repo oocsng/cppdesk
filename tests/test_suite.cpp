@@ -9480,6 +9480,15 @@ void testWaylandShareNoticeUi() {
         app.onTick();
         TEST_ASSERT(id.settings().waylandRestoreToken.empty());
     }
+    {   // A share that ends or is refused: a toast tells the host why the viewer was disconnected
+        AppUi app(id, net, shell, "");
+        ui::RecordingCanvas rc;
+        net.setShareNoticeForTest({ShareState::Denied, ""});
+        app.onTick();
+        for (int i = 0; i < 30; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);
+        TEST_ASSERT(rc.serialize().find("viewer was disconnected") != npos);
+        net.setShareNoticeForTest({});
+    }
     {   // The two new states close the list of snapshots
         const auto names = AppUi::snapshotStateNames();
         TEST_ASSERT(names.size() >= 2 && names[names.size() - 2] == "dashboard_wayland_denied" &&
@@ -9756,6 +9765,15 @@ void testWaylandHelpers() {
         TEST_ASSERT(text(ShareState::Unavailable).body.find("X11") != std::string::npos ||
                     text(ShareState::Unavailable).body.find("Xorg") != std::string::npos);
         TEST_ASSERT(text(ShareState::Closed, "the reason text").body.find("the reason text") != std::string::npos);
+        // What ends a session, and what the viewer is told
+        for (ShareState st : {ShareState::Denied, ShareState::Failed, ShareState::Closed}) {
+            TEST_ASSERT(isShareEnd(st) && !endMessageForViewer(st).empty());
+            std::string said = endMessageForViewer(st);
+            for (auto& c : said) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (const char* jargon : {"portal", "pipewire", "d-bus", "dbus", "api"}) TEST_ASSERT(said.find(jargon) == std::string::npos);
+        }
+        for (ShareState st : {ShareState::Idle, ShareState::WaitingForDialog, ShareState::Running, ShareState::ViewOnly, ShareState::Unavailable})
+            TEST_ASSERT(!isShareEnd(st) && endMessageForViewer(st).empty());
         TEST_ASSERT(text(ShareState::Failed, "the reason text").body.find("the reason text") != std::string::npos);
     }
 }
@@ -10435,6 +10453,84 @@ void testWaylandShareIntegration() {
         TEST_ASSERT(fake.calls().empty());
     }
 }
+
+void testHostEndsSessionWhenSharingEnds() {
+    std::cout << "[TEST 96] The host ends the session, with a reason, when screen sharing is refused or ends..." << std::endl;
+    using namespace cppdesk::wayland;
+    using namespace cppdesk::wayland::test;
+    gchar* daemon = g_find_program_in_path("dbus-daemon");
+    if (!daemon) { std::cout << "  skipped: no dbus-daemon on this machine" << std::endl; return; }
+    g_free(daemon);
+
+    SessionEnvGuard env;
+    setenv("XDG_SESSION_TYPE", "wayland", 1);
+    unsetenv("WAYLAND_DISPLAY");
+    unsetenv("CPPDESK_FORCE_X11");
+    std::atomic<int> starts{0};
+
+    // One viewer connecting to one host whose desktop answers the sharing question as the scenario says.
+    auto run = [&](const FakeScenario& sc, bool endAfterFrames, const std::string& expectInStatus, ShareState expectNotice,
+                   int hostPort, int viewerPort, int idSeed) {
+        PrivateBus bus;
+        FakePortal fake(bus.address(), sc);
+        WaylandShare::setFactoryForTest([&starts, address = bus.address()](const std::string& token) {
+            PortalOptions o;
+            o.busAddress = address;
+            o.restoreToken = token;
+            auto source = std::make_unique<GradientSource>();
+            source->starts = &starts;
+            return std::make_shared<WaylandShare>(o, std::move(source));
+        });
+        IdentityManager hostId(idSeed);
+        hostId.loadOrCreate();
+        hostId.setListenPort(static_cast<uint16_t>(hostPort));
+        hostId.setUnattendedEnabled(true);
+        hostId.setUnattendedPassword("TestPass99");
+        hostId.setRelayServerAddress("127.0.0.1:50999");
+        IdentityManager viewerId(idSeed + 1);
+        viewerId.loadOrCreate();
+        viewerId.setListenPort(static_cast<uint16_t>(viewerPort));
+        viewerId.setRelayServerAddress("127.0.0.1:50999");
+        NetworkEngine hostNet(hostId);
+        NetworkEngine viewerNet(viewerId);
+        TEST_ASSERT(hostNet.start());
+        hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
+        TEST_ASSERT(viewerNet.start());
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        TEST_ASSERT(viewerNet.connectToRemote(hostId.formattedDeskId(), "TestPass99"));
+
+        if (endAfterFrames) {   // the desktop ends the sharing while the viewer watches
+            uint64_t seq = 0;
+            std::vector<uint8_t> frame;
+            int w = 0, h = 0;
+            CursorState cur{};
+            TEST_ASSERT(waitUntil([&] { return viewerNet.copyLatestViewerFrame(seq, frame, w, h, cur) && w > 0; }, 10000));
+            fake.emitSessionClosed();
+        }
+        // The viewer is told why and stays disconnected: it does not reconnect (which would ask the host's desktop again)
+        TEST_ASSERT(waitUntil([&] {
+            auto st = viewerNet.viewerStats();
+            return st.state == ViewerConnectionState::Error && st.statusMessage.find(expectInStatus) != std::string::npos;
+        }, 10000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(3500));   // longer than the viewer's first reconnect wait
+        TEST_ASSERT(viewerNet.viewerStats().state == ViewerConnectionState::Error);
+        TEST_ASSERT(fake.count("org.freedesktop.portal.RemoteDesktop", "Start") == 1);
+        TEST_ASSERT(waitUntil([&] { return !hostNet.hostSessionStatus().active; }));
+        TEST_ASSERT(hostNet.shareNotice().state == expectNotice);              // the host can still see why
+        viewerNet.disconnectViewer();
+        hostNet.disconnectHostClient();
+        std::error_code ec;
+        std::filesystem::remove(hostId.configFilePath(), ec);
+        std::filesystem::remove(viewerId.configFilePath(), ec);
+    };
+
+    FakeScenario refused;
+    refused.startResponse = 1;
+    run(refused, false, "did not allow", ShareState::Denied, 50940, 50941, 4260);
+    FakeScenario allowed;
+    run(allowed, true, "stopped sharing", ShareState::Closed, 50942, 50943, 4262);
+}
+
 #endif
 
 #if defined(__linux__)
@@ -10601,6 +10697,7 @@ int main(int argc, char** argv) {
         testLinuxNotifications(); std::cout << "Test 79 done\n" << std::flush;
         testPortalSession(); std::cout << "Test 90 done\n" << std::flush;
         testWaylandShareIntegration(); std::cout << "Test 92 done\n" << std::flush;
+        testHostEndsSessionWhenSharingEnds(); std::cout << "Test 96 done\n" << std::flush;
 #endif
 #if defined(__APPLE__)
         testMacWindow(); std::cout << "Test 81 done\n" << std::flush;
