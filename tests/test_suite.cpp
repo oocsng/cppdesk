@@ -2230,15 +2230,30 @@ void testSelfHostedRelayAndStunDiagnostics() {
 
     // 3. RFC 5389 STUN Binding Request & XOR-MAPPED-ADDRESS Resolution with Mock Responder
     {
+        // Another program on the machine may hold any fixed port (the old 50989 made this test fail now and then):
+        // occupy it here so the test proves it does not depend on it.
+        SOCKET portHolder = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        {
+            sockaddr_in held{};
+            held.sin_family = AF_INET;
+            held.sin_addr.s_addr = inet_addr("127.0.0.1");
+            held.sin_port = htons(50989);
+            bind(portHolder, reinterpret_cast<sockaddr*>(&held), sizeof(held));
+        }
+
         SOCKET mockStunSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         TEST_ASSERT(mockStunSock != INVALID_SOCKET);
 
         sockaddr_in stunBind{};
         stunBind.sin_family = AF_INET;
         stunBind.sin_addr.s_addr = inet_addr("127.0.0.1");
-        stunBind.sin_port = htons(50989);
+        stunBind.sin_port = 0;   // any free port
         int bErr = bind(mockStunSock, reinterpret_cast<sockaddr*>(&stunBind), sizeof(stunBind));
         TEST_ASSERT(bErr == 0);
+        sockaddr_in stunBound{};
+        socklen_t stunBoundLen = sizeof(stunBound);
+        getsockname(mockStunSock, reinterpret_cast<sockaddr*>(&stunBound), &stunBoundLen);
+        const std::string stunAddress = "127.0.0.1:" + std::to_string(ntohs(stunBound.sin_port));
 
         std::atomic<bool> mockRunning{true};
         std::thread mockThread([mockStunSock, &mockRunning]() {
@@ -2286,10 +2301,11 @@ void testSelfHostedRelayAndStunDiagnostics() {
             }
         });
 
-        auto stunResult = NetworkEngine::queryStunServer("127.0.0.1:50989", 1000);
+        auto stunResult = NetworkEngine::queryStunServer(stunAddress, 1000);
         mockRunning = false;
         if (mockThread.joinable()) mockThread.join();
         closesocket(mockStunSock);
+        closesocket(portHolder);
 
         TEST_ASSERT(stunResult.success);
         TEST_ASSERT(stunResult.publicIp == "203.0.113.195");
