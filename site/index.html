@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CppDesk: remote desktop with no server and no account</title>
+<meta name="description" content="CppDesk is a portable remote desktop app. Two machines on the same network connect directly with a 9-digit ID. No server, no account, no installer. Free and open source.">
+<meta name="theme-color" content="#C9D1CC">
+<link rel="icon" href="assets/icon.png">
+<meta property="og:type" content="website">
+<meta property="og:title" content="CppDesk: remote desktop with no server and no account">
+<meta property="og:description" content="Two machines on one network connect directly. One portable file for Windows and Linux. Free and open source.">
+<meta property="og:image" content="https://oocsng.github.io/cppdesk/assets/icon.png">
+<meta property="og:url" content="https://oocsng.github.io/cppdesk/">
+<link rel="preload" href="fonts/big-shoulders-display-latin-900-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="tape">
+  <div class="tape-in">
+    <a class="brand" href="#top"><img src="assets/icon.png" width="32" height="32" alt="">CppDesk</a>
+    <nav aria-label="Page">
+      <a class="hide-sm" href="#connect">How it connects</a>
+      <a href="#features">Features</a>
+      <a href="#download">Download</a>
+      <a class="hide-sm" href="https://github.com/oocsng/cppdesk">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- Sheet 1: the register -->
+<section class="sheet" aria-labelledby="h1">
+  <div class="grid hero">
+
+    <div class="tag hot hero-tag" style="--i:0">
+      <h1 id="h1">No server.<br>No account.</h1>
+      <p class="lede">CppDesk is a portable remote desktop app. Machines on the same network connect to each other directly, with a 9-digit ID and a password. One file. Nothing to install.</p>
+      <p class="actions">
+        <a class="btn" href="https://github.com/oocsng/cppdesk/releases/latest/download/CppDesk.exe" data-primary>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="square" aria-hidden="true"><path d="M12 3v13M6 10l6 6 6-6M4 21h16"/></svg>
+          <span data-primary-label>Download for Windows</span>
+        </a>
+      </p>
+      <p class="alt">Also for <a href="https://github.com/oocsng/cppdesk/releases/latest/download/CppDesk-x86_64.AppImage">Linux (AppImage)</a>, the <a href="https://github.com/oocsng/cppdesk/releases/latest">Ubuntu / Debian package</a>. <a href="#macos">macOS: not yet</a>.</p>
+      <div class="bars" aria-hidden="true"></div>
+      <p class="band">Free · MIT licence · Windows · Linux</p>
+    </div>
+
+    <article class="tag pc pc1" style="--i:1">
+      <p class="lbl">PC-07</p>
+      <p class="id">482 910 337</p>
+      <div class="bars" aria-hidden="true"></div>
+      <p class="band">Example · Windows</p>
+    </article>
+
+    <article class="tag pc pc2" style="--i:2">
+      <p class="lbl">PC-12</p>
+      <p class="id">106 553 801</p>
+      <div class="bars" aria-hidden="true"></div>
+      <p class="band">Example · Linux</p>
+    </article>
+
+    <div class="ghost g-server" style="--i:3">
+      <p class="name">Server</p>
+      <p class="sub">None required</p>
+    </div>
+
+    <div class="ghost g-account" style="--i:4">
+      <p class="name">Account</p>
+      <p class="sub">None required</p>
+    </div>
+
+    <div class="tag first" style="--i:5">
+      <h2 class="h3">First connection</h2>
+      <ol>
+        <li>On the machine you want to control, note its 9-digit ID and one-time password.</li>
+        <li>On the other machine, enter the ID and password and press Connect. Leave the password blank to ask the person at the host to approve.</li>
+      </ol>
+      <p class="band">Password or on-screen approval</p>
+    </div>
+
+    <div class="ghost g-install" style="--i:6">
+      <p class="name">Installer</p>
+      <p class="sub">None required</p>
+    </div>
+
+    <div class="tag peek" style="--i:7">
+      <h2 class="h3">Also in the file</h2>
+      <p>File sync, remote terminal, task manager, session recording and rewind, voice, drawing.</p>
+      <p><a class="more" href="#features">See all features</a></p>
+      <p class="band">One portable file</p>
+    </div>
+
+  </div>
+</section>
+
+<!-- Sheet 2: how it connects -->
+<section class="sheet" id="connect" aria-labelledby="h-connect">
+  <div class="grid">
+    <div class="head">
+      <h2 id="h-connect">Pick two machines.<br>Nothing sits between them.</h2>
+      <p>Choose one machine, then another. A direct link joins them, and the server slot stays empty. This is an illustration: the machines and IDs are made up.</p>
+    </div>
+
+    <div class="net" id="net">
+      <svg class="link" aria-hidden="true" focusable="false"><path id="cable" d=""/><circle id="plug-a" r="11" style="display:none"/><circle id="plug-b" r="11" style="display:none"/></svg>
+      <p class="sr" id="announce" aria-live="polite"></p>
+
+      <button type="button" class="tag pc pick" aria-pressed="false" data-name="Reception" data-id="482 910 337">
+        <span class="lbl">Reception</span><span class="id">482 910 337</span><span class="bars" aria-hidden="true"></span><span class="band">Windows</span>
+      </button>
+      <button type="button" class="tag pc pick" aria-pressed="false" data-name="Accounts" data-id="271 604 998">
+        <span class="lbl">Accounts</span><span class="id">271 604 998</span><span class="bars" aria-hidden="true"></span><span class="band">Windows</span>
+      </button>
+      <button type="button" class="tag pc pick" aria-pressed="false" data-name="Print room" data-id="106 553 801">
+        <span class="lbl">Print room</span><span class="id">106 553 801</span><span class="bars" aria-hidden="true"></span><span class="band">Linux</span>
+      </button>
+      <button type="button" class="tag pc pick" aria-pressed="false" data-name="Boardroom" data-id="733 018 245">
+        <span class="lbl">Boardroom</span><span class="id">733 018 245</span><span class="bars" aria-hidden="true"></span><span class="band">Windows</span>
+      </button>
+      <button type="button" class="tag pc pick" aria-pressed="false" data-name="Stockroom" data-id="590 372 164">
+        <span class="lbl">Stockroom</span><span class="id">590 372 164</span><span class="bars" aria-hidden="true"></span><span class="band">Linux</span>
+      </button>
+      <button type="button" class="tag pc pick" aria-pressed="false" data-name="Front desk" data-id="318 846 072">
+        <span class="lbl">Front desk</span><span class="id">318 846 072</span><span class="bars" aria-hidden="true"></span><span class="band">Windows</span>
+      </button>
+
+      <div class="ghost g-wide">
+        <p class="name">Server</p>
+        <p class="sub note">None required. The machines talk to each other.</p>
+      </div>
+
+      <div class="session" id="session">
+        <div class="ghost" id="session-empty">
+          <p class="name">Session</p>
+          <p class="sub" id="connect-status">Pick a machine.</p>
+        </div>
+        <div class="tag hot" id="session-live" hidden>
+          <p class="lbl">Session</p>
+          <p class="pair"><span id="live-a"></span> <svg class="arrow" width="48" height="26" viewBox="0 0 48 26" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="square" aria-hidden="true"><path d="M3 13h40M32 3l11 10-11 10"/></svg> <span id="live-b"></span></p>
+          <p class="actions"><button type="button" class="btn" id="unplug">Unplug</button></p>
+          <p class="band">Direct · same network · AES-256-GCM · illustration</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Sheet 3: features -->
+<section class="sheet" id="features" aria-labelledby="h-features">
+  <div class="grid">
+    <div class="head">
+      <h2 id="h-features">One file does the whole job.</h2>
+      <p>Everything below ships in the same portable app, on the host and on the viewer.</p>
+    </div>
+
+    <article class="tag f w4">
+      <h3>Every machine in a tab</h3>
+      <p>Control several machines at once. Each tab shows a live ping and an unread chat count. An address book with quick tags keeps the list tidy.</p>
+      <p class="band">Tabs · Ping · Address book</p>
+    </article>
+    <article class="tag f w4">
+      <h3>Move files</h3>
+      <p>Drag and drop with progress for each file. Folders can mirror both ways in the background. Every file is checked with SHA-256.</p>
+      <p class="band">SHA-256 · Two-way sync</p>
+    </article>
+    <article class="tag f w4">
+      <h3>Fix things</h3>
+      <p>Remote command prompt, PowerShell or bash, and a task manager that can end processes. Ctrl+K opens a command palette.</p>
+      <p class="band">Terminal · Tasks</p>
+    </article>
+
+    <article class="tag f ink w6">
+      <h3>Locked down</h3>
+      <p class="stamp">Encrypted end to end</p>
+      <p>Keys are exchanged with ECDH on NIST P-256, and the session is encrypted with AES-256-GCM. Optional TOTP two-factor (RFC 6238) with QR setup, brute-force rate limiting, a curtain mode that blanks the host screen, and privacy zones that hide parts of it.</p>
+      <div class="bars" aria-hidden="true"></div>
+      <p class="band">ECDH P-256 · AES-256-GCM · TOTP</p>
+    </article>
+    <article class="tag f w3">
+      <h3>Record and rewind</h3>
+      <p>Record a session to a video file with a built-in player, or scrub back through recent frames without dropping the connection.</p>
+      <p class="band">Record · Rewind</p>
+    </article>
+    <article class="tag f w3">
+      <h3>Talk and point</h3>
+      <p>Voice chat, shared clipboard, a shared scratchpad, and pens and pointers to draw on the remote screen.</p>
+      <p class="band">Voice · Clipboard · Draw</p>
+    </article>
+
+    <article class="tag f w4">
+      <h3>Pick the quality</h3>
+      <p class="numerals" aria-label="15, 30, 45 or 60 frames per second"><span>15</span><span>30</span><span>45</span><span>60</span></p>
+      <p>Four presets in frames per second, plus multi-monitor selection and automatic resolution matching.</p>
+      <p class="band">Quality presets</p>
+    </article>
+    <article class="tag f w4">
+      <h3>Forward ports</h3>
+      <p>One-click presets for RDP, SSH, VNC and HTTP, plus diagnostics for the connection.</p>
+      <p class="band">RDP · SSH · VNC · HTTP</p>
+    </article>
+    <div class="ghost w4">
+      <p class="name">Relay</p>
+      <p class="sub note">Optional. STUN and a self-hosted relay can cross networks. You do not need them on one LAN.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Sheet 4: download -->
+<section class="sheet" id="download" aria-labelledby="h-download">
+  <div class="grid">
+    <div class="head">
+      <h2 id="h-download">Get it.</h2>
+      <p>Free and open source under the MIT licence. Each download is the latest release on GitHub.</p>
+    </div>
+
+    <article class="tag hot f w4">
+      <h3>Windows</h3>
+      <p>Portable. Double-click <code>CppDesk.exe</code>. No installer and no registry changes. Windows 10 or 11, 64-bit.</p>
+      <p class="actions"><a class="btn" href="https://github.com/oocsng/cppdesk/releases/latest/download/CppDesk.exe">Download .exe</a></p>
+      <p class="band">Windows 10/11 · x64</p>
+    </article>
+    <article class="tag f w4">
+      <h3>Linux, any distro</h3>
+      <p>The AppImage runs on an X11 desktop. Allow it to run once (<code>chmod +x</code>), then double-click. Wayland screen sharing is experimental.</p>
+      <p class="actions"><a class="btn" href="https://github.com/oocsng/cppdesk/releases/latest/download/CppDesk-x86_64.AppImage">Download AppImage</a></p>
+      <p class="band">Linux · x86_64</p>
+    </article>
+    <article class="tag f w4">
+      <h3>Ubuntu / Debian</h3>
+      <p>Install the <code>.deb</code> from the release page. CppDesk then appears in the app menu.</p>
+      <p class="actions"><a class="btn" href="https://github.com/oocsng/cppdesk/releases/latest">Open latest release</a></p>
+      <p class="band">Debian · amd64</p>
+    </article>
+
+    <div class="ghost w12" id="macos">
+      <p class="name">macOS</p>
+      <p class="sub note">No download yet. The Mac build is tested in CI but has not been run on a real Mac. You can <a href="https://github.com/oocsng/cppdesk#building-from-source">build it from source</a>.</p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="tape">
+  <div class="tape-in">
+    <p>CppDesk · MIT licence</p>
+    <nav aria-label="Project">
+      <a href="https://github.com/oocsng/cppdesk">Source</a>
+      <a href="https://github.com/oocsng/cppdesk/releases">Releases</a>
+      <a href="https://github.com/oocsng/cppdesk/issues">Issues</a>
+      <a href="https://github.com/oocsng/cppdesk/blob/main/SECURITY.md">Security</a>
+    </nav>
+  </div>
+</footer>
+
+<script src="main.js"></script>
+</body>
+</html>

@@ -5,6 +5,9 @@
 .superpowers/
 graphify-out/
 AGENTS.md
+PRODUCT.md
+DESIGN.md
+.impeccable/
 
 # Build artifacts & binaries
 build/
