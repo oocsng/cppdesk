@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, host-ends-session]
+    branches: [main]
   pull_request:
 
 jobs:
