@@ -33,6 +33,8 @@
 #include "../src/capture/wayland_portal.hpp"
 #include "../src/capture/wayland_pipewire.hpp"
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include "fake_portal.hpp"
 #include <gio/gio.h>
 #include <set>
@@ -10335,10 +10337,55 @@ void testWaylandShareIntegration() {
 }
 #endif
 
+#if defined(__linux__)
+// Run by CI only (`CppDeskTests --pipewire`), against a PipeWire daemon with a test video source published as a node:
+// the stream connects the way the portal's descriptor would, and the frames must arrive as BGRA.
+void testRealPipeWire() {
+    std::cout << "[TEST 95] Real PipeWire: a test video source arrives as BGRA frames..." << std::endl;
+    const char* nodeEnv = std::getenv("CPPDESK_PIPEWIRE_TEST_NODE");
+    const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+    if (!nodeEnv || !*nodeEnv || !runtime) { std::cout << "  skipped: no PipeWire test node" << std::endl; return; }
+    const uint32_t node = static_cast<uint32_t>(std::strtoul(nodeEnv, nullptr, 10));
+    const char* remote = std::getenv("PIPEWIRE_REMOTE");
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/%s", runtime, remote && *remote ? remote : "pipewire-0");
+    const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    TEST_ASSERT(fd >= 0 && connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    auto sink = std::make_shared<LatestFrame>();
+    cppdesk::wayland::PipeWireStream stream(sink);
+    TEST_ASSERT(stream.start(fd, node));
+    std::vector<uint8_t> px;
+    int w = 0, h = 0;
+    bool isNew = false;
+    const bool got = waitUntil([&] { return sink->copy(px, w, h, isNew); }, 15000);
+    TEST_ASSERT(got);
+    if (got) {
+        const size_t c = (static_cast<size_t>(h / 2) * w + w / 2) * 4;
+        std::cout << "  frame " << w << "x" << h << ", centre pixel B" << int(px[c]) << " G" << int(px[c + 1]) << " R"
+                  << int(px[c + 2]) << " A" << int(px[c + 3]) << std::endl;
+        TEST_ASSERT(w == 320 && h == 240);
+        TEST_ASSERT(px[c] == 255 && px[c + 1] == 0 && px[c + 2] == 0 && px[c + 3] == 255);   // a solid blue source
+    }
+    TEST_ASSERT(stream.state() == cppdesk::wayland::PwState::Streaming);
+    stream.stop();
+}
+#endif
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+#if defined(__linux__)
+        if (argc > 1 && std::string(argv[1]) == "--pipewire") {   // CI only, see ci.yml
+            testRealPipeWire();
+            std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
+            return (g_failed == 0) ? 0 : 1;
+        }
+#else
+        (void)argc;
+        (void)argv;
+#endif
 #if defined(_WIN32)
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 #endif

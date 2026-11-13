@@ -34,6 +34,12 @@ jobs:
       - name: Build and run the test suite
         # The capture and input tests need an X server.
         run: xvfb-run -a -s "-screen 0 1920x1080x24" ./build.sh --test
+      - name: Real PipeWire check
+        # The video receiver against a live PipeWire with a test source. Not a gate yet (continue-on-error).
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y pipewire pipewire-bin wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-base jq
+          dbus-run-session -- bash scripts/ci_pipewire_check.sh
       - name: Build the app
         run: cmake --build build --target CppDesk -j 4
 
