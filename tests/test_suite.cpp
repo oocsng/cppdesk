@@ -9389,6 +9389,41 @@ void testHostPermissionUi() {
     std::filesystem::remove(id.configFilePath(), ec);
 }
 
+void testEcdhKnownVector() {
+    std::cout << "[TEST 88] ECDH fixed vector: both sides agree and the session key bytes are pinned..." << std::endl;
+    auto hex = [](const std::string& h) {
+        std::vector<uint8_t> out;
+        for (size_t i = 0; i + 1 < h.size(); i += 2) out.push_back(static_cast<uint8_t>(std::stoi(h.substr(i, 2), nullptr, 16)));
+        return out;
+    };
+    // Two P-256 key pairs in the CNG layout every platform speaks: magic, key size (32), X, Y, and for a private key d.
+    const std::string aX = "8be886b3ea4780a19c55b02aea516e7daa11edd682619f359cf06cb47e03c689";
+    const std::string aY = "a55e114f15d418d4e9fb19273d7e3ce2566af640bc07559b8b0c2dd004e3b3d9";
+    const std::string aD = "e5c768a8a9ccbacc081ab2692738294474355b58e5029d52587f3eeb41a665f7";
+    const std::string bX = "37fe25d7b26d547aaa10e96de099dae411ae9b2a0a01db2f01cc65cc4061b455";
+    const std::string bY = "b4d01ffab1d7b70fb728bc839ca167b3d57a56634f95a6ff58682a1ade9cc576";
+    const std::string bD = "8e6fc46ea14f017ed54b4465641705125406121c6f31a34f1888ce415ceb3485";
+    const std::vector<uint8_t> aPriv = hex("45434B32" "20000000" + aX + aY + aD);
+    const std::vector<uint8_t> bPriv = hex("45434B32" "20000000" + bX + bY + bD);
+    const std::vector<uint8_t> aPub = hex("45434B31" "20000000" + aX + aY);
+    const std::vector<uint8_t> bPub = hex("45434B31" "20000000" + bX + bY);
+
+    EcdhKeyExchange a, b;
+    TEST_ASSERT(a.initializeForTest(aPriv) && b.initializeForTest(bPriv));
+    TEST_ASSERT(a.localPublicKey() == aPub && b.localPublicKey() == bPub);
+
+    std::array<uint8_t, 32> nonce{};
+    for (size_t i = 0; i < nonce.size(); ++i) nonce[i] = static_cast<uint8_t>(i);
+    std::array<uint8_t, 32> keyA{}, keyB{};
+    TEST_ASSERT(a.computeSharedSessionKey(bPub.data(), bPub.size(), 111222333ULL, 444555666ULL, nonce, keyA));
+    TEST_ASSERT(b.computeSharedSessionKey(aPub.data(), aPub.size(), 111222333ULL, 444555666ULL, nonce, keyB));
+    TEST_ASSERT(keyA == keyB);
+    // The same bytes on Windows (CNG), Linux and macOS (OpenSSL): the raw secret's byte order is the interop point.
+    // Reference: the Windows CNG implementation.
+    const std::vector<uint8_t> expected = hex("c51072e5a014dbfffcb68874ae5e1555c8d2d1323a93e9ec0d3d0dc0bb73adac");
+    TEST_ASSERT(std::vector<uint8_t>(keyA.begin(), keyA.end()) == expected);
+}
+
 void testMacInputLogic() {
     std::cout << "[TEST 82] Mac host input logic (drags, click counts, key and point mapping)..." << std::endl;
     {   // A move while a button is held is a drag.
@@ -9608,6 +9643,7 @@ int main() {
         testMacInputLogic(); std::cout << "Test 82 done\n" << std::flush;
         testHostPermissionCard(); std::cout << "Test 86 done\n" << std::flush;
         testHostPermissionUi(); std::cout << "Test 87 done\n" << std::flush;
+        testEcdhKnownVector(); std::cout << "Test 88 done\n" << std::flush;
         testMacFrameHelpers(); std::cout << "Test 84 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;

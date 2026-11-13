@@ -183,6 +183,9 @@ public:
     EcdhKeyExchange& operator=(const EcdhKeyExchange&) = delete;
 
     bool initialize();
+    // Tests only: a fixed key pair instead of a random one, in the Windows CNG ECCPRIVATE blob layout (magic "ECK2",
+    // key size 32, X, Y, d: 104 bytes), the same on every platform.
+    bool initializeForTest(const std::vector<uint8_t>& privateBlob);
     bool isInitialized() const { return initialized_; }
     const std::vector<uint8_t>& localPublicKey() const { return localPubBlob_; }
 

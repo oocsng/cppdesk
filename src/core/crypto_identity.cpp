@@ -12,6 +12,7 @@
 #else
 #include <unistd.h>
 // ECDH and AES-GCM use OpenSSL on Linux and macOS (CommonCrypto exposes no public AES-GCM).
+#include <openssl/bn.h>
 #include <openssl/core_names.h>
 #include <openssl/ec.h>
 #include <openssl/evp.h>
@@ -1052,6 +1053,41 @@ bool EcdhKeyExchange::initialize() {
     return true;
 }
 
+bool EcdhKeyExchange::initializeForTest(const std::vector<uint8_t>& privateBlob) {
+    reset();
+    if (privateBlob.size() != sizeof(BCRYPT_ECCKEY_BLOB) + 3 * 32) return false;
+
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_ECDH_P256_ALGORITHM, nullptr, 0);
+    if (status < 0) return false;
+    hAlg_ = reinterpret_cast<uintptr_t>(hAlg);
+
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+    status = BCryptImportKeyPair(hAlg, nullptr, BCRYPT_ECCPRIVATE_BLOB, &hKey, const_cast<PUCHAR>(privateBlob.data()),
+                                 static_cast<ULONG>(privateBlob.size()), 0);
+    if (status < 0) {
+        reset();
+        return false;
+    }
+    hKey_ = reinterpret_cast<uintptr_t>(hKey);
+
+    ULONG pubLen = 0;
+    BCryptExportKey(hKey, nullptr, BCRYPT_ECCPUBLIC_BLOB, nullptr, 0, &pubLen, 0);
+    if (pubLen == 0) {
+        reset();
+        return false;
+    }
+    localPubBlob_.resize(pubLen);
+    status = BCryptExportKey(hKey, nullptr, BCRYPT_ECCPUBLIC_BLOB, localPubBlob_.data(), pubLen, &pubLen, 0);
+    if (status < 0) {
+        reset();
+        return false;
+    }
+    localPubBlob_.resize(pubLen);
+    initialized_ = true;
+    return true;
+}
+
 bool EcdhKeyExchange::computeSharedSessionKey(
     const uint8_t* peerPubBlob,
     size_t peerPubLen,
@@ -1321,6 +1357,7 @@ bool AesGcmSessionCipher::decrypt(
 
 namespace {
 constexpr uint32_t kEccPublicP256Magic = 0x314B4345; // BCRYPT_ECDH_PUBLIC_P256_MAGIC
+constexpr uint32_t kEccPrivateP256Magic = 0x324B4345; // BCRYPT_ECDH_PRIVATE_P256_MAGIC
 constexpr size_t kEccBlobLen = 8 + 32 + 32;
 }
 
@@ -1349,6 +1386,53 @@ bool EcdhKeyExchange::initialize() {
     std::memcpy(localPubBlob_.data() + 4, &cbKey, 4);
     std::memcpy(localPubBlob_.data() + 8, point + 1, 64);
 
+    hKey_ = reinterpret_cast<uintptr_t>(key);
+    initialized_ = true;
+    return true;
+}
+
+bool EcdhKeyExchange::initializeForTest(const std::vector<uint8_t>& privateBlob) {
+    reset();
+    if (privateBlob.size() != kEccBlobLen + 32) return false;
+    uint32_t magic = 0, cbKey = 0;
+    std::memcpy(&magic, privateBlob.data(), 4);
+    std::memcpy(&cbKey, privateBlob.data() + 4, 4);
+    if (magic != kEccPrivateP256Magic || cbKey != 32) return false;
+
+    uint8_t point[65];
+    point[0] = 0x04;
+    std::memcpy(point + 1, privateBlob.data() + 8, 64);
+    BIGNUM* d = BN_bin2bn(privateBlob.data() + kEccBlobLen, 32, nullptr);
+
+    EVP_PKEY* key = nullptr;
+    OSSL_PARAM_BLD* bld = OSSL_PARAM_BLD_new();
+    OSSL_PARAM* params = nullptr;
+    EVP_PKEY_CTX* ctx = nullptr;
+    bool ok = false;
+    do {
+        if (!d || !bld ||
+            OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME, "P-256", 0) != 1 ||
+            OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, point, sizeof(point)) != 1 ||
+            OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, d) != 1) break;
+        params = OSSL_PARAM_BLD_to_param(bld);
+        ctx = EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr);
+        if (!params || !ctx || EVP_PKEY_fromdata_init(ctx) != 1 ||
+            EVP_PKEY_fromdata(ctx, &key, EVP_PKEY_KEYPAIR, params) != 1) break;
+        ok = true;
+    } while (false);
+    EVP_PKEY_CTX_free(ctx);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    BN_clear_free(d);
+    if (!ok) {
+        EVP_PKEY_free(key);
+        return false;
+    }
+
+    localPubBlob_.resize(kEccBlobLen);
+    std::memcpy(localPubBlob_.data(), &kEccPublicP256Magic, 4);
+    std::memcpy(localPubBlob_.data() + 4, &cbKey, 4);
+    std::memcpy(localPubBlob_.data() + 8, point + 1, 64);
     hKey_ = reinterpret_cast<uintptr_t>(key);
     initialized_ = true;
     return true;
