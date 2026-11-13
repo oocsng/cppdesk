@@ -10,7 +10,7 @@ make sure the session really is Wayland: `echo $XDG_SESSION_TYPE` prints `waylan
 
 ## The question
 - [ ] Connect from the viewer. The desktop asks whether to share the screen (and allow remote control). Until you answer, the viewer sees nothing and the dashboard says it is waiting for your permission.
-- [ ] Answer no. Nothing is shared, the dashboard says screen sharing is off, and mouse and keyboard from the viewer do nothing.
+- [ ] Answer no. Nothing is shared, the viewer is disconnected at once and shows "The host did not allow screen sharing.", the host shows a message, Settings -> System & Service says screen sharing is off, and the viewer does not reconnect on its own.
 - [ ] Connect again and answer yes: the viewer sees the screen. Choose a monitor in the dialog if there are several.
 - [ ] Untick remote control in the dialog (where the desktop offers that): the viewer sees the screen, the dashboard says control is off, and nothing the viewer types or clicks reaches the desktop.
 - [ ] The viewer disconnects while the question is still open: the question goes away by itself.
@@ -21,7 +21,7 @@ make sure the session really is Wayland: `echo $XDG_SESSION_TYPE` prints `waylan
 - [ ] Moving a window, scrolling and playing a video look smooth; note the frame rate on the viewer.
 - [ ] The mouse pointer appears once on the viewer (not twice).
 - [ ] Changing the resolution or scale during a session keeps the picture right.
-- [ ] Clicking "Stop sharing" in the desktop's own indicator ends the picture and the dashboard says so.
+- [ ] Clicking "Stop sharing" in the desktop's own indicator ends the session: the viewer is disconnected with "The host stopped sharing the screen." and the host is told why.
 
 ## Controlling the desktop
 - [ ] Mouse moves and clicks land exactly where the viewer points (compare near the corners, on a scaled screen, and on the second monitor if there is one).

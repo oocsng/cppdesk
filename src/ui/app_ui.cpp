@@ -9265,6 +9265,9 @@ void AppUi::onTick() {
     if (const wayland::ShareNotice notice = currentShareNotice();
         notice.state != shareNoticeSeen_.state || notice.reason != shareNoticeSeen_.reason) {
         shareNoticeSeen_ = notice;
+        if (wayland::isShareEnd(notice.state) && !snapshotShareNotice_) {   // the host ended the session: say why
+            showToast(wayland::describeShareNotice(notice).title + ", so the viewer was disconnected.", true);
+        }
         shell_->invalidate();
     }
     if (std::string token; !snapshotShareNotice_ && network_.takeRestoreTokenForSave(token)) {

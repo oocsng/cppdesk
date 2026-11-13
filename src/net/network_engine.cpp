@@ -1935,9 +1935,10 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         ScreenCapturer capturer;
         capturer.setAutoHeadless(identity_.settings().autoVirtualDisplay);
         capturer.setRestoreToken(shareHub_.restoreToken());
-        struct ShareNoticeReset {   // the notice belongs to this session
+        shareHub_.setNotice({});   // the last session's notice is old news
+        struct ShareNoticeReset {   // the notice belongs to this session, except a share that was refused or ended: the host keeps seeing why
             wayland::ShareHub& hub;
-            ~ShareNoticeReset() { hub.setNotice({}); }
+            ~ShareNoticeReset() { if (!wayland::isShareEnd(hub.notice().state)) hub.setNotice({}); }
         } shareNoticeReset{shareHub_};
         auto monitors = capturer.enumerateMonitors();
         capturer.selectMonitor(0);
@@ -2891,6 +2892,14 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
             const bool gotFrame = capturer.captureDirtyTiles(wantKf, preset, dirtyTiles, isKf, curState);
             shareHub_.setNotice(capturer.shareNotice());
             if (std::string shareToken; capturer.takeRestoreTokenChange(shareToken)) shareHub_.pushToken(shareToken);
+            if (const wayland::ShareNotice ended = capturer.shareNotice(); wayland::isShareEnd(ended.state)) {
+                // Refused, or ended on this desktop: tell the viewer why and end the session. A viewer that is merely
+                // cut off would reconnect and ask this desktop's question again.
+                ByteWriter bye;
+                bye.writeString(wayland::endMessageForViewer(ended.state));
+                sendHostEncryptedPacket(PacketType::DISCONNECT, 0, bye.buffer().data(), bye.buffer().size());
+                break;
+            }
             if (gotFrame) {
                 // Detect dynamic desktop resolution change mid-session
                 if (capturer.frameWidth() != currentMonDesc.width || capturer.frameHeight() != currentMonDesc.height) {
@@ -4413,6 +4422,13 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             break;
                         }
                         case PacketType::DISCONNECT:
+                            // The host may say why it ended the session (an older host sends nothing).
+                            if (!payload.empty()) {
+                                try {
+                                    const std::string why = r.readString();
+                                    if (!why.empty()) setStatus(ViewerConnectionState::Error, why);
+                                } catch (...) {}
+                            }
                             viewerActive_.store(false);
                             break;
                         default:

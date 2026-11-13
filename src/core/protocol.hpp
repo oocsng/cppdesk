@@ -80,7 +80,7 @@ enum class PacketType : uint8_t {
     PERMISSION_UPDATE   = 0x06,
     PING                = 0x07,
     PONG                = 0x08,
-    DISCONNECT          = 0x09,
+    DISCONNECT          = 0x09, // Either way. Host -> Viewer may carry a string: why the host ended the session
     TOTP_VERIFY         = 0x0A, // Viewer -> Host: 6-digit TOTP verification code
 
     // Video & Monitor Control

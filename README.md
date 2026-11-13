@@ -127,8 +127,8 @@ The tray icon needs a panel with a system tray. GNOME has none without the AppIn
 Ubuntu and Fedora log in to Wayland by default, where an X11 program cannot see or control the real desktop. On a
 Wayland session the host therefore uses the desktop's own screen-sharing permission, with the video coming through
 PipeWire. When a viewer connects, the desktop asks once whether to share the screen and allow remote control; nothing is
-shared until you say yes, and saying no ends it (the dashboard says so, and mouse and keyboard from the viewer do
-nothing). Untick remote control in that question and the viewer can see the screen but not control it. A desktop with a
+shared until you say yes, and saying no ends the session: the viewer is disconnected with the reason, and you get a
+message and a note in Settings. The same happens when the desktop stops the sharing later. Untick remote control in that question and the viewer can see the screen but not control it. A desktop with a
 newer portal remembers the answer, so later sessions do not ask again (the desktop lists remembered permissions in its
 own privacy settings, where they can be revoked; a viewer still has to pass CppDesk's own password or approval).
 
