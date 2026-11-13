@@ -33,7 +33,7 @@
   </sub>
 </p>
 
-CppDesk is a portable remote desktop application built with modern C++ and hardware-accelerated rendering (Direct2D on Windows, Cocoa and Metal on macOS, X11 and MIT-SHM on Linux). It runs standalone with no installer, registry clutter, or external runtime requirements. Sessions authenticate via ephemeral or permanent keys and run end-to-end encrypted over direct LAN, NAT hole punching (STUN), or an optional relay server.
+CppDesk is a portable remote desktop application built with modern C++ and hardware-accelerated rendering (Direct2D on Windows, Cocoa and Metal on macOS, X11 and MIT-SHM on Linux). It runs standalone with no installer, registry clutter, or external runtime requirements. Sessions authenticate via ephemeral or permanent keys and run end-to-end encrypted. CppDesk is built for devices on the same network: two machines on one LAN connect directly, with no server and no account. NAT hole punching (STUN) and a self-hosted relay server exist for connecting across networks, but they are optional and not the focus.
 
 Hosts and clients identify each other with a 9-digit desk ID (`XXX XXX XXX`). Access can be granted with a password or through interactive on-screen approval.
 
@@ -47,7 +47,7 @@ Hosts and clients identify each other with a 9-digit desk ID (`XXX XXX XXX`). Ac
 - Terminal, process control, and command palette: Built-in remote command prompt, PowerShell / bash execution, live task manager with process killing, and an omnibar command palette (`Ctrl+K`).
 - Security and privacy: ECDH (NIST P-256) key exchange, AES-256-GCM AEAD authenticated encryption, optional TOTP 2FA (RFC 6238) with QR setup, brute-force rate limiting, curtain screen privacy mode, and real-time privacy cloak redaction zones.
 - Collaboration tools: In-session screen drawing tools (pens, highlighters, pointers), shared clipboard sync, and a real-time collaborative scratchpad.
-- Built-in networking tools: Port forwarding presets (RDP, SSH, VNC, HTTP), STUN diagnostics, and address book with quick tags.
+- Built-in networking tools: Port forwarding presets (RDP, SSH, VNC, HTTP), STUN and relay diagnostics (for connecting across networks), and address book with quick tags.
 
 ## Quick start
 
