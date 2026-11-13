@@ -87,7 +87,7 @@ Headless Linux host / service mode:
 ## Building from source
 
 ### Requirements
-- Windows 10 or 11 (x64), macOS 12.3+, or Linux (X11 desktop)
+- Windows 10 or 11 (x64), macOS 12.3+, or Linux (X11 desktop; Wayland screen sharing is experimental)
 - C++20 compiler (such as MinGW-w64 from MSYS2, MSVC, Apple Clang, or GCC 11+)
 - CMake 3.20+ (for cross-platform builds)
 
@@ -121,6 +121,23 @@ programs when they are installed and works without them:
 
 The tray icon needs a panel with a system tray. GNOME has none without the AppIndicator extension; there the
 "minimize to tray" option is hidden and closing the window quits.
+
+### Sharing a Wayland desktop (experimental)
+
+Ubuntu and Fedora log in to Wayland by default, where an X11 program cannot see or control the real desktop. On a
+Wayland session the host therefore uses the desktop's own screen-sharing permission, with the video coming through
+PipeWire. When a viewer connects, the desktop asks once whether to share the screen and allow remote control; nothing is
+shared until you say yes, and saying no ends it (the dashboard says so, and mouse and keyboard from the viewer do
+nothing). Untick remote control in that question and the viewer can see the screen but not control it. A desktop with a
+newer portal remembers the answer, so later sessions do not ask again.
+
+This has **not been run on a real Wayland desktop yet**: it is tested against a stand-in for the desktop's service, not
+on GNOME or KDE. What to check by hand is in [docs/wayland-host-test-checklist.md](docs/wayland-host-test-checklist.md).
+If the desktop has no screen-sharing service, or PipeWire is missing, the host falls back to the old X11 way, which shows
+only X applications (log in with an Xorg session to share everything). Viewing other computers is not affected, and
+clipboard sync on Wayland reaches only X applications. To build the video part you need the PipeWire headers
+(`sudo apt install libpipewire-0.3-dev`; without them it is left out); at run time the app loads the system's PipeWire
+only when a Wayland share starts, so it still starts on machines without it.
 
 ### Build commands
 
