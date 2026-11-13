@@ -1540,17 +1540,26 @@ bool ScreenCapturer::captureViaCoreGraphics() {
     const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     if (!macStream_) macStream_ = std::make_unique<MacCaptureStream>();
+    bool justStarted = false;
     if (macStreamDisplay_ != displayId ||
         (macStream_->state() != MacCaptureState::Running && nowMs - macLastStartMs_ >= 2000)) {
         macStreamDisplay_ = displayId;
         macLastStartMs_ = nowMs;
-        macStream_->start(displayId, 60, 3840);
+        justStarted = macStream_->start(displayId, 60, 3840);
     }
 
     int w = 0, h = 0;
     bool isNew = false;
-    const bool haveFrame = macStream_->state() == MacCaptureState::Running &&
-                           macStream_->copyLatest(currentFrame_, w, h, isNew);
+    bool haveFrame = false;
+    if (macStream_->state() == MacCaptureState::Running) {
+        haveFrame = macStream_->copyLatest(currentFrame_, w, h, isNew);
+        // A new stream delivers its first frame a moment after it started: wait for it (up to 2 s) instead of
+        // reporting a failed capture.
+        for (int i = 0; !haveFrame && justStarted && i < 200; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            haveFrame = macStream_->copyLatest(currentFrame_, w, h, isNew);
+        }
+    }
     if (!haveFrame && !fillMacTestPattern(currentFrame_, w, h)) return false;
     // Frames are in pixels while the monitor's x, y (and the pointer) are in points; the host loop sees the pixel
     // size here and tells the viewer, and the injector reads the display's points from CoreGraphics itself.
