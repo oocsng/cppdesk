@@ -26,5 +26,13 @@ Linux or another Mac) as the viewer. Note the macOS version and whether the Mac 
 - [ ] From a Windows viewer: Ctrl+C / Ctrl+V / Ctrl+A act as Command+C / V / A on the Mac; the Windows key acts as Control.
 - [ ] Ending the session while holding a key or button leaves nothing stuck on the Mac.
 
+## Sound
+- [ ] Voice intercom: the first use asks for the microphone; after allowing it, the viewer hears the Mac's room and the Mac hears the viewer, clearly and without echo piling up.
+- [ ] While the viewer talks, the dashboard's session box says "Microphone is on: the viewer can hear this room"; it disappears when the viewer stops or the session ends (also when the connection is cut).
+- [ ] On macOS 13 or later: sound played on the Mac (music, a video) is heard on the viewer; CppDesk's own sounds and the viewer's voice are not sent back to the viewer.
+- [ ] On macOS 12: the picture works as before and there is simply no host sound.
+- [ ] The viewer's volume slider and mute button act at once; a viewer that starts muted hears nothing until it unmutes.
+- [ ] Pausing the viewer's network for a few seconds and resuming does not leave the sound seconds behind.
+
 ## Report
 Send the macOS version, hardware, what failed and, if the app crashed, the crash report from Console.app.

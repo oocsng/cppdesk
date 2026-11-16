@@ -11,6 +11,8 @@
 #include "../control/clipboard_file_manager.hpp"
 #include "../control/whiteboard_manager.hpp"
 #include "../media/voice_intercom.hpp"
+#include "../media/system_audio.hpp"
+#include "../media/audio_convert.hpp"
 #include "../capture/display_manager.hpp"
 #include "../control/file_sync_manager.hpp"
 #include "../control/remote_file_browser.hpp"
@@ -351,6 +353,21 @@ public:
     bool isAudioMuted() const;
     void syncAudioControl();
     bool isHostAudioSuspended() const;
+    // True while the host's microphone is open because a viewer's voice arrived: the dashboard says so.
+    bool isHostMicLive() const { return hostMicLive_.load(); }
+    void setHostMicLiveForTest(bool live) { hostMicLive_.store(live); }
+#if !defined(_WIN32)
+    // Tests stand in for the sound hardware: what the host captures and what the viewer plays through. A null factory
+    // keeps the real one. Set before a session starts.
+    using SystemAudioSourceFactory = std::function<std::unique_ptr<SystemAudioSource>()>;
+    using AudioPlayerFactory = std::function<std::unique_ptr<AudioPlayer>()>;
+    void setAudioFactoriesForTest(SystemAudioSourceFactory source, AudioPlayerFactory player) {
+        sourceFactory_ = std::move(source);
+        playerFactory_ = std::move(player);
+    }
+    // Hands the viewer a received AUDIO_STREAM_CHUNK payload as if the host had sent it (malformed ones included).
+    void injectViewerAudioChunkForTest(const uint8_t* payload, size_t len) { enqueueViewerAudioChunk(payload, len); }
+#endif
 
     // Privacy screen controls (v2.1.0, v3.2.0 & DPMS power management)
     void requestTogglePrivacyMode(ScreenBlankMode blankMode = ScreenBlankMode::Unified);
@@ -583,6 +600,8 @@ private:
     void initViewerAudioPlayback();
     void shutdownViewerAudioPlayback();
     void enqueueViewerAudioChunk(const uint8_t* payload, size_t len);
+    // The host's sound (48 kHz 16-bit stereo) as AUDIO_STREAM_CHUNK; sends nothing while the viewer has muted.
+    void sendHostSoundChunk(const int16_t* stereo48k, size_t frames);
 
     // Host Privacy Curtain Window
     void createPrivacyCurtainWindow();
@@ -604,6 +623,15 @@ private:
     std::atomic<int>        audioVolumePercent_{100};
     std::atomic<bool>       audioMuted_{false};
     std::atomic<bool>       hostAudioSuspended_{false};
+    std::atomic<bool>       hostMicLive_{false};
+#if !defined(_WIN32)
+    SystemAudioSourceFactory sourceFactory_;
+    AudioPlayerFactory       playerFactory_;
+    std::unique_ptr<AudioPlayer> viewerPlayer_;     // guarded by audioPlaybackMutex_
+    bool                    viewerAudioOpen_ = false;    // between a session's start and its end
+    bool                    viewerPlayerTried_ = false;  // one attempt per session
+    audio::ConvertState     viewerConvert_;
+#endif
 
     // Privacy Mode state
     std::atomic<bool>       hostPrivacyModeActive_{false};

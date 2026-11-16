@@ -1586,6 +1586,7 @@ bool ScreenCapturer::captureViaCoreGraphics() {
         (macStream_->state() != MacCaptureState::Running && nowMs - macLastStartMs_ >= 2000)) {
         macStreamDisplay_ = displayId;
         macLastStartMs_ = nowMs;
+        macStream_->setAudioSink(soundSink_);
         justStarted = macStream_->start(displayId, 60, 3840);
     }
 

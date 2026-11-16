@@ -8,6 +8,8 @@
 #include "../src/capture/wayland_helpers.hpp"
 #include "../src/capture/latest_frame.hpp"
 #include "../src/capture/share_hub.hpp"
+#include "../src/media/audio_convert.hpp"
+#include <limits>
 #include "../src/capture/wayland_share.hpp"
 #include "../src/control/clipboard_file_manager.hpp"
 #include "../src/net/network_engine.hpp"
@@ -36,6 +38,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include "fake_portal.hpp"
+#include "../src/media/pulse_stream.hpp"
 #include <gio/gio.h>
 #include <set>
 #include <unistd.h>
@@ -9424,7 +9427,7 @@ void testHostPermissionUi() {
 
     {   // Two more snapshot states show the card on every platform.
         const auto names = AppUi::snapshotStateNames();
-        TEST_ASSERT(names.size() >= 4 && names[names.size() - 4] == "dashboard_mac_permissions" && names[names.size() - 3] == "dashboard_mac_restart");
+        TEST_ASSERT(names.size() >= 5 && names[names.size() - 5] == "dashboard_mac_permissions" && names[names.size() - 4] == "dashboard_mac_restart");
         FakeShell plain;
         TEST_ASSERT(renderAppState(id, net, plain, "dashboard_mac_permissions").find("|Allow screen sharing") != npos);
         const std::string restartState = renderAppState(id, net, plain, "dashboard_mac_restart");
@@ -9491,8 +9494,8 @@ void testWaylandShareNoticeUi() {
     }
     {   // The two new states close the list of snapshots
         const auto names = AppUi::snapshotStateNames();
-        TEST_ASSERT(names.size() >= 2 && names[names.size() - 2] == "dashboard_wayland_denied" &&
-                    names.back() == "dashboard_wayland_view_only");
+        TEST_ASSERT(names.size() >= 3 && names[names.size() - 3] == "dashboard_wayland_denied" &&
+                    names[names.size() - 2] == "dashboard_wayland_view_only" && names.back() == "dashboard_mic_on");
     }
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
@@ -10568,6 +10571,705 @@ void testRealPipeWire() {
 }
 #endif
 
+void testAudioConvertHelpers() {
+    std::cout << "[TEST 97] Audio helpers: format conversion, resampling, bounded queue..." << std::endl;
+    using namespace cppdesk::audio;
+    auto run = [](const PcmBlock& b, ConvertState& st) {
+        std::vector<int16_t> out;
+        toWire(b, st, out);
+        return out;
+    };
+    {   // Already the wire format: unchanged
+        std::vector<int16_t> in = {1, -2, 300, -400, 32767, -32768};
+        ConvertState st;
+        TEST_ASSERT(run({in.data(), 3, 2, 48000, SampleFormat::S16, false}, st) == in);
+    }
+    {   // Mono is duplicated into both channels
+        std::vector<int16_t> in = {5, -7, 9};
+        ConvertState st;
+        TEST_ASSERT((run({in.data(), 3, 1, 48000, SampleFormat::S16, false}, st) == std::vector<int16_t>{5, 5, -7, -7, 9, 9}));
+    }
+    {   // Float planar stereo: full scale, clipping, and NaN or infinity become silence
+        std::vector<float> in = {1.0f, 1.5f, -1.0f, std::nanf(""),                       // left plane
+                                 0.0f, -2.0f, std::numeric_limits<float>::infinity(), 0.5f};   // right plane
+        ConvertState st;
+        auto out = run({in.data(), 4, 2, 48000, SampleFormat::F32, true}, st);
+        TEST_ASSERT(out.size() == 8);
+        if (out.size() == 8) {
+            TEST_ASSERT(out[0] == 32767 && out[1] == 0);
+            TEST_ASSERT(out[2] == 32767 && std::abs(out[3] + 32767) <= 1);
+            TEST_ASSERT(std::abs(out[4] + 32767) <= 1 && out[5] == 0);
+            TEST_ASSERT(out[6] == 0 && std::abs(out[7] - 16384) <= 1);
+        }
+    }
+    {   // Six channels (interleaved float): the centre channel alone is folded into both sides at about 0.707
+        const size_t frames = 100;
+        std::vector<float> in(frames * 6, 0.0f);
+        for (size_t f = 0; f < frames; ++f) in[f * 6 + 2] = 0.5f;
+        ConvertState st;
+        auto out = run({in.data(), frames, 6, 48000, SampleFormat::F32, false}, st);
+        TEST_ASSERT(out.size() == frames * 2);
+        if (out.size() == frames * 2) {
+            const int expected = static_cast<int>(0.5 * 0.707 * 32767.0);
+            TEST_ASSERT(std::abs(out[40] - expected) < 60 && std::abs(out[41] - expected) < 60);
+        }
+    }
+    {   // Other sample rates: the number of frames follows the rate
+        std::vector<int16_t> in44(441 * 2, 1000);
+        ConvertState st44;
+        const size_t n44 = run({in44.data(), 441, 2, 44100, SampleFormat::S16, false}, st44).size() / 2;
+        TEST_ASSERT(n44 >= 479 && n44 <= 481);
+        std::vector<int16_t> in96(960 * 2, 1000);
+        ConvertState st96;
+        const size_t n96 = run({in96.data(), 960, 2, 96000, SampleFormat::S16, false}, st96).size() / 2;
+        TEST_ASSERT(n96 >= 479 && n96 <= 481);
+    }
+    {   // A sine converted in small chunks equals the same sine converted whole: no clicks at the chunk edges
+        const int total = 4400;   // a whole number of 100-frame chunks
+        std::vector<int16_t> sine(total);
+        for (int i = 0; i < total; ++i) sine[i] = static_cast<int16_t>(10000.0 * std::sin(2.0 * 3.14159265358979 * 1000.0 * i / 44100.0));
+        ConvertState whole;
+        auto all = run({sine.data(), static_cast<size_t>(total), 1, 44100, SampleFormat::S16, false}, whole);
+        ConvertState chunked;
+        std::vector<int16_t> parts;
+        for (int at = 0; at < total; at += 100) toWire({sine.data() + at, 100, 1, 44100, SampleFormat::S16, false}, chunked, parts);
+        TEST_ASSERT(std::abs(static_cast<long>(all.size() / 2) - static_cast<long>(parts.size() / 2)) <= 1);
+        const size_t common = std::min(all.size(), parts.size());
+        int worst = 0;
+        for (size_t i = 0; i < common; ++i) worst = std::max(worst, std::abs(all[i] - parts[i]));
+        TEST_ASSERT(worst <= 2);
+    }
+    {   // An empty block adds nothing
+        ConvertState st;
+        std::vector<int16_t> out;
+        toWire({nullptr, 0, 2, 48000, SampleFormat::S16, false}, st, out);
+        TEST_ASSERT(out.empty());
+    }
+    {   // One channel to two and back
+        std::vector<int16_t> mono = {10, -20, 30};
+        std::vector<int16_t> stereo, back;
+        adaptChannels(mono.data(), 3, 1, 2, stereo);
+        TEST_ASSERT((stereo == std::vector<int16_t>{10, 10, -20, -20, 30, 30}));
+        std::vector<int16_t> pair = {100, 300, -50, 50};
+        adaptChannels(pair.data(), 2, 2, 1, back);
+        TEST_ASSERT((back == std::vector<int16_t>{200, 0}));
+        std::vector<int16_t> same;
+        adaptChannels(pair.data(), 2, 2, 2, same);
+        TEST_ASSERT(same == pair);
+    }
+    {   // The bounded queue: the oldest bytes go first, the newest stay, in order
+        BoundedPcmQueue q(1000);
+        std::vector<uint8_t> a(600), b(600);
+        for (size_t i = 0; i < a.size(); ++i) a[i] = static_cast<uint8_t>(i % 251);
+        for (size_t i = 0; i < b.size(); ++i) b[i] = static_cast<uint8_t>((i + 7) % 241);
+        q.push(a.data(), a.size());
+        q.push(b.data(), b.size());
+        TEST_ASSERT(q.size() == 1000 && q.droppedBytes() == 200);
+        std::vector<uint8_t> out(2000);
+        const size_t got = q.pop(out.data(), out.size());
+        TEST_ASSERT(got == 1000 && q.size() == 0);
+        std::vector<uint8_t> want(a.begin() + 200, a.end());
+        want.insert(want.end(), b.begin(), b.end());
+        TEST_ASSERT(got == 1000 && std::equal(want.begin(), want.end(), out.begin()));
+        std::vector<uint8_t> big(3000);
+        for (size_t i = 0; i < big.size(); ++i) big[i] = static_cast<uint8_t>(i % 199);
+        q.push(big.data(), big.size());
+        TEST_ASSERT(q.size() == 1000);
+        const size_t got2 = q.pop(out.data(), 400);                      // partial pops come out oldest first
+        TEST_ASSERT(got2 == 400 && std::equal(big.begin() + 2000, big.begin() + 2400, out.begin()) && q.size() == 600);
+        q.clear();
+        TEST_ASSERT(q.size() == 0 && q.pop(out.data(), 10) == 0);
+    }
+    {   // One thread pushes, one pops: never a torn frame (every 4 bytes are the same value)
+        BoundedPcmQueue q(4096);
+        std::atomic<bool> stop{false};
+        std::atomic<int> torn{0}, popped{0};
+        std::thread producer([&] {
+            uint8_t v = 0;
+            while (!stop) {
+                uint8_t chunk[8];
+                std::memset(chunk, v, 4);
+                std::memset(chunk + 4, static_cast<uint8_t>(v + 1), 4);
+                v = static_cast<uint8_t>(v + 2);
+                q.push(chunk, sizeof(chunk));
+            }
+        });
+        std::thread consumer([&] {
+            uint8_t buf[1024];
+            while (!stop) {
+                const size_t n = q.pop(buf, sizeof(buf));
+                popped += static_cast<int>(n);
+                for (size_t i = 0; i + 4 <= n; i += 4)
+                    if (buf[i] != buf[i + 1] || buf[i] != buf[i + 2] || buf[i] != buf[i + 3]) ++torn;
+            }
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        stop = true;
+        producer.join();
+        consumer.join();
+        TEST_ASSERT(torn == 0 && popped > 0);
+    }
+}
+
+#if defined(__linux__)
+void testPulseStream() {
+    std::cout << "[TEST 98] PulseAudio client: unavailable, no server, stopping..." << std::endl;
+    using cppdesk::PulseStream;
+    using Clock = std::chrono::steady_clock;
+    auto ms = [](Clock::time_point from) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - from).count();
+    };
+    uint8_t buf[64] = {};
+
+    // The library cannot be found: everything fails quietly
+    setenv("CPPDESK_PULSE_LIB", "/nonexistent/libpulse-simple.so.0", 1);
+    {
+        TEST_ASSERT(!PulseStream::available());
+        PulseStream s;
+        TEST_ASSERT(!s.open(PulseStream::Dir::Record, nullptr, 48000, 2, "cppdesk-test"));
+        TEST_ASSERT(!s.open(PulseStream::Dir::Playback, nullptr, 48000, 2, "cppdesk-test"));
+        TEST_ASSERT(!s.isOpen());
+        TEST_ASSERT(s.read(buf, sizeof(buf)) == -1);
+        TEST_ASSERT(!s.write(buf, sizeof(buf)));
+        s.flush();
+        s.close();
+        s.close();
+    }
+    unsetenv("CPPDESK_PULSE_LIB");
+
+    if (!PulseStream::available()) {
+        std::cout << "  (PulseAudio client library not found: the no-server checks are skipped)" << std::endl;
+        return;
+    }
+
+    // The library is there but no sound server answers: open fails promptly
+    const char* oldServer = std::getenv("PULSE_SERVER");
+    const std::string saved = oldServer ? oldServer : "";
+    setenv("PULSE_SERVER", "unix:/nonexistent/pulse-socket", 1);
+    {
+        PulseStream rec, play;
+        const auto t0 = Clock::now();
+        TEST_ASSERT(!rec.open(PulseStream::Dir::Record, nullptr, 48000, 2, "cppdesk-test"));
+        TEST_ASSERT(!play.open(PulseStream::Dir::Playback, nullptr, 48000, 2, "cppdesk-test"));
+        TEST_ASSERT(!rec.isOpen() && !play.isOpen());
+        TEST_ASSERT(ms(t0) < 3000);
+        rec.close();
+        play.close();
+    }
+    if (oldServer) setenv("PULSE_SERVER", saved.c_str(), 1);
+    else unsetenv("PULSE_SERVER");
+}
+
+void testLinuxVoiceIntercom() {
+    std::cout << "[TEST 99] Voice intercom on Linux: without sound support, without a server..." << std::endl;
+    using cppdesk::VoiceIntercom;
+    using Clock = std::chrono::steady_clock;
+    auto ms = [](Clock::time_point from) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - from).count();
+    };
+    auto noChunks = [](const uint8_t*, size_t, uint32_t, uint8_t) {};
+    uint8_t pcm[960] = {};
+
+    setenv("CPPDESK_PULSE_LIB", "/nonexistent/libpulse-simple.so.0", 1);
+    {
+        VoiceIntercom v;
+        TEST_ASSERT(!v.startCapture(noChunks));
+        TEST_ASSERT(!v.isCapturing());
+        TEST_ASSERT(!v.startPlayback());
+        TEST_ASSERT(!v.isPlaying());
+        v.enqueuePlaybackChunk(pcm, sizeof(pcm), 1);   // nothing is playing: ignored
+        v.stopCapture();
+        v.stopCapture();
+        v.stopPlayback();
+        v.stopPlayback();
+        TEST_ASSERT(!v.isCapturing() && !v.isPlaying());
+        const auto in = VoiceIntercom::enumerateInputDevices();
+        const auto out = VoiceIntercom::enumerateOutputDevices();
+        TEST_ASSERT(in.size() == 1 && in[0].isDefault && out.size() == 1 && out[0].isDefault);
+        const int16_t loud[4] = {32767, -32768, 32767, -32768};
+        TEST_ASSERT(VoiceIntercom::calculateRmsLevel(loud, 4) > 0.99f);
+        int16_t g[2] = {1000, -1000};
+        VoiceIntercom::applyGain(g, 2, 0.5f);
+        TEST_ASSERT(g[0] == 500 && g[1] == -500);
+    }
+    unsetenv("CPPDESK_PULSE_LIB");
+
+    if (!cppdesk::PulseStream::available()) {
+        std::cout << "  (PulseAudio client library not found: the no-server checks are skipped)" << std::endl;
+        return;
+    }
+    const char* oldServer = std::getenv("PULSE_SERVER");
+    const std::string saved = oldServer ? oldServer : "";
+    setenv("PULSE_SERVER", "unix:/nonexistent/pulse-socket", 1);
+    {
+        VoiceIntercom v;
+        const auto t0 = Clock::now();
+        TEST_ASSERT(!v.startCapture(noChunks));
+        TEST_ASSERT(!v.startPlayback());
+        TEST_ASSERT(!v.isCapturing() && !v.isPlaying());
+        TEST_ASSERT(ms(t0) < 3000);
+    }
+    if (oldServer) setenv("PULSE_SERVER", saved.c_str(), 1);
+    else unsetenv("PULSE_SERVER");
+}
+
+// The energy of one frequency in a mono signal (Goertzel).
+double goertzelEnergy(const std::vector<float>& x, double freq, double rate) {
+    const double w = 2.0 * 3.14159265358979 * freq / rate;
+    const double coeff = 2.0 * std::cos(w);
+    double s1 = 0, s2 = 0;
+    for (float v : x) {
+        const double s = v + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s;
+    }
+    return s1 * s1 + s2 * s2 - coeff * s1 * s2;
+}
+
+// CI only (see ci.yml and scripts/ci_pulse_check.sh): needs a running PulseAudio-compatible server whose default output
+// is a null sink. Anything the default output plays comes back from its monitor.
+void testRealPulse() {
+    std::cout << "[TEST 103] Real PulseAudio-compatible server: capture, playback, stopping..." << std::endl;
+    using cppdesk::PulseStream;
+    using Clock = std::chrono::steady_clock;
+    auto ms = [](Clock::time_point from) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - from).count();
+    };
+    TEST_ASSERT(PulseStream::available());
+    if (!PulseStream::available()) return;
+
+    // Plays a tone of `freq` into the default output (straight, or through VoiceIntercom) and returns what the monitor heard.
+    auto heard = [&](double freq, double seconds, bool viaIntercom) {
+        PulseStream rec, play;
+        cppdesk::VoiceIntercom intercom;
+        TEST_ASSERT(rec.open(PulseStream::Dir::Record, "@DEFAULT_MONITOR@", 48000, 2, "cppdesk-test"));
+        if (viaIntercom) TEST_ASSERT(intercom.startPlayback(48000, 2));
+        else TEST_ASSERT(play.open(PulseStream::Dir::Playback, nullptr, 48000, 2, "cppdesk-test", 120));
+        std::vector<float> mono;
+        std::atomic<bool> stop{false};
+        std::thread writer([&] {
+            const size_t frames = 960;   // 20 ms
+            std::vector<int16_t> chunk(frames * 2);
+            size_t n = 0;
+            const auto start = Clock::now();
+            while (!stop && ms(start) < static_cast<long long>(seconds * 1000)) {
+                for (size_t i = 0; i < frames; ++i, ++n) {
+                    const auto v = static_cast<int16_t>(12000.0 * std::sin(2.0 * 3.14159265358979 * freq * static_cast<double>(n) / 48000.0));
+                    chunk[i * 2] = chunk[i * 2 + 1] = v;
+                }
+                if (viaIntercom) intercom.enqueuePlaybackChunk(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size() * 2, 2);
+                else play.write(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size() * 2);
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        });
+        const auto t0 = Clock::now();
+        uint8_t tmp[4096];
+        while (ms(t0) < static_cast<long long>(seconds * 1000) + 400) {
+            const int n = rec.read(tmp, sizeof(tmp));
+            if (n < 0) break;
+            const auto* s = reinterpret_cast<const int16_t*>(tmp);
+            for (int i = 0; i + 1 < n / 2; i += 2) mono.push_back((s[i] + s[i + 1]) * 0.5f / 32768.0f);
+        }
+        stop = true;
+        writer.join();
+        const auto tc = Clock::now();
+        play.close();
+        intercom.stopPlayback();
+        rec.close();
+        TEST_ASSERT(ms(tc) < 1000);
+        return mono;
+    };
+
+    for (bool viaIntercom : {false, true}) {   // A played 1 kHz tone comes back from the monitor: at least half a second of it, and clearly 1 kHz
+        const auto mono = heard(1000.0, 2.0, viaIntercom);
+        TEST_ASSERT(mono.size() >= 24000);
+        const double e1k = goertzelEnergy(mono, 1000.0, 48000.0);
+        const double e3k = goertzelEnergy(mono, 3000.0, 48000.0);
+        TEST_ASSERT(e1k > 20.0 * e3k);
+    }
+    {   // The microphone path delivers chunks (the default input is the monitor here, so a tone is played) and stops promptly
+        PulseStream player;
+        TEST_ASSERT(player.open(PulseStream::Dir::Playback, nullptr, 48000, 2, "cppdesk-test", 120));
+        cppdesk::VoiceIntercom mic;
+        std::atomic<int> chunks{0};
+        std::atomic<bool> shapeOk{true};
+        TEST_ASSERT(mic.startCapture([&](const uint8_t* data, size_t bytes, uint32_t rate, uint8_t channels) {
+            if (!data || bytes == 0 || rate != 48000 || channels != 1) shapeOk = false;
+            ++chunks;
+        }, 48000, 1));
+        TEST_ASSERT(mic.isCapturing());
+        std::vector<int16_t> chunk(960 * 2);
+        size_t n = 0;
+        const auto t0 = Clock::now();
+        while (chunks.load() == 0 && ms(t0) < 2500) {
+            for (size_t i = 0; i < 960; ++i, ++n) chunk[i * 2] = chunk[i * 2 + 1] = static_cast<int16_t>(12000.0 * std::sin(2.0 * 3.14159265358979 * 1000.0 * static_cast<double>(n) / 48000.0));
+            player.write(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size() * 2);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        TEST_ASSERT(chunks.load() > 0 && shapeOk.load());
+        const float level = mic.inputLevel();
+        TEST_ASSERT(level >= 0.0f && level <= 1.0f);
+        const auto tc = Clock::now();
+        mic.stopCapture();
+        TEST_ASSERT(ms(tc) < 1000 && !mic.isCapturing() && mic.inputLevel() == 0.0f);
+        player.close();
+    }
+    {   // With nothing played the monitor is silent, and stopping an idle stream is prompt
+        PulseStream rec;
+        TEST_ASSERT(rec.open(PulseStream::Dir::Record, "@DEFAULT_MONITOR@", 48000, 2, "cppdesk-test"));
+        double sumSq = 0;
+        size_t count = 0;
+        const auto t0 = Clock::now();
+        uint8_t tmp[4096];
+        while (ms(t0) < 600) {
+            const int n = rec.read(tmp, sizeof(tmp));
+            if (n < 0) break;
+            const auto* s = reinterpret_cast<const int16_t*>(tmp);
+            for (int i = 0; i < n / 2; ++i) {
+                sumSq += static_cast<double>(s[i]) * s[i] / (32768.0 * 32768.0);
+                ++count;
+            }
+        }
+        TEST_ASSERT(count == 0 || std::sqrt(sumSq / static_cast<double>(count)) < 0.01);
+        const auto tc = Clock::now();
+        rec.close();
+        TEST_ASSERT(ms(tc) < 1000);
+    }
+}
+#endif
+
+#if !defined(_WIN32)
+void testHostSoundOverTheSession() {
+    std::cout << "[TEST 100] The host's sound reaches the viewer: sequence, volume, mute, stopping, no capture..." << std::endl;
+    using namespace cppdesk;
+    auto waitUntil = [](const std::function<bool()>& pred, int ms = 8000) {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!pred()) {
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(ms)) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return true;
+    };
+
+    struct Heard {
+        std::mutex mu;
+        std::vector<int16_t> played;   // interleaved stereo, in the order it arrived
+        size_t mostFrames = 0;         // the largest single play() call
+        std::atomic<bool> stopped{false};
+        std::atomic<int> afterStop{0};
+    };
+    // A numbered ramp (the same value in both channels, +1 per frame, wrapping), 480 frames every 10 ms
+    struct RampSource : SystemAudioSource {
+        std::thread t;
+        std::atomic<bool> halt{false};
+        bool start(Sink sink) override {
+            halt = false;
+            t = std::thread([this, sink = std::move(sink)] {
+                int32_t n = 0;
+                int16_t buf[480 * 2];
+                while (!halt) {
+                    for (int f = 0; f < 480; ++f, ++n) buf[f * 2] = buf[f * 2 + 1] = static_cast<int16_t>(n % 20000 - 10000);
+                    sink(buf, 480);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            });
+            return true;
+        }
+        void stop() override {
+            halt = true;
+            if (t.joinable()) t.join();
+        }
+        ~RampSource() override { stop(); }
+    };
+    struct NoSource : SystemAudioSource {
+        bool start(Sink) override { return false; }
+        void stop() override {}
+    };
+    struct FakePlayer : AudioPlayer {
+        std::shared_ptr<Heard> h;
+        explicit FakePlayer(std::shared_ptr<Heard> heard) : h(std::move(heard)) {}
+        bool start() override { return true; }
+        void play(const int16_t* pcm, size_t frames) override {
+            if (h->stopped) ++h->afterStop;
+            std::lock_guard<std::mutex> lk(h->mu);
+            h->played.insert(h->played.end(), pcm, pcm + frames * 2);
+            h->mostFrames = std::max(h->mostFrames, frames);
+        }
+        void stop() override { h->stopped = true; }
+    };
+
+    auto makeEngines = [](int seed, int hostPort, int viewerPort, std::unique_ptr<IdentityManager>& hostId,
+                          std::unique_ptr<IdentityManager>& viewerId) {
+        hostId = std::make_unique<IdentityManager>(seed);
+        hostId->loadOrCreate();
+        hostId->setListenPort(static_cast<uint16_t>(hostPort));
+        hostId->setUnattendedEnabled(true);
+        hostId->setUnattendedPassword("TestPass99");
+        hostId->setRelayServerAddress("127.0.0.1:50999");
+        viewerId = std::make_unique<IdentityManager>(seed + 1);
+        viewerId->loadOrCreate();
+        viewerId->setListenPort(static_cast<uint16_t>(viewerPort));
+        viewerId->setRelayServerAddress("127.0.0.1:50999");
+    };
+    auto removeConfigs = [](IdentityManager& a, IdentityManager& b) {
+        std::error_code ec;
+        std::filesystem::remove(a.configFilePath(), ec);
+        std::filesystem::remove(b.configFilePath(), ec);
+    };
+
+    {   // A working source: every frame arrives in order, volume and mute act, and nothing plays after the session ends
+        auto heard = std::make_shared<Heard>();
+        std::unique_ptr<IdentityManager> hostId, viewerId;
+        makeEngines(4270, 50944, 50945, hostId, viewerId);
+        NetworkEngine hostNet(*hostId);
+        NetworkEngine viewerNet(*viewerId);
+        hostNet.setAudioFactoriesForTest([]() -> std::unique_ptr<SystemAudioSource> { return std::make_unique<RampSource>(); }, {});
+        viewerNet.setAudioFactoriesForTest({}, [heard]() -> std::unique_ptr<AudioPlayer> { return std::make_unique<FakePlayer>(heard); });
+        TEST_ASSERT(hostNet.start());
+        hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
+        TEST_ASSERT(viewerNet.start());
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        TEST_ASSERT(viewerNet.connectToRemote(hostId->formattedDeskId(), "TestPass99"));
+
+        auto framesPlayed = [&] {
+            std::lock_guard<std::mutex> lk(heard->mu);
+            return heard->played.size() / 2;
+        };
+        TEST_ASSERT(waitUntil([&] { return framesPlayed() >= 4800; }, 15000));
+
+        int phase = 0;   // where in the ramp the first received frame is
+        {
+            std::lock_guard<std::mutex> lk(heard->mu);
+            phase = heard->played.empty() ? 0 : heard->played[0] + 10000;
+            bool inOrder = true;
+            for (size_t i = 0; i * 2 + 1 < heard->played.size() && inOrder; ++i) {
+                const int want = static_cast<int>((phase + i) % 20000) - 10000;
+                inOrder = heard->played[i * 2] == want && heard->played[i * 2 + 1] == want;
+            }
+            TEST_ASSERT(inOrder);   // no frame lost, repeated or altered at full volume
+        }
+
+        viewerNet.setAudioVolume(50);
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        const size_t atHalf = framesPlayed();
+        TEST_ASSERT(waitUntil([&] { return framesPlayed() >= atHalf + 4800; }, 5000));
+        {
+            std::lock_guard<std::mutex> lk(heard->mu);
+            bool halved = true;
+            const size_t total = heard->played.size() / 2;
+            for (size_t i = total - 2400; i < total && halved; ++i) {
+                const int full = static_cast<int>((phase + i) % 20000) - 10000;
+                halved = std::abs(heard->played[i * 2] - full / 2) <= 1 && std::abs(heard->played[i * 2 + 1] - full / 2) <= 1;
+            }
+            TEST_ASSERT(halved);
+        }
+
+        viewerNet.setAudioMuted(true);
+        TEST_ASSERT(waitUntil([&] { return hostNet.isHostAudioSuspended(); }, 3000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        const size_t atMute = framesPlayed();
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        TEST_ASSERT(framesPlayed() == atMute);   // nothing more arrives while muted
+        viewerNet.setAudioMuted(false);
+        TEST_ASSERT(waitUntil([&] { return !hostNet.isHostAudioSuspended(); }, 3000));
+        TEST_ASSERT(waitUntil([&] { return framesPlayed() > atMute; }, 3000));
+
+        {   // A broken or hostile host cannot make the viewer resample without bound or play garbage: such chunks are dropped
+            auto inject = [&](uint32_t rate, uint8_t channels, uint32_t frames) {
+                AudioChunkHeader hdr{};
+                hdr.sampleRate = rate;
+                hdr.channels = channels;
+                hdr.bitsPerSample = 16;
+                hdr.sampleFrames = frames;
+                std::vector<uint8_t> packet(sizeof(hdr) + static_cast<size_t>(frames) * channels * sizeof(int16_t), 0x39);
+                std::memcpy(packet.data(), &hdr, sizeof(hdr));
+                bool threw = false;
+                try { viewerNet.injectViewerAudioChunkForTest(packet.data(), packet.size()); } catch (...) { threw = true; }
+                TEST_ASSERT(!threw);
+            };
+            inject(1, 1, 200);       // one sample per second: would become 9.6 million frames
+            inject(3000, 2, 200);
+            inject(48000, 200, 50);  // far more channels than any device has
+            inject(0, 2, 100);
+            std::lock_guard<std::mutex> lk(heard->mu);
+            TEST_ASSERT(heard->mostFrames <= 4800);   // the host's own chunks are 480 frames
+        }
+
+        viewerNet.disconnectViewer();   // in the middle of the stream
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        TEST_ASSERT(heard->stopped.load());
+        const size_t afterDisconnect = framesPlayed();
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        TEST_ASSERT(framesPlayed() == afterDisconnect && heard->afterStop.load() == 0);
+        hostNet.disconnectHostClient();
+        removeConfigs(*hostId, *viewerId);
+    }
+
+    {   // A source that cannot start: the session still shows the screen and carries no sound
+        auto heard = std::make_shared<Heard>();
+        std::unique_ptr<IdentityManager> hostId, viewerId;
+        makeEngines(4274, 50948, 50949, hostId, viewerId);
+        NetworkEngine hostNet(*hostId);
+        NetworkEngine viewerNet(*viewerId);
+        hostNet.setAudioFactoriesForTest([]() -> std::unique_ptr<SystemAudioSource> { return std::make_unique<NoSource>(); }, {});
+        viewerNet.setAudioFactoriesForTest({}, [heard]() -> std::unique_ptr<AudioPlayer> { return std::make_unique<FakePlayer>(heard); });
+        TEST_ASSERT(hostNet.start());
+        hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
+        TEST_ASSERT(viewerNet.start());
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        TEST_ASSERT(viewerNet.connectToRemote(hostId->formattedDeskId(), "TestPass99"));
+        uint64_t seq = 0;
+        std::vector<uint8_t> frame;
+        int w = 0, h = 0;
+        CursorState cur{};
+        TEST_ASSERT(waitUntil([&] { return viewerNet.copyLatestViewerFrame(seq, frame, w, h, cur) && w > 0; }, 15000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        {
+            std::lock_guard<std::mutex> lk(heard->mu);
+            TEST_ASSERT(heard->played.empty());
+        }
+        viewerNet.disconnectViewer();
+        hostNet.disconnectHostClient();
+        removeConfigs(*hostId, *viewerId);
+    }
+}
+#endif
+
+void testMuteStateAndHostMicSign() {
+    std::cout << "[TEST 101] Mute known at connect, fresh sessions start with sound, view-only mute, host microphone sign..." << std::endl;
+    auto waitUntil = [](const std::function<bool()>& pred, int ms = 8000) {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!pred()) {
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(ms)) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return true;
+    };
+
+    IdentityManager hostId(4272);
+    hostId.loadOrCreate();
+    hostId.setListenPort(50946);
+    hostId.setUnattendedEnabled(true);
+    hostId.setUnattendedPassword("TestPass99");
+    hostId.setRelayServerAddress("127.0.0.1:50999");
+    IdentityManager viewerId(4273);
+    viewerId.loadOrCreate();
+    viewerId.setListenPort(50947);
+    viewerId.setRelayServerAddress("127.0.0.1:50999");
+    NetworkEngine hostNet(hostId);
+    NetworkEngine viewerNet(viewerId);
+    TEST_ASSERT(hostNet.start());
+    hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
+    TEST_ASSERT(viewerNet.start());
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+    auto connected = [&] { return viewerNet.viewerStats().state == ViewerConnectionState::Connected; };
+    auto sessionEnded = [&] { return !hostNet.hostSessionStatus().active; };
+
+    {   // The host's microphone flag: off, on, off again
+        TEST_ASSERT(!hostNet.isHostMicLive());
+        hostNet.setHostMicLiveForTest(true);
+        TEST_ASSERT(hostNet.isHostMicLive());
+        hostNet.stopVoiceIntercom();
+        TEST_ASSERT(!hostNet.isHostMicLive());
+    }
+
+    {   // A viewer that is muted before it connects: the host stops sending as soon as the session is up
+        viewerNet.setAudioMuted(true);
+        TEST_ASSERT(viewerNet.connectToRemote(hostId.formattedDeskId(), "TestPass99"));
+        TEST_ASSERT(waitUntil(connected, 15000));
+        TEST_ASSERT(waitUntil([&] { return hostNet.isHostAudioSuspended(); }, 3000));
+
+        // The host's microphone was opened for this viewer, then the session ends abruptly: the flag clears with it
+        hostNet.setHostMicLiveForTest(true);
+        viewerNet.disconnectViewer();
+        TEST_ASSERT(waitUntil(sessionEnded, 10000));
+        TEST_ASSERT(waitUntil([&] { return !hostNet.isHostMicLive(); }, 3000));
+    }
+
+    {   // The next session, unmuted, starts with sound
+        viewerNet.setAudioMuted(false);
+        TEST_ASSERT(viewerNet.connectToRemote(hostId.formattedDeskId(), "TestPass99"));
+        TEST_ASSERT(waitUntil(connected, 15000));
+        TEST_ASSERT(waitUntil([&] { return !hostNet.isHostAudioSuspended(); }, 3000));
+
+        // A viewer that may only watch can still turn the sound off for itself
+        hostNet.updateHostSessionPermissions(PERM_ALL & ~PERM_INPUT);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        viewerNet.setAudioMuted(true);
+        TEST_ASSERT(waitUntil([&] { return hostNet.isHostAudioSuspended(); }, 3000));
+        viewerNet.setAudioMuted(false);
+        TEST_ASSERT(waitUntil([&] { return !hostNet.isHostAudioSuspended(); }, 3000));
+
+        viewerNet.disconnectViewer();
+        hostNet.disconnectHostClient();
+    }
+
+    {   // The sign on the dashboard: shown while the microphone is live, not otherwise
+        FakeShell shell;
+        const auto npos = std::string::npos;
+        TEST_ASSERT(renderAppState(hostId, hostNet, shell, "dashboard_light").find("Microphone is on") == npos);
+        const std::string on = renderAppState(hostId, hostNet, shell, "dashboard_mic_on");
+        TEST_ASSERT(on.find("|Microphone is on") != npos && on.find("|Disconnect") != npos);
+        const auto names = AppUi::snapshotStateNames();
+        TEST_ASSERT(!names.empty() && names.back() == "dashboard_mic_on");
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(hostId.configFilePath(), ec);
+    std::filesystem::remove(viewerId.configFilePath(), ec);
+}
+
+#if defined(__APPLE__)
+void testMacAudioPaths() {
+    std::cout << "[TEST 102] Mac sound: playback queue, screen stream with sound, capturer sound sink..." << std::endl;
+    using Clock = std::chrono::steady_clock;
+    auto ms = [](Clock::time_point from) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - from).count();
+    };
+    {   // The speaker: a burst of chunks (stereo and mono) then stop, promptly. A runner without an output may refuse to start.
+        VoiceIntercom speaker;
+        const auto t0 = Clock::now();
+        const bool started = speaker.startPlayback(48000, 2);
+        TEST_ASSERT(started == speaker.isPlaying());
+        std::vector<int16_t> stereo(960 * 2, 1000), mono(480, 500);
+        for (int i = 0; i < 100; ++i) {
+            speaker.enqueuePlaybackChunk(reinterpret_cast<const uint8_t*>(stereo.data()), stereo.size() * 2, 2);
+            speaker.enqueuePlaybackChunk(reinterpret_cast<const uint8_t*>(mono.data()), mono.size() * 2, 1);
+        }
+        speaker.stopPlayback();
+        speaker.stopPlayback();
+        TEST_ASSERT(!speaker.isPlaying() && ms(t0) < 3000);
+        speaker.enqueuePlaybackChunk(reinterpret_cast<const uint8_t*>(stereo.data()), stereo.size() * 2, 2);   // after stop: ignored
+    }
+    {   // A screen stream with a sound sink starts (or says why not) and stops, with or without sound
+        MacCaptureStream stream;
+        std::atomic<size_t> frames{0};
+        stream.setAudioSink([&](const int16_t* pcm, size_t n) { if (pcm) frames += n; });
+        const auto t0 = Clock::now();
+        const bool started = stream.start(CGMainDisplayID(), 30, 3840);
+        TEST_ASSERT(ms(t0) < 12000);
+        const MacCaptureState st = stream.state();
+        TEST_ASSERT(started == (st == MacCaptureState::Running));
+        if (st == MacCaptureState::Running) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        stream.stop();
+        stream.stop();
+        TEST_ASSERT(stream.state() == MacCaptureState::Stopped && !stream.audioAvailable());
+        std::cout << "  sound " << frames.load() << " frames" << std::endl;
+    }
+    {   // A capturer with a sound sink still captures the screen
+        ScreenCapturer capturer;
+        std::atomic<size_t> frames{0};
+        capturer.setSoundSink([&](const int16_t*, size_t n) { frames += n; });
+        std::vector<EncodedTile> tiles;
+        bool isKf = false;
+        CursorState cursor{};
+        TEST_ASSERT(capturer.captureDirtyTiles(true, QualityPreset::Balanced, tiles, isKf, cursor));
+        TEST_ASSERT(isKf && !tiles.empty());
+    }
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -10575,6 +11277,11 @@ int main(int argc, char** argv) {
 #if defined(__linux__)
         if (argc > 1 && std::string(argv[1]) == "--pipewire") {   // CI only, see ci.yml
             testRealPipeWire();
+            std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
+            return (g_failed == 0) ? 0 : 1;
+        }
+        if (argc > 1 && std::string(argv[1]) == "--pulse") {   // CI only, see ci.yml
+            testRealPulse();
             std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
             return (g_failed == 0) ? 0 : 1;
         }
@@ -10683,8 +11390,14 @@ int main(int argc, char** argv) {
         testWaylandHelpers(); std::cout << "Test 89 done\n" << std::flush;
         testLatestFrameAndPipeWireStream(); std::cout << "Test 91 done\n" << std::flush;
         testShareHub(); std::cout << "Test 94 done\n" << std::flush;
+        testAudioConvertHelpers(); std::cout << "Test 97 done\n" << std::flush;
+#if !defined(_WIN32)
+        testHostSoundOverTheSession(); std::cout << "Test 100 done\n" << std::flush;
+#endif
+        testMuteStateAndHostMicSign(); std::cout << "Test 101 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
+        testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;
 #endif
 #if defined(__APPLE__)
         testMacInjectorSurvivesPixelSizedMonitor(); std::cout << "Test 83 done\n" << std::flush;
@@ -10698,6 +11411,8 @@ int main(int argc, char** argv) {
         testPortalSession(); std::cout << "Test 90 done\n" << std::flush;
         testWaylandShareIntegration(); std::cout << "Test 92 done\n" << std::flush;
         testHostEndsSessionWhenSharingEnds(); std::cout << "Test 96 done\n" << std::flush;
+        testPulseStream(); std::cout << "Test 98 done\n" << std::flush;
+        testLinuxVoiceIntercom(); std::cout << "Test 99 done\n" << std::flush;
 #endif
 #if defined(__APPLE__)
         testMacWindow(); std::cout << "Test 81 done\n" << std::flush;

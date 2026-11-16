@@ -28,6 +28,8 @@ $CoreSources = @(
     "src/media/session_recorder.cpp",
     "src/media/session_recording_player.cpp",
     "src/media/voice_intercom.cpp",
+    "src/media/audio_convert.cpp",
+    "src/media/system_audio.cpp",
     "src/capture/display_manager.cpp",
     "src/capture/virtual_display_manager.cpp",
     "src/capture/screen_blank_manager.cpp",

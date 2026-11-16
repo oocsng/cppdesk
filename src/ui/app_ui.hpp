@@ -235,6 +235,12 @@ private:
     wayland::ShareNotice currentShareNotice() const {
         return snapshotShareNotice_ ? *snapshotShareNotice_ : network_.shareNotice();
     }
+    // Whether the host's microphone is open for a viewer, redrawn when it changes.
+    bool                    hostMicLiveSeen_ = false;
+    std::optional<bool>     snapshotHostMicLive_;
+    bool currentHostMicLive() const {
+        return snapshotHostMicLive_ ? *snapshotHostMicLive_ : network_.isHostMicLive();
+    }
 
 
 private:

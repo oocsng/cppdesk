@@ -37,6 +37,8 @@ set(CORE_SOURCES
     src/media/session_recorder.cpp
     src/media/session_recording_player.cpp
     src/media/voice_intercom.cpp
+    src/media/audio_convert.cpp
+    src/media/system_audio.cpp
     src/ui/notification_manager.cpp
     src/ui/ui_platform.cpp
     src/ui/recording_canvas.cpp
@@ -155,6 +157,7 @@ elseif(UNIX AND NOT APPLE)
         src/capture/wayland_portal.cpp
         src/capture/wayland_share.cpp
         src/capture/wayland_pipewire.cpp
+        src/media/pulse_stream.cpp
     )
     # PipeWire is never linked (it is loaded at run time); only its headers are needed, and only to build the video receiver.
     pkg_check_modules(PIPEWIRE QUIET libpipewire-0.3)
@@ -163,6 +166,14 @@ elseif(UNIX AND NOT APPLE)
         add_compile_definitions(CPPDESK_WAYLAND)
     else()
         message(STATUS "libpipewire-0.3 headers not found: screen sharing on Wayland is built without the video receiver")
+    endif()
+    # Likewise PulseAudio (also served by PipeWire): loaded at run time, headers only needed to build the sound code.
+    pkg_check_modules(PULSE QUIET libpulse-simple)
+    if(PULSE_FOUND)
+        include_directories(${PULSE_INCLUDE_DIRS})
+        add_compile_definitions(CPPDESK_PULSE)
+    else()
+        message(STATUS "libpulse headers not found: built without sound on Linux")
     endif()
 
     set(PLATFORM_LIBS

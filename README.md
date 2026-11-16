@@ -141,6 +141,19 @@ clipboard sync on Wayland reaches only X applications. To build the video part y
 (`sudo apt install libpipewire-0.3-dev`; without them it is left out); at run time the app loads the system's PipeWire
 only when a Wayland share starts, so it still starts on machines without it.
 
+### Sound
+
+The voice intercom (microphone and speaker) and the host's system sound work on Windows, Linux and macOS. The host's
+sound is sent as plain 48 kHz stereo with no compression, which costs about 1.5 Mbit/s and suits a LAN. On Linux sound
+goes through PulseAudio, or PipeWire's PulseAudio support, loaded only when needed, so the app still starts without it;
+to build the sound part you need the PulseAudio headers (`sudo apt install libpulse-dev`; without them sound is left
+out). A Mac host sends its sound on macOS 13 or later (macOS 12 shares the screen without sound). When a viewer talks,
+the host's microphone opens by itself, and the dashboard shows "Microphone is on: the viewer can hear this room" while
+it is open. A viewer's mute and volume apply at once and again after a reconnect. Not done: compression, choosing a
+sound device on Linux (the system default is used) and echo cancellation. The Linux sound is tested against a test sound
+server and the Mac sound has **not been run on a real Mac**; what to check by hand is in
+[docs/audio-test-checklist.md](docs/audio-test-checklist.md).
+
 ### Build commands
 
 ```powershell

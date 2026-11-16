@@ -18,6 +18,10 @@
 #include <mmsystem.h>
 #elif defined(__APPLE__)
 #include <AudioToolbox/AudioToolbox.h>
+#include <memory>
+#include "audio_convert.hpp"
+#elif defined(__linux__)
+#include "pulse_stream.hpp"
 #endif
 
 namespace cppdesk {
@@ -120,9 +124,16 @@ private:
     AudioQueueRef               outQueue_{nullptr};
     static constexpr size_t     NUM_CAPTURE_BUFFERS = 3;
     AudioQueueBufferRef         inBuffers_[NUM_CAPTURE_BUFFERS]{};
-    static constexpr size_t     NUM_PLAYBACK_BUFFERS = 8;
+    // Playback pulls from a bounded queue in the audio queue's own callback (silence when it is empty), so old sound is
+    // dropped instead of piling up.
+    static void MacAudioOutputCallback(void* custom_data, AudioQueueRef queue, AudioQueueBufferRef buffer);
+    static constexpr size_t     NUM_PLAYBACK_BUFFERS = 3;
     AudioQueueBufferRef         outBuffers_[NUM_PLAYBACK_BUFFERS]{};
-    size_t                      currentPlayIdx_{0};
+    std::unique_ptr<audio::BoundedPcmQueue> playQueue_;
+    mutable std::mutex          playbackMutex_;
+#elif defined(__linux__)
+    PulseStream                 capStream_;
+    PulseStream                 playStream_;
     mutable std::mutex          playbackMutex_;
 #else
     mutable std::mutex          playbackMutex_;
