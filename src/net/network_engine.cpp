@@ -1583,6 +1583,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
 
     auto cleanup = [&]() {
         stopHostAudioCapture();
+        voiceOpenFailed_.store(false);
         if (hostMicLive_.exchange(false)) {   // the viewer's voice opened the microphone: it closes with the session
             voiceIntercom_.stopCapture();
             voiceIntercom_.stopPlayback();
@@ -5481,6 +5482,7 @@ void NetworkEngine::stopVoiceIntercom() {
     voiceIntercom_.stopCapture();
     voiceIntercom_.stopPlayback();
     hostMicLive_.store(false);
+    voiceOpenFailed_.store(false);
 }
 
 bool NetworkEngine::isVoiceIntercomActive() const {
@@ -5537,6 +5539,7 @@ void NetworkEngine::handleIncomingVoiceChunk(const uint8_t* payload, size_t len)
         voiceIntercom_.stopCapture();
         voiceIntercom_.stopPlayback();
         hostMicLive_.store(false);
+        voiceOpenFailed_.store(false);
         return;
     }
 
@@ -5547,13 +5550,14 @@ void NetworkEngine::handleIncomingVoiceChunk(const uint8_t* payload, size_t len)
     uint32_t srate = (hdr->sampleRate >= 8000 && hdr->sampleRate <= 96000) ? hdr->sampleRate : 48000;
     uint8_t ch = (hdr->channels == 1 || hdr->channels == 2) ? hdr->channels : 1;
 
-    if (!voiceIntercom_.isPlaying()) {
-        voiceIntercom_.startPlayback(srate, ch);
+    if (!voiceOpenFailed_.load() && !voiceIntercom_.isPlaying() && !voiceIntercom_.startPlayback(srate, ch)) {
+        voiceOpenFailed_.store(true);
     }
     voiceIntercom_.enqueuePlaybackChunk(pcm, pcmBytes, ch);
 
-    if (!voiceIntercom_.isCapturing() && activeHostClientSock_.load() != ~uintptr_t(0)) {
+    if (!voiceOpenFailed_.load() && !voiceIntercom_.isCapturing() && activeHostClientSock_.load() != ~uintptr_t(0)) {
         if (startVoiceIntercom()) hostMicLive_.store(true);
+        else voiceOpenFailed_.store(true);
     }
 }
 

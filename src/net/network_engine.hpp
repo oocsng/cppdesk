@@ -356,6 +356,8 @@ public:
     // True while the host's microphone is open because a viewer's voice arrived: the dashboard says so.
     bool isHostMicLive() const { return hostMicLive_.load(); }
     void setHostMicLiveForTest(bool live) { hostMicLive_.store(live); }
+    void injectVoiceChunkForTest(const uint8_t* payload, size_t len) { handleIncomingVoiceChunk(payload, len); }
+    bool voiceOpenFailedForTest() const { return voiceOpenFailed_.load(); }
 #if !defined(_WIN32)
     // Tests stand in for the sound hardware: what the host captures and what the viewer plays through. A null factory
     // keeps the real one. Set before a session starts.
@@ -624,6 +626,7 @@ private:
     std::atomic<bool>       audioMuted_{false};
     std::atomic<bool>       hostAudioSuspended_{false};
     std::atomic<bool>       hostMicLive_{false};
+    std::atomic<bool>       voiceOpenFailed_{false};   // a voice device that failed to open is not retried until the voice stops or the session ends
 #if !defined(_WIN32)
     SystemAudioSourceFactory sourceFactory_;
     AudioPlayerFactory       playerFactory_;

@@ -10792,6 +10792,25 @@ void testLinuxVoiceIntercom() {
         VoiceIntercom::applyGain(g, 2, 0.5f);
         TEST_ASSERT(g[0] == 500 && g[1] == -500);
     }
+    {   // A voice device that cannot open is tried once, not on every chunk, until the voice stops
+        IdentityManager id(4274);
+        NetworkEngine net(id);
+        struct { VoiceChunkHeader h; uint8_t data[960]; } chunk{};
+        chunk.h = VoiceChunkHeader{48000, 1, 16, 0, 480};
+        auto inject = [&] { net.injectVoiceChunkForTest(reinterpret_cast<const uint8_t*>(&chunk), sizeof(chunk)); };
+        TEST_ASSERT(!net.voiceOpenFailedForTest());
+        inject();
+        TEST_ASSERT(net.voiceOpenFailedForTest());
+        const auto t0 = Clock::now();
+        for (int i = 0; i < 50; ++i) inject();
+        TEST_ASSERT(net.voiceOpenFailedForTest());
+        TEST_ASSERT(ms(t0) < 200);
+        VoiceChunkHeader stop{48000, 1, 16, 0x04, 0};
+        net.injectVoiceChunkForTest(reinterpret_cast<const uint8_t*>(&stop), sizeof(stop));
+        TEST_ASSERT(!net.voiceOpenFailedForTest());
+        inject();
+        TEST_ASSERT(net.voiceOpenFailedForTest());
+    }
     unsetenv("CPPDESK_PULSE_LIB");
 
     if (!cppdesk::PulseStream::available()) {
