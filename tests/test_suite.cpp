@@ -8,6 +8,8 @@
 #include "../src/capture/wayland_helpers.hpp"
 #include "../src/capture/latest_frame.hpp"
 #include "../src/capture/share_hub.hpp"
+#include "../src/media/audio_convert.hpp"
+#include <limits>
 #include "../src/capture/wayland_share.hpp"
 #include "../src/control/clipboard_file_manager.hpp"
 #include "../src/net/network_engine.hpp"
@@ -10568,6 +10570,146 @@ void testRealPipeWire() {
 }
 #endif
 
+void testAudioConvertHelpers() {
+    std::cout << "[TEST 97] Audio helpers: format conversion, resampling, bounded queue..." << std::endl;
+    using namespace cppdesk::audio;
+    auto run = [](const PcmBlock& b, ConvertState& st) {
+        std::vector<int16_t> out;
+        toWire(b, st, out);
+        return out;
+    };
+    {   // Already the wire format: unchanged
+        std::vector<int16_t> in = {1, -2, 300, -400, 32767, -32768};
+        ConvertState st;
+        TEST_ASSERT(run({in.data(), 3, 2, 48000, SampleFormat::S16, false}, st) == in);
+    }
+    {   // Mono is duplicated into both channels
+        std::vector<int16_t> in = {5, -7, 9};
+        ConvertState st;
+        TEST_ASSERT((run({in.data(), 3, 1, 48000, SampleFormat::S16, false}, st) == std::vector<int16_t>{5, 5, -7, -7, 9, 9}));
+    }
+    {   // Float planar stereo: full scale, clipping, and NaN or infinity become silence
+        std::vector<float> in = {1.0f, 1.5f, -1.0f, std::nanf(""),                       // left plane
+                                 0.0f, -2.0f, std::numeric_limits<float>::infinity(), 0.5f};   // right plane
+        ConvertState st;
+        auto out = run({in.data(), 4, 2, 48000, SampleFormat::F32, true}, st);
+        TEST_ASSERT(out.size() == 8);
+        if (out.size() == 8) {
+            TEST_ASSERT(out[0] == 32767 && out[1] == 0);
+            TEST_ASSERT(out[2] == 32767 && std::abs(out[3] + 32767) <= 1);
+            TEST_ASSERT(std::abs(out[4] + 32767) <= 1 && out[5] == 0);
+            TEST_ASSERT(out[6] == 0 && std::abs(out[7] - 16384) <= 1);
+        }
+    }
+    {   // Six channels (interleaved float): the centre channel alone is folded into both sides at about 0.707
+        const size_t frames = 100;
+        std::vector<float> in(frames * 6, 0.0f);
+        for (size_t f = 0; f < frames; ++f) in[f * 6 + 2] = 0.5f;
+        ConvertState st;
+        auto out = run({in.data(), frames, 6, 48000, SampleFormat::F32, false}, st);
+        TEST_ASSERT(out.size() == frames * 2);
+        if (out.size() == frames * 2) {
+            const int expected = static_cast<int>(0.5 * 0.707 * 32767.0);
+            TEST_ASSERT(std::abs(out[40] - expected) < 60 && std::abs(out[41] - expected) < 60);
+        }
+    }
+    {   // Other sample rates: the number of frames follows the rate
+        std::vector<int16_t> in44(441 * 2, 1000);
+        ConvertState st44;
+        const size_t n44 = run({in44.data(), 441, 2, 44100, SampleFormat::S16, false}, st44).size() / 2;
+        TEST_ASSERT(n44 >= 479 && n44 <= 481);
+        std::vector<int16_t> in96(960 * 2, 1000);
+        ConvertState st96;
+        const size_t n96 = run({in96.data(), 960, 2, 96000, SampleFormat::S16, false}, st96).size() / 2;
+        TEST_ASSERT(n96 >= 479 && n96 <= 481);
+    }
+    {   // A sine converted in small chunks equals the same sine converted whole: no clicks at the chunk edges
+        const int total = 4400;   // a whole number of 100-frame chunks
+        std::vector<int16_t> sine(total);
+        for (int i = 0; i < total; ++i) sine[i] = static_cast<int16_t>(10000.0 * std::sin(2.0 * 3.14159265358979 * 1000.0 * i / 44100.0));
+        ConvertState whole;
+        auto all = run({sine.data(), static_cast<size_t>(total), 1, 44100, SampleFormat::S16, false}, whole);
+        ConvertState chunked;
+        std::vector<int16_t> parts;
+        for (int at = 0; at < total; at += 100) toWire({sine.data() + at, 100, 1, 44100, SampleFormat::S16, false}, chunked, parts);
+        TEST_ASSERT(std::abs(static_cast<long>(all.size() / 2) - static_cast<long>(parts.size() / 2)) <= 1);
+        const size_t common = std::min(all.size(), parts.size());
+        int worst = 0;
+        for (size_t i = 0; i < common; ++i) worst = std::max(worst, std::abs(all[i] - parts[i]));
+        TEST_ASSERT(worst <= 2);
+    }
+    {   // An empty block adds nothing
+        ConvertState st;
+        std::vector<int16_t> out;
+        toWire({nullptr, 0, 2, 48000, SampleFormat::S16, false}, st, out);
+        TEST_ASSERT(out.empty());
+    }
+    {   // One channel to two and back
+        std::vector<int16_t> mono = {10, -20, 30};
+        std::vector<int16_t> stereo, back;
+        adaptChannels(mono.data(), 3, 1, 2, stereo);
+        TEST_ASSERT((stereo == std::vector<int16_t>{10, 10, -20, -20, 30, 30}));
+        std::vector<int16_t> pair = {100, 300, -50, 50};
+        adaptChannels(pair.data(), 2, 2, 1, back);
+        TEST_ASSERT((back == std::vector<int16_t>{200, 0}));
+        std::vector<int16_t> same;
+        adaptChannels(pair.data(), 2, 2, 2, same);
+        TEST_ASSERT(same == pair);
+    }
+    {   // The bounded queue: the oldest bytes go first, the newest stay, in order
+        BoundedPcmQueue q(1000);
+        std::vector<uint8_t> a(600), b(600);
+        for (size_t i = 0; i < a.size(); ++i) a[i] = static_cast<uint8_t>(i % 251);
+        for (size_t i = 0; i < b.size(); ++i) b[i] = static_cast<uint8_t>((i + 7) % 241);
+        q.push(a.data(), a.size());
+        q.push(b.data(), b.size());
+        TEST_ASSERT(q.size() == 1000 && q.droppedBytes() == 200);
+        std::vector<uint8_t> out(2000);
+        const size_t got = q.pop(out.data(), out.size());
+        TEST_ASSERT(got == 1000 && q.size() == 0);
+        std::vector<uint8_t> want(a.begin() + 200, a.end());
+        want.insert(want.end(), b.begin(), b.end());
+        TEST_ASSERT(got == 1000 && std::equal(want.begin(), want.end(), out.begin()));
+        std::vector<uint8_t> big(3000);
+        for (size_t i = 0; i < big.size(); ++i) big[i] = static_cast<uint8_t>(i % 199);
+        q.push(big.data(), big.size());
+        TEST_ASSERT(q.size() == 1000);
+        const size_t got2 = q.pop(out.data(), 400);                      // partial pops come out oldest first
+        TEST_ASSERT(got2 == 400 && std::equal(big.begin() + 2000, big.begin() + 2400, out.begin()) && q.size() == 600);
+        q.clear();
+        TEST_ASSERT(q.size() == 0 && q.pop(out.data(), 10) == 0);
+    }
+    {   // One thread pushes, one pops: never a torn frame (every 4 bytes are the same value)
+        BoundedPcmQueue q(4096);
+        std::atomic<bool> stop{false};
+        std::atomic<int> torn{0}, popped{0};
+        std::thread producer([&] {
+            uint8_t v = 0;
+            while (!stop) {
+                uint8_t chunk[8];
+                std::memset(chunk, v, 4);
+                std::memset(chunk + 4, static_cast<uint8_t>(v + 1), 4);
+                v = static_cast<uint8_t>(v + 2);
+                q.push(chunk, sizeof(chunk));
+            }
+        });
+        std::thread consumer([&] {
+            uint8_t buf[1024];
+            while (!stop) {
+                const size_t n = q.pop(buf, sizeof(buf));
+                popped += static_cast<int>(n);
+                for (size_t i = 0; i + 4 <= n; i += 4)
+                    if (buf[i] != buf[i + 1] || buf[i] != buf[i + 2] || buf[i] != buf[i + 3]) ++torn;
+            }
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        stop = true;
+        producer.join();
+        consumer.join();
+        TEST_ASSERT(torn == 0 && popped > 0);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -10683,6 +10825,7 @@ int main(int argc, char** argv) {
         testWaylandHelpers(); std::cout << "Test 89 done\n" << std::flush;
         testLatestFrameAndPipeWireStream(); std::cout << "Test 91 done\n" << std::flush;
         testShareHub(); std::cout << "Test 94 done\n" << std::flush;
+        testAudioConvertHelpers(); std::cout << "Test 97 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
 #endif

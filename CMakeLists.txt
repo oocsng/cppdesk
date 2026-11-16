@@ -37,6 +37,7 @@ set(CORE_SOURCES
     src/media/session_recorder.cpp
     src/media/session_recording_player.cpp
     src/media/voice_intercom.cpp
+    src/media/audio_convert.cpp
     src/ui/notification_manager.cpp
     src/ui/ui_platform.cpp
     src/ui/recording_canvas.cpp
