@@ -367,6 +367,18 @@ void testEndToEndSessionAndFileTransfer() {
     TEST_ASSERT(chatSynced);
     std::cout << "  -> Verified bidirectional encrypted live chat!\n";
 
+    // The remote terminal runs a command on the host and returns its output (cmd.exe on Windows, bash elsewhere)
+    viewerNet.sendTerminalCommand("echo cppdesk-term-ok");
+    bool terminalAnswered = false;
+    for (int i = 0; i < 100 && !terminalAnswered; ++i) {
+        for (const auto& line : viewerNet.getTerminalScrollback()) {
+            if (line.find("cppdesk-term-ok") != std::string::npos && line.rfind("> ", 0) != 0) terminalAnswered = true;
+        }
+        if (!terminalAnswered) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    TEST_ASSERT(terminalAnswered);
+    std::cout << "  -> Verified the remote terminal returns command output!\n";
+
     // Test chunked file transfer from Viewer -> Host with streaming SHA-256 verification & .part rename
     std::filesystem::path srcFile = tempDir / "source_payload.bin";
     std::string testContent(150000, '\0'); // ~150 KB (> 2 chunks)

@@ -44,6 +44,11 @@
 #include <sys/sysctl.h>
 #endif
 #include <sys/types.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <cerrno>
 #include <unistd.h>
 #include <cctype>
 #include <filesystem>
@@ -5569,8 +5574,10 @@ void NetworkEngine::sendTerminalCommand(const std::string& cmd) {
         std::lock_guard<std::mutex> lk(terminalMutex_);
         terminalHistory_.push_back(cmd);
         if (terminalHistory_.size() > 50) terminalHistory_.erase(terminalHistory_.begin());
-        terminalLines_.push_back("> " + cmd);
-        if (terminalLines_.size() > 500) terminalLines_.erase(terminalLines_.begin());
+        if (!terminalLines_.empty() && terminalLines_.back().empty()) terminalLines_.back() = "> " + cmd;
+        else terminalLines_.push_back("> " + cmd);
+        terminalLines_.push_back("");   // the host's output starts on its own line, not after the command
+        while (terminalLines_.size() > 500) terminalLines_.erase(terminalLines_.begin());
     }
 
     ByteWriter w;
@@ -5627,8 +5634,8 @@ void NetworkEngine::sendWhiteboardLaser(float normX, float normY) {
     }
 }
 
-void NetworkEngine::startHostTerminal(bool usePowerShell) {
 #if defined(_WIN32)
+void NetworkEngine::startHostTerminal(bool usePowerShell) {
     stopHostTerminal();
 
     SECURITY_ATTRIBUTES sa{};
@@ -5746,20 +5753,101 @@ void NetworkEngine::hostTerminalReaderLoop() {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-#else
-    (void)usePowerShell;
-#endif
 }
+#endif
 
 #if !defined(_WIN32)
-// shortcut: no remote terminal off Windows; the request is ignored.
-void NetworkEngine::stopHostTerminal() {
-    hostTerminalActive_.store(false);
+// The shell runs on plain pipes, as cmd.exe does on Windows: no echo and no prompt, the viewer shows each command itself.
+// The Windows "PowerShell" switch has no equivalent here, so both start bash (or sh where bash is missing).
+void NetworkEngine::startHostTerminal(bool /*usePowerShell*/) {
+    stopHostTerminal();
+
+    int in[2], out[2];
+    if (pipe(in) != 0) return;
+    if (pipe(out) != 0) {
+        close(in[0]); close(in[1]);
+        return;
+    }
+    for (int fd : { in[0], in[1], out[0], out[1] }) fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+    struct rlimit rl{};
+    const int maxFd = (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+                          ? static_cast<int>(std::min<rlim_t>(rl.rlim_cur, 65536)) : 65536;
+    const char* shell = access("/bin/bash", X_OK) == 0 ? "/bin/bash" : "/bin/sh";
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Only async-signal-safe calls between fork and exec: this process has other threads.
+        setsid();   // its own process group, so stopping the terminal also ends what was started from it
+        dup2(in[0], 0);
+        dup2(out[1], 1);
+        dup2(out[1], 2);
+        for (int fd = 3; fd < maxFd; ++fd) close(fd);   // the session socket and everything else stays with us
+        execl(shell, shell, static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    close(in[0]);
+    close(out[1]);
+    if (pid < 0) {
+        close(in[1]); close(out[0]);
+        return;
+    }
+
+    childStdinFd_ = in[1];
+    childStdoutFd_ = out[0];
+    childPid_ = pid;
+
+    hostTerminalActive_.store(true);
+    hostTerminalThread_ = std::thread(&NetworkEngine::hostTerminalReaderLoop, this);
 }
 
-void NetworkEngine::injectHostTerminalStdin(const std::string&) {}
+void NetworkEngine::stopHostTerminal() {
+    hostTerminalActive_.store(false);
+    try {
+        if (hostTerminalThread_.joinable()) {
+            hostTerminalThread_.join();
+        }
+    } catch (...) {}
+    if (childPid_ > 0) {
+        kill(-childPid_, SIGKILL);
+        waitpid(childPid_, nullptr, 0);
+        childPid_ = -1;
+    }
+    if (childStdinFd_ >= 0) { close(childStdinFd_); childStdinFd_ = -1; }
+    if (childStdoutFd_ >= 0) { close(childStdoutFd_); childStdoutFd_ = -1; }
+}
 
-void NetworkEngine::hostTerminalReaderLoop() {}
+void NetworkEngine::injectHostTerminalStdin(const std::string& input) {
+    if (childStdinFd_ < 0) return;
+    std::string toWrite = input + "\n";
+    const char* p = toWrite.data();
+    size_t left = toWrite.size();
+    while (left > 0) {   // SIGPIPE is ignored, so a shell that has exited only makes this fail
+        ssize_t n = write(childStdinFd_, p, left);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return;
+        p += n;
+        left -= static_cast<size_t>(n);
+    }
+}
+
+void NetworkEngine::hostTerminalReaderLoop() {
+    char buf[4096];
+    while (hostTerminalActive_.load() && running_.load() && activeHostClientSock_.load() != ~uintptr_t(0)) {
+        pollfd pfd{ childStdoutFd_, POLLIN, 0 };
+        int pr = poll(&pfd, 1, 20);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr <= 0) continue;
+        ssize_t numRead = read(childStdoutFd_, buf, sizeof(buf));
+        if (numRead < 0 && errno == EINTR) continue;
+        if (numRead <= 0) break;   // the shell exited
+        ByteWriter w;
+        w.writeU8(static_cast<uint8_t>(TerminalStreamKind::StdoutChunk));
+        w.writeU32(static_cast<uint32_t>(numRead));
+        w.writeBytes(buf, static_cast<size_t>(numRead));
+        sendHostEncryptedPacket(PacketType::TERMINAL_DATA, 0, w.buffer().data(), w.buffer().size());
+    }
+}
 #endif
 
 uint32_t NetworkEngine::addPortForwardRule(uint16_t localPort, uint16_t targetPort, const std::string& desc, bool startActive) {

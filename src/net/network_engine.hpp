@@ -660,10 +660,9 @@ private:
     HANDLE              hChildProcess_ = nullptr;
     HANDLE              hChildThread_ = nullptr;
 #else
-    void*               hChildStdinWrite_ = nullptr;
-    void*               hChildStdoutRead_ = nullptr;
-    void*               hChildProcess_ = nullptr;
-    void*               hChildThread_ = nullptr;
+    int                 childStdinFd_ = -1;
+    int                 childStdoutFd_ = -1;
+    int                 childPid_ = -1;
 #endif
     std::thread         hostTerminalThread_;
     std::atomic<bool>   hostTerminalActive_{false};
