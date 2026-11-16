@@ -1583,6 +1583,10 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
 
     auto cleanup = [&]() {
         stopHostAudioCapture();
+        if (hostMicLive_.exchange(false)) {   // the viewer's voice opened the microphone: it closes with the session
+            voiceIntercom_.stopCapture();
+            voiceIntercom_.stopPlayback();
+        }
         destroyPrivacyCurtainWindow();
         ScreenBlankManager::instance().setEmergencyWakeCallback(nullptr);
         ScreenBlankManager::instance().disengageBlanking();
@@ -1976,6 +1980,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
             return;
         }
 
+        hostAudioSuspended_.store(false);   // a new session starts with sound, whatever the last viewer chose
         startHostAudioCapture();
         if (grantedPerms & PERM_INPUT) {
             startHostTerminal(false);
@@ -2466,7 +2471,8 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             break;
                         }
                         case PacketType::AUDIO_CONTROL: {
-                            if ((perms & PERM_INPUT) != 0 && r.hasRemaining(sizeof(AudioControlPayload))) {
+                            // Only decides whether this viewer is sent sound, so it needs no permission.
+                            if (r.hasRemaining(sizeof(AudioControlPayload))) {
                                 AudioControlPayload p{};
                                 r.readBytes(&p, sizeof(p));
                                 hostAudioSuspended_.store(p.isMuted != 0);
@@ -3675,6 +3681,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                     }
                     identity_.addOrUpdateRecentSession(remoteId, remoteHost, targetInput);
                     initViewerAudioPlayback();
+                    syncAudioControl();   // the host learns this viewer's mute and volume now, and again after a reconnect
                     startViewerTunnelMultiplexer();
 
                     requestVideoSettings(
@@ -5466,6 +5473,7 @@ void NetworkEngine::stopVoiceIntercom() {
 
     voiceIntercom_.stopCapture();
     voiceIntercom_.stopPlayback();
+    hostMicLive_.store(false);
 }
 
 bool NetworkEngine::isVoiceIntercomActive() const {
@@ -5521,6 +5529,7 @@ void NetworkEngine::handleIncomingVoiceChunk(const uint8_t* payload, size_t len)
     if (hdr->flags & 0x04) {
         voiceIntercom_.stopCapture();
         voiceIntercom_.stopPlayback();
+        hostMicLive_.store(false);
         return;
     }
 
@@ -5537,7 +5546,7 @@ void NetworkEngine::handleIncomingVoiceChunk(const uint8_t* payload, size_t len)
     voiceIntercom_.enqueuePlaybackChunk(pcm, pcmBytes, ch);
 
     if (!voiceIntercom_.isCapturing() && activeHostClientSock_.load() != ~uintptr_t(0)) {
-        startVoiceIntercom();
+        if (startVoiceIntercom()) hostMicLive_.store(true);
     }
 }
 

@@ -9427,7 +9427,7 @@ void testHostPermissionUi() {
 
     {   // Two more snapshot states show the card on every platform.
         const auto names = AppUi::snapshotStateNames();
-        TEST_ASSERT(names.size() >= 4 && names[names.size() - 4] == "dashboard_mac_permissions" && names[names.size() - 3] == "dashboard_mac_restart");
+        TEST_ASSERT(names.size() >= 5 && names[names.size() - 5] == "dashboard_mac_permissions" && names[names.size() - 4] == "dashboard_mac_restart");
         FakeShell plain;
         TEST_ASSERT(renderAppState(id, net, plain, "dashboard_mac_permissions").find("|Allow screen sharing") != npos);
         const std::string restartState = renderAppState(id, net, plain, "dashboard_mac_restart");
@@ -9494,8 +9494,8 @@ void testWaylandShareNoticeUi() {
     }
     {   // The two new states close the list of snapshots
         const auto names = AppUi::snapshotStateNames();
-        TEST_ASSERT(names.size() >= 2 && names[names.size() - 2] == "dashboard_wayland_denied" &&
-                    names.back() == "dashboard_wayland_view_only");
+        TEST_ASSERT(names.size() >= 3 && names[names.size() - 3] == "dashboard_wayland_denied" &&
+                    names[names.size() - 2] == "dashboard_wayland_view_only" && names.back() == "dashboard_mic_on");
     }
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
@@ -11112,6 +11112,91 @@ void testHostSoundOverTheSession() {
 }
 #endif
 
+void testMuteStateAndHostMicSign() {
+    std::cout << "[TEST 101] Mute known at connect, fresh sessions start with sound, view-only mute, host microphone sign..." << std::endl;
+    auto waitUntil = [](const std::function<bool()>& pred, int ms = 8000) {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!pred()) {
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(ms)) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return true;
+    };
+
+    IdentityManager hostId(4272);
+    hostId.loadOrCreate();
+    hostId.setListenPort(50946);
+    hostId.setUnattendedEnabled(true);
+    hostId.setUnattendedPassword("TestPass99");
+    hostId.setRelayServerAddress("127.0.0.1:50999");
+    IdentityManager viewerId(4273);
+    viewerId.loadOrCreate();
+    viewerId.setListenPort(50947);
+    viewerId.setRelayServerAddress("127.0.0.1:50999");
+    NetworkEngine hostNet(hostId);
+    NetworkEngine viewerNet(viewerId);
+    TEST_ASSERT(hostNet.start());
+    hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
+    TEST_ASSERT(viewerNet.start());
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+    auto connected = [&] { return viewerNet.viewerStats().state == ViewerConnectionState::Connected; };
+    auto sessionEnded = [&] { return !hostNet.hostSessionStatus().active; };
+
+    {   // The host's microphone flag: off, on, off again
+        TEST_ASSERT(!hostNet.isHostMicLive());
+        hostNet.setHostMicLiveForTest(true);
+        TEST_ASSERT(hostNet.isHostMicLive());
+        hostNet.stopVoiceIntercom();
+        TEST_ASSERT(!hostNet.isHostMicLive());
+    }
+
+    {   // A viewer that is muted before it connects: the host stops sending as soon as the session is up
+        viewerNet.setAudioMuted(true);
+        TEST_ASSERT(viewerNet.connectToRemote(hostId.formattedDeskId(), "TestPass99"));
+        TEST_ASSERT(waitUntil(connected, 15000));
+        TEST_ASSERT(waitUntil([&] { return hostNet.isHostAudioSuspended(); }, 3000));
+
+        // The host's microphone was opened for this viewer, then the session ends abruptly: the flag clears with it
+        hostNet.setHostMicLiveForTest(true);
+        viewerNet.disconnectViewer();
+        TEST_ASSERT(waitUntil(sessionEnded, 10000));
+        TEST_ASSERT(waitUntil([&] { return !hostNet.isHostMicLive(); }, 3000));
+    }
+
+    {   // The next session, unmuted, starts with sound
+        viewerNet.setAudioMuted(false);
+        TEST_ASSERT(viewerNet.connectToRemote(hostId.formattedDeskId(), "TestPass99"));
+        TEST_ASSERT(waitUntil(connected, 15000));
+        TEST_ASSERT(waitUntil([&] { return !hostNet.isHostAudioSuspended(); }, 3000));
+
+        // A viewer that may only watch can still turn the sound off for itself
+        hostNet.updateHostSessionPermissions(PERM_ALL & ~PERM_INPUT);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        viewerNet.setAudioMuted(true);
+        TEST_ASSERT(waitUntil([&] { return hostNet.isHostAudioSuspended(); }, 3000));
+        viewerNet.setAudioMuted(false);
+        TEST_ASSERT(waitUntil([&] { return !hostNet.isHostAudioSuspended(); }, 3000));
+
+        viewerNet.disconnectViewer();
+        hostNet.disconnectHostClient();
+    }
+
+    {   // The sign on the dashboard: shown while the microphone is live, not otherwise
+        FakeShell shell;
+        const auto npos = std::string::npos;
+        TEST_ASSERT(renderAppState(hostId, hostNet, shell, "dashboard_light").find("Microphone is on") == npos);
+        const std::string on = renderAppState(hostId, hostNet, shell, "dashboard_mic_on");
+        TEST_ASSERT(on.find("|Microphone is on") != npos && on.find("|Disconnect") != npos);
+        const auto names = AppUi::snapshotStateNames();
+        TEST_ASSERT(!names.empty() && names.back() == "dashboard_mic_on");
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(hostId.configFilePath(), ec);
+    std::filesystem::remove(viewerId.configFilePath(), ec);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -11236,6 +11321,7 @@ int main(int argc, char** argv) {
 #if !defined(_WIN32)
         testHostSoundOverTheSession(); std::cout << "Test 100 done\n" << std::flush;
 #endif
+        testMuteStateAndHostMicSign(); std::cout << "Test 101 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
 #endif

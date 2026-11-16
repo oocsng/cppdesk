@@ -1255,6 +1255,13 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
         // before the Disconnect button does.
         const wayland::NoticeText shareText = wayland::describeShareNotice(currentShareNotice());
         const float discTop = hostBox.bottom - 8.0f - 32.0f;
+        const bool micLive = currentHostMicLive();
+        if (micLive) {   // the viewer's voice opened this computer's microphone
+            const std::string micText = "Microphone is on: the viewer can hear this room";
+            const float micH = canvas_->measureTextBlock(micText, ui::FontRole::Tooltip, hrx - hx).y;
+            drawText(micText, { hx, hy, hrx, hy + micH }, ui::FontRole::Tooltip, COL_WARNING);
+            hy += micH + 8.0f;
+        }
         if (shareText.visible) {
             drawText(shareText.title, { hx, hy, hrx, hy + 20.0f }, ui::FontRole::BodyBold, COL_WARNING);
             hy += 22.0f;
@@ -1262,7 +1269,7 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
             drawText(shareText.body, { hx, hy, hrx, hy + noticeH }, ui::FontRole::Tooltip, COL_TEXT_SECONDARY);
             hy += noticeH + 8.0f;
         }
-        const auto roomForSwitch = [&]() { return !shareText.visible || hy + 24.0f <= discTop - 4.0f; };
+        const auto roomForSwitch = [&]() { return (!shareText.visible && !micLive) || hy + 24.0f <= discTop - 4.0f; };
 
         uint8_t perms = hStatus.permissions;
         if (roomForSwitch()) drawToggleSwitch("perm_host_input", { hx, hy, hrx, hy + 24.0f }, (perms & PERM_INPUT) != 0,
@@ -1281,7 +1288,7 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
                          });
         hy += 30.0f;
 
-        const float discY = (shareText.visible && hy + 32.0f > hostBox.bottom - 8.0f) ? discTop : hy;
+        const float discY = ((shareText.visible || micLive) && hy + 32.0f > hostBox.bottom - 8.0f) ? discTop : hy;
         if (discY + 32.0f <= hostBox.bottom - 8.0f) {
             UiRect discHostBtn = { hx, discY, hrx, discY + 32.0f };
             drawButton("btn_disc_host", discHostBtn, "Disconnect",
@@ -9270,6 +9277,10 @@ void AppUi::onTick() {
         }
         shell_->invalidate();
     }
+    if (currentHostMicLive() != hostMicLiveSeen_) {
+        hostMicLiveSeen_ = currentHostMicLive();
+        shell_->invalidate();
+    }
     if (std::string token; !snapshotShareNotice_ && network_.takeRestoreTokenForSave(token)) {
         AppSettings ns = identity_.settings();
         ns.waylandRestoreToken = token;   // the desktop's remembered answer, kept with the other settings
@@ -9692,7 +9703,8 @@ std::vector<std::string> AppUi::snapshotStateNames() {
              "settings_system", "settings_about", "session_view", "session_tabs_3", "drawer_file_transfer",
              "drawer_file_manager", "drawer_sync", "chat_long_text", "modal_approval", "modal_totp", "modal_run_task",
              "modal_address_book", "modal_recording_player", "modal_omnibar", "toast", "tooltip",
-             "dashboard_mac_permissions", "dashboard_mac_restart", "dashboard_wayland_denied", "dashboard_wayland_view_only" };
+             "dashboard_mac_permissions", "dashboard_mac_restart", "dashboard_wayland_denied", "dashboard_wayland_view_only",
+             "dashboard_mic_on" };
 }
 
 void AppUi::applySnapshotState(const std::string& name) {
@@ -9702,6 +9714,7 @@ void AppUi::applySnapshotState(const std::string& name) {
     snapshotHostPermsReturned_ = false;
     snapshotShareNotice_.reset();
     snapshotHostStatus_.reset();
+    snapshotHostMicLive_.reset();
     // The audio settings page would open the microphone; snapshots must not, and a live level meter
     // would make the output differ run to run.
     voiceMonitorAttempted_ = true;
@@ -9781,6 +9794,15 @@ void AppUi::applySnapshotState(const std::string& name) {
         snapshotHostStatus_ = viewer;
         snapshotShareNotice_ = wayland::ShareNotice{ name == "dashboard_wayland_denied" ? wayland::ShareState::Denied
                                                                                         : wayland::ShareState::ViewOnly, "" };
+    } else if (name == "dashboard_mic_on") {
+        activeTab_ = ActiveTab::Dashboard;
+        HostSessionStatus viewer;
+        viewer.active = true;
+        viewer.viewerDeskId = 123456789;
+        viewer.viewerHostname = "Office";
+        viewer.viewerIp = "192.168.1.20";
+        snapshotHostStatus_ = viewer;
+        snapshotHostMicLive_ = true;
     } else if (name == "modal_approval") {
         activeTab_ = ActiveTab::Dashboard;
         snapshotPerFrame_ = [](AppUi& a) { a.modalAnimT_ = 1.0f; a.modalAnimVel_ = 0.0f; };

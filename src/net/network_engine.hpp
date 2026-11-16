@@ -353,6 +353,9 @@ public:
     bool isAudioMuted() const;
     void syncAudioControl();
     bool isHostAudioSuspended() const;
+    // True while the host's microphone is open because a viewer's voice arrived: the dashboard says so.
+    bool isHostMicLive() const { return hostMicLive_.load(); }
+    void setHostMicLiveForTest(bool live) { hostMicLive_.store(live); }
 #if !defined(_WIN32)
     // Tests stand in for the sound hardware: what the host captures and what the viewer plays through. A null factory
     // keeps the real one. Set before a session starts.
@@ -618,6 +621,7 @@ private:
     std::atomic<int>        audioVolumePercent_{100};
     std::atomic<bool>       audioMuted_{false};
     std::atomic<bool>       hostAudioSuspended_{false};
+    std::atomic<bool>       hostMicLive_{false};
 #if !defined(_WIN32)
     SystemAudioSourceFactory sourceFactory_;
     AudioPlayerFactory       playerFactory_;
