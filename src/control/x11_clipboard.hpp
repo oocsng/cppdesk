@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <vector>
 
 typedef struct _XDisplay Display;
 
@@ -40,6 +41,16 @@ private:
     bool owned_ = false;
     bool replied_ = false;
     std::optional<std::string> reply_;
+    bool incoming_ = false;      // the owner answered getText with INCR: its text arrives in pieces
+    std::string incomingText_;
+
+    // Text larger than one X request goes to other apps in pieces (INCR); only run() touches these.
+    struct Outgoing {
+        unsigned long requestor = 0, property = 0, type = 0;
+        std::string text;
+        size_t sent = 0;
+    };
+    std::vector<Outgoing> outgoing_;
 
     std::atomic<bool> stop_{false};
     std::thread thread_;

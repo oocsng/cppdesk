@@ -8620,6 +8620,83 @@ void testX11Clipboard() {
     stop = true;
     server.join();
 
+    // Text larger than one X request goes both ways in pieces (INCR), as browsers and editors send it.
+    {
+        std::string big(1500000, '\0');
+        for (size_t i = 0; i < big.size(); ++i) big[i] = static_cast<char>('a' + i % 26);
+        const Atom incr = XInternAtom(peer, "INCR", False), prop = XInternAtom(peer, "CPPDESK_TEST_PROP", False);
+
+        // CppDesk copies it; another app pastes it.
+        TEST_ASSERT(ClipboardManager::setClipboardUtf8(big));
+        XSelectInput(peer, pw, PropertyChangeMask);
+        auto first = requestClipboard(peer, pw, utf8);   // reads (and deletes) the INCR announcement
+        std::string pasted;
+        XEvent ev;
+        for (auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+             first && first->size() == 4 && std::chrono::steady_clock::now() < end;) {
+            if (!XCheckTypedWindowEvent(peer, pw, PropertyNotify, &ev)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            if (ev.xproperty.atom != prop || ev.xproperty.state != PropertyNewValue) continue;
+            Atom type = 0;
+            int format = 0;
+            unsigned long count = 0, after = 0;
+            unsigned char* data = nullptr;
+            XGetWindowProperty(peer, pw, prop, 0, 1 << 22, True, AnyPropertyType, &type, &format, &count, &after, &data);
+            if (data) pasted.append(reinterpret_cast<char*>(data), count);
+            if (data) XFree(data);
+            if (type == None) continue;   // the announcement's own change event, already read
+            if (count == 0) break;
+        }
+        TEST_ASSERT(pasted == big);
+
+        // Another app copies it; CppDesk reads it.
+        XSetSelectionOwner(peer, clip, pw, CurrentTime);
+        XFlush(peer);
+        std::atomic<bool> done{false};
+        std::thread owner([&] {
+            Window requestor = 0;
+            Atom property = 0;
+            size_t sent = 0;
+            while (!done.load()) {
+                XEvent e;
+                if (XCheckTypedWindowEvent(peer, pw, SelectionRequest, &e) && e.xselectionrequest.target == utf8) {
+                    requestor = e.xselectionrequest.requestor;
+                    property = e.xselectionrequest.property;
+                    sent = 0;
+                    XSelectInput(peer, requestor, PropertyChangeMask);
+                    const long size = static_cast<long>(big.size());
+                    XChangeProperty(peer, requestor, property, incr, 32, PropModeReplace,
+                                    reinterpret_cast<const unsigned char*>(&size), 1);
+                    XEvent reply{};
+                    reply.xselection.type = SelectionNotify;
+                    reply.xselection.requestor = requestor;
+                    reply.xselection.selection = clip;
+                    reply.xselection.target = utf8;
+                    reply.xselection.property = property;
+                    reply.xselection.time = e.xselectionrequest.time;
+                    XSendEvent(peer, requestor, False, NoEventMask, &reply);
+                    XFlush(peer);
+                } else if (requestor && XCheckTypedWindowEvent(peer, requestor, PropertyNotify, &e)) {
+                    if (e.xproperty.atom != property || e.xproperty.state != PropertyDelete) continue;
+                    const size_t piece = std::min<size_t>(big.size() - sent, 100000);
+                    XChangeProperty(peer, requestor, property, utf8, 8, PropModeReplace,
+                                    reinterpret_cast<const unsigned char*>(big.data() + sent), static_cast<int>(piece));
+                    XFlush(peer);
+                    sent += piece;
+                    if (piece == 0) requestor = 0;
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+        });
+        TEST_ASSERT(ClipboardManager::getClipboardUtf8() == big);
+        done = true;
+        owner.join();
+        XSelectInput(peer, pw, NoEventMask);
+    }
+
     // Old apps asking for STRING get Latin-1, as the X spec defines it.
     TEST_ASSERT(ClipboardManager::setClipboardUtf8("\xC3\xA9"));
     TEST_ASSERT(requestClipboard(peer, pw, XA_STRING) == std::string("\xE9"));
