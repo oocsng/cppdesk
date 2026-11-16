@@ -5406,7 +5406,10 @@ void NetworkEngine::enqueueViewerAudioChunk(const uint8_t* payload, size_t len) 
     AudioChunkHeader hdr{};
     std::memcpy(&hdr, payload, sizeof(hdr));
     if (hdr.isSilent || hdr.sampleFrames == 0 || hdr.bitsPerSample != 16 || hdr.channels == 0) return;
-    const size_t frames = std::min<size_t>(hdr.sampleFrames, (len - sizeof(hdr)) / (hdr.channels * sizeof(int16_t)));
+    // Anything outside what a sound device does is dropped, so a broken or hostile host cannot make the viewer resample
+    // (and allocate) without bound.
+    if (hdr.sampleRate < 8000 || hdr.sampleRate > 192000 || hdr.channels > 8) return;
+    const size_t frames = std::min<size_t>({ static_cast<size_t>(hdr.sampleFrames), (len - sizeof(hdr)) / (hdr.channels * sizeof(int16_t)), size_t{96000} });
     if (frames == 0) return;
 
     std::lock_guard<std::mutex> lk(audioPlaybackMutex_);

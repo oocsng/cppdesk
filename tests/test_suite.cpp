@@ -10954,6 +10954,7 @@ void testHostSoundOverTheSession() {
     struct Heard {
         std::mutex mu;
         std::vector<int16_t> played;   // interleaved stereo, in the order it arrived
+        size_t mostFrames = 0;         // the largest single play() call
         std::atomic<bool> stopped{false};
         std::atomic<int> afterStop{0};
     };
@@ -10992,6 +10993,7 @@ void testHostSoundOverTheSession() {
             if (h->stopped) ++h->afterStop;
             std::lock_guard<std::mutex> lk(h->mu);
             h->played.insert(h->played.end(), pcm, pcm + frames * 2);
+            h->mostFrames = std::max(h->mostFrames, frames);
         }
         void stop() override { h->stopped = true; }
     };
@@ -11071,6 +11073,27 @@ void testHostSoundOverTheSession() {
         viewerNet.setAudioMuted(false);
         TEST_ASSERT(waitUntil([&] { return !hostNet.isHostAudioSuspended(); }, 3000));
         TEST_ASSERT(waitUntil([&] { return framesPlayed() > atMute; }, 3000));
+
+        {   // A broken or hostile host cannot make the viewer resample without bound or play garbage: such chunks are dropped
+            auto inject = [&](uint32_t rate, uint8_t channels, uint32_t frames) {
+                AudioChunkHeader hdr{};
+                hdr.sampleRate = rate;
+                hdr.channels = channels;
+                hdr.bitsPerSample = 16;
+                hdr.sampleFrames = frames;
+                std::vector<uint8_t> packet(sizeof(hdr) + static_cast<size_t>(frames) * channels * sizeof(int16_t), 0x39);
+                std::memcpy(packet.data(), &hdr, sizeof(hdr));
+                bool threw = false;
+                try { viewerNet.injectViewerAudioChunkForTest(packet.data(), packet.size()); } catch (...) { threw = true; }
+                TEST_ASSERT(!threw);
+            };
+            inject(1, 1, 200);       // one sample per second: would become 9.6 million frames
+            inject(3000, 2, 200);
+            inject(48000, 200, 50);  // far more channels than any device has
+            inject(0, 2, 100);
+            std::lock_guard<std::mutex> lk(heard->mu);
+            TEST_ASSERT(heard->mostFrames <= 4800);   // the host's own chunks are 480 frames
+        }
 
         viewerNet.disconnectViewer();   // in the middle of the stream
         std::this_thread::sleep_for(std::chrono::milliseconds(600));

@@ -365,6 +365,8 @@ public:
         sourceFactory_ = std::move(source);
         playerFactory_ = std::move(player);
     }
+    // Hands the viewer a received AUDIO_STREAM_CHUNK payload as if the host had sent it (malformed ones included).
+    void injectViewerAudioChunkForTest(const uint8_t* payload, size_t len) { enqueueViewerAudioChunk(payload, len); }
 #endif
 
     // Privacy screen controls (v2.1.0, v3.2.0 & DPMS power management)
