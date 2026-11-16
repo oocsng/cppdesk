@@ -11,6 +11,7 @@
 
 namespace cppdesk {
 
+// One PulseStream must not be opened or closed from two threads at once; callers serialize.
 class PulseStream {
 public:
     enum class Dir { Record, Playback };
@@ -24,7 +25,8 @@ public:
     static bool available();
 
     // `device` nullptr is the default; "@DEFAULT_MONITOR@" is what the default output plays. 16-bit interleaved.
-    // Returns false when the library, the server or the device is missing.
+    // Returns false when the library, the server or the device is missing. A server that accepts the connection but never
+    // answers blocks this call until libpulse gives up (the simple API has no timeout).
     bool open(Dir dir, const char* device, uint32_t rate, uint8_t channels, const char* appName, int latencyMs = 40);
 
     // Record: >0 bytes copied, 0 when nothing arrived within about 100 ms, -1 on error or when not open.

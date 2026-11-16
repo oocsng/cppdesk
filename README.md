@@ -147,11 +147,13 @@ The voice intercom (microphone and speaker) and the host's system sound work on 
 sound is sent as plain 48 kHz stereo with no compression, which costs about 1.5 Mbit/s and suits a LAN. On Linux sound
 goes through PulseAudio, or PipeWire's PulseAudio support, loaded only when needed, so the app still starts without it;
 to build the sound part you need the PulseAudio headers (`sudo apt install libpulse-dev`; without them sound is left
-out). A Mac host sends its sound on macOS 13 or later (macOS 12 shares the screen without sound). When a viewer talks,
-the host's microphone opens by itself, and the dashboard shows "Microphone is on: the viewer can hear this room" while
-it is open. A viewer's mute and volume apply at once and again after a reconnect. Not done: compression, choosing a
-sound device on Linux (the system default is used) and echo cancellation. The Linux sound is tested against a test sound
-server and the Mac sound has **not been run on a real Mac**; what to check by hand is in
+out). A Mac host sends its sound on macOS 13 or later (macOS 12 shares the screen without sound). A Linux host sends
+everything its speakers play, CppDesk's own playback included, so a viewer who talks to a Linux host hears their own
+voice back about a quarter second late; a Mac host leaves its own sound out. When a viewer talks, the host's
+microphone opens by itself, and the dashboard shows "Microphone is on: the viewer can hear this room" while it is open.
+A viewer's mute and volume apply at once and again after a reconnect. Not done: compression, choosing a sound device on
+Linux (the system default is used) and echo cancellation, which would also remove that echo. The Linux sound is tested
+against a test sound server and the Mac sound has **not been run on a real Mac**; what to check by hand is in
 [docs/audio-test-checklist.md](docs/audio-test-checklist.md).
 
 ### Build commands

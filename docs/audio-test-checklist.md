@@ -12,6 +12,7 @@ headphones were used. Headphones avoid echo; skip them for the echo item below.
       "Microphone is on: the viewer can hear this room", and the line disappears when the viewer stops or the session ends,
       including when the network cable is pulled.
 - [ ] Stopping the intercom returns at once (no frozen window), on every platform.
+- [ ] Linux host: the viewer hears their own voice back about a quarter second late (expected: the host sends what its speakers play).
 
 ## The host's system sound
 - [ ] Play music or a video on the host: the viewer hears it, in time with the picture, without crackling.
@@ -32,6 +33,10 @@ headphones were used. Headphones avoid echo; skip them for the echo item below.
 - [ ] A Linux machine with no PulseAudio or PipeWire: the app starts, a session shows the screen, and sound is simply absent.
 - [ ] A host with no sound device (a headless server): the same.
 - [ ] Echo: host and viewer in the same room without headphones squeal or echo; this is expected (no echo cancellation).
+
+## Known issues
+- The receive thread and the UI can start and stop the host's microphone at the same moment (a viewer's stop message
+  during a local stop). This race is not guarded yet.
 
 ## Report
 Send the systems and versions, what failed, and for a crash the backtrace or crash report.
