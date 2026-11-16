@@ -6893,9 +6893,10 @@ void AppUi::drawRecordingPlayerModal(float width, float height, float modalProgr
     drawButton("player_open_btn", openBtnRect, "Open...",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f,
                [this]() {
-                   if (auto path = shell_->chooseOpenFile("Open Session Recording", "AVI Session Recordings", "*.avi")) {
-                       openRecordingPlayer(*path);
-                   }
+                   shell_->chooseOpenFile("Open Session Recording", "AVI Session Recordings", "*.avi",
+                                          [this](std::optional<std::string> path) {
+                                              if (path) openRecordingPlayer(*path);
+                                          });
                }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
     // Close button
@@ -8753,7 +8754,8 @@ void AppUi::initiateConnection() {
 }
 
 void AppUi::openSendFileDialog() {
-    if (auto path = shell_->chooseOpenFile("Send File", "All Files", "*.*")) {
+    shell_->chooseOpenFile("Send File", "All Files", "*.*", [this](std::optional<std::string> path) {
+        if (!path) return;
         if (network_.sendFile(*path) > 0) {
             drawerTab_ = DrawerTab::FilesAndClip;
             showFileDrawer_ = true;
@@ -8761,13 +8763,14 @@ void AppUi::openSendFileDialog() {
         } else {
             showToast("No active session", true);
         }
-    }
+    });
 }
 
 void AppUi::openPickFolderDialog(std::string& outPath) {
-    if (auto path = shell_->chooseFolder("Select Folder to Synchronize")) {
-        outPath = *path;
-    }
+    // outPath is a member of this AppUi, so it outlives a dialog that answers later
+    shell_->chooseFolder("Select Folder to Synchronize", [&outPath](std::optional<std::string> path) {
+        if (path) outPath = *path;
+    });
 }
 
 void AppUi::saveRemoteScreenshot() {

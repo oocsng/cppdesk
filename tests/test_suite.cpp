@@ -9087,8 +9087,8 @@ public:
     uint64_t clock = 10000;
     uint64_t nowMs() const override { return clock; }
     void setTextInputActive(bool) override {}
-    std::optional<std::string> chooseOpenFile(const std::string&, const std::string&, const std::string&) override { return std::nullopt; }
-    std::optional<std::string> chooseFolder(const std::string&) override { return std::nullopt; }
+    void chooseOpenFile(const std::string&, const std::string&, const std::string&, ChosenPath chosen) override { chosen(std::nullopt); }
+    void chooseFolder(const std::string&, ChosenPath chosen) override { chosen(std::nullopt); }
     void openUrl(const std::string&) override {}
     void revealPath(const std::string&) override {}
     int relaunches = 0;

@@ -47,11 +47,13 @@ public:
     virtual uint64_t nowMs() const = 0;
     virtual void setTextInputActive(bool active) = 0;
 
-    // Dialogs and launching. Paths are UTF-8; nullopt when the user cancels.
+    // Dialogs and launching. Paths are UTF-8. `chosen` runs on the UI thread once the dialog closes, with nullopt
+    // when the user cancels; it may run before the call returns, or later while the window keeps drawing.
     // filterName/filterPattern describe one file type, e.g. "AVI Session Recordings" / "*.avi".
-    virtual std::optional<std::string> chooseOpenFile(const std::string& title, const std::string& filterName,
-                                                      const std::string& filterPattern) = 0;
-    virtual std::optional<std::string> chooseFolder(const std::string& title) = 0;
+    using ChosenPath = std::function<void(std::optional<std::string>)>;
+    virtual void chooseOpenFile(const std::string& title, const std::string& filterName,
+                                const std::string& filterPattern, ChosenPath chosen) = 0;
+    virtual void chooseFolder(const std::string& title, ChosenPath chosen) = 0;
     virtual void openUrl(const std::string& url) = 0;
     virtual void revealPath(const std::string& path) = 0;
     // Start a fresh copy of the app and close this one.

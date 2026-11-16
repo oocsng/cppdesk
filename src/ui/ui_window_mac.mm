@@ -482,9 +482,8 @@ public:
     // shortcut: composition is always available and the screens ignore text with no field focused.
     void setTextInputActive(bool) override {}
 
-    // shortcut: the panels block the UI thread (the window does not repaint while one is open), as on Linux.
-    std::optional<std::string> chooseOpenFile(const std::string& title, const std::string& /*filterName*/,
-                                              const std::string& filterPattern) override {
+    void chooseOpenFile(const std::string& title, const std::string& /*filterName*/, const std::string& filterPattern,
+                        ChosenPath chosen) override {
         @autoreleasepool {
             NSOpenPanel* panel = [NSOpenPanel openPanel];
             panel.title = toNs(title);
@@ -505,20 +504,39 @@ public:
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
             if (types.count) panel.allowedFileTypes = types;
 #pragma clang diagnostic pop
-            if ([panel runModal] != NSModalResponseOK || !panel.URL) return std::nullopt;
-            return fromNs(panel.URL.path);
+            runPanel(panel, std::move(chosen));
         }
     }
-    std::optional<std::string> chooseFolder(const std::string& title) override {
+    void chooseFolder(const std::string& title, ChosenPath chosen) override {
         @autoreleasepool {
             NSOpenPanel* panel = [NSOpenPanel openPanel];
             panel.title = toNs(title);
             panel.canChooseFiles = NO;
             panel.canChooseDirectories = YES;
             panel.allowsMultipleSelection = NO;
-            if ([panel runModal] != NSModalResponseOK || !panel.URL) return std::nullopt;
-            return fromNs(panel.URL.path);
+            runPanel(panel, std::move(chosen));
         }
+    }
+    // The panel is a sheet on the window, so the window keeps drawing while it is open (and takes no clicks).
+    void runPanel(NSOpenPanel* panel, ChosenPath chosen) {
+        if (!live()) {
+            chosen(std::nullopt);
+            return;
+        }
+        std::shared_ptr<CppDeskWindowMacImpl::LiveToken> token = w_->liveToken;
+        [panel beginSheetModalForWindow:w_->window
+                      completionHandler:^(NSModalResponse result) {
+                          std::optional<std::string> path;
+                          if (result == NSModalResponseOK && panel.URL) path = fromNs(panel.URL.path);
+                          CppDeskWindowMacImpl* w = nullptr;
+                          {
+                              std::lock_guard<std::mutex> alive(token->m);
+                              w = token->w;
+                          }
+                          if (!w) return;   // the window closed while the panel was open
+                          chosen(path);
+                          w->invalidate();
+                      }];
     }
     void openUrl(const std::string& url) override {
         @autoreleasepool {

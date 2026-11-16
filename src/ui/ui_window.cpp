@@ -105,8 +105,15 @@ public:
 
     void setTextInputActive(bool) override {}
 
-    std::optional<std::string> chooseOpenFile(const std::string& title, const std::string& filterName,
-                                              const std::string& filterPattern) override {
+    // The Windows dialogs are modal but keep painting the window, so they answer before returning.
+    void chooseOpenFile(const std::string& title, const std::string& filterName, const std::string& filterPattern,
+                        ChosenPath chosen) override {
+        chosen(openFileDialog(title, filterName, filterPattern));
+    }
+    void chooseFolder(const std::string& title, ChosenPath chosen) override { chosen(folderDialog(title)); }
+
+    std::optional<std::string> openFileDialog(const std::string& title, const std::string& filterName,
+                                              const std::string& filterPattern) {
         std::wstring wTitle = utf8ToWide(title);
         std::wstring filter = utf8ToWide(filterName + " (" + filterPattern + ")");
         filter.push_back(L'\0');
@@ -130,7 +137,7 @@ public:
         return wideToUtf8(file);
     }
 
-    std::optional<std::string> chooseFolder(const std::string& title) override {
+    std::optional<std::string> folderDialog(const std::string& title) {
         std::optional<std::string> result;
         IFileDialog* pfd = nullptr;
         if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd))) || !pfd) {

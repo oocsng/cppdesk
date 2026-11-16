@@ -34,6 +34,7 @@
 #include <iostream>
 #include <atomic>
 #include <memory>
+#include <thread>
 #include <mutex>
 #include <vector>
 
@@ -423,23 +424,49 @@ public:
         else XUnsetICFocus(w_->xic);
     }
 
-    // shortcut: the dialog blocks the UI thread, so the window does not repaint while it is open; move it to a
-    // worker thread with a posted result if that bothers anyone.
-    std::optional<std::string> chooseOpenFile(const std::string& title, const std::string& filterName,
-                                              const std::string& filterPattern) override {
+    void chooseOpenFile(const std::string& title, const std::string& filterName, const std::string& filterPattern,
+                        ChosenPath chosen) override {
         // Pick the tool up front: a cancelled zenity must not be followed by a second, kdialog dialog.
         if (spawn::onPath("zenity")) {
-            return spawn::output({ "zenity", "--file-selection", "--title=" + title,
-                                   "--file-filter=" + filterName + " | " + filterPattern, "--file-filter=All files | *" });
+            runDialog({ "zenity", "--file-selection", "--title=" + title,
+                        "--file-filter=" + filterName + " | " + filterPattern, "--file-filter=All files | *" },
+                      std::move(chosen));
+        } else {
+            runDialog({ "kdialog", "--title", title, "--getopenfilename", ".", filterPattern + "|" + filterName },
+                      std::move(chosen));
         }
-        return spawn::output({ "kdialog", "--title", title, "--getopenfilename", ".", filterPattern + "|" + filterName });
     }
-    std::optional<std::string> chooseFolder(const std::string& title) override {
+    void chooseFolder(const std::string& title, ChosenPath chosen) override {
         if (spawn::onPath("zenity")) {
-            return spawn::output({ "zenity", "--file-selection", "--directory", "--title=" + title });
+            runDialog({ "zenity", "--file-selection", "--directory", "--title=" + title }, std::move(chosen));
+        } else {
+            runDialog({ "kdialog", "--title", title, "--getexistingdirectory", "." }, std::move(chosen));
         }
-        return spawn::output({ "kdialog", "--title", title, "--getexistingdirectory", "." });
     }
+    // The dialog program runs on a worker thread so the window keeps drawing; the answer is posted back to the UI
+    // thread. One at a time, as with a modal dialog: a second request while one is open is cancelled.
+    void runDialog(std::vector<std::string> args, ChosenPath chosen) {
+        if (!w_ || dialogOpen_) {
+            chosen(std::nullopt);
+            return;
+        }
+        dialogOpen_ = true;
+        std::shared_ptr<CppDeskWindowLinuxImpl::LiveToken> token = w_->liveToken;
+        std::thread([token, args = std::move(args), chosen = std::move(chosen)]() mutable {
+            std::optional<std::string> path = spawn::output(args);
+            std::lock_guard<std::mutex> alive(token->m);
+            CppDeskWindowLinuxImpl* w = token->w;
+            if (!w) return;   // the window closed while the dialog was open
+            std::lock_guard<std::mutex> lock(w->postMutex);
+            w->posted.push_back([w, path = std::move(path), chosen = std::move(chosen)] {
+                if (w->shell) w->shell->dialogOpen_ = false;
+                chosen(path);
+                w->invalidate();
+            });
+            w->wake();
+        }).detach();
+    }
+    bool dialogOpen_ = false;   // UI thread only
     void openUrl(const std::string& url) override { spawn::detached({ "xdg-open", url }); }
     void revealPath(const std::string& path) override {
         std::error_code ec;
