@@ -839,6 +839,37 @@ inline bool deserializeChatMedia(const uint8_t* data, size_t size, ChatMediaPayl
     }
 }
 
+// File names travel as UTF-16, which is Windows' wchar_t; on Linux and macOS wchar_t holds UTF-32 and is converted.
+inline std::u16string wideToUtf16(const std::wstring& s) {
+    if constexpr (sizeof(wchar_t) == 2) return std::u16string(s.begin(), s.end());
+    std::u16string out;
+    for (wchar_t wc : s) {
+        uint32_t c = static_cast<uint32_t>(wc);
+        if (c >= 0x10000 && c <= 0x10FFFF) {
+            c -= 0x10000;
+            out.push_back(static_cast<char16_t>(0xD800 + (c >> 10)));
+            out.push_back(static_cast<char16_t>(0xDC00 + (c & 0x3FF)));
+        } else {
+            out.push_back(static_cast<char16_t>(c > 0x10FFFF ? 0xFFFD : c));
+        }
+    }
+    return out;
+}
+
+inline std::wstring utf16ToWide(const std::u16string& s) {
+    if constexpr (sizeof(wchar_t) == 2) return std::wstring(s.begin(), s.end());
+    std::wstring out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        uint32_t c = s[i];
+        if (c >= 0xD800 && c < 0xDC00 && i + 1 < s.size() && s[i + 1] >= 0xDC00 && s[i + 1] < 0xE000) {
+            c = 0x10000 + ((c - 0xD800) << 10) + (s[i + 1] - 0xDC00);
+            ++i;
+        }
+        out.push_back(static_cast<wchar_t>(c));
+    }
+    return out;
+}
+
 inline void serializeClipboardFileList(uint32_t transferId, const std::vector<VirtualFileEntry>& files, std::vector<uint8_t>& out) {
     ByteWriter w;
     ClipboardFileListHeader hdr{};
@@ -853,10 +884,12 @@ inline void serializeClipboardFileList(uint32_t transferId, const std::vector<Vi
         desc.fileIndex = f.fileIndex;
         desc.fileSize = f.fileSize;
         desc.fileAttributes = f.fileAttributes;
-        desc.nameLengthChars = static_cast<uint16_t>(f.fileName.size());
+        std::u16string name = wideToUtf16(f.fileName);
+        if (name.size() > 0xFFFF) name.resize(0xFFFF);
+        desc.nameLengthChars = static_cast<uint16_t>(name.size());
         w.writeBytes(&desc, sizeof(desc));
         if (desc.nameLengthChars > 0) {
-            w.writeBytes(reinterpret_cast<const uint8_t*>(f.fileName.data()), desc.nameLengthChars * sizeof(wchar_t));
+            w.writeBytes(name.data(), name.size() * sizeof(char16_t));
         }
     }
     out = w.takeBuffer();
@@ -877,7 +910,7 @@ inline bool deserializeClipboardFileList(const uint8_t* data, size_t size, uint3
             if (!r.hasRemaining(sizeof(ClipboardFileDescHeader))) return false;
             ClipboardFileDescHeader desc{};
             r.readBytes(&desc, sizeof(desc));
-            size_t nameBytes = static_cast<size_t>(desc.nameLengthChars) * sizeof(wchar_t);
+            size_t nameBytes = static_cast<size_t>(desc.nameLengthChars) * sizeof(char16_t);
             if (!r.hasRemaining(nameBytes)) return false;
 
             VirtualFileEntry entry{};
@@ -885,8 +918,9 @@ inline bool deserializeClipboardFileList(const uint8_t* data, size_t size, uint3
             entry.fileSize = desc.fileSize;
             entry.fileAttributes = desc.fileAttributes;
             if (desc.nameLengthChars > 0) {
-                entry.fileName.resize(desc.nameLengthChars);
-                std::memcpy(entry.fileName.data(), r.currentPtr(), nameBytes);
+                std::u16string name(desc.nameLengthChars, u' ');
+                std::memcpy(name.data(), r.currentPtr(), nameBytes);
+                entry.fileName = utf16ToWide(name);
                 r.skip(nameBytes);
             }
             outFiles.push_back(std::move(entry));

@@ -7,7 +7,9 @@
 #include <poll.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <vector>
 
 namespace cppdesk {
 
@@ -34,6 +36,49 @@ std::string toLatin1(const std::string& utf8) {
     return out;
 }
 
+// file:///a%20b -> /a b. Lines starting with # are comments; other schemes are skipped.
+std::vector<std::string> pathsFromUriList(const std::string& list) {
+    std::vector<std::string> paths;
+    size_t pos = 0;
+    while (pos < list.size()) {
+        size_t end = list.find('\n', pos);
+        if (end == std::string::npos) end = list.size();
+        std::string line = list.substr(pos, end - pos);
+        pos = end + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#' || line.compare(0, 7, "file://") != 0) continue;
+        const size_t slash = line.find('/', 7);   // after an optional host (file://localhost/...)
+        if (slash == std::string::npos) continue;
+        std::string path;
+        for (size_t i = slash; i < line.size(); ++i) {
+            if (line[i] == '%' && i + 2 < line.size() && std::isxdigit(static_cast<unsigned char>(line[i + 1])) &&
+                std::isxdigit(static_cast<unsigned char>(line[i + 2]))) {
+                path.push_back(static_cast<char>(std::stoi(line.substr(i + 1, 2), nullptr, 16)));
+                i += 2;
+            } else {
+                path.push_back(line[i]);
+            }
+        }
+        paths.push_back(std::move(path));
+    }
+    return paths;
+}
+
+std::string uriFromPath(const std::string& path) {
+    static const char hex[] = "0123456789ABCDEF";
+    std::string uri = "file://";
+    for (unsigned char c : path) {
+        if (std::isalnum(c) || c == '/' || c == '-' || c == '.' || c == '_' || c == '~') {
+            uri.push_back(static_cast<char>(c));
+        } else {
+            uri.push_back('%');
+            uri.push_back(hex[c >> 4]);
+            uri.push_back(hex[c & 15]);
+        }
+    }
+    return uri;
+}
+
 } // namespace
 
 X11Clipboard& X11Clipboard::instance() {
@@ -52,6 +97,8 @@ X11Clipboard::X11Clipboard() {
     text_ = XInternAtom(dpy_, "TEXT", False);
     incr_ = XInternAtom(dpy_, "INCR", False);
     prop_ = XInternAtom(dpy_, "CPPDESK_CLIPBOARD", False);
+    uriList_ = XInternAtom(dpy_, "text/uri-list", False);
+    gnomeFiles_ = XInternAtom(dpy_, "x-special/gnome-copied-files", False);
     XSelectInput(dpy_, win_, PropertyChangeMask);   // INCR replies arrive as property changes
     thread_ = std::thread([this] { run(); });
 }
@@ -69,6 +116,7 @@ bool X11Clipboard::setText(const std::string& utf8) {
     {
         std::lock_guard<std::mutex> lock(m_);
         ours_ = utf8;
+        files_ = nullptr;
         owned_ = true;
     }
     XSetSelectionOwner(dpy_, clip_, win_, CurrentTime);
@@ -80,8 +128,52 @@ bool X11Clipboard::setText(const std::string& utf8) {
     return owner;
 }
 
+bool X11Clipboard::setFiles(FetchFiles fetch) {
+    if (!dpy_) return false;
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        ours_.clear();
+        files_ = std::move(fetch);
+        owned_ = true;
+    }
+    XSetSelectionOwner(dpy_, clip_, win_, CurrentTime);
+    const bool owner = XGetSelectionOwner(dpy_, clip_) == win_;
+    if (!owner) {
+        std::lock_guard<std::mutex> lock(m_);
+        owned_ = false;
+        files_ = nullptr;
+    }
+    return owner;
+}
+
+void X11Clipboard::clearFiles() {
+    if (!dpy_) return;
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        if (!owned_ || !files_) return;
+        owned_ = false;
+        files_ = nullptr;
+    }
+    if (XGetSelectionOwner(dpy_, clip_) == win_) XSetSelectionOwner(dpy_, clip_, None, CurrentTime);
+    XFlush(dpy_);
+}
+
+std::optional<std::vector<std::string>> X11Clipboard::getFiles(int timeoutMs) {
+    if (!dpy_) return std::nullopt;
+    if (XGetSelectionOwner(dpy_, clip_) == win_) return std::nullopt;   // our own text or the peer's files
+    auto list = request(uriList_, timeoutMs);
+    if (!list) return std::nullopt;
+    auto paths = pathsFromUriList(*list);
+    if (paths.empty()) return std::nullopt;
+    return paths;
+}
+
 std::optional<std::string> X11Clipboard::getText(int timeoutMs) {
     if (!dpy_) return std::nullopt;
+    return request(utf8_, timeoutMs);
+}
+
+std::optional<std::string> X11Clipboard::request(unsigned long target, int timeoutMs) {
     // One request at a time: replies share one property and one reply slot.
     std::lock_guard<std::mutex> one(getMutex_);
     // Ask the server: our SelectionClear may not have been handled yet when another app has just copied.
@@ -92,7 +184,7 @@ std::optional<std::string> X11Clipboard::getText(int timeoutMs) {
     reply_.reset();
     incoming_ = false;
     incomingText_.clear();
-    XConvertSelection(dpy_, clip_, utf8_, prop_, win_, CurrentTime);
+    XConvertSelection(dpy_, clip_, target, prop_, win_, CurrentTime);
     XFlush(dpy_);
     if (!cv_.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this] { return replied_; })) return std::nullopt;
     return reply_;
@@ -118,20 +210,53 @@ void X11Clipboard::run() {
             reply.xselection.property = None;
             const Atom property = req.property != None ? req.property : req.target;   // obsolete clients
             std::string text;
+            FetchFiles files;
             bool own = false;
             {
                 std::lock_guard<std::mutex> lock(m_);
                 own = owned_;
                 text = ours_;
+                files = files_;
+            }
+            if (own && files && (req.target == uriList_ || req.target == gnomeFiles_)) {
+                // The files are fetched from the peer first, so the answer comes from a worker thread when they are
+                // here; the requesting app waits for it.
+                std::thread([this, req, property, files = std::move(files)] {
+                    const auto paths = files();
+                    XEvent late{};
+                    late.xselection.type = SelectionNotify;
+                    late.xselection.requestor = req.requestor;
+                    late.xselection.selection = req.selection;
+                    late.xselection.target = req.target;
+                    late.xselection.time = req.time;
+                    late.xselection.property = None;
+                    if (paths) {
+                        const bool gnome = req.target == gnomeFiles_;
+                        std::string body = gnome ? "copy" : "";
+                        for (const auto& p : *paths) body += gnome ? "\n" + uriFromPath(p) : uriFromPath(p) + "\r\n";
+                        XChangeProperty(dpy_, req.requestor, property, req.target, 8, PropModeReplace,
+                                        reinterpret_cast<const unsigned char*>(body.data()), static_cast<int>(body.size()));
+                        late.xselection.property = property;
+                    }
+                    XSendEvent(dpy_, req.requestor, False, NoEventMask, &late);
+                    XFlush(dpy_);
+                }).detach();
+                continue;
             }
             const bool fits = text.size() + 1024 < static_cast<size_t>(XMaxRequestSize(dpy_)) * 4;
-            if (own && req.target == targets_) {
+            if (own && files && req.target == targets_) {
+                const Atom offered[] = { static_cast<Atom>(targets_), static_cast<Atom>(uriList_),
+                                         static_cast<Atom>(gnomeFiles_) };
+                XChangeProperty(dpy_, req.requestor, property, XA_ATOM, 32, PropModeReplace,
+                                reinterpret_cast<const unsigned char*>(offered), 3);
+                reply.xselection.property = property;
+            } else if (own && !files && req.target == targets_) {
                 const Atom offered[] = { static_cast<Atom>(targets_), static_cast<Atom>(utf8_), XA_STRING,
                                          static_cast<Atom>(text_) };
                 XChangeProperty(dpy_, req.requestor, property, XA_ATOM, 32, PropModeReplace,
                                 reinterpret_cast<const unsigned char*>(offered), 4);
                 reply.xselection.property = property;
-            } else if (own && (req.target == utf8_ || req.target == text_ || req.target == XA_STRING)) {
+            } else if (own && !files && (req.target == utf8_ || req.target == text_ || req.target == XA_STRING)) {
                 if (req.target == XA_STRING) text = toLatin1(text);   // STRING is Latin-1 by definition
                 const Atom type = req.target == XA_STRING ? XA_STRING : static_cast<Atom>(utf8_);
                 if (fits) {
@@ -195,6 +320,7 @@ void X11Clipboard::run() {
         } else if (ev.type == SelectionClear) {
             std::lock_guard<std::mutex> lock(m_);
             owned_ = false;
+            files_ = nullptr;
         } else if (ev.type == SelectionNotify) {
             std::optional<std::string> text;
             bool incr = false;

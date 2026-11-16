@@ -1,9 +1,10 @@
 #pragma once
 
-// The X11 CLIPBOARD selection for text: what CppDesk copies reaches other apps, and what they copy reaches
-// CppDesk (and clipboard sync with a remote peer). A hidden window on its own X connection serves requests.
+// The X11 CLIPBOARD selection for text and files: what CppDesk copies reaches other apps, and what they copy
+// reaches CppDesk (and clipboard sync with a remote peer). A hidden window on its own X connection serves requests.
 
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -25,19 +26,30 @@ public:
     // The current clipboard text; nullopt when nobody offers text or the owner did not answer in time.
     std::optional<std::string> getText(int timeoutMs = 500);
 
+    // Files for other apps to paste (text/uri-list, and GNOME's list for file managers). `fetch` runs on a worker
+    // thread when an app pastes and returns the files' local paths, or nullopt when they could not be fetched.
+    using FetchFiles = std::function<std::optional<std::vector<std::string>>()>;
+    bool setFiles(FetchFiles fetch);
+    // Gives up the clipboard if it still holds the files from setFiles.
+    void clearFiles();
+    // Local paths of the files another app copied; nullopt when it offers none, or when the files are CppDesk's own.
+    std::optional<std::vector<std::string>> getFiles(int timeoutMs = 500);
+
 private:
     X11Clipboard();
     ~X11Clipboard();
     void run();
+    std::optional<std::string> request(unsigned long target, int timeoutMs);
 
     Display* dpy_ = nullptr;
     unsigned long win_ = 0;
-    unsigned long clip_ = 0, utf8_ = 0, targets_ = 0, text_ = 0, incr_ = 0, prop_ = 0;
+    unsigned long clip_ = 0, utf8_ = 0, targets_ = 0, text_ = 0, incr_ = 0, prop_ = 0, uriList_ = 0, gnomeFiles_ = 0;
 
     std::mutex getMutex_;   // serializes getText
     std::mutex m_;
     std::condition_variable cv_;
     std::string ours_;
+    FetchFiles files_;   // set while CppDesk offers files instead of text
     bool owned_ = false;
     bool replied_ = false;
     std::optional<std::string> reply_;

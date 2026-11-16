@@ -1959,6 +1959,22 @@ void testMultiSessionTabbedManagement() {
     }
 }
 
+// Clipboard file lists cross platforms: a Windows peer reads names as UTF-16, whatever wchar_t is here.
+void testClipboardFileNamesOnTheWire() {
+    std::cout << "[TEST 104] Clipboard file names travel as UTF-16 on every platform..." << std::endl;
+    // e-acute is one UTF-16 unit, the emoji two (a surrogate pair): three units even where wchar_t is 32 bits
+    const std::vector<VirtualFileEntry> files{ { 0, L"\u00e9\U0001F600", 7, 0x80 } };
+    std::vector<uint8_t> payload;
+    serializeClipboardFileList(5, files, payload);
+    TEST_ASSERT(payload.size() == sizeof(ClipboardFileListHeader) + sizeof(ClipboardFileDescHeader) + 6);
+    const uint8_t utf16le[] = { 0xE9, 0x00, 0x3D, 0xD8, 0x00, 0xDE };
+    TEST_ASSERT(payload.size() >= 6 && std::memcmp(payload.data() + payload.size() - 6, utf16le, 6) == 0);
+    uint32_t id = 0;
+    std::vector<VirtualFileEntry> back;
+    TEST_ASSERT(deserializeClipboardFileList(payload.data(), payload.size(), id, back));
+    TEST_ASSERT(id == 5 && back.size() == 1 && back[0].fileName == files[0].fileName && back[0].fileSize == 7);
+}
+
 #if defined(_WIN32)
 void testNativeClipboardFileTransfer() {
     std::cout << "[TEST 19] Native OS Clipboard File Copy-Paste & COM Virtual Streams...\n";
@@ -8707,6 +8723,119 @@ void testX11Clipboard() {
 #endif
 
 #if defined(__linux__)
+// Plays a file manager on the other side of the X11 clipboard: copying files there, pasting the peer's files.
+void testX11ClipboardFiles() {
+    std::cout << "[TEST 105] Copied files reach the peer, and the peer's files paste into other apps (X11)..." << std::endl;
+    Display* peer = XOpenDisplay(nullptr);
+    if (!peer) {
+        std::cout << "  SKIP: no X display\n";
+        return;
+    }
+    const Window pw = XCreateSimpleWindow(peer, DefaultRootWindow(peer), 0, 0, 1, 1, 0, 0, 0);
+    const Atom clip = XInternAtom(peer, "CLIPBOARD", False), uriList = XInternAtom(peer, "text/uri-list", False);
+    const Atom gnome = XInternAtom(peer, "x-special/gnome-copied-files", False);
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "cppdesk_clipfiles_test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    {
+        std::ofstream(dir / "a b.txt") << "hello";
+    }
+    std::filesystem::create_directories(dir / "folder", ec);
+
+    // A file manager copies a file and a folder; CppDesk offers the file to the peer (folders are not sent).
+    XSetSelectionOwner(peer, clip, pw, CurrentTime);
+    XFlush(peer);
+    std::atomic<bool> stop{false};
+    std::thread server([&] {
+        const std::string list = "# copied\r\nfile://" + dir.string() + "/a%20b.txt\r\nfile://localhost" + dir.string() +
+                                 "/folder\r\n";
+        while (!stop.load()) {
+            XEvent ev;
+            if (!XCheckTypedWindowEvent(peer, pw, SelectionRequest, &ev)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            XSelectionRequestEvent& req = ev.xselectionrequest;
+            XEvent reply{};
+            reply.xselection.type = SelectionNotify;
+            reply.xselection.requestor = req.requestor;
+            reply.xselection.selection = req.selection;
+            reply.xselection.target = req.target;
+            reply.xselection.time = req.time;
+            reply.xselection.property = None;
+            if (req.target == uriList) {
+                XChangeProperty(peer, req.requestor, req.property, uriList, 8, PropModeReplace,
+                                reinterpret_cast<const unsigned char*>(list.data()), static_cast<int>(list.size()));
+                reply.xselection.property = req.property;
+            }
+            XSendEvent(peer, req.requestor, False, NoEventMask, &reply);
+            XFlush(peer);
+        }
+    });
+    std::vector<VirtualFileEntry> files;
+    std::vector<std::wstring> paths;
+    TEST_ASSERT(ShellClipboard::getLocalClipboardFiles(files, paths));
+    TEST_ASSERT(files.size() == 1 && files[0].fileName == L"a b.txt" && files[0].fileSize == 5);
+    TEST_ASSERT(paths.size() == 1 && std::filesystem::path(paths[0]) == dir / "a b.txt");
+    stop = true;
+    server.join();
+
+    // The peer copies a file: nothing is fetched until an app pastes, and the paste gets a local copy of it.
+    std::string content(200000, '\0');
+    for (size_t i = 0; i < content.size(); ++i) content[i] = static_cast<char>('a' + i % 26);
+    std::atomic<int> reads{0};
+    const std::vector<VirtualFileEntry> offered{ { 0, L"report \u00e9.txt", content.size(), 0x80 } };
+    TEST_ASSERT(ShellClipboard::setVirtualClipboardFiles(offered, [&](uint32_t, uint64_t off, uint32_t len,
+                                                                        std::vector<uint8_t>& out) {
+        ++reads;
+        out.assign(content.begin() + static_cast<std::ptrdiff_t>(off), content.begin() + static_cast<std::ptrdiff_t>(off + len));
+        return true;
+    }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    TEST_ASSERT(reads.load() == 0);
+    TEST_ASSERT(!ShellClipboard::getLocalClipboardFiles(files, paths));   // not sent back to the peer as a new copy
+
+    auto decode = [](const std::string& uri) {
+        std::string path;
+        for (size_t i = 7; i < uri.size(); ++i) {   // after file://
+            if (uri[i] == '%' && i + 2 < uri.size()) {
+                path.push_back(static_cast<char>(std::stoi(uri.substr(i + 1, 2), nullptr, 16)));
+                i += 2;
+            } else {
+                path.push_back(uri[i]);
+            }
+        }
+        return path;
+    };
+    auto pasted = requestClipboard(peer, pw, uriList);
+    TEST_ASSERT(pasted && pasted->size() > 9 && pasted->compare(0, 7, "file://") == 0 &&
+                pasted->compare(pasted->size() - 2, 2, "\r\n") == 0);
+    if (pasted && pasted->size() > 9) {
+        const std::string local = decode(pasted->substr(0, pasted->size() - 2));
+        TEST_ASSERT(std::filesystem::path(local).filename() == "report \xC3\xA9.txt");
+        std::ifstream in(local, std::ios::binary);
+        const std::string got((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        TEST_ASSERT(got == content);
+    }
+    const int readsAfterFirstPaste = reads.load();
+    TEST_ASSERT(readsAfterFirstPaste > 0);
+    // A file manager asks for GNOME's list; the files already here are reused.
+    auto forFileManager = requestClipboard(peer, pw, gnome);
+    TEST_ASSERT(forFileManager && forFileManager->compare(0, 12, "copy\nfile://") == 0);
+    TEST_ASSERT(reads.load() == readsAfterFirstPaste);
+
+    // Withdrawn (the transfer was cancelled): the clipboard no longer offers them.
+    ShellClipboard::clearClipboard();
+    TEST_ASSERT(!requestClipboard(peer, pw, uriList).has_value());
+
+    XDestroyWindow(peer, pw);
+    XCloseDisplay(peer);
+    std::filesystem::remove_all(dir, ec);
+}
+#endif
+
+#if defined(__linux__)
 // Plays a file manager dragging one file onto the window over the XDND protocol.
 void testXdndDrop() {
     std::cout << "[TEST 77] Files dropped from another app reach the screens (XDND)..." << std::endl;
@@ -11527,6 +11656,7 @@ int main(int argc, char** argv) {
         testHostSoundOverTheSession(); std::cout << "Test 100 done\n" << std::flush;
 #endif
         testMuteStateAndHostMicSign(); std::cout << "Test 101 done\n" << std::flush;
+        testClipboardFileNamesOnTheWire(); std::cout << "Test 104 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;
@@ -11537,6 +11667,7 @@ int main(int argc, char** argv) {
 #if defined(__linux__)
         testLinuxWindow(); std::cout << "Test 75 done\n" << std::flush;
         testX11Clipboard(); std::cout << "Test 76 done\n" << std::flush;
+        testX11ClipboardFiles(); std::cout << "Test 105 done\n" << std::flush;
         testXdndDrop(); std::cout << "Test 77 done\n" << std::flush;
         testLinuxTray(); std::cout << "Test 78 done\n" << std::flush;
         testLinuxNotifications(); std::cout << "Test 79 done\n" << std::flush;

@@ -6,6 +6,18 @@
 #include <filesystem>
 #include <type_traits>
 
+#if defined(__APPLE__)
+#include "mac_clipboard.hpp"
+#elif defined(__linux__)
+#include "x11_clipboard.hpp"
+#endif
+#if !defined(_WIN32)
+#include <unistd.h>
+#include <fstream>
+#include <mutex>
+#include <optional>
+#endif
+
 namespace cppdesk {
 
 #if defined(_WIN32)
@@ -85,6 +97,157 @@ bool ShellClipboard::setVirtualClipboardFiles(const std::vector<VirtualFileEntry
 
 void ShellClipboard::clearClipboard() {
     OleSetClipboard(nullptr);
+}
+
+#else
+
+namespace {
+
+// The peer's files on offer. The first paste fetches all of them into a folder of their own; later pastes reuse it.
+struct OfferedFiles {
+    std::mutex m;               // guards the fields below
+    std::mutex fetching;        // one fetch at a time: a second paste waits for the first and reuses its files
+    uint64_t generation = 0;    // bumped by every new offer and by clearClipboard
+    std::vector<VirtualFileEntry> files;
+    VirtualChunkReadFn reader;
+    std::optional<std::vector<std::string>> paths;
+};
+
+OfferedFiles& offered() {
+    static OfferedFiles o;
+    return o;
+}
+
+std::filesystem::path offerFolder(uint64_t generation) {
+    return std::filesystem::temp_directory_path() / "CppDesk_Clipboard" /
+           ("paste_" + std::to_string(getpid()) + "_" + std::to_string(generation));
+}
+
+// Runs on whichever thread an app's paste arrives on; blocks until every file is here.
+std::optional<std::vector<std::string>> fetchOffered(uint64_t generation) {
+    OfferedFiles& o = offered();
+    std::lock_guard<std::mutex> one(o.fetching);
+    std::vector<VirtualFileEntry> files;
+    VirtualChunkReadFn reader;
+    {
+        std::lock_guard<std::mutex> lock(o.m);
+        if (o.generation != generation) return std::nullopt;   // a newer copy replaced these files
+        if (o.paths) return o.paths;
+        files = o.files;
+        reader = o.reader;
+    }
+    auto stillOffered = [&] {
+        std::lock_guard<std::mutex> lock(o.m);
+        return o.generation == generation;
+    };
+
+    // Earlier offers' folders go: those files have left the clipboard.
+    const std::filesystem::path folder = offerFolder(generation);
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(folder.parent_path(), ec)) {
+        const std::string name = entry.path().filename().string();
+        const std::string mine = "paste_" + std::to_string(getpid()) + "_";
+        if (name.compare(0, mine.size(), mine) == 0 && entry.path() != folder) std::filesystem::remove_all(entry.path(), ec);
+    }
+    std::filesystem::create_directories(folder, ec);
+    bool ok = !ec && reader;
+    std::vector<std::string> paths;
+    for (const auto& f : files) {
+        if (!ok) break;
+        const std::string name = std::filesystem::path(f.fileName).filename().string();
+        const std::filesystem::path target = folder / ShellClipboard::resolveConflictFilename(folder.string(), name);
+        std::ofstream out(target, std::ios::binary | std::ios::trunc);
+        ok = out.is_open();
+        for (uint64_t offset = 0; ok && offset < f.fileSize;) {
+            std::vector<uint8_t> chunk;
+            const auto want = static_cast<uint32_t>(std::min<uint64_t>(64 * 1024, f.fileSize - offset));
+            ok = stillOffered() && reader(f.fileIndex, offset, want, chunk) && !chunk.empty();
+            if (!ok) break;
+            out.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+            offset += chunk.size();
+            ok = static_cast<bool>(out);
+        }
+        out.close();
+        ok = ok && !out.fail();
+        paths.push_back(target.string());
+    }
+    std::lock_guard<std::mutex> lock(o.m);
+    if (!ok || o.generation != generation) {
+        std::filesystem::remove_all(folder, ec);   // no half-fetched files are left for an app to find
+        return std::nullopt;
+    }
+    o.paths = paths;
+    return paths;
+}
+
+} // namespace
+
+bool ShellClipboard::getLocalClipboardFiles(std::vector<VirtualFileEntry>& outFiles, std::vector<std::wstring>& outFullPaths) {
+    outFiles.clear();
+    outFullPaths.clear();
+    std::vector<std::string> paths;
+#if defined(__APPLE__)
+    if (!macClipboardGetFiles(paths)) return false;
+#elif defined(__linux__)
+    auto copied = X11Clipboard::instance().getFiles();
+    if (!copied) return false;
+    paths = std::move(*copied);
+#else
+    return false;
+#endif
+    for (const auto& s : paths) {
+        const std::filesystem::path p(s);
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(p, ec)) continue;   // folders are not sent, as on Windows
+        const uint64_t size = std::filesystem::file_size(p, ec);
+        if (ec) continue;
+        VirtualFileEntry entry{};
+        entry.fileIndex = static_cast<uint32_t>(outFiles.size());
+        entry.fileName = p.filename().wstring();
+        entry.fileSize = size;
+        entry.fileAttributes = 0x80;   // FILE_ATTRIBUTE_NORMAL, for a Windows peer
+        outFiles.push_back(std::move(entry));
+        outFullPaths.push_back(p.wstring());
+    }
+    return !outFiles.empty();
+}
+
+bool ShellClipboard::setVirtualClipboardFiles(const std::vector<VirtualFileEntry>& files, VirtualChunkReadFn chunkReader) {
+    if (files.empty()) return false;
+    OfferedFiles& o = offered();
+    uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(o.m);
+        generation = ++o.generation;
+        o.files = files;
+        o.reader = std::move(chunkReader);
+        o.paths.reset();
+    }
+    auto fetch = [generation] { return fetchOffered(generation); };
+#if defined(__APPLE__)
+    return macClipboardOfferFiles(files.size(), fetch);
+#elif defined(__linux__)
+    return X11Clipboard::instance().setFiles(fetch);
+#else
+    (void)fetch;
+    return false;
+#endif
+}
+
+void ShellClipboard::clearClipboard() {
+    OfferedFiles& o = offered();
+    {
+        std::lock_guard<std::mutex> lock(o.m);
+        ++o.generation;
+        o.files.clear();
+        o.reader = nullptr;   // it calls into the transfer manager, which may be going away
+        o.paths.reset();
+    }
+#if defined(__APPLE__)
+    macClipboardClearFiles();
+#elif defined(__linux__)
+    X11Clipboard::instance().clearFiles();
+#endif
 }
 
 #endif

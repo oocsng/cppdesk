@@ -147,9 +147,13 @@ public:
     static uint32_t getFileContentsFormat() { return 0; }
     static uint32_t getPreferredDropEffectFormat() { return 0; }
 
-    static bool getLocalClipboardFiles(std::vector<VirtualFileEntry>&, std::vector<std::wstring>&) { return false; }
-    static bool setVirtualClipboardFiles(const std::vector<VirtualFileEntry>&, VirtualChunkReadFn) { return false; }
-    static void clearClipboard() {}
+    // Files another app copied (X11 text/uri-list, macOS file URLs); false when there are none.
+    static bool getLocalClipboardFiles(std::vector<VirtualFileEntry>& outFiles, std::vector<std::wstring>& outFullPaths);
+    // Offers the peer's files to other apps. Nothing is fetched until an app pastes; then every file is fetched
+    // through chunkReader into a staging folder, which later pastes reuse.
+    static bool setVirtualClipboardFiles(const std::vector<VirtualFileEntry>& files, VirtualChunkReadFn chunkReader);
+    // Withdraws the files offered by setVirtualClipboardFiles.
+    static void clearClipboard();
 
     static std::string getLocalClipboardText();
     static bool setLocalClipboardText(const std::string& text);

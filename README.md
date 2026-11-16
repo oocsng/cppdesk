@@ -47,7 +47,7 @@ Hosts and clients identify each other with a 9-digit desk ID (`XXX XXX XXX`). Ac
 - Session recording and instant rewind: Record sessions directly into self-contained video files with an integrated in-app player, or scrub backwards through a rolling frame cache without interrupting the connection.
 - Terminal, process control, and command palette: Built-in remote command prompt, PowerShell / bash execution, live task manager with process killing, and an omnibar command palette (`Ctrl+K`).
 - Security and privacy: ECDH (NIST P-256) key exchange, AES-256-GCM AEAD authenticated encryption, optional TOTP 2FA (RFC 6238) with QR setup, brute-force rate limiting, curtain screen privacy mode, and real-time privacy cloak redaction zones.
-- Collaboration tools: In-session screen drawing tools (pens, highlighters, pointers), shared clipboard sync, and a real-time collaborative scratchpad.
+- Collaboration tools: In-session screen drawing tools (pens, highlighters, pointers), shared clipboard sync (text, and files: copy them on one computer and paste them on the other, where they are fetched when you paste), and a real-time collaborative scratchpad.
 - Built-in networking tools: Port forwarding presets (RDP, SSH, VNC, HTTP), STUN and relay diagnostics (for connecting across networks), and address book with quick tags.
 
 ## Quick start

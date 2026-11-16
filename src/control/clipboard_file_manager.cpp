@@ -1239,6 +1239,9 @@ ClipboardFileTransferManager::ClipboardFileTransferManager() {
 ClipboardFileTransferManager::~ClipboardFileTransferManager() {
     reset();
     purgeStaging();
+#if !defined(_WIN32)
+    ShellClipboard::clearClipboard();   // the offered files are fetched through this manager
+#endif
 }
 
 void ClipboardFileTransferManager::purgeStaging() {
@@ -1255,12 +1258,10 @@ void ClipboardFileTransferManager::purgeStaging() {
 bool ClipboardFileTransferManager::pollLocalClipboardFiles(const SendPacketFn& sendPacket) {
 #if defined(_WIN32)
     uint32_t seq = GetClipboardSequenceNumber();
-#else
-    // shortcut: there is no clipboard change counter or file clipboard here, so nothing is ever offered.
-    uint32_t seq = lastSequenceNumber_;
-#endif
     if (seq == lastSequenceNumber_) return false;
     lastSequenceNumber_ = seq;
+#endif
+    // Elsewhere there is no change counter: the files are read every poll and the manifest check below drops repeats.
 
     std::vector<VirtualFileEntry> files;
     std::vector<std::wstring> fullPaths;
