@@ -5808,13 +5808,14 @@ void NetworkEngine::stopHostTerminal() {
             hostTerminalThread_.join();
         }
     } catch (...) {}
+    if (childStdinFd_ >= 0) { close(childStdinFd_); childStdinFd_ = -1; }
+    if (childStdoutFd_ >= 0) { close(childStdoutFd_); childStdoutFd_ = -1; }
     if (childPid_ > 0) {
-        kill(-childPid_, SIGKILL);
+        kill(-childPid_, SIGKILL);   // what was started from the shell
+        kill(childPid_, SIGKILL);    // the shell itself, even if it has not reached setsid() yet
         waitpid(childPid_, nullptr, 0);
         childPid_ = -1;
     }
-    if (childStdinFd_ >= 0) { close(childStdinFd_); childStdinFd_ = -1; }
-    if (childStdoutFd_ >= 0) { close(childStdoutFd_); childStdoutFd_ = -1; }
 }
 
 void NetworkEngine::injectHostTerminalStdin(const std::string& input) {
