@@ -34,9 +34,5 @@ headphones were used. Headphones avoid echo; skip them for the echo item below.
 - [ ] A host with no sound device (a headless server): the same.
 - [ ] Echo: host and viewer in the same room without headphones squeal or echo; this is expected (no echo cancellation).
 
-## Known issues
-- The receive thread and the UI can start and stop the host's microphone at the same moment (a viewer's stop message
-  during a local stop). This race is not guarded yet.
-
 ## Report
 Send the systems and versions, what failed, and for a crash the backtrace or crash report.
