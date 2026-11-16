@@ -10839,12 +10839,17 @@ void testRealPulse() {
     if (!PulseStream::available()) return;
 
     // Plays a tone of `freq` into the default output (straight, or through VoiceIntercom) and returns what the monitor heard.
-    auto heard = [&](double freq, double seconds, bool viaIntercom) {
+    auto heard = [&](double freq, double seconds, bool viaIntercom, bool oddChunkFirst = false) {
         PulseStream rec, play;
         cppdesk::VoiceIntercom intercom;
         TEST_ASSERT(rec.open(PulseStream::Dir::Record, "@DEFAULT_MONITOR@", 48000, 2, "cppdesk-test"));
         if (viaIntercom) TEST_ASSERT(intercom.startPlayback(48000, 2));
         else TEST_ASSERT(play.open(PulseStream::Dir::Playback, nullptr, 48000, 2, "cppdesk-test", 120));
+        if (viaIntercom && oddChunkFirst) {   // 3 samples = 1.5 stereo frames: the half frame must not kill the stream
+            const int16_t odd[3] = {1, 2, 3};
+            intercom.enqueuePlaybackChunk(reinterpret_cast<const uint8_t*>(odd), sizeof(odd), 2);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
         std::vector<float> mono;
         std::atomic<bool> stop{false};
         std::thread writer([&] {
@@ -10886,6 +10891,11 @@ void testRealPulse() {
         const double e1k = goertzelEnergy(mono, 1000.0, 48000.0);
         const double e3k = goertzelEnergy(mono, 3000.0, 48000.0);
         TEST_ASSERT(e1k > 20.0 * e3k);
+    }
+    {   // A chunk that is not a whole number of frames is trimmed; the tone after it still plays
+        const auto mono = heard(1000.0, 1.5, true, true);
+        TEST_ASSERT(mono.size() >= 24000);
+        TEST_ASSERT(goertzelEnergy(mono, 1000.0, 48000.0) > 20.0 * goertzelEnergy(mono, 3000.0, 48000.0));
     }
     {   // The microphone path delivers chunks (the default input is the monitor here, so a tone is played) and stops promptly
         PulseStream player;

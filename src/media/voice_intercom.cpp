@@ -830,6 +830,7 @@ void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes, uint8
         audio::adaptChannels(samples.data(), samples.size() / sourceChannels, sourceChannels, playbackChannels_, adapted);
         samples.swap(adapted);
     }
+    samples.resize(samples.size() / playbackChannels_ * playbackChannels_);   // whole frames only
     const int vol = outputVolume_.load();
     if (vol != 100) applyGain(samples.data(), samples.size(), static_cast<float>(vol) / 100.0f);
     playStream_.write(reinterpret_cast<const uint8_t*>(samples.data()), samples.size() * sizeof(int16_t));
