@@ -88,8 +88,11 @@ private:
     uint8_t                     channels_{1};
     AudioChunkCallback          onChunkCallback_;
     std::thread                 captureThread_;
+    // Serialises startCapture/stopCapture (the UI and the receive threads can both call them). Recursive because
+    // startCapture calls stopCapture. Never taken by captureWorker or the chunk callback, so stopCapture can join.
+    std::recursive_mutex        captureMutex_;
 
-    int                         selectedInputDeviceId_{-1};
+    int                       selectedInputDeviceId_{-1};
     int                         selectedOutputDeviceId_{-1};
     uint8_t                     hwChannels_{1};
     uint32_t                    hwSampleRate_{48000};

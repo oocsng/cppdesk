@@ -231,6 +231,7 @@ std::vector<AudioDeviceDesc> VoiceIntercom::enumerateOutputDevices() {
 #if defined(_WIN32)
 
 bool VoiceIntercom::startCapture(AudioChunkCallback onChunk, uint32_t sampleRate, uint8_t channels) {
+    std::lock_guard<std::recursive_mutex> lk(captureMutex_);
     stopCapture();
     sampleRate_ = sampleRate;
     channels_ = channels;
@@ -376,6 +377,7 @@ void VoiceIntercom::captureWorker() {
 }
 
 void VoiceIntercom::stopCapture() {
+    std::lock_guard<std::recursive_mutex> lk(captureMutex_);
     if (!capturing_.load() && !hWaveIn_) return;
     captureStopping_.store(true);
     if (hCaptureEvent_) SetEvent(hCaptureEvent_);
@@ -620,6 +622,7 @@ void VoiceIntercom::MacAudioInputCallback(
 }
 
 bool VoiceIntercom::startCapture(AudioChunkCallback onChunk, uint32_t sampleRate, uint8_t channels) {
+    std::lock_guard<std::recursive_mutex> lk(captureMutex_);
     stopCapture();
     sampleRate_ = sampleRate;
     channels_ = channels;
@@ -662,6 +665,7 @@ void VoiceIntercom::captureWorker() {
 }
 
 void VoiceIntercom::stopCapture() {
+    std::lock_guard<std::recursive_mutex> lk(captureMutex_);
     if (!capturing_.load() && !inQueue_) return;
     captureStopping_.store(true);
     capturing_.store(false);
@@ -771,6 +775,7 @@ void VoiceIntercom::stopPlayback() {
 #elif defined(__linux__)
 
 bool VoiceIntercom::startCapture(AudioChunkCallback onChunk, uint32_t sampleRate, uint8_t channels) {
+    std::lock_guard<std::recursive_mutex> lk(captureMutex_);
     stopCapture();
     if (!capStream_.open(PulseStream::Dir::Record, nullptr, sampleRate, channels, "CppDesk voice", 40)) return false;
     sampleRate_ = sampleRate;
@@ -797,6 +802,7 @@ void VoiceIntercom::captureWorker() {
 }
 
 void VoiceIntercom::stopCapture() {
+    std::lock_guard<std::recursive_mutex> lk(captureMutex_);
     captureStopping_.store(true);
     capStream_.close();   // wakes a read in progress
     if (captureThread_.joinable()) captureThread_.join();

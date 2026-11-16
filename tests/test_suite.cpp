@@ -10943,6 +10943,20 @@ void testRealPulse() {
         TEST_ASSERT(ms(tc) < 1000 && !mic.isCapturing() && mic.inputLevel() == 0.0f);
         player.close();
     }
+    {   // Two threads starting and stopping the microphone at the same moment must not crash or leave it running
+        cppdesk::VoiceIntercom mic;
+        auto hammer = [&mic] {
+            for (int i = 0; i < 200; ++i) {
+                mic.startCapture([](const uint8_t*, size_t, uint32_t, uint8_t) {}, 48000, 1);
+                mic.stopCapture();
+            }
+        };
+        std::thread a(hammer), b(hammer);
+        a.join();
+        b.join();
+        mic.stopCapture();
+        TEST_ASSERT(!mic.isCapturing());
+    }
     {   // With nothing played the monitor is silent, and stopping an idle stream is prompt
         PulseStream rec;
         TEST_ASSERT(rec.open(PulseStream::Dir::Record, "@DEFAULT_MONITOR@", 48000, 2, "cppdesk-test"));
