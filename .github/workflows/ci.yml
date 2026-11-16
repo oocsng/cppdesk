@@ -30,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ xvfb libzstd-dev libssl-dev libx11-dev libxtst-dev libxext-dev libxrandr-dev libjpeg-dev libcairo2-dev libpango1.0-dev libpipewire-0.3-dev dbus pkg-config
+          sudo apt-get install -y cmake g++ xvfb libzstd-dev libssl-dev libx11-dev libxtst-dev libxext-dev libxrandr-dev libjpeg-dev libcairo2-dev libpango1.0-dev libpipewire-0.3-dev libpulse-dev dbus pkg-config
       - name: Build and run the test suite
         # The capture and input tests need an X server.
         run: xvfb-run -a -s "-screen 0 1920x1080x24" ./build.sh --test
@@ -39,6 +39,12 @@ jobs:
         run: |
           sudo apt-get install -y pipewire pipewire-bin wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-base jq
           dbus-run-session -- bash scripts/ci_pipewire_check.sh
+      - name: Real PulseAudio check
+        # Sound capture, playback and prompt stopping against PipeWire's PulseAudio-compatible server with a null output
+        # (a played 1 kHz tone must come back from the output's monitor).
+        run: |
+          sudo apt-get install -y pipewire-pulse pulseaudio-utils
+          dbus-run-session -- bash scripts/ci_pulse_check.sh
       - name: Build the app
         run: cmake --build build --target CppDesk -j 4
 
@@ -50,7 +56,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++-12 xvfb libzstd-dev libssl-dev libx11-dev libxtst-dev libxext-dev libxrandr-dev libjpeg-dev libcairo2-dev libpango1.0-dev libpipewire-0.3-dev dbus pkg-config
+          sudo apt-get install -y cmake g++-12 xvfb libzstd-dev libssl-dev libx11-dev libxtst-dev libxext-dev libxrandr-dev libjpeg-dev libcairo2-dev libpango1.0-dev libpipewire-0.3-dev libpulse-dev dbus pkg-config
       - name: Build
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-12 -DCMAKE_C_COMPILER=gcc-12
