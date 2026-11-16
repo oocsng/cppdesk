@@ -5248,10 +5248,31 @@ void NetworkEngine::hostAudioCaptureLoop() {
 
     cleanupCom();
 #else
+    // Linux captures the monitor of the default output here; macOS gets its sound with the screen stream, so it has no
+    // source of its own. When nothing can be captured the session carries on without sound.
+    std::unique_ptr<SystemAudioSource> source = sourceFactory_ ? sourceFactory_() : makeSystemAudioSource();
+    const bool capturing = source && source->start([this](const int16_t* pcm, size_t frames) { sendHostSoundChunk(pcm, frames); });
     while (hostAudioActive_.load() && running_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
+    if (capturing) source->stop();
 #endif
+}
+
+void NetworkEngine::sendHostSoundChunk(const int16_t* stereo48k, size_t frames) {
+    if (!stereo48k || frames == 0 || hostAudioSuspended_.load() || activeHostClientSock_.load() == ~uintptr_t(0)) return;
+    AudioChunkHeader hdr{};
+    hdr.sampleRate = 48000;
+    hdr.channels = 2;
+    hdr.bitsPerSample = 16;
+    hdr.isSilent = 0;
+    hdr.sampleFrames = static_cast<uint32_t>(frames);
+    const size_t pcmBytes = frames * 2 * sizeof(int16_t);
+    thread_local std::vector<uint8_t> packet;
+    packet.resize(sizeof(hdr) + pcmBytes);
+    std::memcpy(packet.data(), &hdr, sizeof(hdr));
+    std::memcpy(packet.data() + sizeof(hdr), stereo48k, pcmBytes);
+    sendHostEncryptedPacket(PacketType::AUDIO_STREAM_CHUNK, 0, packet.data(), packet.size());
 }
 
 void NetworkEngine::initViewerAudioPlayback() {
@@ -5281,6 +5302,12 @@ void NetworkEngine::initViewerAudioPlayback() {
         waveHeaders_[i].dwBufferLength = static_cast<DWORD>(waveBuffers_[i].size());
     }
     currentWaveIdx_ = 0;
+#else
+    // The player is made when the first sound arrives; this only opens the session for it.
+    std::lock_guard<std::mutex> lk(audioPlaybackMutex_);
+    viewerAudioOpen_ = true;
+    viewerPlayerTried_ = false;
+    viewerConvert_ = audio::ConvertState{};
 #endif
 }
 
@@ -5298,6 +5325,14 @@ void NetworkEngine::shutdownViewerAudioPlayback() {
     }
     waveOutClose(hWaveOut_);
     hWaveOut_ = nullptr;
+#else
+    // Under the lock, so no sound reaches a player after this returns.
+    std::lock_guard<std::mutex> lk(audioPlaybackMutex_);
+    viewerAudioOpen_ = false;
+    if (viewerPlayer_) {
+        viewerPlayer_->stop();
+        viewerPlayer_.reset();
+    }
 #endif
 }
 
@@ -5354,7 +5389,35 @@ void NetworkEngine::enqueueViewerAudioChunk(const uint8_t* payload, size_t len) 
         currentWaveIdx_ = (currentWaveIdx_ + 1) % 3;
     }
 #else
-    (void)payload; (void)len;
+    if (len < sizeof(AudioChunkHeader) || audioMuted_.load()) return;
+    const int volPercent = audioVolumePercent_.load();
+    if (volPercent <= 0) return;
+    AudioChunkHeader hdr{};
+    std::memcpy(&hdr, payload, sizeof(hdr));
+    if (hdr.isSilent || hdr.sampleFrames == 0 || hdr.bitsPerSample != 16 || hdr.channels == 0) return;
+    const size_t frames = std::min<size_t>(hdr.sampleFrames, (len - sizeof(hdr)) / (hdr.channels * sizeof(int16_t)));
+    if (frames == 0) return;
+
+    std::lock_guard<std::mutex> lk(audioPlaybackMutex_);
+    if (!viewerAudioOpen_) return;
+    if (!viewerPlayer_) {
+        if (viewerPlayerTried_) return;   // it could not start this session: stay silent without retrying every chunk
+        viewerPlayerTried_ = true;
+        auto player = playerFactory_ ? playerFactory_() : makeAudioPlayer();
+        if (!player || !player->start()) return;
+        viewerPlayer_ = std::move(player);
+    }
+
+    std::vector<int16_t> samples(frames * hdr.channels);
+    std::memcpy(samples.data(), payload + sizeof(hdr), samples.size() * sizeof(int16_t));
+    if (hdr.channels != 2 || hdr.sampleRate != 48000) {
+        std::vector<int16_t> wire;
+        audio::toWire({samples.data(), frames, hdr.channels, static_cast<int>(hdr.sampleRate), audio::SampleFormat::S16, false}, viewerConvert_, wire);
+        samples.swap(wire);
+    }
+    if (samples.empty()) return;
+    if (volPercent != 100) VoiceIntercom::applyGain(samples.data(), samples.size(), static_cast<float>(volPercent) / 100.0f);
+    viewerPlayer_->play(samples.data(), samples.size() / 2);
 #endif
 }
 

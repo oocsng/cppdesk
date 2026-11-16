@@ -10938,6 +10938,180 @@ void testRealPulse() {
 }
 #endif
 
+#if !defined(_WIN32)
+void testHostSoundOverTheSession() {
+    std::cout << "[TEST 100] The host's sound reaches the viewer: sequence, volume, mute, stopping, no capture..." << std::endl;
+    using namespace cppdesk;
+    auto waitUntil = [](const std::function<bool()>& pred, int ms = 8000) {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!pred()) {
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(ms)) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return true;
+    };
+
+    struct Heard {
+        std::mutex mu;
+        std::vector<int16_t> played;   // interleaved stereo, in the order it arrived
+        std::atomic<bool> stopped{false};
+        std::atomic<int> afterStop{0};
+    };
+    // A numbered ramp (the same value in both channels, +1 per frame, wrapping), 480 frames every 10 ms
+    struct RampSource : SystemAudioSource {
+        std::thread t;
+        std::atomic<bool> halt{false};
+        bool start(Sink sink) override {
+            halt = false;
+            t = std::thread([this, sink = std::move(sink)] {
+                int32_t n = 0;
+                int16_t buf[480 * 2];
+                while (!halt) {
+                    for (int f = 0; f < 480; ++f, ++n) buf[f * 2] = buf[f * 2 + 1] = static_cast<int16_t>(n % 20000 - 10000);
+                    sink(buf, 480);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            });
+            return true;
+        }
+        void stop() override {
+            halt = true;
+            if (t.joinable()) t.join();
+        }
+        ~RampSource() override { stop(); }
+    };
+    struct NoSource : SystemAudioSource {
+        bool start(Sink) override { return false; }
+        void stop() override {}
+    };
+    struct FakePlayer : AudioPlayer {
+        std::shared_ptr<Heard> h;
+        explicit FakePlayer(std::shared_ptr<Heard> heard) : h(std::move(heard)) {}
+        bool start() override { return true; }
+        void play(const int16_t* pcm, size_t frames) override {
+            if (h->stopped) ++h->afterStop;
+            std::lock_guard<std::mutex> lk(h->mu);
+            h->played.insert(h->played.end(), pcm, pcm + frames * 2);
+        }
+        void stop() override { h->stopped = true; }
+    };
+
+    auto makeEngines = [](int seed, int hostPort, int viewerPort, std::unique_ptr<IdentityManager>& hostId,
+                          std::unique_ptr<IdentityManager>& viewerId) {
+        hostId = std::make_unique<IdentityManager>(seed);
+        hostId->loadOrCreate();
+        hostId->setListenPort(static_cast<uint16_t>(hostPort));
+        hostId->setUnattendedEnabled(true);
+        hostId->setUnattendedPassword("TestPass99");
+        hostId->setRelayServerAddress("127.0.0.1:50999");
+        viewerId = std::make_unique<IdentityManager>(seed + 1);
+        viewerId->loadOrCreate();
+        viewerId->setListenPort(static_cast<uint16_t>(viewerPort));
+        viewerId->setRelayServerAddress("127.0.0.1:50999");
+    };
+    auto removeConfigs = [](IdentityManager& a, IdentityManager& b) {
+        std::error_code ec;
+        std::filesystem::remove(a.configFilePath(), ec);
+        std::filesystem::remove(b.configFilePath(), ec);
+    };
+
+    {   // A working source: every frame arrives in order, volume and mute act, and nothing plays after the session ends
+        auto heard = std::make_shared<Heard>();
+        std::unique_ptr<IdentityManager> hostId, viewerId;
+        makeEngines(4270, 50944, 50945, hostId, viewerId);
+        NetworkEngine hostNet(*hostId);
+        NetworkEngine viewerNet(*viewerId);
+        hostNet.setAudioFactoriesForTest([]() -> std::unique_ptr<SystemAudioSource> { return std::make_unique<RampSource>(); }, {});
+        viewerNet.setAudioFactoriesForTest({}, [heard]() -> std::unique_ptr<AudioPlayer> { return std::make_unique<FakePlayer>(heard); });
+        TEST_ASSERT(hostNet.start());
+        hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
+        TEST_ASSERT(viewerNet.start());
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        TEST_ASSERT(viewerNet.connectToRemote(hostId->formattedDeskId(), "TestPass99"));
+
+        auto framesPlayed = [&] {
+            std::lock_guard<std::mutex> lk(heard->mu);
+            return heard->played.size() / 2;
+        };
+        TEST_ASSERT(waitUntil([&] { return framesPlayed() >= 4800; }, 15000));
+
+        int phase = 0;   // where in the ramp the first received frame is
+        {
+            std::lock_guard<std::mutex> lk(heard->mu);
+            phase = heard->played.empty() ? 0 : heard->played[0] + 10000;
+            bool inOrder = true;
+            for (size_t i = 0; i * 2 + 1 < heard->played.size() && inOrder; ++i) {
+                const int want = static_cast<int>((phase + i) % 20000) - 10000;
+                inOrder = heard->played[i * 2] == want && heard->played[i * 2 + 1] == want;
+            }
+            TEST_ASSERT(inOrder);   // no frame lost, repeated or altered at full volume
+        }
+
+        viewerNet.setAudioVolume(50);
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        const size_t atHalf = framesPlayed();
+        TEST_ASSERT(waitUntil([&] { return framesPlayed() >= atHalf + 4800; }, 5000));
+        {
+            std::lock_guard<std::mutex> lk(heard->mu);
+            bool halved = true;
+            const size_t total = heard->played.size() / 2;
+            for (size_t i = total - 2400; i < total && halved; ++i) {
+                const int full = static_cast<int>((phase + i) % 20000) - 10000;
+                halved = std::abs(heard->played[i * 2] - full / 2) <= 1 && std::abs(heard->played[i * 2 + 1] - full / 2) <= 1;
+            }
+            TEST_ASSERT(halved);
+        }
+
+        viewerNet.setAudioMuted(true);
+        TEST_ASSERT(waitUntil([&] { return hostNet.isHostAudioSuspended(); }, 3000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        const size_t atMute = framesPlayed();
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        TEST_ASSERT(framesPlayed() == atMute);   // nothing more arrives while muted
+        viewerNet.setAudioMuted(false);
+        TEST_ASSERT(waitUntil([&] { return !hostNet.isHostAudioSuspended(); }, 3000));
+        TEST_ASSERT(waitUntil([&] { return framesPlayed() > atMute; }, 3000));
+
+        viewerNet.disconnectViewer();   // in the middle of the stream
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        TEST_ASSERT(heard->stopped.load());
+        const size_t afterDisconnect = framesPlayed();
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        TEST_ASSERT(framesPlayed() == afterDisconnect && heard->afterStop.load() == 0);
+        hostNet.disconnectHostClient();
+        removeConfigs(*hostId, *viewerId);
+    }
+
+    {   // A source that cannot start: the session still shows the screen and carries no sound
+        auto heard = std::make_shared<Heard>();
+        std::unique_ptr<IdentityManager> hostId, viewerId;
+        makeEngines(4274, 50948, 50949, hostId, viewerId);
+        NetworkEngine hostNet(*hostId);
+        NetworkEngine viewerNet(*viewerId);
+        hostNet.setAudioFactoriesForTest([]() -> std::unique_ptr<SystemAudioSource> { return std::make_unique<NoSource>(); }, {});
+        viewerNet.setAudioFactoriesForTest({}, [heard]() -> std::unique_ptr<AudioPlayer> { return std::make_unique<FakePlayer>(heard); });
+        TEST_ASSERT(hostNet.start());
+        hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
+        TEST_ASSERT(viewerNet.start());
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        TEST_ASSERT(viewerNet.connectToRemote(hostId->formattedDeskId(), "TestPass99"));
+        uint64_t seq = 0;
+        std::vector<uint8_t> frame;
+        int w = 0, h = 0;
+        CursorState cur{};
+        TEST_ASSERT(waitUntil([&] { return viewerNet.copyLatestViewerFrame(seq, frame, w, h, cur) && w > 0; }, 15000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        {
+            std::lock_guard<std::mutex> lk(heard->mu);
+            TEST_ASSERT(heard->played.empty());
+        }
+        viewerNet.disconnectViewer();
+        hostNet.disconnectHostClient();
+        removeConfigs(*hostId, *viewerId);
+    }
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -11059,6 +11233,9 @@ int main(int argc, char** argv) {
         testLatestFrameAndPipeWireStream(); std::cout << "Test 91 done\n" << std::flush;
         testShareHub(); std::cout << "Test 94 done\n" << std::flush;
         testAudioConvertHelpers(); std::cout << "Test 97 done\n" << std::flush;
+#if !defined(_WIN32)
+        testHostSoundOverTheSession(); std::cout << "Test 100 done\n" << std::flush;
+#endif
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
 #endif
