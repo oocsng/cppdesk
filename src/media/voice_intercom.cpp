@@ -2,6 +2,9 @@
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#if defined(__linux__)
+#include "audio_convert.hpp"
+#endif
 
 #if defined(_WIN32)
 #include <mmdeviceapi.h>
@@ -746,6 +749,79 @@ void VoiceIntercom::stopPlayback() {
     for (size_t i = 0; i < NUM_PLAYBACK_BUFFERS; ++i) {
         outBuffers_[i] = nullptr;
     }
+    playing_.store(false);
+}
+
+#elif defined(__linux__)
+
+bool VoiceIntercom::startCapture(AudioChunkCallback onChunk, uint32_t sampleRate, uint8_t channels) {
+    stopCapture();
+    if (!capStream_.open(PulseStream::Dir::Record, nullptr, sampleRate, channels, "CppDesk voice", 40)) return false;
+    sampleRate_ = sampleRate;
+    channels_ = channels;
+    onChunkCallback_ = std::move(onChunk);
+    captureStopping_.store(false);
+    capturing_.store(true);
+    captureThread_ = std::thread(&VoiceIntercom::captureWorker, this);
+    return true;
+}
+
+void VoiceIntercom::captureWorker() {
+    std::vector<uint8_t> buf(std::max<size_t>(64, (sampleRate_ / 50) * channels_ * sizeof(int16_t)));
+    while (!captureStopping_.load()) {
+        const int n = capStream_.read(buf.data(), buf.size());
+        if (n < 0) break;   // the server went away or the stream was closed
+        if (n == 0) continue;
+        inputLevel_.store(calculateRmsLevel(reinterpret_cast<const int16_t*>(buf.data()), static_cast<size_t>(n) / sizeof(int16_t)));
+        if (!micMuted_.load() && onChunkCallback_) {
+            onChunkCallback_(buf.data(), static_cast<size_t>(n), sampleRate_, channels_);
+        }
+    }
+    capturing_.store(false);
+}
+
+void VoiceIntercom::stopCapture() {
+    captureStopping_.store(true);
+    capStream_.close();   // wakes a read in progress
+    if (captureThread_.joinable()) captureThread_.join();
+    capturing_.store(false);
+    inputLevel_.store(0.0f);
+}
+
+bool VoiceIntercom::startPlayback(uint32_t sampleRate, uint8_t channels) {
+    std::lock_guard<std::mutex> lk(playbackMutex_);
+    if (playStream_.isOpen()) return true;
+    if (!playStream_.open(PulseStream::Dir::Playback, nullptr, sampleRate, channels, "CppDesk voice", 60)) {
+        playing_.store(false);
+        return false;
+    }
+    playbackSampleRate_ = sampleRate;
+    playbackChannels_ = channels;
+    playing_.store(true);
+    return true;
+}
+
+void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes, uint8_t sourceChannels) {
+    bytes = (bytes / sizeof(int16_t)) * sizeof(int16_t);
+    if (!pcm || bytes < sizeof(int16_t) || bytes > 192000) return;
+    std::lock_guard<std::mutex> lk(playbackMutex_);
+    if (!playing_.load()) return;
+
+    std::vector<int16_t> samples(bytes / sizeof(int16_t));
+    std::memcpy(samples.data(), pcm, bytes);
+    if (sourceChannels != playbackChannels_ && sourceChannels >= 1 && sourceChannels <= 2 && playbackChannels_ >= 1 && playbackChannels_ <= 2) {
+        std::vector<int16_t> adapted;
+        audio::adaptChannels(samples.data(), samples.size() / sourceChannels, sourceChannels, playbackChannels_, adapted);
+        samples.swap(adapted);
+    }
+    const int vol = outputVolume_.load();
+    if (vol != 100) applyGain(samples.data(), samples.size(), static_cast<float>(vol) / 100.0f);
+    playStream_.write(reinterpret_cast<const uint8_t*>(samples.data()), samples.size() * sizeof(int16_t));
+}
+
+void VoiceIntercom::stopPlayback() {
+    std::lock_guard<std::mutex> lk(playbackMutex_);
+    playStream_.close();
     playing_.store(false);
 }
 

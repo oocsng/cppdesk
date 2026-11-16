@@ -18,6 +18,8 @@
 #include <mmsystem.h>
 #elif defined(__APPLE__)
 #include <AudioToolbox/AudioToolbox.h>
+#elif defined(__linux__)
+#include "pulse_stream.hpp"
 #endif
 
 namespace cppdesk {
@@ -123,6 +125,10 @@ private:
     static constexpr size_t     NUM_PLAYBACK_BUFFERS = 8;
     AudioQueueBufferRef         outBuffers_[NUM_PLAYBACK_BUFFERS]{};
     size_t                      currentPlayIdx_{0};
+    mutable std::mutex          playbackMutex_;
+#elif defined(__linux__)
+    PulseStream                 capStream_;
+    PulseStream                 playStream_;
     mutable std::mutex          playbackMutex_;
 #else
     mutable std::mutex          playbackMutex_;

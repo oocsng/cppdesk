@@ -10760,6 +10760,59 @@ void testPulseStream() {
     else unsetenv("PULSE_SERVER");
 }
 
+void testLinuxVoiceIntercom() {
+    std::cout << "[TEST 99] Voice intercom on Linux: without sound support, without a server..." << std::endl;
+    using cppdesk::VoiceIntercom;
+    using Clock = std::chrono::steady_clock;
+    auto ms = [](Clock::time_point from) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - from).count();
+    };
+    auto noChunks = [](const uint8_t*, size_t, uint32_t, uint8_t) {};
+    uint8_t pcm[960] = {};
+
+    setenv("CPPDESK_PULSE_LIB", "/nonexistent/libpulse-simple.so.0", 1);
+    {
+        VoiceIntercom v;
+        TEST_ASSERT(!v.startCapture(noChunks));
+        TEST_ASSERT(!v.isCapturing());
+        TEST_ASSERT(!v.startPlayback());
+        TEST_ASSERT(!v.isPlaying());
+        v.enqueuePlaybackChunk(pcm, sizeof(pcm), 1);   // nothing is playing: ignored
+        v.stopCapture();
+        v.stopCapture();
+        v.stopPlayback();
+        v.stopPlayback();
+        TEST_ASSERT(!v.isCapturing() && !v.isPlaying());
+        const auto in = VoiceIntercom::enumerateInputDevices();
+        const auto out = VoiceIntercom::enumerateOutputDevices();
+        TEST_ASSERT(in.size() == 1 && in[0].isDefault && out.size() == 1 && out[0].isDefault);
+        const int16_t loud[4] = {32767, -32768, 32767, -32768};
+        TEST_ASSERT(VoiceIntercom::calculateRmsLevel(loud, 4) > 0.99f);
+        int16_t g[2] = {1000, -1000};
+        VoiceIntercom::applyGain(g, 2, 0.5f);
+        TEST_ASSERT(g[0] == 500 && g[1] == -500);
+    }
+    unsetenv("CPPDESK_PULSE_LIB");
+
+    if (!cppdesk::PulseStream::available()) {
+        std::cout << "  (PulseAudio client library not found: the no-server checks are skipped)" << std::endl;
+        return;
+    }
+    const char* oldServer = std::getenv("PULSE_SERVER");
+    const std::string saved = oldServer ? oldServer : "";
+    setenv("PULSE_SERVER", "unix:/nonexistent/pulse-socket", 1);
+    {
+        VoiceIntercom v;
+        const auto t0 = Clock::now();
+        TEST_ASSERT(!v.startCapture(noChunks));
+        TEST_ASSERT(!v.startPlayback());
+        TEST_ASSERT(!v.isCapturing() && !v.isPlaying());
+        TEST_ASSERT(ms(t0) < 3000);
+    }
+    if (oldServer) setenv("PULSE_SERVER", saved.c_str(), 1);
+    else unsetenv("PULSE_SERVER");
+}
+
 // The energy of one frequency in a mono signal (Goertzel).
 double goertzelEnergy(const std::vector<float>& x, double freq, double rate) {
     const double w = 2.0 * 3.14159265358979 * freq / rate;
@@ -10785,11 +10838,13 @@ void testRealPulse() {
     TEST_ASSERT(PulseStream::available());
     if (!PulseStream::available()) return;
 
-    // Plays a tone of `freq` into the default output for about a second and returns what the monitor heard.
-    auto heard = [&](double freq, double seconds) {
+    // Plays a tone of `freq` into the default output (straight, or through VoiceIntercom) and returns what the monitor heard.
+    auto heard = [&](double freq, double seconds, bool viaIntercom) {
         PulseStream rec, play;
+        cppdesk::VoiceIntercom intercom;
         TEST_ASSERT(rec.open(PulseStream::Dir::Record, "@DEFAULT_MONITOR@", 48000, 2, "cppdesk-test"));
-        TEST_ASSERT(play.open(PulseStream::Dir::Playback, nullptr, 48000, 2, "cppdesk-test", 120));
+        if (viaIntercom) TEST_ASSERT(intercom.startPlayback(48000, 2));
+        else TEST_ASSERT(play.open(PulseStream::Dir::Playback, nullptr, 48000, 2, "cppdesk-test", 120));
         std::vector<float> mono;
         std::atomic<bool> stop{false};
         std::thread writer([&] {
@@ -10802,7 +10857,8 @@ void testRealPulse() {
                     const auto v = static_cast<int16_t>(12000.0 * std::sin(2.0 * 3.14159265358979 * freq * static_cast<double>(n) / 48000.0));
                     chunk[i * 2] = chunk[i * 2 + 1] = v;
                 }
-                play.write(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size() * 2);
+                if (viaIntercom) intercom.enqueuePlaybackChunk(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size() * 2, 2);
+                else play.write(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size() * 2);
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
         });
@@ -10818,17 +10874,45 @@ void testRealPulse() {
         writer.join();
         const auto tc = Clock::now();
         play.close();
+        intercom.stopPlayback();
         rec.close();
         TEST_ASSERT(ms(tc) < 1000);
         return mono;
     };
 
-    {   // A played 1 kHz tone comes back from the monitor: at least half a second of it, and clearly 1 kHz
-        const auto mono = heard(1000.0, 2.0);
+    for (bool viaIntercom : {false, true}) {   // A played 1 kHz tone comes back from the monitor: at least half a second of it, and clearly 1 kHz
+        const auto mono = heard(1000.0, 2.0, viaIntercom);
         TEST_ASSERT(mono.size() >= 24000);
         const double e1k = goertzelEnergy(mono, 1000.0, 48000.0);
         const double e3k = goertzelEnergy(mono, 3000.0, 48000.0);
         TEST_ASSERT(e1k > 20.0 * e3k);
+    }
+    {   // The microphone path delivers chunks (the default input is the monitor here, so a tone is played) and stops promptly
+        PulseStream player;
+        TEST_ASSERT(player.open(PulseStream::Dir::Playback, nullptr, 48000, 2, "cppdesk-test", 120));
+        cppdesk::VoiceIntercom mic;
+        std::atomic<int> chunks{0};
+        std::atomic<bool> shapeOk{true};
+        TEST_ASSERT(mic.startCapture([&](const uint8_t* data, size_t bytes, uint32_t rate, uint8_t channels) {
+            if (!data || bytes == 0 || rate != 48000 || channels != 1) shapeOk = false;
+            ++chunks;
+        }, 48000, 1));
+        TEST_ASSERT(mic.isCapturing());
+        std::vector<int16_t> chunk(960 * 2);
+        size_t n = 0;
+        const auto t0 = Clock::now();
+        while (chunks.load() == 0 && ms(t0) < 2500) {
+            for (size_t i = 0; i < 960; ++i, ++n) chunk[i * 2] = chunk[i * 2 + 1] = static_cast<int16_t>(12000.0 * std::sin(2.0 * 3.14159265358979 * 1000.0 * static_cast<double>(n) / 48000.0));
+            player.write(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size() * 2);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        TEST_ASSERT(chunks.load() > 0 && shapeOk.load());
+        const float level = mic.inputLevel();
+        TEST_ASSERT(level >= 0.0f && level <= 1.0f);
+        const auto tc = Clock::now();
+        mic.stopCapture();
+        TEST_ASSERT(ms(tc) < 1000 && !mic.isCapturing() && mic.inputLevel() == 0.0f);
+        player.close();
     }
     {   // With nothing played the monitor is silent, and stopping an idle stream is prompt
         PulseStream rec;
@@ -10991,6 +11075,7 @@ int main(int argc, char** argv) {
         testWaylandShareIntegration(); std::cout << "Test 92 done\n" << std::flush;
         testHostEndsSessionWhenSharingEnds(); std::cout << "Test 96 done\n" << std::flush;
         testPulseStream(); std::cout << "Test 98 done\n" << std::flush;
+        testLinuxVoiceIntercom(); std::cout << "Test 99 done\n" << std::flush;
 #endif
 #if defined(__APPLE__)
         testMacWindow(); std::cout << "Test 81 done\n" << std::flush;
