@@ -38,6 +38,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include "fake_portal.hpp"
+#include "../src/media/pulse_stream.hpp"
 #include <gio/gio.h>
 #include <set>
 #include <unistd.h>
@@ -10710,6 +10711,149 @@ void testAudioConvertHelpers() {
     }
 }
 
+#if defined(__linux__)
+void testPulseStream() {
+    std::cout << "[TEST 98] PulseAudio client: unavailable, no server, stopping..." << std::endl;
+    using cppdesk::PulseStream;
+    using Clock = std::chrono::steady_clock;
+    auto ms = [](Clock::time_point from) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - from).count();
+    };
+    uint8_t buf[64] = {};
+
+    // The library cannot be found: everything fails quietly
+    setenv("CPPDESK_PULSE_LIB", "/nonexistent/libpulse-simple.so.0", 1);
+    {
+        TEST_ASSERT(!PulseStream::available());
+        PulseStream s;
+        TEST_ASSERT(!s.open(PulseStream::Dir::Record, nullptr, 48000, 2, "cppdesk-test"));
+        TEST_ASSERT(!s.open(PulseStream::Dir::Playback, nullptr, 48000, 2, "cppdesk-test"));
+        TEST_ASSERT(!s.isOpen());
+        TEST_ASSERT(s.read(buf, sizeof(buf)) == -1);
+        TEST_ASSERT(!s.write(buf, sizeof(buf)));
+        s.flush();
+        s.close();
+        s.close();
+    }
+    unsetenv("CPPDESK_PULSE_LIB");
+
+    if (!PulseStream::available()) {
+        std::cout << "  (PulseAudio client library not found: the no-server checks are skipped)" << std::endl;
+        return;
+    }
+
+    // The library is there but no sound server answers: open fails promptly
+    const char* oldServer = std::getenv("PULSE_SERVER");
+    const std::string saved = oldServer ? oldServer : "";
+    setenv("PULSE_SERVER", "unix:/nonexistent/pulse-socket", 1);
+    {
+        PulseStream rec, play;
+        const auto t0 = Clock::now();
+        TEST_ASSERT(!rec.open(PulseStream::Dir::Record, nullptr, 48000, 2, "cppdesk-test"));
+        TEST_ASSERT(!play.open(PulseStream::Dir::Playback, nullptr, 48000, 2, "cppdesk-test"));
+        TEST_ASSERT(!rec.isOpen() && !play.isOpen());
+        TEST_ASSERT(ms(t0) < 3000);
+        rec.close();
+        play.close();
+    }
+    if (oldServer) setenv("PULSE_SERVER", saved.c_str(), 1);
+    else unsetenv("PULSE_SERVER");
+}
+
+// The energy of one frequency in a mono signal (Goertzel).
+double goertzelEnergy(const std::vector<float>& x, double freq, double rate) {
+    const double w = 2.0 * 3.14159265358979 * freq / rate;
+    const double coeff = 2.0 * std::cos(w);
+    double s1 = 0, s2 = 0;
+    for (float v : x) {
+        const double s = v + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s;
+    }
+    return s1 * s1 + s2 * s2 - coeff * s1 * s2;
+}
+
+// CI only (see ci.yml and scripts/ci_pulse_check.sh): needs a running PulseAudio-compatible server whose default output
+// is a null sink. Anything the default output plays comes back from its monitor.
+void testRealPulse() {
+    std::cout << "[TEST 103] Real PulseAudio-compatible server: capture, playback, stopping..." << std::endl;
+    using cppdesk::PulseStream;
+    using Clock = std::chrono::steady_clock;
+    auto ms = [](Clock::time_point from) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - from).count();
+    };
+    TEST_ASSERT(PulseStream::available());
+    if (!PulseStream::available()) return;
+
+    // Plays a tone of `freq` into the default output for about a second and returns what the monitor heard.
+    auto heard = [&](double freq, double seconds) {
+        PulseStream rec, play;
+        TEST_ASSERT(rec.open(PulseStream::Dir::Record, "@DEFAULT_MONITOR@", 48000, 2, "cppdesk-test"));
+        TEST_ASSERT(play.open(PulseStream::Dir::Playback, nullptr, 48000, 2, "cppdesk-test", 120));
+        std::vector<float> mono;
+        std::atomic<bool> stop{false};
+        std::thread writer([&] {
+            const size_t frames = 960;   // 20 ms
+            std::vector<int16_t> chunk(frames * 2);
+            size_t n = 0;
+            const auto start = Clock::now();
+            while (!stop && ms(start) < static_cast<long long>(seconds * 1000)) {
+                for (size_t i = 0; i < frames; ++i, ++n) {
+                    const auto v = static_cast<int16_t>(12000.0 * std::sin(2.0 * 3.14159265358979 * freq * static_cast<double>(n) / 48000.0));
+                    chunk[i * 2] = chunk[i * 2 + 1] = v;
+                }
+                play.write(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size() * 2);
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        });
+        const auto t0 = Clock::now();
+        uint8_t tmp[4096];
+        while (ms(t0) < static_cast<long long>(seconds * 1000) + 400) {
+            const int n = rec.read(tmp, sizeof(tmp));
+            if (n < 0) break;
+            const auto* s = reinterpret_cast<const int16_t*>(tmp);
+            for (int i = 0; i + 1 < n / 2; i += 2) mono.push_back((s[i] + s[i + 1]) * 0.5f / 32768.0f);
+        }
+        stop = true;
+        writer.join();
+        const auto tc = Clock::now();
+        play.close();
+        rec.close();
+        TEST_ASSERT(ms(tc) < 1000);
+        return mono;
+    };
+
+    {   // A played 1 kHz tone comes back from the monitor: at least half a second of it, and clearly 1 kHz
+        const auto mono = heard(1000.0, 2.0);
+        TEST_ASSERT(mono.size() >= 24000);
+        const double e1k = goertzelEnergy(mono, 1000.0, 48000.0);
+        const double e3k = goertzelEnergy(mono, 3000.0, 48000.0);
+        TEST_ASSERT(e1k > 20.0 * e3k);
+    }
+    {   // With nothing played the monitor is silent, and stopping an idle stream is prompt
+        PulseStream rec;
+        TEST_ASSERT(rec.open(PulseStream::Dir::Record, "@DEFAULT_MONITOR@", 48000, 2, "cppdesk-test"));
+        double sumSq = 0;
+        size_t count = 0;
+        const auto t0 = Clock::now();
+        uint8_t tmp[4096];
+        while (ms(t0) < 600) {
+            const int n = rec.read(tmp, sizeof(tmp));
+            if (n < 0) break;
+            const auto* s = reinterpret_cast<const int16_t*>(tmp);
+            for (int i = 0; i < n / 2; ++i) {
+                sumSq += static_cast<double>(s[i]) * s[i] / (32768.0 * 32768.0);
+                ++count;
+            }
+        }
+        TEST_ASSERT(count == 0 || std::sqrt(sumSq / static_cast<double>(count)) < 0.01);
+        const auto tc = Clock::now();
+        rec.close();
+        TEST_ASSERT(ms(tc) < 1000);
+    }
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -10717,6 +10861,11 @@ int main(int argc, char** argv) {
 #if defined(__linux__)
         if (argc > 1 && std::string(argv[1]) == "--pipewire") {   // CI only, see ci.yml
             testRealPipeWire();
+            std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
+            return (g_failed == 0) ? 0 : 1;
+        }
+        if (argc > 1 && std::string(argv[1]) == "--pulse") {   // CI only, see ci.yml
+            testRealPulse();
             std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
             return (g_failed == 0) ? 0 : 1;
         }
@@ -10841,6 +10990,7 @@ int main(int argc, char** argv) {
         testPortalSession(); std::cout << "Test 90 done\n" << std::flush;
         testWaylandShareIntegration(); std::cout << "Test 92 done\n" << std::flush;
         testHostEndsSessionWhenSharingEnds(); std::cout << "Test 96 done\n" << std::flush;
+        testPulseStream(); std::cout << "Test 98 done\n" << std::flush;
 #endif
 #if defined(__APPLE__)
         testMacWindow(); std::cout << "Test 81 done\n" << std::flush;
