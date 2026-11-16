@@ -112,7 +112,7 @@ MacCaptureState stateForError(NSError* error) {
     if (!((isFloat && asbd->mBitsPerChannel == 32) || (!isFloat && asbd->mBitsPerChannel == 16))) return;
 
     size_t listSize = 0;
-    CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sampleBuffer, &listSize, nullptr, 0, nullptr, nullptr, 0, nullptr);
+    CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sampleBuffer, &listSize, nullptr, 0, nullptr, nullptr, kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, nullptr);
     if (listSize == 0) return;
     std::vector<uint8_t> storage(listSize);
     auto* list = reinterpret_cast<AudioBufferList*>(storage.data());
