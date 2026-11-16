@@ -2,7 +2,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cmath>
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include "audio_convert.hpp"
 #endif
 
@@ -677,6 +677,17 @@ void VoiceIntercom::stopCapture() {
     inputLevel_.store(0.0f);
 }
 
+void VoiceIntercom::MacAudioOutputCallback(void* custom_data, AudioQueueRef queue, AudioQueueBufferRef buffer) {
+    auto* self = static_cast<VoiceIntercom*>(custom_data);
+    if (!self || !queue || !buffer) return;
+    auto* dst = static_cast<uint8_t*>(buffer->mAudioData);
+    const size_t capacity = buffer->mAudioDataBytesCapacity;
+    const size_t got = self->playQueue_ ? self->playQueue_->pop(dst, capacity) : 0;
+    if (got < capacity) std::memset(dst + got, 0, capacity - got);   // nothing to play yet: silence keeps the clock running
+    buffer->mAudioDataByteSize = static_cast<UInt32>(capacity);
+    if (self->playing_.load()) AudioQueueEnqueueBuffer(queue, buffer, 0, nullptr);
+}
+
 bool VoiceIntercom::startPlayback(uint32_t sampleRate, uint8_t channels) {
     std::lock_guard<std::mutex> lk(playbackMutex_);
     if (outQueue_) return true;
@@ -691,65 +702,70 @@ bool VoiceIntercom::startPlayback(uint32_t sampleRate, uint8_t channels) {
     format.mFramesPerPacket = 1;
     format.mBytesPerPacket = format.mBytesPerFrame * format.mFramesPerPacket;
 
-    OSStatus status = AudioQueueNewOutput(&format, nullptr, nullptr, nullptr, nullptr, 0, &outQueue_);
+    UInt32 bufferByteSize = (sampleRate / 50) * format.mBytesPerFrame;   // 20 ms
+    if (bufferByteSize == 0) bufferByteSize = 1920;
+    // About 250 ms of the newest sound is kept; whole frames only.
+    const size_t keepBytes = std::max<size_t>(bufferByteSize * 2, (sampleRate / 4) * format.mBytesPerFrame);
+    playQueue_ = std::make_unique<audio::BoundedPcmQueue>(keepBytes);
+    playbackSampleRate_ = sampleRate;
+    playbackChannels_ = channels;
+
+    OSStatus status = AudioQueueNewOutput(&format, MacAudioOutputCallback, this, nullptr, nullptr, 0, &outQueue_);
     if (status != noErr || !outQueue_) {
         outQueue_ = nullptr;
+        playQueue_.reset();
         playing_.store(false);
         return false;
     }
 
-    UInt32 bufferByteSize = (sampleRate / 50) * format.mBytesPerFrame * 4;
-    if (bufferByteSize == 0) bufferByteSize = 1920 * 4;
-
-    for (size_t i = 0; i < NUM_PLAYBACK_BUFFERS; ++i) {
-        AudioQueueAllocateBuffer(outQueue_, bufferByteSize, &outBuffers_[i]);
-    }
-    currentPlayIdx_ = 0;
     playing_.store(true);
-    AudioQueueStart(outQueue_, nullptr);
+    for (size_t i = 0; i < NUM_PLAYBACK_BUFFERS; ++i) {
+        if (AudioQueueAllocateBuffer(outQueue_, bufferByteSize, &outBuffers_[i]) == noErr && outBuffers_[i]) {
+            MacAudioOutputCallback(this, outQueue_, outBuffers_[i]);   // fills it (silence for now) and queues it
+        }
+    }
+    if (AudioQueueStart(outQueue_, nullptr) != noErr) {
+        playing_.store(false);
+        AudioQueueDispose(outQueue_, true);
+        outQueue_ = nullptr;
+        for (size_t i = 0; i < NUM_PLAYBACK_BUFFERS; ++i) outBuffers_[i] = nullptr;
+        playQueue_.reset();
+        return false;
+    }
     return true;
 }
 
 void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes, uint8_t sourceChannels) {
-    (void)sourceChannels;   // shortcut: macOS plays mono as received, no stereo up-mix; revisit with macOS audio in step 5
     bytes = (bytes / sizeof(int16_t)) * sizeof(int16_t);
     if (!pcm || bytes < sizeof(int16_t) || bytes > 192000) return;
     std::lock_guard<std::mutex> lk(playbackMutex_);
-    if (!outQueue_) return;
+    if (!outQueue_ || !playQueue_) return;
 
-    int vol = outputVolume_.load();
-    float gain = static_cast<float>(vol) / 100.0f;
-
-    AudioQueueBufferRef buf = outBuffers_[currentPlayIdx_];
-    if (!buf) return;
-
-    if (buf->mAudioDataBytesCapacity < bytes) {
-        bytes = buf->mAudioDataBytesCapacity;
+    std::vector<int16_t> samples(bytes / sizeof(int16_t));
+    std::memcpy(samples.data(), pcm, bytes);
+    if (sourceChannels != playbackChannels_ && sourceChannels >= 1 && sourceChannels <= 2 && playbackChannels_ >= 1 && playbackChannels_ <= 2) {
+        std::vector<int16_t> adapted;
+        audio::adaptChannels(samples.data(), samples.size() / sourceChannels, sourceChannels, playbackChannels_, adapted);
+        samples.swap(adapted);
     }
-
-    std::memcpy(buf->mAudioData, pcm, bytes);
-    buf->mAudioDataByteSize = static_cast<UInt32>(bytes);
-
-    if (vol != 100) {
-        applyGain(reinterpret_cast<int16_t*>(buf->mAudioData),
-                  bytes / sizeof(int16_t), gain);
-    }
-
-    AudioQueueEnqueueBuffer(outQueue_, buf, 0, nullptr);
-    currentPlayIdx_ = (currentPlayIdx_ + 1) % NUM_PLAYBACK_BUFFERS;
+    samples.resize(samples.size() / playbackChannels_ * playbackChannels_);   // whole frames only
+    const int vol = outputVolume_.load();
+    if (vol != 100) applyGain(samples.data(), samples.size(), static_cast<float>(vol) / 100.0f);
+    playQueue_->push(reinterpret_cast<const uint8_t*>(samples.data()), samples.size() * sizeof(int16_t));
 }
 
 void VoiceIntercom::stopPlayback() {
     std::lock_guard<std::mutex> lk(playbackMutex_);
     if (!outQueue_) return;
 
+    playing_.store(false);   // the callback stops queueing buffers
     AudioQueueStop(outQueue_, true);
     AudioQueueDispose(outQueue_, true);
     outQueue_ = nullptr;
     for (size_t i = 0; i < NUM_PLAYBACK_BUFFERS; ++i) {
         outBuffers_[i] = nullptr;
     }
-    playing_.store(false);
+    playQueue_.reset();   // after the dispose: no callback can still be reading it
 }
 
 #elif defined(__linux__)

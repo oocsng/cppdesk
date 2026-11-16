@@ -1939,6 +1939,9 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         ScreenCapturer capturer;
         capturer.setAutoHeadless(identity_.settings().autoVirtualDisplay);
         capturer.setRestoreToken(shareHub_.restoreToken());
+#if defined(__APPLE__)
+        capturer.setSoundSink([this](const int16_t* pcm, size_t frames) { sendHostSoundChunk(pcm, frames); });   // the screen stream carries the Mac's sound
+#endif
         shareHub_.setNotice({});   // the last session's notice is old news
         struct ShareNoticeReset {   // the notice belongs to this session, except a share that was refused or ended: the host keeps seeing why
             wayland::ShareHub& hub;

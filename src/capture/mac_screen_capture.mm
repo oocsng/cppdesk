@@ -2,11 +2,14 @@
 
 #include "mac_screen_capture.hpp"
 #include "mac_frame.hpp"
+#include "../media/audio_convert.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreMedia/CoreMedia.h>
@@ -30,6 +33,8 @@ struct Shared {
     uint64_t seq = 0;
     uint64_t copiedSeq = 0;
     bool accepting = false;   // callbacks only touch the frame while this is true (guarded by `mutex`)
+    MacCaptureStream::AudioSink audioSink;   // guarded by `mutex`
+    audio::ConvertState convert;             // the audio queue only
 
     void setState(MacCaptureState s) { state.store(static_cast<int>(s)); }
 };
@@ -48,12 +53,19 @@ MacCaptureState stateForError(NSError* error) {
 @public
     std::shared_ptr<cppdesk::Shared> shared_;
 }
+- (void)deliverAudio:(CMSampleBufferRef)sampleBuffer;
 @end
 
 @implementation CppDeskStreamOutput
 
 - (void)stream:(SCStream*)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
-    if (type != SCStreamOutputTypeScreen || !CMSampleBufferIsValid(sampleBuffer)) return;
+    if (type != SCStreamOutputTypeScreen) {
+        if (@available(macOS 13.0, *)) {
+            if (type == SCStreamOutputTypeAudio) [self deliverAudio:sampleBuffer];
+        }
+        return;
+    }
+    if (!CMSampleBufferIsValid(sampleBuffer)) return;
     // Only complete frames: macOS also sends "idle" (nothing changed) and "blank" notifications without pixels.
     NSArray* attachments = (__bridge NSArray*)CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
     NSDictionary* info = attachments.firstObject;
@@ -81,6 +93,56 @@ MacCaptureState stateForError(NSError* error) {
     CVPixelBufferUnlockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly);
 }
 
+// The Mac's sound: float or 16-bit, planar or interleaved, any rate: converted to what the wire carries.
+- (void)deliverAudio:(CMSampleBufferRef)sampleBuffer {
+    if (!CMSampleBufferIsValid(sampleBuffer) || !CMSampleBufferDataIsReady(sampleBuffer)) return;
+    cppdesk::MacCaptureStream::AudioSink sink;
+    {
+        std::lock_guard<std::mutex> lock(shared_->mutex);
+        if (!shared_->accepting) return;
+        sink = shared_->audioSink;
+    }
+    if (!sink) return;
+    CMAudioFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sampleBuffer);
+    const AudioStreamBasicDescription* asbd = format ? CMAudioFormatDescriptionGetStreamBasicDescription(format) : nullptr;
+    const CMItemCount frameCount = CMSampleBufferGetNumSamples(sampleBuffer);
+    if (!asbd || frameCount <= 0 || asbd->mChannelsPerFrame == 0) return;
+    const bool isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    const bool planar = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+    if (!((isFloat && asbd->mBitsPerChannel == 32) || (!isFloat && asbd->mBitsPerChannel == 16))) return;
+
+    size_t listSize = 0;
+    CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sampleBuffer, &listSize, nullptr, 0, nullptr, nullptr, 0, nullptr);
+    if (listSize == 0) return;
+    std::vector<uint8_t> storage(listSize);
+    auto* list = reinterpret_cast<AudioBufferList*>(storage.data());
+    CMBlockBufferRef block = nullptr;
+    if (CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sampleBuffer, nullptr, list, listSize, nullptr, nullptr,
+            kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &block) != noErr) return;
+
+    // One block of memory in the layout PcmBlock says: planes one after another, or interleaved.
+    const size_t channels = asbd->mChannelsPerFrame;
+    const size_t frames = static_cast<size_t>(frameCount);
+    const size_t bytesPerSample = isFloat ? sizeof(float) : sizeof(int16_t);
+    std::vector<uint8_t> flat(frames * channels * bytesPerSample, 0);
+    if (planar) {
+        for (UInt32 c = 0; c < list->mNumberBuffers && c < channels; ++c) {
+            if (!list->mBuffers[c].mData) continue;
+            std::memcpy(flat.data() + c * frames * bytesPerSample, list->mBuffers[c].mData,
+                        std::min<size_t>(list->mBuffers[c].mDataByteSize, frames * bytesPerSample));
+        }
+    } else if (list->mNumberBuffers >= 1 && list->mBuffers[0].mData) {
+        std::memcpy(flat.data(), list->mBuffers[0].mData, std::min<size_t>(list->mBuffers[0].mDataByteSize, flat.size()));
+    }
+    if (block) CFRelease(block);
+
+    std::vector<int16_t> wire;
+    cppdesk::audio::toWire({ flat.data(), frames, static_cast<int>(channels), static_cast<int>(asbd->mSampleRate),
+                             isFloat ? cppdesk::audio::SampleFormat::F32 : cppdesk::audio::SampleFormat::S16, planar },
+                           shared_->convert, wire);
+    if (!wire.empty()) sink(wire.data(), wire.size() / 2);
+}
+
 // macOS ended the stream: permission revoked, display unplugged or changed, sleep.
 - (void)stream:(SCStream*)stream didStopWithError:(NSError*)error {
     std::lock_guard<std::mutex> lock(shared_->mutex);
@@ -96,6 +158,9 @@ struct MacCaptureStream::Impl {
     SCStream* stream = nil;
     CppDeskStreamOutput* output = nil;
     dispatch_queue_t queue = nil;
+    dispatch_queue_t audioQueue = nil;
+    AudioSink sink;          // kept across stop() and start(): the capturer restarts the stream by itself
+    bool audioOn = false;    // this run also delivers sound
 };
 
 MacCaptureStream::MacCaptureStream() : impl_(std::make_unique<Impl>()) {}
@@ -147,6 +212,16 @@ bool MacCaptureStream::start(uint32_t displayId, int fps, int maxLongEdge) {
         config.showsCursor = NO;
         config.queueDepth = 3;
         config.minimumFrameInterval = CMTimeMake(1, std::max(1, fps));
+        bool wantAudio = false;
+        if (@available(macOS 13.0, *)) {
+            if (impl_->sink) {   // the Mac's own sound, without CppDesk's, at the wire's rate
+                config.capturesAudio = YES;
+                config.excludesCurrentProcessAudio = YES;
+                config.sampleRate = 48000;
+                config.channelCount = 2;
+                wantAudio = true;
+            }
+        }
         SCContentFilter* filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
 
         impl_->output = [[CppDeskStreamOutput alloc] init];
@@ -163,6 +238,20 @@ bool MacCaptureStream::start(uint32_t displayId, int fps, int maxLongEdge) {
             impl_->stream = nil;
             impl_->output = nil;
             return false;
+        }
+        if (wantAudio) {   // sound that cannot be added leaves the screen stream as it was
+            if (@available(macOS 13.0, *)) {
+                impl_->audioQueue = dispatch_queue_create("cppdesk.capture.audio", DISPATCH_QUEUE_SERIAL);
+                NSError* audioError = nil;
+                if ([impl_->stream addStreamOutput:impl_->output type:SCStreamOutputTypeAudio sampleHandlerQueue:impl_->audioQueue error:&audioError]) {
+                    std::lock_guard<std::mutex> lock(shared.mutex);
+                    shared.audioSink = impl_->sink;
+                    shared.convert = audio::ConvertState{};
+                    impl_->audioOn = true;
+                } else {
+                    impl_->audioQueue = nil;
+                }
+            }
         }
 
         // 3. Start it.
@@ -193,21 +282,32 @@ void MacCaptureStream::stop() {
             [stream stopCaptureWithCompletionHandler:^(NSError*) { dispatch_semaphore_signal(stopped); }];
             dispatch_semaphore_wait(stopped, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
             [stream removeStreamOutput:impl_->output type:SCStreamOutputTypeScreen error:nil];
+            if (impl_->audioOn) {
+                if (@available(macOS 13.0, *)) [stream removeStreamOutput:impl_->output type:SCStreamOutputTypeAudio error:nil];
+            }
             impl_->stream = nil;
         }
         // Let a callback that is already running finish, then refuse any later one.
         if (impl_->queue) dispatch_sync(impl_->queue, ^{});
+        if (impl_->audioQueue) dispatch_sync(impl_->audioQueue, ^{});
         impl_->output = nil;
         impl_->queue = nil;
+        impl_->audioQueue = nil;
+        impl_->audioOn = false;
     }
     Shared& shared = *impl_->shared;
     std::lock_guard<std::mutex> lock(shared.mutex);
     shared.accepting = false;
+    shared.audioSink = nullptr;
     shared.frame.clear();
     shared.width = shared.height = 0;
     shared.seq = shared.copiedSeq = 0;
     shared.setState(MacCaptureState::Stopped);
 }
+
+void MacCaptureStream::setAudioSink(AudioSink sink) { impl_->sink = std::move(sink); }
+
+bool MacCaptureStream::audioAvailable() const { return impl_->audioOn; }
 
 MacCaptureState MacCaptureStream::state() const {
     return static_cast<MacCaptureState>(impl_->shared->state.load());

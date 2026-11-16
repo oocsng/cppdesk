@@ -11197,6 +11197,56 @@ void testMuteStateAndHostMicSign() {
     std::filesystem::remove(viewerId.configFilePath(), ec);
 }
 
+#if defined(__APPLE__)
+void testMacAudioPaths() {
+    std::cout << "[TEST 102] Mac sound: playback queue, screen stream with sound, capturer sound sink..." << std::endl;
+    using Clock = std::chrono::steady_clock;
+    auto ms = [](Clock::time_point from) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - from).count();
+    };
+    {   // The speaker: a burst of chunks (stereo and mono) then stop, promptly. A runner without an output may refuse to start.
+        VoiceIntercom speaker;
+        const auto t0 = Clock::now();
+        const bool started = speaker.startPlayback(48000, 2);
+        TEST_ASSERT(started == speaker.isPlaying());
+        std::vector<int16_t> stereo(960 * 2, 1000), mono(480, 500);
+        for (int i = 0; i < 100; ++i) {
+            speaker.enqueuePlaybackChunk(reinterpret_cast<const uint8_t*>(stereo.data()), stereo.size() * 2, 2);
+            speaker.enqueuePlaybackChunk(reinterpret_cast<const uint8_t*>(mono.data()), mono.size() * 2, 1);
+        }
+        speaker.stopPlayback();
+        speaker.stopPlayback();
+        TEST_ASSERT(!speaker.isPlaying() && ms(t0) < 3000);
+        speaker.enqueuePlaybackChunk(reinterpret_cast<const uint8_t*>(stereo.data()), stereo.size() * 2, 2);   // after stop: ignored
+    }
+    {   // A screen stream with a sound sink starts (or says why not) and stops, with or without sound
+        MacCaptureStream stream;
+        std::atomic<size_t> frames{0};
+        stream.setAudioSink([&](const int16_t* pcm, size_t n) { if (pcm) frames += n; });
+        const auto t0 = Clock::now();
+        const bool started = stream.start(CGMainDisplayID(), 30, 3840);
+        TEST_ASSERT(ms(t0) < 12000);
+        const MacCaptureState st = stream.state();
+        TEST_ASSERT(started == (st == MacCaptureState::Running));
+        if (st == MacCaptureState::Running) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        stream.stop();
+        stream.stop();
+        TEST_ASSERT(stream.state() == MacCaptureState::Stopped && !stream.audioAvailable());
+        std::cout << "  sound " << frames.load() << " frames" << std::endl;
+    }
+    {   // A capturer with a sound sink still captures the screen
+        ScreenCapturer capturer;
+        std::atomic<size_t> frames{0};
+        capturer.setSoundSink([&](const int16_t*, size_t n) { frames += n; });
+        std::vector<EncodedTile> tiles;
+        bool isKf = false;
+        CursorState cursor{};
+        TEST_ASSERT(capturer.captureDirtyTiles(true, QualityPreset::Balanced, tiles, isKf, cursor));
+        TEST_ASSERT(isKf && !tiles.empty());
+    }
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -11324,6 +11374,7 @@ int main(int argc, char** argv) {
         testMuteStateAndHostMicSign(); std::cout << "Test 101 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
+        testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;
 #endif
 #if defined(__APPLE__)
         testMacInjectorSurvivesPixelSizedMonitor(); std::cout << "Test 83 done\n" << std::flush;

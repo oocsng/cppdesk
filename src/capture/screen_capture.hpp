@@ -16,6 +16,7 @@
 #include "wayland_helpers.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 #include <string>
 #include <memory>
@@ -178,6 +179,10 @@ public:
     // time. The token is set before the first capture; a change is handed out once.
     wayland::ShareNotice shareNotice() const;
     void setRestoreToken(const std::string& token) { restoreToken_ = token; }
+
+    // What the host's computer is playing, when the screen stream carries it (macOS 13 and later). Set before the
+    // first capture; interleaved 48 kHz 16-bit stereo.
+    void setSoundSink(std::function<void(const int16_t* interleavedStereo, size_t frames)> sink) { soundSink_ = std::move(sink); }
     bool takeRestoreTokenChange(std::string& token);
     static int x11CaptureCallsForTest();   // how often the X11 capture path was entered (tests)
 
@@ -212,6 +217,7 @@ private:
     bool                      waylandMode_ = false;   // a Wayland session: the desktop is asked, X11 is not read
     std::shared_ptr<wayland::WaylandShare> wayland_;
     std::string               restoreToken_;
+    std::function<void(const int16_t*, size_t)> soundSink_;
 
 #if defined(_WIN32)
     HDC                       gdiMemDC_ = nullptr;
