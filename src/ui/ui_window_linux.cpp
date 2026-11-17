@@ -2,6 +2,7 @@
 
 #include "ui_window.hpp"
 #include "canvas_cairo.hpp"
+#include "../capture/wayland_helpers.hpp"
 #include "../capture/xlib_threads.hpp"
 #include "../control/input_injector.hpp"
 #include "../core/spawn.hpp"
@@ -16,6 +17,7 @@
 #include <X11/XKBlib.h>
 #include <X11/cursorfont.h>
 #include <X11/extensions/XShm.h>
+#include <X11/extensions/Xrandr.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <poll.h>
@@ -28,6 +30,8 @@
 #include <bitset>
 #include <chrono>
 #include <clocale>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -503,14 +507,73 @@ public:
         XMapRaised(w_->dpy, w_->win);
         w_->sendWmMessage(w_->netActiveWindow, 1, CurrentTime, 0, 0);
     }
-    // Glide stubs; the real versions come in a later task.
-    std::optional<ui::Point> cursorScreenPos() const override { return std::nullopt; }
-    ui::Rect desktopBounds() const override { return {}; }
-    ui::Rect monitorBoundsAt(ui::Point) const override { return {}; }
-    void warpCursor(ui::Point) override {}
-    void moveWindowToMonitorAt(ui::Point) override {}
-    ui::WindowPresence windowPresence() const override { return ui::WindowPresence::Shown; }
-    void setWindowPresence(ui::WindowPresence) override {}
+    // Root window coordinates. On Wayland, XWayland cannot see the pointer over other apps' windows: no answer.
+    std::optional<ui::Point> cursorScreenPos() const override {
+        if (!live() || wayland::isWaylandSession([](const char* name) { return std::getenv(name); })) return std::nullopt;
+        Window root = 0, child = 0;
+        int rootX = 0, rootY = 0, winX = 0, winY = 0;
+        unsigned int mask = 0;
+        if (!XQueryPointer(w_->dpy, RootWindow(w_->dpy, w_->screen), &root, &child, &rootX, &rootY, &winX, &winY,
+                           &mask)) {
+            return std::nullopt;   // the pointer is on another X screen
+        }
+        return ui::Point{ static_cast<float>(rootX), static_cast<float>(rootY) };
+    }
+    ui::Rect desktopBounds() const override {
+        const std::vector<ui::Rect> all = monitors();
+        if (all.empty()) return {};
+        ui::Rect r = all[0];
+        for (const ui::Rect& m : all) {
+            r.left = std::min(r.left, m.left);
+            r.top = std::min(r.top, m.top);
+            r.right = std::max(r.right, m.right);
+            r.bottom = std::max(r.bottom, m.bottom);
+        }
+        return r;
+    }
+    ui::Rect monitorBoundsAt(ui::Point p) const override {
+        const std::vector<ui::Rect> all = monitors();
+        if (all.empty()) return {};
+        return *std::min_element(all.begin(), all.end(), [p](const ui::Rect& a, const ui::Rect& b) {
+            return distanceSq(a, p) < distanceSq(b, p);
+        });
+    }
+    void warpCursor(ui::Point p) override {
+        if (!live()) return;
+        XWarpPointer(w_->dpy, None, RootWindow(w_->dpy, w_->screen), 0, 0, 0, 0, static_cast<int>(std::lround(p.x)),
+                     static_cast<int>(std::lround(p.y)));
+        XFlush(w_->dpy);
+    }
+    // shortcut: the monitor's top-left, not its work area (EWMH has none per monitor); the WM may nudge the window.
+    void moveWindowToMonitorAt(ui::Point p) override {
+        if (!live()) return;
+        const ui::Rect m = monitorBoundsAt(p);
+        XMoveWindow(w_->dpy, w_->win, static_cast<int>(m.left), static_cast<int>(m.top));
+        XFlush(w_->dpy);
+    }
+    ui::WindowPresence windowPresence() const override {
+        if (!live() || w_->hiddenInTray) return ui::WindowPresence::Hidden;
+        if (w_->iconified()) return ui::WindowPresence::Minimized;
+        return w_->mapped ? ui::WindowPresence::Shown : ui::WindowPresence::Hidden;
+    }
+    void setWindowPresence(ui::WindowPresence p) override {
+        if (!live()) return;
+        switch (p) {
+            case ui::WindowPresence::Shown:
+                w_->hiddenInTray = false;
+                bringToFront();   // mapping an iconified window also restores it
+                break;
+            case ui::WindowPresence::Minimized:
+                XIconifyWindow(w_->dpy, w_->win, w_->screen);
+                XFlush(w_->dpy);
+                break;
+            case ui::WindowPresence::Hidden:   // in the tray, as hideToTrayIfWanted leaves it
+                XWithdrawWindow(w_->dpy, w_->win, w_->screen);
+                XFlush(w_->dpy);
+                w_->hiddenInTray = true;
+                break;
+        }
+    }
     // X grabs the pointer for us while a button is held, so drags outside the window keep reporting.
     void setMouseCapture(bool) override {}
     bool isKeyDown(uint16_t vk) const override { return w_ && vk < 256 && w_->keys[vk]; }
@@ -553,6 +616,31 @@ public:
 
 private:
     bool live() const { return w_ && w_->dpy && w_->win && !w_->closed; }
+
+    // Each monitor's bounds; the whole root window when RandR lists none (older servers).
+    std::vector<ui::Rect> monitors() const {
+        std::vector<ui::Rect> out;
+        if (!live()) return out;
+        int count = 0;
+        if (XRRMonitorInfo* m = XRRGetMonitors(w_->dpy, RootWindow(w_->dpy, w_->screen), True, &count)) {
+            for (int i = 0; i < count; ++i) {
+                out.push_back({ static_cast<float>(m[i].x), static_cast<float>(m[i].y),
+                                static_cast<float>(m[i].x + m[i].width), static_cast<float>(m[i].y + m[i].height) });
+            }
+            XRRFreeMonitors(m);
+        }
+        if (out.empty()) {
+            out.push_back({ 0.0f, 0.0f, static_cast<float>(DisplayWidth(w_->dpy, w_->screen)),
+                            static_cast<float>(DisplayHeight(w_->dpy, w_->screen)) });
+        }
+        return out;
+    }
+    // Squared distance from p to r: 0 inside (right/bottom exclusive), so the nearest monitor wins when none holds p.
+    static float distanceSq(const ui::Rect& r, ui::Point p) {
+        const float dx = p.x < r.left ? r.left - p.x : p.x >= r.right ? p.x - r.right + 1.0f : 0.0f;
+        const float dy = p.y < r.top ? r.top - p.y : p.y >= r.bottom ? p.y - r.bottom + 1.0f : 0.0f;
+        return dx * dx + dy * dy;
+    }
 
     CppDeskWindowLinuxImpl* w_ = nullptr;
     bool snapshotMode_ = false;
