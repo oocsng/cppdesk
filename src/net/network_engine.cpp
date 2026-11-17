@@ -5289,19 +5289,29 @@ void NetworkEngine::destroyPrivacyCurtainWindow() {
 }
 #endif
 
+// stop() and the host session's own cleanup both stop these workers. Moving the thread out under a lock gives exactly
+// one of them the join; two threads joining one std::thread is undefined (on Linux the second never returns).
+void NetworkEngine::joinHostWorker(std::thread& worker) {
+    std::thread mine;
+    {
+        std::lock_guard<std::mutex> lk(hostWorkerThreadMutex_);
+        mine = std::move(worker);
+    }
+    try {
+        if (mine.joinable()) mine.join();
+    } catch (...) {}
+}
+
 void NetworkEngine::startHostAudioCapture() {
     stopHostAudioCapture();
     hostAudioActive_.store(true);
+    std::lock_guard<std::mutex> lk(hostWorkerThreadMutex_);
     hostAudioThread_ = std::thread(&NetworkEngine::hostAudioCaptureLoop, this);
 }
 
 void NetworkEngine::stopHostAudioCapture() {
     hostAudioActive_.store(false);
-    try {
-        if (hostAudioThread_.joinable()) {
-            hostAudioThread_.join();
-        }
-    } catch (...) {}
+    joinHostWorker(hostAudioThread_);
 }
 
 void NetworkEngine::hostAudioCaptureLoop() {
@@ -5920,16 +5930,13 @@ void NetworkEngine::startHostTerminal(bool usePowerShell) {
     hChildThread_ = pi.hThread;
 
     hostTerminalActive_.store(true);
+    std::lock_guard<std::mutex> lk(hostWorkerThreadMutex_);
     hostTerminalThread_ = std::thread(&NetworkEngine::hostTerminalReaderLoop, this);
 }
 
 void NetworkEngine::stopHostTerminal() {
     hostTerminalActive_.store(false);
-    try {
-        if (hostTerminalThread_.joinable()) {
-            hostTerminalThread_.join();
-        }
-    } catch (...) {}
+    joinHostWorker(hostTerminalThread_);
     if (hChildProcess_) {
         TerminateProcess(hChildProcess_, 0);
         CloseHandle(hChildProcess_);
@@ -6020,16 +6027,13 @@ void NetworkEngine::startHostTerminal(bool /*usePowerShell*/) {
     childPid_ = pid;
 
     hostTerminalActive_.store(true);
+    std::lock_guard<std::mutex> lk(hostWorkerThreadMutex_);
     hostTerminalThread_ = std::thread(&NetworkEngine::hostTerminalReaderLoop, this);
 }
 
 void NetworkEngine::stopHostTerminal() {
     hostTerminalActive_.store(false);
-    try {
-        if (hostTerminalThread_.joinable()) {
-            hostTerminalThread_.join();
-        }
-    } catch (...) {}
+    joinHostWorker(hostTerminalThread_);
     if (childStdinFd_ >= 0) { close(childStdinFd_); childStdinFd_ = -1; }
     if (childStdoutFd_ >= 0) { close(childStdoutFd_); childStdoutFd_ = -1; }
     if (childPid_ > 0) {
@@ -6329,16 +6333,13 @@ void NetworkEngine::viewerTunnelMultiplexerLoop() {
 void NetworkEngine::startHostTunnelProxy() {
     stopHostTunnelProxy();
     hostTunnelActive_.store(true);
+    std::lock_guard<std::mutex> lk(hostWorkerThreadMutex_);
     hostTunnelThread_ = std::thread(&NetworkEngine::hostTunnelProxyLoop, this);
 }
 
 void NetworkEngine::stopHostTunnelProxy() {
     hostTunnelActive_.store(false);
-    try {
-        if (hostTunnelThread_.joinable()) {
-            hostTunnelThread_.join();
-        }
-    } catch (...) {}
+    joinHostWorker(hostTunnelThread_);
     std::lock_guard<std::mutex> lk(tunnelMutex_);
     for (auto& kv : hostTunnels_) {
         closesocket(kv.second.sock);

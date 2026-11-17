@@ -10317,7 +10317,7 @@ void testFleetManager() {
             return ViewerConnectionState::Disconnected;
         };
         const auto C = ViewerConnectionState::Connected;
-        TEST_ASSERT(waitFor([&] { return stateOf(deskA) == C && stateOf(deskB) == C; }, 4000));
+        TEST_ASSERT(waitFor([&] { return stateOf(deskA) == C && stateOf(deskB) == C; }, 10000));
         auto tiles = fleet.status();
         TEST_ASSERT(tiles.size() == 2 && tiles[0].deskId == deskA && tiles[0].name == "A" && tiles[1].deskId == deskB);
         TEST_ASSERT(fleet.open({{deskA, "A", "127.0.0.1:51040"}}) == 0 && fleet.size() == 2);

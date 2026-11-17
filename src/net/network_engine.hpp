@@ -651,6 +651,8 @@ private:
 
     // Audio Capture & Playback state
     std::thread             hostAudioThread_;
+    std::mutex              hostWorkerThreadMutex_;   // guards hostAudioThread_, hostTerminalThread_, hostTunnelThread_
+    void joinHostWorker(std::thread& worker);
     std::atomic<bool>       hostAudioActive_{false};
 #if defined(_WIN32)
     HWAVEOUT                hWaveOut_ = nullptr;
