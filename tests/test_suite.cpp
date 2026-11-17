@@ -10738,6 +10738,76 @@ void testGlideEdges() {
     TEST_ASSERT(glideAlong(b, GlideEdge::Right, {1919, 270}) == 0.25f);
 }
 
+void testGlideSettingsUi() {
+    std::cout << "[TEST 116] Glide settings: section renders the paired PCs and edge slots, Wayland note..." << std::endl;
+    IdentityManager id(4253);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    FakeShell shell;
+    shell.cursor = ui::Point{ 100.0f, 100.0f };
+    PairedPeer p;
+    p.hostname = "Office-PC-3";
+    p.deskId = 555000401;
+    p.pairedAtUnix = 1700000000;
+    id.addPairedHost(p);
+    p.hostname = "Reception";
+    p.deskId = 555000402;
+    id.addPairedHost(p);
+    AppSettings s = id.settings();
+    glidePlace(s, GlideEdge::Right, 555000402);
+    id.updateSettings(s);
+
+    const auto names = AppUi::snapshotStateNames();
+    TEST_ASSERT(std::find(names.begin(), names.end(), "settings_glide") != names.end());
+    const std::string glide = renderAppState(id, net, shell, "settings_glide");
+    TEST_ASSERT(glide.find("|Glide\n") != std::string::npos);
+    TEST_ASSERT(glide.find("|Push your mouse off a screen edge to control the paired PC you put there.") != std::string::npos);
+    TEST_ASSERT(glide.find("|Office-PC-3") != std::string::npos);
+    TEST_ASSERT(glide.find("|Reception") != std::string::npos);
+    TEST_ASSERT(glide.find("|Empty") != std::string::npos);
+    TEST_ASSERT(glide.find("|Pick a PC, then click an edge.") != std::string::npos);
+    TEST_ASSERT(glide.find("Glide needs X11.") == std::string::npos);
+    TEST_ASSERT(glide.find("Pair with a PC first") == std::string::npos);
+
+    {   // Click a PC, then an edge: it moves there; clicking an occupied edge with nothing picked clears it.
+        AppUi app(id, net, shell, "");
+        ui::RecordingCanvas rc;
+        app.applySnapshotState("settings_glide");
+        auto settle = [&] { for (int i = 0; i < 150; ++i) app.render(rc, 1280, 800, 1.0 / 60.0); };
+        auto click = [&](float x, float y) {
+            settle();
+            app.onMouseMove(x, y);
+            settle();
+            app.onMouseButton(MouseButtonId::Left, true, x, y);
+            settle();
+            app.onMouseButton(MouseButtonId::Left, false, x, y);
+            settle();
+        };
+        const float rowX = 990.0f, officeY = 198.0f, receptionY = 237.0f, leftX = 350.0f, slotY = 267.0f;
+        click(rowX, officeY);
+        click(leftX, slotY);
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Left) == 555000401);
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Right) == 555000402);
+        click(rowX, receptionY);
+        click(leftX, slotY);
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Left) == 555000402 && glidePcAt(id.settings(), GlideEdge::Right) == 0);
+        click(leftX, slotY);
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Left) == 0);
+    }
+
+    shell.cursor = std::nullopt;
+    TEST_ASSERT(renderAppState(id, net, shell, "settings_glide")
+                    .find("|Glide needs X11. On Wayland, other PCs can still glide to this one.") != std::string::npos);
+
+    id.removePairedHost(555000401);
+    id.removePairedHost(555000402);
+    TEST_ASSERT(renderAppState(id, net, shell, "settings_glide")
+                    .find("|Pair with a PC first: connect to it normally and choose Pair.") != std::string::npos);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
+
 void testPairingOfferEveryConnection() {
     std::cout << "[TEST 113] Pairing offer: asked again on a new connection dialled while the last one was up..." << std::endl;
     std::error_code ec;
@@ -12756,6 +12826,7 @@ int main(int argc, char** argv) {
         testPairingOfferEveryConnection(); std::cout << "Test 113 done\n" << std::flush;
         testGlideLayout(); std::cout << "Test 114 done\n" << std::flush;
         testGlideEdges(); std::cout << "Test 115 done\n" << std::flush;
+        testGlideSettingsUi(); std::cout << "Test 116 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;

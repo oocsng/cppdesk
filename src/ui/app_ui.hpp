@@ -65,7 +65,8 @@ enum class SettingsSection : uint8_t {
     NetworkRelay    = 5,
     CurtainPrivacy  = 6,
     SystemService   = 7,
-    About           = 8
+    About           = 8,
+    Glide           = 9
 };
 
 enum class FocusedField : uint8_t {
@@ -268,6 +269,7 @@ private:
     void drawSessionTabBar(const UiRect& bounds, float alpha = 1.0f);
     void drawRemoteSessionView(const UiRect& bounds, float alpha = 1.0f);
     void drawSettingsView(const UiRect& bounds, float alpha = 1.0f);
+    void drawGlideSettings(float cx, float crx, float& cy);
     void drawFileTransferDrawer(const UiRect& bounds, float slideProgress);
     void drawFileManagerDrawer(const UiRect& contentRect);
     void drawSyncDrawer(const UiRect& contentRect);
@@ -647,6 +649,7 @@ private:
     bool                    showFleetPicker_ = false;
     float                   fleetPickerAnimT_ = 0.0f;
     float                   fleetPickerAnimVel_ = 0.0f;
+    uint64_t                glidePickedDesk_ = 0;      // paired PC picked in Settings > Glide, waiting for an edge click
     std::vector<uint64_t>   fleetPicked_;              // desk IDs ticked in the picker
     bool                    fleetTypeAll_ = false;
     uint64_t                fleetFocused_ = 0;

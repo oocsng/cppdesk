@@ -2,6 +2,7 @@
 #include "theme.hpp"
 #include "../core/win_compat.hpp"
 #include "vk_codes.hpp"
+#include "glide.hpp"
 
 #include <algorithm>
 #include <ctime>
@@ -2580,6 +2581,95 @@ void AppUi::drawRemoteSessionView(const UiRect& bounds, float alpha) {
     }
 }
 
+// Settings > Glide: click a paired PC to pick it, then an edge slot to place it there (or an occupied slot with nothing picked to clear it).
+void AppUi::drawGlideSettings(float cx, float crx, float& cy) {
+    drawText("Glide", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    cy += 25.0f;
+    drawText("Push your mouse off a screen edge to control the paired PC you put there.",
+             { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+    cy += 22.0f;
+
+    const bool cursorKnown = shell_->cursorScreenPos().has_value();
+    const char* note = nullptr;
+    if (!cursorKnown) note = "Glide needs X11. On Wayland, other PCs can still glide to this one.";
+    else if (glidePaused(sessionTabs_.tabCount() > 0, fleet_.size() > 0, false, true))
+        note = "Glide is paused while a session or the Do it on all grid is open.";
+    if (note) {
+        drawText(note, { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_WARNING);
+        cy += 22.0f;
+    }
+
+    const std::vector<PairedPeer> hosts = identity_.pairedHosts();
+    if (hosts.empty()) {
+        drawText("Pair with a PC first: connect to it normally and choose Pair.",
+                 { cx, cy + 6.0f, crx, cy + 26.0f }, ui::FontRole::Body, COL_TEXT_SECONDARY);
+        return;
+    }
+    if (std::none_of(hosts.begin(), hosts.end(), [&](const PairedPeer& h) { return h.deskId == glidePickedDesk_; }))
+        glidePickedDesk_ = 0;   // forgotten while picked
+
+    const auto eligible = FleetManager::eligibleMembers(identity_, network_.discoveredPeers());
+    auto online = [&](uint64_t id) {
+        return std::any_of(eligible.begin(), eligible.end(), [&](const FleetMember& m) { return m.deskId == id; });
+    };
+    auto nameOf = [&](uint64_t id) {
+        for (const auto& h : hosts) if (h.deskId == id) return h.hostname;
+        return std::string();
+    };
+    const AppSettings s = identity_.settings();
+
+    // Left: "This PC" with an edge slot on each side
+    // shortcut: a hostname wider than the slot is clipped, not shortened; add an ellipsis helper if long names matter
+    const float slotW = 136.0f, slotH = 46.0f, diaW = 460.0f, diaH = 250.0f;
+    UiRect dia = { cx, cy, cx + diaW, cy + diaH };
+    fillRoundRect(dia, 12.0f, COL_BG_SUBTLE);
+    strokeRoundRect(dia, 12.0f, COL_BORDER);
+    UiRect me = { dia.centerX() - 60.0f, dia.centerY() - 28.0f, dia.centerX() + 60.0f, dia.centerY() + 28.0f };
+    fillRoundRect(me, 10.0f, COL_BG_CARD);
+    strokeRoundRect(me, 10.0f, COL_BORDER_ALT);
+    drawText("This PC", me, ui::FontRole::BodyBold, COL_TEXT_PRIMARY, ui::HAlign::Center, ui::VAlign::Center);
+
+    struct Slot { GlideEdge edge; const char* id; UiRect rect; };
+    const Slot slots[] = {
+        { GlideEdge::Top,    "glide_slot_top",    { dia.centerX() - slotW * 0.5f, dia.top + 16.0f, dia.centerX() + slotW * 0.5f, dia.top + 16.0f + slotH } },
+        { GlideEdge::Bottom, "glide_slot_bottom", { dia.centerX() - slotW * 0.5f, dia.bottom - 16.0f - slotH, dia.centerX() + slotW * 0.5f, dia.bottom - 16.0f } },
+        { GlideEdge::Left,   "glide_slot_left",   { dia.left + 16.0f, dia.centerY() - slotH * 0.5f, dia.left + 16.0f + slotW, dia.centerY() + slotH * 0.5f } },
+        { GlideEdge::Right,  "glide_slot_right",  { dia.right - 16.0f - slotW, dia.centerY() - slotH * 0.5f, dia.right - 16.0f, dia.centerY() + slotH * 0.5f } },
+    };
+    for (const auto& sl : slots) {
+        const uint64_t at = glidePcAt(s, sl.edge);
+        const bool filled = at != 0 && !nameOf(at).empty();
+        drawButton(sl.id, sl.rect, filled ? nameOf(at) : "Empty",
+                   filled ? COL_SEC_BTN_BG : COL_BG_SUBTLE, COL_SEC_BTN_HV,
+                   filled && online(at) ? COL_TEXT_PRIMARY : COL_TEXT_MUTED,
+                   8.0f, [this, e = sl.edge]() {
+                       AppSettings ns = identity_.settings();
+                       glidePlace(ns, e, glidePickedDesk_);   // nothing picked: clears the slot
+                       glidePickedDesk_ = 0;
+                       identity_.updateSettings(ns);
+                   }, ui::FontRole::Small, true, glidePickedDesk_ ? COL_PRIMARY_ACCENT : COL_BORDER);
+    }
+
+    // Right: the paired PCs
+    const float rowH = 38.0f;
+    UiRect list = { dia.right + 14.0f, cy, crx, cy + std::max(diaH, 46.0f + rowH * static_cast<float>(hosts.size()) + 8.0f) };
+    fillRoundRect(list, 12.0f, COL_BG_SUBTLE);
+    strokeRoundRect(list, 12.0f, COL_BORDER);
+    drawText("Pick a PC, then click an edge.", { list.left + 16.0f, list.top + 12.0f, list.right - 16.0f, list.top + 30.0f },
+             ui::FontRole::Small, COL_TEXT_ACCENT);
+    float ry = list.top + 40.0f;
+    for (const auto& h : hosts) {
+        const bool picked = h.deskId == glidePickedDesk_;
+        drawButton("glide_pc_" + std::to_string(h.deskId), { list.left + 12.0f, ry, list.right - 12.0f, ry + rowH - 6.0f }, h.hostname,
+                   picked ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG, picked ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                   picked ? COL_TEXT_ON_ACCENT : (online(h.deskId) ? COL_TEXT_PRIMARY : COL_TEXT_MUTED),
+                   8.0f, [this, id = h.deskId]() { glidePickedDesk_ = (glidePickedDesk_ == id) ? 0 : id; },
+                   ui::FontRole::Small, !picked, COL_BORDER);
+        ry += rowH;
+    }
+    cy = list.bottom + 14.0f;
+}
+
 void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
     if (alpha <= 0.01f) return;
 
@@ -2617,6 +2707,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         { SettingsSection::CurtainPrivacy, "sett_sec_priv",   "Curtain & Privacy" },
         { SettingsSection::SystemService,  "sett_sec_svc",    "System & Service" },
         { SettingsSection::About,          "sett_sec_about",  "About & Data" },
+        { SettingsSection::Glide,          "sett_sec_glide",  "Glide" },
     };
 
     for (const auto& item : navItems) {
@@ -2665,6 +2756,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         case SettingsSection::CurtainPrivacy: sectionContentH = 270.0f; break;
         case SettingsSection::SystemService:  sectionContentH = 360.0f; break;
         case SettingsSection::About:          sectionContentH = 350.0f; break;
+        case SettingsSection::Glide:          sectionContentH = 330.0f + 38.0f * identity_.pairedHosts().size(); break;
     }
 
     float availContentH = navCard.height();
@@ -3973,6 +4065,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ON_ACCENT);
 
         cy = maintBox.bottom + 12.0f;
+    }
+    else if (settingsSection_ == SettingsSection::Glide) {
+        drawGlideSettings(cx, crx, cy);
     }
 
     // Clamp hit-test regions inside contentPane viewport
@@ -10221,7 +10316,7 @@ void AppUi::ensureAppIconImage() {
 std::vector<std::string> AppUi::snapshotStateNames() {
     return { "dashboard_light", "dashboard_dark", "theme_mid_blend", "settings_appearance", "settings_display",
              "settings_audio", "settings_permissions", "settings_2fa", "settings_network", "settings_privacy",
-             "settings_system", "settings_about", "session_view", "session_tabs_3", "drawer_file_transfer",
+             "settings_system", "settings_about", "settings_glide", "session_view", "session_tabs_3", "drawer_file_transfer",
              "drawer_file_manager", "drawer_sync", "chat_long_text", "modal_approval", "modal_totp", "modal_run_task",
              "modal_address_book", "modal_recording_player", "modal_omnibar", "toast", "tooltip",
              "modal_pair_offer", "settings_permissions_paired", "fleet_picker", "fleet_grid",
@@ -10265,7 +10360,7 @@ void AppUi::applySnapshotState(const std::string& name) {
         { "settings_audio", SettingsSection::AudioVoice }, { "settings_permissions", SettingsSection::Permissions },
         { "settings_2fa", SettingsSection::TwoFactorAuth }, { "settings_network", SettingsSection::NetworkRelay },
         { "settings_privacy", SettingsSection::CurtainPrivacy }, { "settings_system", SettingsSection::SystemService },
-        { "settings_about", SettingsSection::About },
+        { "settings_about", SettingsSection::About }, { "settings_glide", SettingsSection::Glide },
     };
 
     // Pairing states seed these two peers; clear them so no other state shows them
