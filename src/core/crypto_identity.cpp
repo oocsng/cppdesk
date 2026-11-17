@@ -1017,6 +1017,37 @@ EcdhKeyExchange::~EcdhKeyExchange() {
     reset();
 }
 
+PairingKey::~PairingKey() {
+    CryptoUtils::secureZero(keyPair_.data(), keyPair_.size());
+}
+
+std::array<uint8_t, 32> CryptoUtils::pairingTranscript(
+    char role,
+    uint64_t hostId,
+    uint64_t viewerId,
+    const std::array<uint8_t, 32>& nonce,
+    const std::vector<uint8_t>& hostEcdhPub,
+    const std::vector<uint8_t>& viewerEcdhPub)
+{
+    std::vector<uint8_t> buf;
+    auto putU = [&buf](uint64_t v, int bytes) {
+        for (int i = 0; i < bytes; ++i) buf.push_back(static_cast<uint8_t>(v >> (8 * i)));
+    };
+    auto putLenAndBytes = [&](const std::vector<uint8_t>& b) {
+        putU(b.size(), 2);
+        buf.insert(buf.end(), b.begin(), b.end());
+    };
+    static const char kLabel[] = "CPPDESK-PAIR-V1";
+    buf.insert(buf.end(), kLabel, kLabel + sizeof(kLabel) - 1);
+    buf.push_back(static_cast<uint8_t>(role));
+    putU(hostId, 8);
+    putU(viewerId, 8);
+    buf.insert(buf.end(), nonce.begin(), nonce.end());
+    putLenAndBytes(hostEcdhPub);
+    putLenAndBytes(viewerEcdhPub);
+    return sha256(buf.data(), buf.size());
+}
+
 #if defined(_WIN32)
 bool EcdhKeyExchange::initialize() {
     reset();
@@ -1155,6 +1186,86 @@ void EcdhKeyExchange::reset() {
     CryptoUtils::secureZero(localPubBlob_.data(), localPubBlob_.size());
     localPubBlob_.clear();
     initialized_ = false;
+}
+
+// ---------------- PairingKey (Windows CNG) ----------------
+
+namespace {
+// An ECDSA P-256 key handle from X || Y (public) or X || Y || d (private); null if CNG rejects it.
+BCRYPT_KEY_HANDLE importEcdsaKey(BCRYPT_ALG_HANDLE hAlg, const uint8_t* keyBytes, bool priv) {
+    const size_t bodyLen = priv ? 96 : 64;
+    std::array<uint8_t, sizeof(BCRYPT_ECCKEY_BLOB) + 96> blob{};
+    BCRYPT_ECCKEY_BLOB header{priv ? BCRYPT_ECDSA_PRIVATE_P256_MAGIC : BCRYPT_ECDSA_PUBLIC_P256_MAGIC, 32};
+    std::memcpy(blob.data(), &header, sizeof(header));
+    std::memcpy(blob.data() + sizeof(header), keyBytes, bodyLen);
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+    NTSTATUS status = BCryptImportKeyPair(hAlg, nullptr, priv ? BCRYPT_ECCPRIVATE_BLOB : BCRYPT_ECCPUBLIC_BLOB, &hKey,
+                                          blob.data(), static_cast<ULONG>(sizeof(header) + bodyLen), 0);
+    CryptoUtils::secureZero(blob.data(), blob.size());
+    return status >= 0 ? hKey : nullptr;
+}
+}
+
+bool PairingKey::generate() {
+    std::array<uint8_t, sizeof(BCRYPT_ECCKEY_BLOB) + 96> blob{};
+    ULONG blobLen = 0;
+    bool ok = false;
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_ECDSA_P256_ALGORITHM, nullptr, 0) >= 0) {
+        BCRYPT_KEY_HANDLE hKey = nullptr;
+        ok = BCryptGenerateKeyPair(hAlg, &hKey, 256, 0) >= 0 && BCryptFinalizeKeyPair(hKey, 0) >= 0 &&
+             BCryptExportKey(hKey, nullptr, BCRYPT_ECCPRIVATE_BLOB, blob.data(), static_cast<ULONG>(blob.size()),
+                             &blobLen, 0) >= 0 && blobLen == blob.size();
+        if (hKey) BCryptDestroyKey(hKey);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+    }
+    KeyPair kp{};
+    if (ok) std::memcpy(kp.data(), blob.data() + sizeof(BCRYPT_ECCKEY_BLOB), kp.size());
+    CryptoUtils::secureZero(blob.data(), blob.size());
+    ok = ok && importKeyPair(kp);
+    CryptoUtils::secureZero(kp.data(), kp.size());
+    return ok;
+}
+
+bool PairingKey::importKeyPair(const KeyPair& kp) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_ECDSA_P256_ALGORITHM, nullptr, 0) < 0) return false;
+    BCRYPT_KEY_HANDLE hKey = importEcdsaKey(hAlg, kp.data(), true);
+    if (hKey) BCryptDestroyKey(hKey);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (!hKey) return false;
+    keyPair_ = kp;
+    std::copy(kp.begin(), kp.begin() + pub_.size(), pub_.begin());
+    valid_ = true;
+    return true;
+}
+
+bool PairingKey::sign(const std::array<uint8_t, 32>& digest, Signature& out) const {
+    if (!valid_) return false;
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_ECDSA_P256_ALGORITHM, nullptr, 0) < 0) return false;
+    bool ok = false;
+    if (BCRYPT_KEY_HANDLE hKey = importEcdsaKey(hAlg, keyPair_.data(), true)) {
+        ULONG len = 0;
+        ok = BCryptSignHash(hKey, nullptr, const_cast<PUCHAR>(digest.data()), static_cast<ULONG>(digest.size()),
+                            out.data(), static_cast<ULONG>(out.size()), &len, 0) >= 0 && len == out.size();
+        BCryptDestroyKey(hKey);
+    }
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return ok;
+}
+
+bool PairingKey::verify(const PublicKey& pub, const std::array<uint8_t, 32>& digest, const Signature& sig) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_ECDSA_P256_ALGORITHM, nullptr, 0) < 0) return false;
+    bool ok = false;
+    if (BCRYPT_KEY_HANDLE hKey = importEcdsaKey(hAlg, pub.data(), false)) {
+        ok = BCryptVerifySignature(hKey, nullptr, const_cast<PUCHAR>(digest.data()), static_cast<ULONG>(digest.size()),
+                                   const_cast<PUCHAR>(sig.data()), static_cast<ULONG>(sig.size()), 0) >= 0;
+        BCryptDestroyKey(hKey);
+    }
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return ok;
 }
 
 // ---------------- AesGcmSessionCipher (Option 1A & 4A) ----------------
@@ -1518,6 +1629,120 @@ void EcdhKeyExchange::reset() {
     }
     initialized_ = false;
     localPubBlob_.clear();
+}
+
+// ---------------- PairingKey (OpenSSL: Linux and other POSIX) ----------------
+
+namespace {
+// A P-256 EVP_PKEY from X || Y, plus the private scalar d when given. Null if OpenSSL rejects it.
+EVP_PKEY* pairingEvpKey(const uint8_t* xy, const uint8_t* d) {
+    uint8_t point[65];
+    point[0] = 0x04;
+    std::memcpy(point + 1, xy, 64);
+    BIGNUM* bn = d ? BN_bin2bn(d, 32, nullptr) : nullptr;
+
+    EVP_PKEY* key = nullptr;
+    OSSL_PARAM_BLD* bld = OSSL_PARAM_BLD_new();
+    OSSL_PARAM* params = nullptr;
+    EVP_PKEY_CTX* ctx = nullptr;
+    bool ok = false;
+    do {
+        if ((d && !bn) || !bld ||
+            OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME, "P-256", 0) != 1 ||
+            OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, point, sizeof(point)) != 1 ||
+            (bn && OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, bn) != 1)) break;
+        params = OSSL_PARAM_BLD_to_param(bld);
+        ctx = EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr);
+        if (!params || !ctx || EVP_PKEY_fromdata_init(ctx) != 1 ||
+            EVP_PKEY_fromdata(ctx, &key, d ? EVP_PKEY_KEYPAIR : EVP_PKEY_PUBLIC_KEY, params) != 1) break;
+        ok = true;
+    } while (false);
+    EVP_PKEY_CTX_free(ctx);
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    BN_clear_free(bn);
+    if (!ok) {
+        EVP_PKEY_free(key);
+        return nullptr;
+    }
+    return key;
+}
+}
+
+bool PairingKey::generate() {
+    EVP_PKEY* key = EVP_EC_gen("P-256");
+    if (!key) return false;
+
+    // Uncompressed point on every OpenSSL 3.x; see EcdhKeyExchange::initialize.
+    unsigned char* encoded = nullptr;
+    const size_t pointLen = EVP_PKEY_get1_encoded_public_key(key, &encoded);
+    BIGNUM* d = nullptr;
+    KeyPair kp{};
+    bool ok = encoded && pointLen == 65 && encoded[0] == 0x04 &&
+              EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_PRIV_KEY, &d) == 1 && d &&
+              BN_bn2binpad(d, kp.data() + 64, 32) == 32;
+    if (ok) std::memcpy(kp.data(), encoded + 1, 64);
+    OPENSSL_free(encoded);
+    BN_clear_free(d);
+    EVP_PKEY_free(key);
+    ok = ok && importKeyPair(kp);
+    CryptoUtils::secureZero(kp.data(), kp.size());
+    return ok;
+}
+
+bool PairingKey::importKeyPair(const KeyPair& kp) {
+    EVP_PKEY* key = pairingEvpKey(kp.data(), kp.data() + 64);
+    if (!key) return false;
+    EVP_PKEY_free(key);
+    keyPair_ = kp;
+    std::copy(kp.begin(), kp.begin() + pub_.size(), pub_.begin());
+    valid_ = true;
+    return true;
+}
+
+bool PairingKey::sign(const std::array<uint8_t, 32>& digest, Signature& out) const {
+    if (!valid_) return false;
+    EVP_PKEY* key = pairingEvpKey(keyPair_.data(), keyPair_.data() + 64);
+    EVP_PKEY_CTX* ctx = key ? EVP_PKEY_CTX_new(key, nullptr) : nullptr;
+    uint8_t der[80]; // an ECDSA P-256 signature is at most 72 bytes of DER
+    size_t derLen = sizeof(der);
+    bool ok = ctx && EVP_PKEY_sign_init(ctx) == 1 && EVP_PKEY_sign(ctx, der, &derLen, digest.data(), digest.size()) == 1;
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(key);
+    if (!ok) return false;
+
+    // DER SEQUENCE { r, s } -> fixed-width r || s
+    const unsigned char* p = der;
+    ECDSA_SIG* es = d2i_ECDSA_SIG(nullptr, &p, static_cast<long>(derLen));
+    const BIGNUM* r = nullptr;
+    const BIGNUM* s = nullptr;
+    if (es) ECDSA_SIG_get0(es, &r, &s);
+    ok = es && BN_bn2binpad(r, out.data(), 32) == 32 && BN_bn2binpad(s, out.data() + 32, 32) == 32;
+    ECDSA_SIG_free(es);
+    return ok;
+}
+
+bool PairingKey::verify(const PublicKey& pub, const std::array<uint8_t, 32>& digest, const Signature& sig) {
+    // r || s -> DER SEQUENCE { r, s }
+    BIGNUM* r = BN_bin2bn(sig.data(), 32, nullptr);
+    BIGNUM* s = BN_bin2bn(sig.data() + 32, 32, nullptr);
+    ECDSA_SIG* es = ECDSA_SIG_new();
+    if (es && r && s && ECDSA_SIG_set0(es, r, s) == 1) r = s = nullptr; // es owns them now
+    BN_free(r);
+    BN_free(s);
+    unsigned char* der = nullptr;
+    const int derLen = es ? i2d_ECDSA_SIG(es, &der) : 0;
+    ECDSA_SIG_free(es);
+
+    EVP_PKEY* key = derLen > 0 ? pairingEvpKey(pub.data(), nullptr) : nullptr;
+    EVP_PKEY_CTX* ctx = key ? EVP_PKEY_CTX_new(key, nullptr) : nullptr;
+    // Reject a point that is not on the curve, as EcdhKeyExchange does for the peer key.
+    const bool ok = ctx && EVP_PKEY_public_check(ctx) == 1 && EVP_PKEY_verify_init(ctx) == 1 &&
+                    EVP_PKEY_verify(ctx, der, static_cast<size_t>(derLen), digest.data(), digest.size()) == 1;
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(key);
+    OPENSSL_free(der);
+    return ok;
 }
 
 // ---------------- AesGcmSessionCipher (OpenSSL: Linux and other POSIX) ----------------

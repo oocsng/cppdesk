@@ -9719,6 +9719,40 @@ void testWaylandShareNoticeUi() {
     std::filesystem::remove(id.configFilePath(), ec);
 }
 
+void testPairingKeyCrypto() {
+    std::cout << "[TEST 106] Pairing key: ECDSA P-256 sign/verify, key round trip, RFC 6979 vector, handshake transcript..." << std::endl;
+    PairingKey a; TEST_ASSERT(a.generate()); TEST_ASSERT(a.isValid());
+    auto d = CryptoUtils::sha256(std::string("hello"));
+    PairingKey::Signature sig{}; TEST_ASSERT(a.sign(d, sig));
+    TEST_ASSERT(PairingKey::verify(a.publicKey(), d, sig));
+    auto d2 = d; d2[0] ^= 1; TEST_ASSERT(!PairingKey::verify(a.publicKey(), d2, sig));
+    auto bad = sig; bad[10] ^= 1; TEST_ASSERT(!PairingKey::verify(a.publicKey(), d, bad));
+    PairingKey b; TEST_ASSERT(b.generate()); TEST_ASSERT(!PairingKey::verify(b.publicKey(), d, sig));
+    PairingKey c; TEST_ASSERT(c.importKeyPair(a.exportKeyPair()));
+    TEST_ASSERT(c.publicKey() == a.publicKey());
+    TEST_ASSERT(c.sign(d, sig) && PairingKey::verify(a.publicKey(), d, sig));
+
+    // Known answer, RFC 6979 A.2.5 (P-256, SHA-256, message "sample"): pins the r||s and X||Y wire format on every platform.
+    PairingKey::PublicKey rfcPub{};
+    PairingKey::Signature rfcSig{};
+    auto ux = CryptoUtils::fromHex("60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6");
+    auto uy = CryptoUtils::fromHex("7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299");
+    auto rr = CryptoUtils::fromHex("EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716");
+    auto ss = CryptoUtils::fromHex("F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8");
+    std::copy(ux.begin(), ux.end(), rfcPub.begin());
+    std::copy(uy.begin(), uy.end(), rfcPub.begin() + 32);
+    std::copy(rr.begin(), rr.end(), rfcSig.begin());
+    std::copy(ss.begin(), ss.end(), rfcSig.begin() + 32);
+    TEST_ASSERT(PairingKey::verify(rfcPub, CryptoUtils::sha256(std::string("sample")), rfcSig));
+
+    // Transcript: role and every field change the digest
+    std::array<uint8_t,32> n{}; std::vector<uint8_t> hp(65, 1), vp(65, 2);
+    auto t = CryptoUtils::pairingTranscript('H', 1, 2, n, hp, vp);
+    TEST_ASSERT(t != CryptoUtils::pairingTranscript('V', 1, 2, n, hp, vp));
+    TEST_ASSERT(t != CryptoUtils::pairingTranscript('H', 1, 3, n, hp, vp));
+    TEST_ASSERT(t != CryptoUtils::pairingTranscript('H', 1, 2, n, vp, hp));
+}
+
 void testEcdhKnownVector() {
     std::cout << "[TEST 88] ECDH fixed vector: both sides agree and the session key bytes are pinned..." << std::endl;
     auto hex = [](const std::string& h) {
@@ -11657,6 +11691,7 @@ int main(int argc, char** argv) {
 #endif
         testMuteStateAndHostMicSign(); std::cout << "Test 101 done\n" << std::flush;
         testClipboardFileNamesOnTheWire(); std::cout << "Test 104 done\n" << std::flush;
+        testPairingKeyCrypto(); std::cout << "Test 106 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;

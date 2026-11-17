@@ -124,6 +124,16 @@ public:
         const std::array<uint8_t, 32>& sessionKey,
         const std::array<uint8_t, 32>& digest);
 
+    // Digest a pairing signature covers: SHA-256 of "CPPDESK-PAIR-V1" | role ('H' host, 'V' viewer) | hostId u64 LE |
+    // viewerId u64 LE | nonce | u16 LE len + hostEcdhPub | u16 LE len + viewerEcdhPub.
+    static std::array<uint8_t, 32> pairingTranscript(
+        char role,
+        uint64_t hostId,
+        uint64_t viewerId,
+        const std::array<uint8_t, 32>& nonce,
+        const std::vector<uint8_t>& hostEcdhPub,
+        const std::vector<uint8_t>& viewerEcdhPub);
+
     // Derive a 256-bit session key from handshake parameters (supports ECDH shared secret)
     static std::array<uint8_t, 32> deriveSessionKey(
         uint64_t hostId,
@@ -207,6 +217,35 @@ private:
     uintptr_t            hAlg_ = 0;
     uintptr_t            hKey_ = 0;
     std::vector<uint8_t> localPubBlob_;
+};
+
+// ---------------- PairingKey ----------------
+// A per-install ECDSA P-256 signing key. All byte strings are big-endian; signatures are raw r || s (not DER).
+class PairingKey {
+public:
+    using PublicKey = std::array<uint8_t, 64>;  // X || Y
+    using KeyPair   = std::array<uint8_t, 96>;  // X || Y || d
+    using Signature = std::array<uint8_t, 64>;  // r || s
+
+    PairingKey() = default;
+    ~PairingKey();
+
+    PairingKey(const PairingKey&) = delete;
+    PairingKey& operator=(const PairingKey&) = delete;
+
+    bool generate();
+    bool importKeyPair(const KeyPair& kp);
+    KeyPair exportKeyPair() const { return keyPair_; }
+    const PublicKey& publicKey() const { return pub_; }
+    bool isValid() const { return valid_; }
+
+    bool sign(const std::array<uint8_t, 32>& digest, Signature& out) const;
+    static bool verify(const PublicKey& pub, const std::array<uint8_t, 32>& digest, const Signature& sig);
+
+private:
+    bool      valid_ = false;
+    KeyPair   keyPair_{};
+    PublicKey pub_{};
 };
 
 // ---------------- AesGcmSessionCipher (Option 1A & 4A) ----------------
