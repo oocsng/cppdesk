@@ -658,7 +658,8 @@ private:
     uint64_t                glidePickedDesk_ = 0;      // paired PC picked in Settings > Glide, waiting for an edge click
     // Glide: the paired PC whose session tab this window shows full screen after a push off a screen edge.
     struct GlideState { uint64_t deskId = 0; GlideEdge edge = GlideEdge::None; uint32_t tabId = 0;
-                        bool inside = false; uint64_t homeSinceMs = 0; ui::WindowPresence prevPresence{}; float along = 0.5f; };
+                        bool inside = false; uint64_t homeSinceMs = 0; ui::WindowPresence prevPresence{}; float along = 0.5f;
+                        bool seenShown = false; };   // the shell has reported the glide window shown at least once
     std::optional<GlideState> glide_;
     GlideDwell              glideDwell_;
     GlideHome               glideHome_;

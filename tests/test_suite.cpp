@@ -11038,13 +11038,35 @@ void testGlideHome() {
             for (uint64_t ms = 6600; ms <= 6900; ms += 50) tick(*r, ms);
             TEST_ASSERT(atHome(*r, backRight));
 
-            // Idle: home at T, the tab lives until T+60 s.
+            // Hidden mid-glide (tray, Win+D): home, modifiers released, and the window stays hidden.
             push(*r, right, 7000);
+            TEST_ASSERT(r->app->isGlidingForTest() && r->shell.fullscreen && frontTab(*r).id == tabP);
+            tick(*r, 7305);   // the window is seen shown
+            { std::lock_guard<std::mutex> lk(m); keys.clear(); }
+            r->shell.presence = ui::WindowPresence::Hidden;
+            tick(*r, 7310);
+            TEST_ASSERT(!r->app->isGlidingForTest() && !r->shell.fullscreen && r->shell.presence == ui::WindowPresence::Hidden);
+            TEST_ASSERT(tabs(*r) == 1 && waitFor(releasedAll, 2000));
+            // Minimised mid-glide; a minimised state the shell reports late, before the window was ever seen shown, is ignored.
+            push(*r, right, 7400);
+            TEST_ASSERT(r->app->isGlidingForTest() && r->shell.presence == ui::WindowPresence::Shown);
+            r->shell.presence = ui::WindowPresence::Minimized;
+            tick(*r, 7710);
+            TEST_ASSERT(r->app->isGlidingForTest());
+            r->shell.presence = ui::WindowPresence::Shown;
+            tick(*r, 7720);
+            r->shell.presence = ui::WindowPresence::Minimized;
+            tick(*r, 7730);
+            TEST_ASSERT(!r->app->isGlidingForTest() && !r->shell.fullscreen && r->shell.presence == ui::WindowPresence::Minimized);
+            TEST_ASSERT(tabs(*r) == 1 && frontTab(*r).id == tabP);
+
+            // Idle: home at T, the tab lives until T+60 s.
+            push(*r, right, 8000);
             TEST_ASSERT(r->app->isGlidingForTest() && tabs(*r) == 1 && frontTab(*r).id == tabP);
-            f11(*r);   // T = 7300
-            tick(*r, 7300 + 59999);
+            f11(*r);   // T = 8300
+            tick(*r, 8300 + 59999);
             TEST_ASSERT(tabs(*r) == 1);
-            tick(*r, 7300 + 60000);
+            tick(*r, 8300 + 60000);
             TEST_ASSERT(tabs(*r) == 0);
             TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active; }, 4000));
 

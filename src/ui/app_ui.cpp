@@ -9732,6 +9732,15 @@ void AppUi::glideTick(uint64_t nowMs, const ViewerSessionStats& viewer, bool hos
             if (tab) closeSessionTab(glide_->tabId);   // no live session left to release modifiers on
             glideHomeNow(nowMs, toast);
             glide_.reset();
+            return;
+        }
+        // Minimised or hidden (tray, Win+D) mid-glide: go home and leave the window as the user put it. Only once the
+        // window has been seen shown, since a shell may report the restore after glideOut late.
+        const ui::WindowPresence presence = shell_->windowPresence();
+        if (presence == ui::WindowPresence::Shown) glide_->seenShown = true;
+        if (presence != ui::WindowPresence::Shown && glide_->seenShown) {
+            glide_->prevPresence = presence;
+            glideHomeNow(nowMs);
         } else if (glideHome_.update(ui::Rect{0.0f, 0.0f, frameWidth_, frameHeight_}, ui::Point{mouseX_, mouseY_}, nowMs)) {
             glideHomeNow(nowMs);
         }
