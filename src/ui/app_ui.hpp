@@ -276,6 +276,7 @@ private:
     void drawShortcutsModal(float width, float height, float modalProgress);
     void drawPortForwardModal(float width, float height, float modalProgress);
     void drawAddressBookModal(float width, float height, float modalProgress);
+    void drawPairOfferModal(float width, float height, float modalProgress);
     void drawWhiteboardOverlay(const UiRect& canvasRect);
     void drawPerformanceHud(const UiRect& stageRect, float alpha);
     void drawUpdateRequiredModal(float width, float height, float modalProgress);
@@ -619,6 +620,14 @@ private:
     std::string             editAliasInput_;
     std::string             editTagInput_;
     std::string             editNotesInput_;
+
+    // Pairing offer: asked once per connection (pairOfferShown_), "Not now" closes it until the next connection
+    bool                    showPairOfferModal_ = false;
+    float                   pairOfferModalAnimT_ = 0.0f;
+    float                   pairOfferModalAnimVel_ = 0.0f;
+    bool                    pairOfferShown_ = false;
+    std::string             pairOfferName_;
+    PairingRequestState     prevPairingState_ = PairingRequestState::Idle;
 
     // Whiteboard & Screen Annotation UI state (v2.1.0)
     bool                    whiteboardActive_ = false;

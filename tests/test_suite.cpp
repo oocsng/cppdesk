@@ -9315,6 +9315,39 @@ void testAppUiRendersEveryScreenHeadless() {
     TEST_ASSERT(approval.find("|Connection Request") != std::string::npos);
     std::string dash = renderAppState(id, net, shell, "dashboard_light");
     TEST_ASSERT(dash.find("|" + CryptoUtils::formatDeskId(id.deskId())) != std::string::npos);
+
+    // Pairing UI: the offer modal, the setting, and the two lists with their Forget buttons.
+    TEST_ASSERT(std::find(names.begin(), names.end(), "modal_pair_offer") != names.end());
+    TEST_ASSERT(std::find(names.begin(), names.end(), "settings_permissions_paired") != names.end());
+    std::string offer = renderAppState(id, net, shell, "modal_pair_offer");
+    TEST_ASSERT(offer.find("|Pair with this PC?") != std::string::npos);
+    TEST_ASSERT(offer.find("|Not now") != std::string::npos);
+    TEST_ASSERT(offer.find("|Pair\n") != std::string::npos);
+    std::string paired = renderAppState(id, net, shell, "settings_permissions_paired");
+    TEST_ASSERT(paired.find("|Allow pairing") != std::string::npos);
+    TEST_ASSERT(paired.find("|PAIRED PCS") != std::string::npos);
+    TEST_ASSERT(paired.find("|PCS THIS ONE CAN ENTER") != std::string::npos);
+    TEST_ASSERT(paired.find("|Forget") != std::string::npos);
+    TEST_ASSERT(paired.find("|Office \xC2\xB7 555 000 111 \xC2\xB7 paired 2023-11-14") != std::string::npos);
+    TEST_ASSERT(paired.find("None yet") == std::string::npos);
+    // The seeded peers never leak into another state, and the lists are empty by default.
+    std::string plain = renderAppState(id, net, shell, "settings_permissions");
+    TEST_ASSERT(plain.find("|Forget") == std::string::npos);
+    TEST_ASSERT(plain.find("|None yet") != std::string::npos);
+
+    // A desk this PC is paired with gets the Paired chip in the recent list.
+    TEST_ASSERT(renderAppState(id, net, shell, "dashboard_light").find("|Paired") == std::string::npos);
+    PairedPeer host;
+    host.deskId = 123123123;
+    host.hostname = "Lab";
+    host.pairedAtUnix = 1700000000;
+    id.addOrUpdateRecentSession(host.deskId, host.hostname, "10.0.0.9:7878");
+    id.addPairedHost(host);
+    TEST_ASSERT(renderAppState(id, net, shell, "dashboard_light").find("|Paired") != std::string::npos);
+    id.removePairedHost(host.deskId);
+    id.removeRecentSession(host.deskId);
+    TEST_ASSERT(renderAppState(id, net, shell, "dashboard_light").find("|Paired") == std::string::npos);
+
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
 }

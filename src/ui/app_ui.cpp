@@ -222,6 +222,9 @@ bool AppUi::stepAnimations(float dt) {
     float targetABModal = showAddressBookEditModal_ ? 1.0f : 0.0f;
     if (stepSpring(addressBookModalAnimT_, addressBookModalAnimVel_, targetABModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
+    float targetPairOfferModal = showPairOfferModal_ ? 1.0f : 0.0f;
+    if (stepSpring(pairOfferModalAnimT_, pairOfferModalAnimVel_, targetPairOfferModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
+
     // 11. Mandatory Update Modal Spring (v3.0.0)
     float targetUpdateModal = showUpdateRequiredModal_ ? 1.0f : 0.0f;
     if (stepSpring(updateModalAnimT_, updateModalAnimVel_, targetUpdateModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
@@ -812,6 +815,10 @@ void AppUi::drawFrame(float width, float height) {
     // Address Book Edit Sheet Modal
     if (addressBookModalAnimT_ > 0.004f) {
         drawAddressBookModal(width, height, addressBookModalAnimT_);
+    }
+
+    if (pairOfferModalAnimT_ > 0.004f) {
+        drawPairOfferModal(width, height, pairOfferModalAnimT_);
     }
 
     // Mandatory Update Required Modal (v3.0.0)
@@ -1495,6 +1502,7 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
         float gap = 14.0f;
         float cardW = (prx - px - gap) / 2.0f;
         float cardH = 96.0f;
+        const auto pairedHostsNow = identity_.pairedHosts();
 
         for (size_t i = 0; i < cardItems.size(); ++i) {
             int row = static_cast<int>(i) / cols;
@@ -1520,17 +1528,29 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
                               0.5f, rgba(255, 255, 255, 0.28f * cardHover));
             }
 
+            float badgeEnd;
             if (cardItems[i].isLive) {
                 drawPulseDot(cardR.left + 19.0f, cardR.top + 18.0f, 3.4f, COL_SUCCESS, alpha);
                 std::string badge = cardItems[i].isFavorite ? "FAVORITE • ONLINE" : "ONLINE";
                 if (!cardItems[i].tag.empty()) badge += " • [" + cardItems[i].tag + "]";
                 drawText(badge, { cardR.left + 28.0f, cardR.top + 10.0f, cardR.right - 92.0f, cardR.top + 26.0f },
                          ui::FontRole::Small, cardItems[i].isFavorite ? COL_PRIMARY_ACCENT : COL_TEXT_SECONDARY);
+                badgeEnd = cardR.left + 28.0f + canvas_->measureTextBlock(badge, ui::FontRole::Small, cardW).x;
             } else {
                 std::string badge = cardItems[i].isFavorite ? "FAVORITE" : "RECENT";
                 if (!cardItems[i].tag.empty()) badge += " • [" + cardItems[i].tag + "]";
                 drawText(badge, { cardR.left + 14.0f, cardR.top + 10.0f, cardR.right - 92.0f, cardR.top + 26.0f },
                          ui::FontRole::Small, cardItems[i].isFavorite ? COL_PRIMARY_ACCENT : COL_TEXT_MUTED);
+                badgeEnd = cardR.left + 14.0f + canvas_->measureTextBlock(badge, ui::FontRole::Small, cardW).x;
+            }
+
+            // Pairing chip: this PC may enter that desk without a password
+            if (std::any_of(pairedHostsNow.begin(), pairedHostsNow.end(),
+                            [&](const PairedPeer& p) { return p.deskId == cardItems[i].deskId; }) &&
+                badgeEnd + 8.0f + 48.0f <= cardR.right - 124.0f) {
+                UiRect chip = { badgeEnd + 8.0f, cardR.top + 10.0f, badgeEnd + 56.0f, cardR.top + 26.0f };
+                fillRoundRect(chip, 8.0f, withAlpha(COL_PRIMARY_ACCENT, 0.14f));
+                drawText("Paired", chip, ui::FontRole::Small, COL_TEXT_ACCENT, ui::HAlign::Center, ui::VAlign::Center);
             }
 
             uint64_t peerId = cardItems[i].deskId;
@@ -2599,11 +2619,17 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
 
     // Right content pane calculation
     float sectionContentH = 340.0f;
+    std::vector<PairedPeer> pairedViewers, pairedHosts;   // copies; the lists can change under us
+    if (settingsSection_ == SettingsSection::Permissions) {
+        pairedViewers = identity_.pairedViewers();
+        pairedHosts = identity_.pairedHosts();
+    }
     switch (settingsSection_) {
         case SettingsSection::Appearance:     sectionContentH = 290.0f; break;
         case SettingsSection::DisplayQuality: sectionContentH = 550.0f; break;
         case SettingsSection::AudioVoice:     sectionContentH = 380.0f; break;
-        case SettingsSection::Permissions:    sectionContentH = 280.0f; break;
+        // 280 + the Allow pairing row (28) + two list boxes (46 + 28 per row, one row when empty)
+        case SettingsSection::Permissions:    sectionContentH = 308.0f + 92.0f + 28.0f * (std::max<size_t>(1, pairedViewers.size()) + std::max<size_t>(1, pairedHosts.size())); break;
         case SettingsSection::TwoFactorAuth:  sectionContentH = 360.0f; break;
         case SettingsSection::NetworkRelay:   sectionContentH = 320.0f; break;
         case SettingsSection::CurtainPrivacy: sectionContentH = 270.0f; break;
@@ -3116,7 +3142,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
-        UiRect permBox = { cx, cy, crx, cy + 172.0f };
+        UiRect permBox = { cx, cy, crx, cy + 200.0f };
         fillRoundRect(permBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(permBox, 12.0f, COL_BORDER);
 
@@ -3167,8 +3193,54 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                              ns.lockWorkstationOnDisconnect = !ns.lockWorkstationOnDisconnect;
                              identity_.updateSettings(ns);
                          }, "Immediately lock the host Windows desktop session upon client disconnection.");
+        py += 28.0f;
+
+        drawToggleSwitch("sett_allow_pairing", { permBox.left + 16.0f, py, permBox.right - 16.0f, py + 24.0f },
+                         s.allowPairing, "Allow pairing", [this]() {
+                             AppSettings ns = identity_.settings();
+                             ns.allowPairing = !ns.allowPairing;
+                             identity_.updateSettings(ns);
+                         }, "Let PCs that have logged in once come back without a password. Off by default.");
 
         cy = permBox.bottom + 12.0f;
+
+        auto drawPairedList = [&](const char* heading, const std::vector<PairedPeer>& peers, bool viewers) {
+            UiRect box = { cx, cy, crx, cy + 34.0f + 28.0f * static_cast<float>(std::max<size_t>(1, peers.size())) };
+            fillRoundRect(box, 12.0f, COL_BG_SUBTLE);
+            strokeRoundRect(box, 12.0f, COL_BORDER);
+            drawText(heading, { box.left + 16.0f, box.top + 8.0f, box.right - 16.0f, box.top + 22.0f },
+                     ui::FontRole::Small, COL_TEXT_ACCENT);
+            float ry = box.top + 26.0f;
+            if (peers.empty()) {
+                drawText("None yet", { box.left + 16.0f, ry, box.right - 16.0f, ry + 28.0f },
+                         ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Leading, ui::VAlign::Center);
+            }
+            for (const auto& p : peers) {
+                std::time_t when = static_cast<std::time_t>(p.pairedAtUnix);
+                std::tm tmUtc{};
+#ifdef _WIN32
+                gmtime_s(&tmUtc, &when);
+#else
+                gmtime_r(&when, &tmUtc);
+#endif
+                char date[16];
+                std::strftime(date, sizeof(date), "%Y-%m-%d", &tmUtc);
+                drawText(p.hostname + " \xC2\xB7 " + CryptoUtils::formatDeskId(p.deskId) + " \xC2\xB7 paired " + date,
+                         { box.left + 16.0f, ry, box.right - 96.0f, ry + 28.0f },
+                         ui::FontRole::Small, COL_TEXT_PRIMARY, ui::HAlign::Leading, ui::VAlign::Center);
+                uint64_t deskId = p.deskId;
+                drawButton((viewers ? "forget_viewer_" : "forget_host_") + std::to_string(deskId),
+                           { box.right - 80.0f, ry + 3.0f, box.right - 16.0f, ry + 25.0f }, "Forget",
+                           COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this, deskId, viewers]() {
+                               if (viewers) identity_.removePairedViewer(deskId);
+                               else identity_.removePairedHost(deskId);
+                           }, ui::FontRole::Small, true, COL_BORDER);
+                ry += 28.0f;
+            }
+            cy = box.bottom + 12.0f;
+        };
+        drawPairedList("PAIRED PCS", pairedViewers, true);
+        drawPairedList("PCS THIS ONE CAN ENTER", pairedHosts, false);
     }
     else if (settingsSection_ == SettingsSection::TwoFactorAuth) {
         drawText("Two-Factor Authentication", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
@@ -6112,6 +6184,54 @@ void AppUi::drawAddressBookModal(float width, float height, float modalProgress)
     canvas_->setTransform(ui::Transform2D::identity());
 }
 
+void AppUi::drawPairOfferModal(float width, float height, float modalProgress) {
+    if (!showPairOfferModal_ && modalProgress <= 0.01f) return;
+
+    float alpha = std::clamp(modalProgress, 0.0f, 1.0f);
+    fillRoundRect({ 0.0f, 0.0f, width, height }, 0.0f, rgba(28, 24, 20, 0.52f * alpha));
+
+    // The scrim swallows clicks but does not dismiss: closing is an explicit "Not now"
+    clickRegions_.push_back({ { 0.0f, 0.0f, width, height }, "modal_pair_scrim", []() {}, false });
+
+    float mw = 440.0f;
+    float mh = 190.0f;
+    UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
+
+    clickRegions_.push_back({ modal, "modal_pair_absorb", []() {}, false });
+
+    float scale = 0.90f + 0.10f * modalProgress;
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, modal.centerX(), modal.centerY()));
+
+    drawCardSurface(modal, 20.0f, alpha);
+
+    float mx = modal.left + 28.0f;
+    float mrx = modal.right - 28.0f;
+    float my = modal.top + 22.0f;
+
+    drawText("Pair with this PC?", { mx, my, mrx, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    my += 38.0f;
+
+    drawText("Next time you connect to " + pairOfferName_ + ", you'll go straight in, with no password.",
+             { mx, my, mrx, my + 48.0f }, ui::FontRole::Body, COL_TEXT_SECONDARY);
+    my += 66.0f;
+
+    float btnW = (mrx - mx - 12.0f) * 0.5f;
+    UiRect notNowBtn = { mx, my, mx + btnW, my + 36.0f };
+    drawButton("pair_not_now", notNowBtn, "Not now",
+               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
+                   showPairOfferModal_ = false;
+               }, ui::FontRole::Small, true, COL_BORDER);
+
+    UiRect pairBtn = { notNowBtn.right + 12.0f, my, mrx, my + 36.0f };
+    drawButton("pair_yes", pairBtn, "Pair",
+               COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
+                   network_.requestPairing();
+                   showPairOfferModal_ = false;
+               }, ui::FontRole::Small);
+
+    canvas_->setTransform(ui::Transform2D::identity());
+}
+
 void AppUi::navigateFilePane(int pane, const std::string& path) {
     if (pane == 0) {
         std::vector<FileBrowserItemEntry> entries;
@@ -7754,7 +7874,8 @@ void AppUi::drawAudioVolumePopup(float anchorX, float anchorY) {
 
 bool AppUi::anyModalActive() const {
     return modalAnimT_ > 0.004f || shortcutsModalAnimT_ > 0.004f || portForwardModalAnimT_ > 0.004f ||
-           addressBookModalAnimT_ > 0.004f || totpModalAnimT_ > 0.004f || omnibarModalAnimT_ > 0.004f ||
+           addressBookModalAnimT_ > 0.004f || pairOfferModalAnimT_ > 0.004f ||
+           totpModalAnimT_ > 0.004f || omnibarModalAnimT_ > 0.004f ||
            recordingPlayerModalAnimT_ > 0.004f || updateModalAnimT_ > 0.004f ||
            rebootModalAnimT_ > 0.004f || hwAccelModalAnimT_ > 0.004f || showPeerMismatchModal_ ||
            runTaskModalAnimT_ > 0.004f || fileBrowserModalAnimT_ > 0.004f ||
@@ -8463,6 +8584,11 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
             }
             if (showAddressBookEditModal_) {
                 showAddressBookEditModal_ = false;
+                shell_->invalidate();
+                return;
+            }
+            if (showPairOfferModal_) {
+                showPairOfferModal_ = false;
                 shell_->invalidate();
                 return;
             }
@@ -9379,8 +9505,32 @@ void AppUi::onTick() {
     }
     prevViewerState_ = vStats.state;
 
+    // Pairing: offer it once per connection, then report the host's answer
+    if (vStats.state != ViewerConnectionState::Connected) {
+        if (pairOfferShown_) {
+            pairOfferShown_ = false;
+            showPairOfferModal_ = false;
+        }
+    } else if (vStats.offerPairing && !pairOfferShown_) {
+        pairOfferShown_ = showPairOfferModal_ = true;
+        pairOfferName_ = vStats.remoteHostname.empty() ? CryptoUtils::formatDeskId(vStats.remoteDeskId) : vStats.remoteHostname;
+        shell_->invalidate();
+    }
+    const PairingRequestState pairState = network_.pairingRequestState();
+    if (pairState != prevPairingState_) {
+        if (pairState == PairingRequestState::Paired) showToast("Paired with " + pairOfferName_);
+        else if (pairState == PairingRequestState::Refused) showToast(pairOfferName_ + " didn't allow pairing", true);
+        prevPairingState_ = pairState;
+    }
+
     // Host session disconnect detection
     auto hostStatus = network_.hostSessionStatus();
+    if (hostStatus.active && !prevHostActive_ && hostStatus.paired && notificationMgr_) {
+        std::string caller = hostStatus.viewerHostname.empty() ? "Remote User" : hostStatus.viewerHostname;
+        notificationMgr_->notify(NotificationType::IncomingConnection, "Paired PC connected",
+                                 caller + " (" + CryptoUtils::formatDeskId(hostStatus.viewerDeskId) + ") connected without a password (paired).",
+                                 identity_.settings());
+    }
     if (prevHostActive_ && !hostStatus.active) {
         if (notificationMgr_) {
             std::string cName = prevHostClientName_.empty() ? "Remote Client" : prevHostClientName_;
@@ -9706,6 +9856,7 @@ std::vector<std::string> AppUi::snapshotStateNames() {
              "settings_system", "settings_about", "session_view", "session_tabs_3", "drawer_file_transfer",
              "drawer_file_manager", "drawer_sync", "chat_long_text", "modal_approval", "modal_totp", "modal_run_task",
              "modal_address_book", "modal_recording_player", "modal_omnibar", "toast", "tooltip",
+             "modal_pair_offer", "settings_permissions_paired",
              "dashboard_mac_permissions", "dashboard_mac_restart", "dashboard_wayland_denied", "dashboard_wayland_view_only",
              "dashboard_mic_on" };
 }
@@ -9748,6 +9899,13 @@ void AppUi::applySnapshotState(const std::string& name) {
         { "settings_privacy", SettingsSection::CurtainPrivacy }, { "settings_system", SettingsSection::SystemService },
         { "settings_about", SettingsSection::About },
     };
+
+    // Pairing states seed these two peers; clear them so no other state shows them
+    constexpr uint64_t kSeedViewer = 555000111, kSeedHost = 555000222;
+    identity_.removePairedViewer(kSeedViewer);
+    identity_.removePairedHost(kSeedHost);
+    showPairOfferModal_ = false;
+    pairOfferShown_ = false;
 
     setDark(false);
     network_.injectViewerFrameForTest({}, 0, 0);
@@ -9817,6 +9975,20 @@ void AppUi::applySnapshotState(const std::string& name) {
         showAddressBookEditModal_ = true;
         editingDeskId_ = 111222333;
         editAliasInput_ = "Office Workstation";
+    } else if (name == "modal_pair_offer") {
+        showPairOfferModal_ = true;
+        pairOfferName_ = "Office";
+    } else if (name == "settings_permissions_paired") {
+        activeTab_ = ActiveTab::Settings;
+        settingsSection_ = SettingsSection::Permissions;
+        PairedPeer p;
+        p.hostname = "Office";
+        p.pairedAtUnix = 1700000000;   // 2023-11-14, fixed so the render is stable
+        p.deskId = kSeedViewer;
+        identity_.addPairedViewer(p);
+        p.hostname = "Build Server";
+        p.deskId = kSeedHost;
+        identity_.addPairedHost(p);
     } else if (name == "modal_recording_player") {
         showRecordingPlayer_ = true;
     } else if (name == "modal_omnibar") {
