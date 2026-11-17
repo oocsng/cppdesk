@@ -153,6 +153,7 @@ bool AppUi::stepAnimations(float dt) {
                            (activeTab_ == ActiveTab::RemoteSession) ? 1.0f : 2.0f;
     if (stepSpring(viewportPos_, viewportVel_, targetViewport, 25.0f, 0.82f, dt)) active = true;
     if (stepSpring(tabEnterStaggerT_, tabEnterStaggerVel_, 1.0f, 22.0f, 0.78f, dt)) active = true;
+    if (stepSpring(glideSlideT_, glideSlideVel_, 1.0f, theme::motion::panel.omega, theme::motion::panel.zeta, dt)) active = true;
 
     // 2. Liquid macOS Segmented Control Pill (leading edge moves faster than trailing edge)
     if (navPillInit_) {
@@ -761,9 +762,22 @@ void AppUi::drawFrame(float width, float height) {
     float viewScale = 0.982f + 0.018f * std::clamp(tabEnterStaggerT_, 0.0f, 1.08f);
     float enterAlpha = std::clamp(0.30f + 0.70f * smoothStepEase(tabEnterStaggerT_), 0.0f, 1.0f);
 
-    if (std::fabs(slideX) > 0.15f || std::fabs(viewScale - 1.0f) > 0.001f) {
+    // A glide slides the remote screen in from the edge it was pushed through.
+    float glideX = 0.0f, glideY = 0.0f;
+    if (glide_ && activeTab_ == ActiveTab::RemoteSession) {
+        const float o = 1.0f - glideSlideT_;
+        switch (glide_->edge) {
+            case GlideEdge::Right:  glideX = o * width;   break;
+            case GlideEdge::Left:   glideX = -o * width;  break;
+            case GlideEdge::Bottom: glideY = o * height;  break;
+            case GlideEdge::Top:    glideY = -o * height; break;
+            default: break;
+        }
+    }
+
+    if (std::fabs(slideX) > 0.15f || std::fabs(viewScale - 1.0f) > 0.001f || glideX != 0.0f || glideY != 0.0f) {
         ui::Point center = ui::Point{contentBounds.centerX(), contentBounds.centerY()};
-        canvas_->setTransform(ui::Transform2D::scale(viewScale, viewScale, (center).x, (center).y) * ui::Transform2D::translation(slideX, 0.0f));
+        canvas_->setTransform(ui::Transform2D::scale(viewScale, viewScale, (center).x, (center).y) * ui::Transform2D::translation(slideX + glideX, glideY));
     }
 
     if (activeTab_ == ActiveTab::Dashboard) {
@@ -9243,7 +9257,7 @@ void AppUi::switchToSessionTab(uint32_t tabId, bool force) {
         network_.disconnectViewer();
         hardResetViewerUiState();
         if (!newTab->targetInput.empty()) {
-            network_.connectToRemote(newTab->targetInput, newTab->password);
+            network_.connectToRemote(newTab->targetInput, newTab->password, newTab->requirePairedDeskId);
         }
     }
 
@@ -9694,6 +9708,70 @@ void AppUi::toggleFullscreen() {
     }
 }
 
+void AppUi::glideTick(uint64_t nowMs) {
+    if (glide_ && !sessionTabs_.getTab(glide_->tabId)) glide_.reset();   // its tab was closed
+    if (glide_ && glide_->inside) return;
+    const std::optional<ui::Point> cursor = shell_->cursorScreenPos();
+    const uint32_t glideTab = glide_ ? glide_->tabId : 0;
+    const auto& tabs = sessionTabs_.tabs();
+    const bool otherSession = std::any_of(tabs.begin(), tabs.end(), [&](const SessionTab& t) { return t.id != glideTab; }) ||
+                              (network_.isViewerActive() && !glide_);
+    if (glidePaused(otherSession, fleet_.size() > 0, network_.hostSessionStatus().active, cursor.has_value())) {
+        glideDwell_.reset();
+        return;
+    }
+    const ui::Rect desk = shell_->desktopBounds();
+    GlideEdge edge = GlideEdge::None;
+    // glideEdgeAt has no outer bound: a stale or off-desktop position (beyond 1 px) must never count as an edge.
+    if (cursor->x >= desk.left - 1 && cursor->x <= desk.right && cursor->y >= desk.top - 1 && cursor->y <= desk.bottom)
+        edge = glideEdgeAt(desk, *cursor);
+    if (glidePcAt(identity_.settings(), edge) == 0) edge = GlideEdge::None;
+    if (const GlideEdge fired = glideDwell_.update(edge, nowMs); fired != GlideEdge::None) glideOut(fired, *cursor, nowMs);
+}
+
+void AppUi::glideOut(GlideEdge edge, ui::Point cursor, uint64_t nowMs) {
+    const uint64_t deskId = glidePcAt(identity_.settings(), edge);
+    // Discovery's address is spoofable: only a paired PC seen directly, dialled with its desk ID required.
+    const auto members = FleetManager::eligibleMembers(identity_, network_.discoveredPeers());
+    const auto target = std::find_if(members.begin(), members.end(), [&](const FleetMember& m) { return m.deskId == deskId; });
+    if (target == members.end()) {
+        const auto said = glideOfflineNotifiedMs_.find(deskId);
+        if (said != glideOfflineNotifiedMs_.end() && nowMs - said->second < 60000) return;
+        glideOfflineNotifiedMs_[deskId] = nowMs;
+        const auto host = identity_.findPairedHost(deskId);
+        const std::string name = host ? host->hostname : CryptoUtils::formatDeskId(deskId);
+        if (notificationMgr_) notificationMgr_->notify(NotificationType::GeneralInfo, "Glide", name + " is offline", identity_.settings());
+        return;
+    }
+    if (glide_ && glide_->deskId != deskId) {   // the window holds one connection
+        closeSessionTab(glide_->tabId);
+        glide_.reset();
+    }
+
+    const ui::WindowPresence prevPresence = shell_->windowPresence();
+    shell_->setWindowPresence(ui::WindowPresence::Shown);
+    // shortcut: the shell cannot say which monitor the window is on, so a windowed window always moves to the cursor's
+    // monitor's top-left (also where it returns to); add a window-monitor query to the shell if that bothers people.
+    if (!isFullscreen_) {   // macOS: a full-screen window must never be moved
+        shell_->moveWindowToMonitorAt(cursor);
+        toggleFullscreen();
+    }
+    shell_->bringToFront();
+    const ui::Rect monitor = shell_->monitorBoundsAt(cursor);
+    shell_->warpCursor(glideEntryPoint(monitor, edge, glideAlong(monitor, edge, cursor)));
+
+    const SessionTab* open = glide_ ? sessionTabs_.getTab(glide_->tabId) : nullptr;
+    const uint32_t tabId = open ? open->id : sessionTabs_.createTab(deskId, target->address, target->name);
+    if (!open) sessionTabs_.getTab(tabId)->requirePairedDeskId = deskId;   // empty password: never a password fallback
+    switchToSessionTab(tabId, true);   // skips the reconnect when still connected to this PC
+
+    glideHome_.arrive(glideOpposite(edge));
+    glideSlideT_ = 0.0f;
+    glideSlideVel_ = 0.0f;
+    glide_ = GlideState{ deskId, edge, tabId, true, 0, prevPresence, glideAlong(shell_->desktopBounds(), edge, cursor) };
+    shell_->invalidate();
+}
+
 void AppUi::applyWindowThemeAttribute() {
     shell_->setDarkTitleBar(identity_.settings().darkTheme);
 }
@@ -10074,6 +10152,8 @@ void AppUi::onTick() {
     if (hasPendingMouseMove_) {
         flushPendingMouseMove();
     }
+
+    glideTick(tickNow);
 
     ++idleTickCounter_;
     bool micMonitoringActive = (activeTab_ == ActiveTab::Settings && settingsSection_ == SettingsSection::AudioVoice && network_.isVoiceMonitoring());

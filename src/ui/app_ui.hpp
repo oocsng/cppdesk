@@ -20,10 +20,12 @@
 #include "notification_manager.hpp"
 #include "host_permissions.hpp"
 #include "../net/updater.hpp"
+#include "glide.hpp"
 
 #include <string>
 #include <vector>
 #include <array>
+#include <map>
 #include <unordered_map>
 #include <functional>
 #include <optional>
@@ -204,6 +206,10 @@ public:
     // From network threads (as before the split).
     void onPeerVersionMismatch(const std::string& hostVer, const std::string& viewerVer);
     void onVersionUpgradeNotice(const std::string& senderVersion);
+
+    // Tests.
+    const SessionTabManager& sessionTabsForTest() const { return sessionTabs_; }
+    bool isGlidingForTest() const { return glide_ && glide_->inside; }
 
 private:
     // WinShell implements services that need the UI state (update download, service actions).
@@ -650,6 +656,17 @@ private:
     float                   fleetPickerAnimT_ = 0.0f;
     float                   fleetPickerAnimVel_ = 0.0f;
     uint64_t                glidePickedDesk_ = 0;      // paired PC picked in Settings > Glide, waiting for an edge click
+    // Glide: the paired PC whose session tab this window shows full screen after a push off a screen edge.
+    struct GlideState { uint64_t deskId = 0; GlideEdge edge = GlideEdge::None; uint32_t tabId = 0;
+                        bool inside = false; uint64_t homeSinceMs = 0; ui::WindowPresence prevPresence{}; float along = 0.5f; };
+    std::optional<GlideState> glide_;
+    GlideDwell              glideDwell_;
+    GlideHome               glideHome_;
+    std::map<uint64_t, uint64_t> glideOfflineNotifiedMs_;   // desk ID -> when "offline" was last said
+    float                   glideSlideT_ = 1.0f;       // 0 -> 1: the session view slides in from the pushed edge
+    float                   glideSlideVel_ = 0.0f;
+    void glideTick(uint64_t nowMs);                    // called from onTick()
+    void glideOut(GlideEdge edge, ui::Point cursor, uint64_t nowMs);
     std::vector<uint64_t>   fleetPicked_;              // desk IDs ticked in the picker
     bool                    fleetTypeAll_ = false;
     uint64_t                fleetFocused_ = 0;

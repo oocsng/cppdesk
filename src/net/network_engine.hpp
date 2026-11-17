@@ -284,6 +284,8 @@ public:
     // Stand-ins for what a host session publishes (tests).
     void setShareNoticeForTest(const wayland::ShareNotice& n) { shareHub_.setNotice(n); }
     void pushRestoreTokenForTest(const std::string& token) { shareHub_.pushToken(token); }
+    // Adds or replaces a peer as if discovery had just heard it (tests).
+    void injectDiscoveredPeerForTest(const DiscoveredPeer& p);
 
     // Copy latest decoded remote frame if frameSeq > lastSeenSeq
     bool copyLatestViewerFrame(
