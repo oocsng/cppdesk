@@ -10418,18 +10418,21 @@ void testFleetUi() {
     // Keys on a live grid: Shift+/ is typed into the PC (not the help sheet), and a modal opening while Shift is held
     // still lets the Shift release through, so no key stays down on the PC.
     std::vector<std::string> cfgs;
-    for (int inst : {4343, 4344}) {
+    for (int inst : {4343, 4344, 4345}) {
         IdentityManager probe(inst);
         cfgs.push_back(probe.configFilePath());
         std::filesystem::remove(cfgs.back(), ec);
     }
     {
-        IdentityManager hostId(4343), viewerId(4344);
-        TEST_ASSERT(hostId.loadOrCreate() && viewerId.loadOrCreate());
+        IdentityManager hostId(4343), viewerId(4344), hostBId(4345);
+        TEST_ASSERT(hostId.loadOrCreate() && viewerId.loadOrCreate() && hostBId.loadOrCreate());
         hostId.setListenPort(51046);
         viewerId.setListenPort(51048);
-        hostId.addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
-        viewerId.addPairedHost({hostId.deskId(), "H", hostId.pairingKey().publicKey(), 1});
+        hostBId.setListenPort(51050);
+        for (IdentityManager* h : {&hostId, &hostBId}) {
+            h->addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
+            viewerId.addPairedHost({h->deskId(), "H", h->pairingKey().publicKey(), 1});
+        }
         std::mutex m;
         std::vector<std::pair<uint16_t, bool>> keys;
         auto saw = [&](uint16_t vk, bool down) {
@@ -10467,6 +10470,74 @@ void testFleetUi() {
             TEST_ASSERT(!saw(VK_F1, true));   // the app kept F1 for its help sheet
         }
         host.setHostKeySinkForTest(nullptr);
+
+        // Open on a tile hands that PC to a session tab after the host has freed it, and keeps the others connected;
+        // the dashboard then leads back to the grid. Open on the last PC closes the grid.
+        TEST_ASSERT(waitFor([&] { return !host.hostSessionStatus().active; }, 4000));   // the grid above has let go
+        NetworkEngine hostB(hostBId);
+        TEST_ASSERT(hostB.start());
+        const uint64_t deskA = hostId.deskId(), deskB = hostBId.deskId();
+        auto count = [](const std::string& ops, const std::string& text) {
+            size_t n = 0;
+            const std::string needle = "|" + text + "\n";
+            for (size_t at = ops.find(needle); at != std::string::npos; at = ops.find(needle, at + 1)) ++n;
+            return n;
+        };
+        auto clickText = [](AppUi& app, const std::string& ops, const std::string& text) {   // the nth=0 button labelled text
+            std::istringstream in(ops);
+            for (std::string line; std::getline(in, line);) {
+                if (line.rfind("drawText ", 0) != 0 || line.size() < text.size() + 1 ||
+                    line.compare(line.size() - text.size() - 1, std::string::npos, "|" + text) != 0) continue;
+                float l = 0, t = 0, r = 0, b = 0;
+                std::istringstream(line.substr(9)) >> l >> t >> r >> b;
+                app.onMouseMove((l + r) * 0.5f, (t + b) * 0.5f);
+                app.onMouseButton(MouseButtonId::Left, true, (l + r) * 0.5f, (t + b) * 0.5f);
+                app.onMouseButton(MouseButtonId::Left, false, (l + r) * 0.5f, (t + b) * 0.5f);
+                return true;
+            }
+            return false;
+        };
+        FakeShell plainShell;
+        {
+            AppUi app(viewerId, viewerNet, plainShell, "");
+            ui::RecordingCanvas rc;
+            auto frame = [&] { app.render(rc, 1280, 800, 1.0 / 60.0); return rc.serialize(); };
+            app.openFleetGrid({{deskA, "Alpha", "127.0.0.1:51046"}, {deskB, "Bravo", "127.0.0.1:51050"}});
+            TEST_ASSERT(waitFor([&] { return count(frame(), "Live") == 2; }, 4000));
+
+            std::string ops = frame();
+            TEST_ASSERT(clickText(app, ops, "Open"));   // tiles are in open order: Alpha's Open comes first
+            ops = frame();
+            TEST_ASSERT(count(ops, "Alpha") == 0 && count(ops, "Bravo") == 1 && count(ops, "Live") == 1);
+            TEST_ASSERT(clickText(app, ops, "Open"));   // Bravo's Open inside the 300 ms window: ignored
+            app.onTick();                               // the deadline has not passed yet
+            ops = frame();
+            TEST_ASSERT(count(ops, "Bravo") == 1 && count(ops, "Live") == 1);
+            TEST_ASSERT(count(ops, "Do it on all") == 1);   // still on the grid (its heading), not handed over yet
+            TEST_ASSERT(waitFor([&] { return !host.hostSessionStatus().active; }, 4000));   // Alpha's host is free
+
+            plainShell.clock += 301;
+            app.onTick();   // dials Alpha in a session tab; leaving the grid keeps Bravo
+            TEST_ASSERT(count(frame(), "Type into all") == 0);   // off the grid
+            TEST_ASSERT(hostB.hostSessionStatus().active);
+            TEST_ASSERT(clickText(app, frame(), "Dashboard"));
+            ops = frame();
+            TEST_ASSERT(count(ops, "Back to grid (1)") == 1 && count(ops, "Do it on all") == 0);
+            TEST_ASSERT(clickText(app, ops, "Back to grid (1)"));
+            ops = frame();   // straight back to the same live connection: no re-dial, so no "Connecting..."
+            TEST_ASSERT(count(ops, "Type into all") == 1 && count(ops, "Bravo") == 1 && count(ops, "Live") == 1);
+            TEST_ASSERT(count(ops, "Connecting\xE2\x80\xA6") == 0 && hostB.hostSessionStatus().active);
+
+            TEST_ASSERT(clickText(app, ops, "Open"));   // Open on the last PC
+            TEST_ASSERT(waitFor([&] { return !hostB.hostSessionStatus().active; }, 4000));
+            plainShell.clock += 301;
+            app.onTick();
+            frame();
+            TEST_ASSERT(clickText(app, frame(), "Dashboard"));
+            ops = frame();
+            TEST_ASSERT(count(ops, "Do it on all") == 1 && ops.find("|Back to grid") == std::string::npos);
+        }
+        viewerNet.disconnectViewer();
     }
     for (const auto& c : cfgs) std::filesystem::remove(c, ec);
 }
