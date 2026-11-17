@@ -2873,6 +2873,37 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             }
                             break;
                         }
+                        case PacketType::PAIR_REQUEST: {
+                            // Reached only after login. The viewer offers its key; the ID it is filed under is the authenticated one.
+                            PairingKey::PublicKey viewerKey{};
+                            std::string viewerName;
+                            bool wellFormed = false;
+                            try {
+                                wellFormed = r.readU16() == viewerKey.size() && r.hasRemaining(viewerKey.size());
+                                if (wellFormed) {
+                                    r.readBytes(viewerKey.data(), viewerKey.size());
+                                    viewerName = r.readString();
+                                    wellFormed = viewerName.size() <= 255;
+                                }
+                            } catch (...) { wellFormed = false; }
+                            const bool allowed = identity_.settings().allowPairing;   // checked now, not at login
+                            const bool accept = wellFormed && allowed;
+                            if (accept) {
+                                identity_.addPairedViewer({viewerId, viewerName, viewerKey, static_cast<uint64_t>(std::time(nullptr))});
+                            }
+                            ByteWriter pw;
+                            pw.writeU8(accept ? 1 : 0);
+                            if (accept) {
+                                const auto& hostKey = identity_.pairingKey().publicKey();
+                                pw.writeU16(static_cast<uint16_t>(hostKey.size()));
+                                pw.writeBytes(hostKey.data(), hostKey.size());
+                            } else {
+                                pw.writeU16(0);
+                            }
+                            pw.writeString(accept ? "Paired" : (!allowed ? "This PC is not accepting new pairings." : "Invalid pairing request."));
+                            enqueueHostPacket(PacketType::PAIR_RESULT, 0, pw.buffer(), false);
+                            break;
+                        }
                         case PacketType::DISCONNECT:
                             sessionAlive.store(false);
                             break;
@@ -3101,6 +3132,7 @@ bool NetworkEngine::connectToRemote(const std::string& targetIdOrAddr, const std
     {
         std::lock_guard<std::mutex> lock(viewerStatsMutex_);
         viewerStats_ = ViewerSessionStats{};
+        pairingState_.store(PairingRequestState::Idle);
         viewerStats_.state = ViewerConnectionState::ResolvingId;
         viewerStats_.statusMessage = "Resolving address...";
         viewerStats_.qualityPreset = identity_.settings().defaultQuality;
@@ -3197,6 +3229,27 @@ void NetworkEngine::cancelViewerTotp() {
 bool NetworkEngine::isWaitingForTotp() const {
     std::lock_guard<std::mutex> lock(viewerStatsMutex_);
     return viewerStats_.state == ViewerConnectionState::WaitingTotp;
+}
+
+bool NetworkEngine::requestPairing() {
+    {
+        std::lock_guard<std::mutex> lock(viewerStatsMutex_);
+        if (viewerStats_.state != ViewerConnectionState::Connected || !viewerStats_.offerPairing) return false;
+    }
+    const PairingKey& key = identity_.pairingKey();
+    if (!key.isValid()) return false;
+    PairingRequestState idleOrDone = pairingState_.load();
+    if (idleOrDone == PairingRequestState::Pending || idleOrDone == PairingRequestState::Paired) return false;
+    ByteWriter w;
+    w.writeU16(static_cast<uint16_t>(key.publicKey().size()));
+    w.writeBytes(key.publicKey().data(), key.publicKey().size());
+    w.writeString(identity_.hostname());
+    pairingState_.store(PairingRequestState::Pending);   // before the send: the answer may beat us back
+    if (!sendViewerEncryptedPacket(PacketType::PAIR_REQUEST, 0, w.buffer().data(), w.buffer().size())) {
+        pairingState_.store(PairingRequestState::Idle);
+        return false;
+    }
+    return true;
 }
 
 ViewerSessionStats NetworkEngine::viewerStats() const {
@@ -3780,6 +3833,9 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         viewerStats_.grantedPermissions = perms;
                         viewerStats_.pairedSession = (pairing == ViewerPairingDecision::UsePaired);
                         viewerStats_.hostAllowsNewPairing = hostAdvertisesPairing && (pairFlags & PAIR_FLAG_ALLOW_NEW);
+                        viewerStats_.offerPairing = viewerStats_.hostAllowsNewPairing && viewerHostKeyVerified_ &&
+                            !viewerStats_.pairedSession && !identity_.findPairedHost(remoteId);
+                        pairingState_.store(PairingRequestState::Idle);
                     }
                     identity_.addOrUpdateRecentSession(remoteId, remoteHost, targetInput);
                     initViewerAudioPlayback();
@@ -4184,6 +4240,36 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                     frameCb();
                                 }
                             }
+                            break;
+                        }
+                        case PacketType::PAIR_RESULT: {
+                            if (pairingState_.load() != PairingRequestState::Pending) break;   // nothing was asked
+                            bool stored = false;
+                            try {
+                                PairingKey::PublicKey hostKey{};
+                                const bool accepted = r.readU8() != 0;
+                                const bool keyLen = r.readU16() == hostKey.size() && r.hasRemaining(hostKey.size());
+                                if (accepted && keyLen) {
+                                    r.readBytes(hostKey.data(), hostKey.size());
+                                    // Only the key this host proved in the handshake is ever stored.
+                                    if (viewerHostKeyVerified_ && hostKey == viewerHostPairingKey_) {
+                                        uint64_t pairedId = 0;
+                                        std::string pairedName;
+                                        {
+                                            std::lock_guard<std::mutex> lock(viewerStatsMutex_);
+                                            pairedId = viewerStats_.remoteDeskId;
+                                            pairedName = viewerStats_.remoteHostname;
+                                        }
+                                        identity_.addPairedHost({pairedId, pairedName, hostKey, static_cast<uint64_t>(std::time(nullptr))});
+                                        stored = true;
+                                    }
+                                }
+                            } catch (...) {}
+                            if (stored) {
+                                std::lock_guard<std::mutex> lock(viewerStatsMutex_);
+                                viewerStats_.offerPairing = false;
+                            }
+                            pairingState_.store(stored ? PairingRequestState::Paired : PairingRequestState::Refused);
                             break;
                         }
                         case PacketType::PERMISSION_UPDATE: {

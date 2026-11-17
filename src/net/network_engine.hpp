@@ -132,7 +132,10 @@ struct ViewerSessionStats {
     VirtualDisplayStatusPayload lastVirtualDisplayStatus{};
     bool                  pairedSession = false;         // logged in with the pairing keys, no password
     bool                  hostAllowsNewPairing = false;  // the host advertised PAIR_FLAG_ALLOW_NEW
+    bool                  offerPairing = false;          // hostAllowsNewPairing && !pairedSession && this host isn't pinned yet
 };
+
+enum class PairingRequestState { Idle, Pending, Paired, Refused };
 
 enum class ViewerPairingDecision { Legacy, UsePaired, RefuseIdentityChanged, RefuseNoPairingSupport };
 
@@ -259,6 +262,10 @@ public:
     bool isWaitingForTotp() const;
 
     ViewerSessionStats viewerStats() const;
+
+    // Viewer: ask the connected host to pair with this PC. False unless connected and the host is offering it.
+    bool requestPairing();
+    PairingRequestState pairingRequestState() const { return pairingState_.load(); }
 
     // Screen sharing on a Wayland desktop. The notice says what the person should know (nothing unless something
     // needs saying); the restore token is the desktop's remembered answer: set it from the settings at start, and
@@ -577,6 +584,7 @@ private:
     std::array<uint8_t, 32>     viewerSessionKey_{};
     PairingKey::PublicKey       viewerHostPairingKey_{};         // the key the host advertised in this handshake
     bool                        viewerHostKeyVerified_ = false;  // ...and it signed this session's transcript with it
+    std::atomic<PairingRequestState> pairingState_{PairingRequestState::Idle};
     uint64_t                    viewerSendSeq_ = 0;
     std::atomic<bool>           viewerEncrypted_{false};
 

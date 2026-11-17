@@ -9947,6 +9947,100 @@ void testPairedLogin() {
     for (const auto& c : cfgs) std::filesystem::remove(c, ec);
 }
 
+void testPairingOffer() {
+    std::cout << "[TEST 109] Pairing offer: pair after a password login, then password-free; refused when switched off..." << std::endl;
+
+    // One host and one viewer on loopback, host unattended with a password.
+    struct Rig {
+        IdentityManager hostId, viewerId;
+        NetworkEngine hostNet, viewerNet;
+        std::string target;
+        Rig(int inst, int port, bool allowPairing)
+            : hostId(inst), viewerId(inst + 1), hostNet(hostId), viewerNet(viewerId) {
+            std::error_code e;
+            std::filesystem::remove(hostId.configFilePath(), e);
+            std::filesystem::remove(viewerId.configFilePath(), e);
+            TEST_ASSERT(hostId.loadOrCreate() && viewerId.loadOrCreate());
+            hostId.setListenPort(port);
+            viewerId.setListenPort(port + 1);
+            hostId.setUnattendedEnabled(true);
+            hostId.setUnattendedPassword("HostPw1");
+            setAllowPairing(allowPairing);
+            TEST_ASSERT(hostNet.start() && viewerNet.start());
+            target = "127.0.0.1:" + std::to_string(hostNet.hostListenPort());
+        }
+        ~Rig() {
+            std::error_code e;
+            std::filesystem::remove(hostId.configFilePath(), e);
+            std::filesystem::remove(viewerId.configFilePath(), e);
+        }
+        void setAllowPairing(bool on) { AppSettings s = hostId.settings(); s.allowPairing = on; hostId.updateSettings(s); }
+        ViewerSessionStats dial(const std::string& password) {
+            viewerNet.connectToRemote(target, password);
+            ViewerSessionStats st;
+            for (int i = 0; i < 80; ++i) {
+                st = viewerNet.viewerStats();
+                if (st.state == ViewerConnectionState::Connected || st.state == ViewerConnectionState::Error) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            return st;
+        }
+        void hangUp() {
+            viewerNet.disconnectViewer();
+            hostNet.disconnectHostClient();
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        PairingRequestState waitForAnswer() {
+            for (int i = 0; i < 40 && viewerNet.pairingRequestState() == PairingRequestState::Pending; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            return viewerNet.pairingRequestState();
+        }
+    };
+
+    {
+        Rig rig(4320, 51020, true);
+        auto st = rig.dial("HostPw1");
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected && !st.pairedSession);
+        TEST_ASSERT(st.hostAllowsNewPairing && st.offerPairing);
+        TEST_ASSERT(rig.viewerNet.pairingRequestState() == PairingRequestState::Idle);
+        TEST_ASSERT(rig.viewerNet.requestPairing());
+        TEST_ASSERT(rig.waitForAnswer() == PairingRequestState::Paired);
+        auto h = rig.viewerId.findPairedHost(rig.hostId.deskId());
+        auto v = rig.hostId.findPairedViewer(rig.viewerId.deskId());
+        TEST_ASSERT(h && h->publicKey == rig.hostId.pairingKey().publicKey());
+        TEST_ASSERT(v && v->publicKey == rig.viewerId.pairingKey().publicKey());
+        TEST_ASSERT(!rig.viewerNet.viewerStats().offerPairing && !rig.viewerNet.requestPairing());
+        rig.hangUp();
+
+        st = rig.dial("");
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected && st.pairedSession);
+        TEST_ASSERT(!st.offerPairing && !rig.viewerNet.requestPairing());
+        TEST_ASSERT(rig.viewerNet.pairingRequestState() == PairingRequestState::Idle);   // reset by the new connection
+        rig.hangUp();
+    }
+    {
+        Rig rig(4322, 51022, false);
+        auto st = rig.dial("HostPw1");
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected);
+        TEST_ASSERT(!st.hostAllowsNewPairing && !st.offerPairing);
+        TEST_ASSERT(!rig.viewerNet.requestPairing());
+        TEST_ASSERT(rig.viewerNet.pairingRequestState() == PairingRequestState::Idle);
+        rig.hangUp();
+    }
+    {
+        // Switched off between login and request: the host decides at the time of the request.
+        Rig rig(4324, 51024, true);
+        auto st = rig.dial("HostPw1");
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected && st.offerPairing);
+        rig.setAllowPairing(false);
+        TEST_ASSERT(rig.viewerNet.requestPairing());
+        TEST_ASSERT(rig.waitForAnswer() == PairingRequestState::Refused);
+        TEST_ASSERT(!rig.viewerId.findPairedHost(rig.hostId.deskId()));
+        TEST_ASSERT(!rig.hostId.findPairedViewer(rig.viewerId.deskId()));
+        rig.hangUp();
+    }
+}
+
 void testEcdhKnownVector() {
     std::cout << "[TEST 88] ECDH fixed vector: both sides agree and the session key bytes are pinned..." << std::endl;
     auto hex = [](const std::string& h) {
@@ -11888,6 +11982,7 @@ int main(int argc, char** argv) {
         testPairingKeyCrypto(); std::cout << "Test 106 done\n" << std::flush;
         testPairingStorage(); std::cout << "Test 107 done\n" << std::flush;
         testPairedLogin(); std::cout << "Test 108 done\n" << std::flush;
+        testPairingOffer(); std::cout << "Test 109 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;

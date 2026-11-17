@@ -170,7 +170,11 @@ enum class PacketType : uint8_t {
     RELAY_BRIDGE_ACCEPT = 0x56,
     RELAY_BRIDGE_READY  = 0x57,
     RELAY_REGISTER_CHALLENGE = 0x5A, // Relay -> Host: prove (or enroll) ownership of the desk ID
-    RELAY_REGISTER_PROOF     = 0x5B  // Host -> Relay: HMAC proof, or the key itself when enrolling
+    RELAY_REGISTER_PROOF     = 0x5B, // Host -> Relay: HMAC proof, or the key itself when enrolling
+
+    // Pairing offer inside an authenticated session
+    PAIR_REQUEST        = 0x5C, // Viewer -> Host: u16 64 + viewer pairing key, string viewer hostname
+    PAIR_RESULT         = 0x5D  // Host -> Viewer: u8 accepted, u16 len + host pairing key (0 if refused), string message
 };
 
 enum class SystemActionType : uint8_t {
