@@ -192,7 +192,64 @@ public:
     bool isWindowForeground() const override {
         return w_.hwnd_ && GetForegroundWindow() == w_.hwnd_ && !IsIconic(w_.hwnd_);
     }
-    void bringToFront() override { if (w_.hwnd_) SetForegroundWindow(w_.hwnd_); }
+    void bringToFront() override {
+        if (!w_.hwnd_ || SetForegroundWindow(w_.hwnd_)) return;
+        // Windows refuses focus to a background process; sharing the foreground thread's input queue lifts that.
+        const DWORD fgThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+        const DWORD ourThread = GetCurrentThreadId();
+        if (fgThread && fgThread != ourThread && AttachThreadInput(ourThread, fgThread, TRUE)) {
+            SetForegroundWindow(w_.hwnd_);
+            AttachThreadInput(ourThread, fgThread, FALSE);
+        }
+    }
+
+    // Physical pixels throughout: the process is per-monitor DPI aware, so these agree with GetCursorPos.
+    static ui::Rect toRect(const RECT& r) {
+        return {static_cast<float>(r.left), static_cast<float>(r.top), static_cast<float>(r.right), static_cast<float>(r.bottom)};
+    }
+    static POINT toPoint(ui::Point p) { return {static_cast<LONG>(std::lround(p.x)), static_cast<LONG>(std::lround(p.y))}; }
+    std::optional<ui::Point> cursorScreenPos() const override {
+        POINT p{};
+        if (!GetCursorPos(&p)) return std::nullopt;
+        return ui::Point{static_cast<float>(p.x), static_cast<float>(p.y)};
+    }
+    ui::Rect desktopBounds() const override {
+        const int x = GetSystemMetrics(SM_XVIRTUALSCREEN), y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        return {static_cast<float>(x), static_cast<float>(y), static_cast<float>(x + GetSystemMetrics(SM_CXVIRTUALSCREEN)),
+                static_cast<float>(y + GetSystemMetrics(SM_CYVIRTUALSCREEN))};
+    }
+    ui::Rect monitorBoundsAt(ui::Point p) const override {
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(MonitorFromPoint(toPoint(p), MONITOR_DEFAULTTONEAREST), &mi)) return desktopBounds();
+        return toRect(mi.rcMonitor);
+    }
+    void warpCursor(ui::Point p) override {
+        const POINT pt = toPoint(p);
+        SetCursorPos(pt.x, pt.y);
+    }
+    void moveWindowToMonitorAt(ui::Point p) override {
+        if (!w_.hwnd_) return;
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(MonitorFromPoint(toPoint(p), MONITOR_DEFAULTTONEAREST), &mi)) return;
+        SetWindowPos(w_.hwnd_, nullptr, mi.rcWork.left, mi.rcWork.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    ui::WindowPresence windowPresence() const override {
+        if (!w_.hwnd_ || !IsWindowVisible(w_.hwnd_)) return ui::WindowPresence::Hidden;
+        return IsIconic(w_.hwnd_) ? ui::WindowPresence::Minimized : ui::WindowPresence::Shown;
+    }
+    void setWindowPresence(ui::WindowPresence p) override {
+        if (!w_.hwnd_) return;
+        switch (p) {
+            case ui::WindowPresence::Shown:
+                ShowWindow(w_.hwnd_, SW_SHOW);
+                if (IsIconic(w_.hwnd_)) ShowWindow(w_.hwnd_, SW_RESTORE);
+                break;
+            case ui::WindowPresence::Minimized: ShowWindow(w_.hwnd_, SW_MINIMIZE); break;
+            case ui::WindowPresence::Hidden: ShowWindow(w_.hwnd_, SW_HIDE); break;
+        }
+    }
     void setMouseCapture(bool capture) override {
         if (capture) {
             if (w_.hwnd_) SetCapture(w_.hwnd_);

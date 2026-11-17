@@ -581,6 +581,14 @@ public:
         [NSApp activateIgnoringOtherApps:YES];
         [w_->window makeKeyAndOrderFront:nil];
     }
+    // Glide stubs; the real versions come in a later task.
+    std::optional<ui::Point> cursorScreenPos() const override { return std::nullopt; }
+    ui::Rect desktopBounds() const override { return {}; }
+    ui::Rect monitorBoundsAt(ui::Point) const override { return {}; }
+    void warpCursor(ui::Point) override {}
+    void moveWindowToMonitorAt(ui::Point) override {}
+    ui::WindowPresence windowPresence() const override { return ui::WindowPresence::Shown; }
+    void setWindowPresence(ui::WindowPresence) override {}
     // AppKit keeps sending a drag's events to the view that started it, outside the window too.
     void setMouseCapture(bool) override {}
     bool isKeyDown(uint16_t vk) const override { return w_ && vk < 256 && w_->keys[vk]; }

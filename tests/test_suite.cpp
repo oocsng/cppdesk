@@ -9247,13 +9247,26 @@ public:
     void showNotification(const std::string&, const std::string&) override {}
     void setTrayStatus(const std::string&) override {}
     void setFrameIntervalMs(unsigned) override {}
-    bool setFullscreen(bool) override { return true; }
+    bool fullscreen = false;
+    bool setFullscreen(bool on) override { fullscreen = on; return true; }
     void setDarkTitleBar(bool) override {}
     void quitApp() override {}
     bool relaunchElevated() override { return false; }
     void playAlertSound() override {}
     bool isWindowForeground() const override { return true; }
-    void bringToFront() override {}
+    int fronts = 0;
+    void bringToFront() override { ++fronts; }
+    std::optional<ui::Point> cursor;
+    ui::Rect desktop{0, 0, 1920, 1080};
+    std::vector<ui::Point> warps;
+    ui::WindowPresence presence = ui::WindowPresence::Shown;
+    std::optional<ui::Point> cursorScreenPos() const override { return cursor; }
+    ui::Rect desktopBounds() const override { return desktop; }
+    ui::Rect monitorBoundsAt(ui::Point) const override { return desktop; }
+    void warpCursor(ui::Point p) override { warps.push_back(p); }
+    void moveWindowToMonitorAt(ui::Point) override {}
+    ui::WindowPresence windowPresence() const override { return presence; }
+    void setWindowPresence(ui::WindowPresence p) override { presence = p; }
     void setMouseCapture(bool) override {}
     bool isKeyDown(uint16_t) const override { return false; }
     void trackMouseLeave() override {}

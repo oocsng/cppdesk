@@ -3,6 +3,8 @@
 // What the platform-neutral screens need from the platform they run on. Each platform's window code
 // implements this; the screens never call the operating system directly. No platform headers.
 
+#include "canvas.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -30,6 +32,8 @@ struct HostPermissionStatus {
 };
 
 enum class CursorShape { Arrow, Hand, IBeam, ResizeH, ResizeV };
+
+enum class WindowPresence : uint8_t { Shown, Minimized, Hidden };   // Hidden = in the tray
 
 // Background service control (only where Capability::WindowsService is available).
 enum class ServiceState { NotInstalled, Stopped, Running, Pending };
@@ -74,6 +78,15 @@ public:
     virtual bool isWindowForeground() const = 0;
     // Raise the app window and give it focus.
     virtual void bringToFront() = 0;
+
+    // Screen pixels, top-left origin, right/bottom exclusive.
+    virtual std::optional<Point> cursorScreenPos() const = 0;   // nullopt: platform can't say (Wayland) -> Glide off
+    virtual Rect desktopBounds() const = 0;                     // bounding box of all monitors
+    virtual Rect monitorBoundsAt(Point p) const = 0;            // the monitor containing p (nearest if none)
+    virtual void warpCursor(Point p) = 0;
+    virtual void moveWindowToMonitorAt(Point p) = 0;            // before setFullscreen(true)
+    virtual WindowPresence windowPresence() const = 0;
+    virtual void setWindowPresence(WindowPresence p) = 0;
 
     // Keep receiving mouse events while a button is held outside the window (scrubber drags).
     virtual void setMouseCapture(bool capture) = 0;

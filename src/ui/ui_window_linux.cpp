@@ -503,6 +503,14 @@ public:
         XMapRaised(w_->dpy, w_->win);
         w_->sendWmMessage(w_->netActiveWindow, 1, CurrentTime, 0, 0);
     }
+    // Glide stubs; the real versions come in a later task.
+    std::optional<ui::Point> cursorScreenPos() const override { return std::nullopt; }
+    ui::Rect desktopBounds() const override { return {}; }
+    ui::Rect monitorBoundsAt(ui::Point) const override { return {}; }
+    void warpCursor(ui::Point) override {}
+    void moveWindowToMonitorAt(ui::Point) override {}
+    ui::WindowPresence windowPresence() const override { return ui::WindowPresence::Shown; }
+    void setWindowPresence(ui::WindowPresence) override {}
     // X grabs the pointer for us while a button is held, so drags outside the window keep reporting.
     void setMouseCapture(bool) override {}
     bool isKeyDown(uint16_t vk) const override { return w_ && vk < 256 && w_->keys[vk]; }
