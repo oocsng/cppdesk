@@ -9,6 +9,7 @@
 #include "../core/protocol.hpp"
 #include "../core/crypto_identity.hpp"
 #include "../net/network_engine.hpp"
+#include "../net/fleet_manager.hpp"
 #include "../media/session_recorder.hpp"
 #include "../media/session_recording_player.hpp"
 #include "../control/session_tab_manager.hpp"
@@ -51,7 +52,8 @@ struct UpdateProgressData {
 enum class ActiveTab : uint8_t {
     Dashboard     = 0,
     RemoteSession = 1,
-    Settings      = 2
+    Settings      = 2,
+    Fleet         = 3     // "Do it on all": a grid of paired PCs
 };
 
 enum class SettingsSection : uint8_t {
@@ -115,6 +117,11 @@ enum class DrawerTab : uint8_t {
 };
 
 // UiRect is provided by ui_platform.hpp (using UiRect = UiPlatformRect;)
+
+// The "Do it on all" grid: count 16:9 tiles in ceil(sqrt(count)) columns, centred in area.
+std::vector<UiRect> fleetGridLayout(size_t count, const UiRect& area, float gap);
+// The index of the tile under (x, y), or -1.
+int fleetTileAt(const std::vector<UiRect>& tiles, float x, float y);
 
 struct ClickRegion {
     UiRect                rect;
@@ -277,6 +284,9 @@ private:
     void drawPortForwardModal(float width, float height, float modalProgress);
     void drawAddressBookModal(float width, float height, float modalProgress);
     void drawPairOfferModal(float width, float height, float modalProgress);
+    void drawFleetPickerModal(float width, float height, float modalProgress);
+    void drawFleetView(const UiRect& bounds, float alpha);
+    void closeFleetGrid();   // disconnects every grid PC and drops the tile images
     void drawWhiteboardOverlay(const UiRect& canvasRect);
     void drawPerformanceHud(const UiRect& stageRect, float alpha);
     void drawUpdateRequiredModal(float width, float height, float modalProgress);
@@ -628,6 +638,30 @@ private:
     bool                    pairOfferShown_ = false;
     std::string             pairOfferName_;
     PairingRequestState     prevPairingState_ = PairingRequestState::Idle;
+
+    // "Do it on all": the picker modal, then the grid (ActiveTab::Fleet). Keys go to every PC while
+    // fleetTypeAll_, else to fleetFocused_; the mouse only ever goes to the tile it is over.
+    FleetManager            fleet_;
+    bool                    showFleetPicker_ = false;
+    float                   fleetPickerAnimT_ = 0.0f;
+    float                   fleetPickerAnimVel_ = 0.0f;
+    std::vector<uint64_t>   fleetPicked_;              // desk IDs ticked in the picker
+    bool                    fleetTypeAll_ = false;
+    uint64_t                fleetFocused_ = 0;
+    uint64_t                fleetPressedDesk_ = 0;     // the tile a mouse button went down on, for its release
+    struct FleetTileImage {
+        ui::ImageId image{};
+        int imageW = 0, imageH = 0;            // size of image
+        uint64_t seq = 0;                      // the last frame copied from the PC
+        std::vector<uint8_t> bgra;
+        int w = 0, h = 0;
+        CursorState cursor{};
+    };
+    std::unordered_map<uint64_t, FleetTileImage> fleetImages_;
+    std::vector<uint64_t>   fleetTileIds_;             // the grid as last drawn, for mouse and drop hit tests
+    std::vector<UiRect>     fleetTileRects_;
+    std::vector<UiRect>     fleetFrameRects_;          // where each tile's screen is drawn; clicks map to it
+    std::function<void(std::vector<FleetTileStatus>&)> snapshotFleetTiles_;   // a snapshot state's stand-in details
 
     // Whiteboard & Screen Annotation UI state (v2.1.0)
     bool                    whiteboardActive_ = false;

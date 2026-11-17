@@ -10361,6 +10361,61 @@ void testFleetManager() {
     for (const auto& c : cfgs) std::filesystem::remove(c, ec);
 }
 
+void testFleetUi() {
+    std::cout << "[TEST 112] Do it on all: grid layout, tile hit test, picker and grid screens..." << std::endl;
+    const UiRect area{ 0.0f, 0.0f, 1000.0f, 600.0f };
+    auto inside = [&](const UiRect& r) {
+        return r.left >= area.left && r.top >= area.top && r.right <= area.right && r.bottom <= area.bottom;
+    };
+    auto overlap = [](const UiRect& a, const UiRect& b) {
+        return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+    };
+    const auto four = fleetGridLayout(4, area, 8.0f);
+    TEST_ASSERT(four.size() == 4);
+    TEST_ASSERT(four[0].top == four[1].top && four[1].top < four[2].top);   // 2 columns
+    TEST_ASSERT(four[0].left == four[2].left && four[0].left < four[1].left);
+    for (size_t i = 0; i < four.size(); ++i) {
+        TEST_ASSERT(inside(four[i]));
+        TEST_ASSERT(four[i].width() > 0.0f && std::fabs(four[i].width() * 9.0f - four[i].height() * 16.0f) < 0.1f);
+        for (size_t j = i + 1; j < four.size(); ++j) TEST_ASSERT(!overlap(four[i], four[j]));
+    }
+    const auto sixteen = fleetGridLayout(16, area, 8.0f);
+    TEST_ASSERT(sixteen.size() == 16);
+    TEST_ASSERT(sixteen[3].top == sixteen[0].top && sixteen[4].top > sixteen[0].top);   // 4 columns
+    for (const auto& r : sixteen) TEST_ASSERT(inside(r));
+    TEST_ASSERT(fleetGridLayout(0, area, 8.0f).empty());
+
+    TEST_ASSERT(fleetTileAt(four, four[3].centerX(), four[3].centerY()) == 3);
+    TEST_ASSERT(fleetTileAt(four, (four[0].right + four[1].left) * 0.5f, four[0].centerY()) == -1);   // the gap
+    TEST_ASSERT(fleetTileAt({}, 10.0f, 10.0f) == -1);
+
+    IdentityManager id(4252);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    FakeShell shell;
+    const auto names = AppUi::snapshotStateNames();
+    TEST_ASSERT(std::find(names.begin(), names.end(), "fleet_picker") != names.end());
+    TEST_ASSERT(std::find(names.begin(), names.end(), "fleet_grid") != names.end());
+    const std::string picker = renderAppState(id, net, shell, "fleet_picker");
+    TEST_ASSERT(picker.find("|Do it on all") != std::string::npos);
+    TEST_ASSERT(picker.find("|Paired PCs on this network") != std::string::npos);
+    TEST_ASSERT(picker.find("|Offline") != std::string::npos);      // a paired PC discovery does not see
+    TEST_ASSERT(picker.find("|Open grid (0)") != std::string::npos);
+    const std::string grid = renderAppState(id, net, shell, "fleet_grid");
+    TEST_ASSERT(grid.find("|Type into all") != std::string::npos);
+    TEST_ASSERT(grid.find("|Live") != std::string::npos);
+    TEST_ASSERT(grid.find("|\xE2\x9C\x93 Sent") != std::string::npos);
+    TEST_ASSERT(grid.find("|Failed") != std::string::npos);
+    TEST_ASSERT(grid.find("|Connecting\xE2\x80\xA6") != std::string::npos);
+    TEST_ASSERT(grid.find("|Send file\xE2\x80\xA6") != std::string::npos);
+    TEST_ASSERT(grid.find("|Open") != std::string::npos);
+    // The dashboard offers the picker; the picker's seeded PC never leaks into another state.
+    TEST_ASSERT(renderAppState(id, net, shell, "dashboard_light").find("|Do it on all") != std::string::npos);
+    TEST_ASSERT(renderAppState(id, net, shell, "settings_permissions").find("|Forget") == std::string::npos);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
 void testEcdhKnownVector() {
     std::cout << "[TEST 88] ECDH fixed vector: both sides agree and the session key bytes are pinned..." << std::endl;
     auto hex = [](const std::string& h) {
@@ -12305,6 +12360,7 @@ int main(int argc, char** argv) {
         testPairingOffer(); std::cout << "Test 109 done\n" << std::flush;
         testViewerOnlyEngine(); std::cout << "Test 110 done\n" << std::flush;
         testFleetManager(); std::cout << "Test 111 done\n" << std::flush;
+        testFleetUi(); std::cout << "Test 112 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;
