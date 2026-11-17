@@ -5880,10 +5880,27 @@ void NetworkEngine::startHostTerminal(bool usePowerShell) {
         wcscpy_s(cmdLine, L"cmd.exe /Q /K");
     }
 
+    // Only the pipe ends reach the shell. Sockets are inheritable, and a shell holding a copy keeps a closed listener
+    // or connection open, so another engine in this process could never hang up on its host.
+    HANDLE inheritOnly[2] = {hStdinRead, hStdoutWrite};
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+    std::vector<uint8_t> attrBuf(attrSize);
+    auto* attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
+    const bool attrsInited = attrSize > 0 && InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize);
+    STARTUPINFOEXW six{};
+    six.StartupInfo = si;
+    six.StartupInfo.cb = sizeof(six);
+    if (attrsInited && UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inheritOnly,
+                                                 sizeof(inheritOnly), nullptr, nullptr)) {
+        six.lpAttributeList = attrs;
+    }
+
     BOOL created = CreateProcessW(
         nullptr, cmdLine, nullptr, nullptr, TRUE,
-        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi
+        CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &six.StartupInfo, &pi
     );
+    if (attrsInited) DeleteProcThreadAttributeList(attrs);
 
     CloseHandle(hStdinRead);
     CloseHandle(hStdoutWrite);

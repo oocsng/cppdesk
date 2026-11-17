@@ -13,6 +13,7 @@ set(CORE_SOURCES
     src/core/totp_manager.cpp
     src/core/qr_matrix.cpp
     src/net/network_engine.cpp
+    src/net/fleet_manager.cpp
     src/net/updater.cpp
     src/capture/screen_capture.cpp
     src/capture/display_manager.cpp

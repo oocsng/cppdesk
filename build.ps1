@@ -23,6 +23,7 @@ $CoreSources = @(
     "src/control/file_sync_manager.cpp",
     "src/control/remote_file_browser.cpp",
     "src/net/network_engine.cpp",
+    "src/net/fleet_manager.cpp",
     "src/net/updater.cpp",
     "src/ui/notification_manager.cpp",
     "src/media/session_recorder.cpp",

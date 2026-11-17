@@ -16,6 +16,7 @@
 #include "../src/net/updater.hpp"
 #include "../src/net/connection_limiter.hpp"
 #include "../src/net/relay_owner.hpp"
+#include "../src/net/fleet_manager.hpp"
 #include "../src/core/win_compat.hpp"
 #include "../src/ui/recording_canvas.hpp"
 #include "../src/ui/app_ui.hpp"
@@ -10208,6 +10209,148 @@ void testViewerOnlyEngine() {
     for (const auto& c : cfgs) std::filesystem::remove(c, ec);
 }
 
+void testFleetManager() {
+    std::cout << "[TEST 111] FleetManager: eligible PCs, 16 cap, keys and files to all, survives a drop, releases modifiers, close frees the host..." << std::endl;
+    using Clock = std::chrono::steady_clock;
+    using Keys = std::vector<std::pair<uint16_t, bool>>;
+    auto waitFor = [](const std::function<bool()>& cond, int ms) {
+        for (int i = 0; i < ms / 50 && !cond(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return cond();
+    };
+    struct KeyLog {
+        std::mutex m;
+        Keys v;
+        Keys get() { std::lock_guard<std::mutex> lk(m); return v; }
+        void clear() { std::lock_guard<std::mutex> lk(m); v.clear(); }
+        bool has(std::pair<uint16_t, bool> k) { std::lock_guard<std::mutex> lk(m); return std::find(v.begin(), v.end(), k) != v.end(); }
+        std::function<void(uint16_t, bool)> sink() { return [this](uint16_t vk, bool d) { std::lock_guard<std::mutex> lk(m); v.emplace_back(vk, d); }; }
+    };
+
+    std::error_code ec;
+    std::vector<std::string> cfgs;
+    for (int inst : {4340, 4341, 4342}) {
+        IdentityManager probe(inst);
+        cfgs.push_back(probe.configFilePath());
+        std::filesystem::remove(cfgs.back(), ec);
+    }
+    const auto tmp = std::filesystem::temp_directory_path() / "CppDesk_Test_Fleet";
+    std::filesystem::remove_all(tmp, ec);
+    std::filesystem::create_directories(tmp / "a", ec);
+    std::filesystem::create_directories(tmp / "b", ec);
+    {
+        IdentityManager hostAId(4340), hostBId(4341), viewerId(4342);
+        TEST_ASSERT(hostAId.loadOrCreate() && hostBId.loadOrCreate() && viewerId.loadOrCreate());
+        hostAId.setListenPort(51040);
+        hostBId.setListenPort(51042);
+        viewerId.setListenPort(51044);
+        for (IdentityManager* h : {&hostAId, &hostBId}) {
+            h->addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
+            viewerId.addPairedHost({h->deskId(), "H", h->pairingKey().publicKey(), 1});
+        }
+        const uint64_t deskA = hostAId.deskId(), deskB = hostBId.deskId();
+
+        // Only paired PCs seen directly on the LAN, sorted by name.
+        std::vector<DiscoveredPeer> peers{{deskA, "A", "10.0.0.5", 6001, 0, false},
+                                          {deskB, "B", "10.0.0.6", 6002, 0, true},
+                                          {123456789, "C", "10.0.0.7", 6003, 0, false}};
+        auto el = FleetManager::eligibleMembers(viewerId, peers);
+        TEST_ASSERT(el.size() == 1 && el[0].deskId == deskA && el[0].name == "A" && el[0].address == "10.0.0.5:6001");
+        peers[1].viaRelay = false;
+        peers[1].hostname = "0B";
+        el = FleetManager::eligibleMembers(viewerId, peers);
+        TEST_ASSERT(el.size() == 2 && el[0].deskId == deskB && el[1].deskId == deskA);
+
+        KeyLog logA, logB;
+        NetworkEngine hostA(hostAId), hostB(hostBId);
+        FleetManager fleet(viewerId);
+
+        // At most 16 at once.
+        std::vector<FleetMember> fakes;
+        for (uint64_t i = 0; i < 20; ++i) fakes.push_back({900000000 + i, "Fake" + std::to_string(i), "127.0.0.1:51059"});
+        TEST_ASSERT(fleet.open(fakes) == 16 && fleet.size() == 16);
+        fleet.closeAll();
+        TEST_ASSERT(fleet.size() == 0);
+
+        hostA.fileTransferManager().setReceiveDirectory((tmp / "a").string());
+        hostB.fileTransferManager().setReceiveDirectory((tmp / "b").string());
+        TEST_ASSERT(hostA.start() && hostB.start());
+        hostA.setHostKeySinkForTest(logA.sink());
+        hostB.setHostKeySinkForTest(logB.sink());
+
+        TEST_ASSERT(fleet.open({{deskA, "A", "127.0.0.1:51040"}, {deskB, "B", "127.0.0.1:51042"}}) == 2);
+        auto stateOf = [&](uint64_t id) {
+            for (const auto& t : fleet.status())
+                if (t.deskId == id) return t.state;
+            return ViewerConnectionState::Disconnected;
+        };
+        const auto C = ViewerConnectionState::Connected;
+        TEST_ASSERT(waitFor([&] { return stateOf(deskA) == C && stateOf(deskB) == C; }, 4000));
+        auto tiles = fleet.status();
+        TEST_ASSERT(tiles.size() == 2 && tiles[0].deskId == deskA && tiles[0].name == "A" && tiles[1].deskId == deskB);
+
+        fleet.sendKeyToAll(0x41, 0x1E, true, false);
+        fleet.sendKeyToAll(0x41, 0x1E, false, false);
+        const Keys aDownUp{{0x41, true}, {0x41, false}};
+        TEST_ASSERT(waitFor([&] { return logA.get() == aDownUp && logB.get() == aDownUp; }, 2000));
+
+        // The same file lands on both PCs.
+        const auto src = tmp / "fleet_payload.bin";
+        std::string payload(100000, '\0');
+        for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>('a' + i % 23);
+        { std::ofstream out(src, std::ios::binary); out.write(payload.data(), static_cast<std::streamsize>(payload.size())); }
+        TEST_ASSERT(fleet.sendFileToAll(src.string()) == 2);
+        auto landed = [&](const char* dir) {
+            std::ifstream in(tmp / dir / "fleet_payload.bin", std::ios::binary);
+            std::string got((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            return CryptoUtils::sha256Hex(got) == CryptoUtils::sha256Hex(payload);
+        };
+        auto sentToAll = [&] {
+            for (const auto& t : fleet.status())
+                if (!t.lastOutgoing || t.lastOutgoing->status != TransferStatus::Completed) return false;
+            return true;
+        };
+        TEST_ASSERT(waitFor([&] { return landed("a") && landed("b") && sentToAll(); }, 5000));
+
+        // fleetSurvivesMemberDrop
+        hostA.stop();
+        TEST_ASSERT(waitFor([&] { return stateOf(deskA) != C; }, 3000));
+        logB.clear();
+        const auto t0 = Clock::now();
+        fleet.sendKeyToAll(0x42, 0x30, true, false);
+        const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+        fleet.sendKeyToAll(0x42, 0x30, false, false);
+        TEST_ASSERT(took < 200);
+        const Keys bDownUp{{0x42, true}, {0x42, false}};
+        TEST_ASSERT(waitFor([&] { return logB.get() == bDownUp; }, 2000));
+
+        // fleetReleasesModifiers
+        logB.clear();
+        fleet.releaseModifiers(0);
+        TEST_ASSERT(waitFor([&] { return logB.has({0, false}); }, 2000));
+        logB.clear();
+        fleet.close(deskB);
+        TEST_ASSERT(fleet.size() == 1);
+        TEST_ASSERT(waitFor([&] { return logB.has({0, false}); }, 2000));
+
+        // fleetCloseFreesHost: the host ends the session on its own side, then takes a normal viewer.
+        TEST_ASSERT(waitFor([&] { return !hostB.hostSessionStatus().active; }, 4000));
+        {
+            NetworkEngine normal(viewerId);
+            TEST_ASSERT(normal.start());
+            normal.connectToRemote("127.0.0.1:51042", "");
+            TEST_ASSERT(waitFor([&] { return normal.viewerStats().state == C; }, 4000));
+            normal.stop();
+        }
+
+        fleet.closeAll();
+        TEST_ASSERT(fleet.size() == 0);
+        hostA.setHostKeySinkForTest(nullptr);
+        hostB.setHostKeySinkForTest(nullptr);
+    }
+    std::filesystem::remove_all(tmp, ec);
+    for (const auto& c : cfgs) std::filesystem::remove(c, ec);
+}
+
 void testEcdhKnownVector() {
     std::cout << "[TEST 88] ECDH fixed vector: both sides agree and the session key bytes are pinned..." << std::endl;
     auto hex = [](const std::string& h) {
@@ -12151,6 +12294,7 @@ int main(int argc, char** argv) {
         testPairedLogin(); std::cout << "Test 108 done\n" << std::flush;
         testPairingOffer(); std::cout << "Test 109 done\n" << std::flush;
         testViewerOnlyEngine(); std::cout << "Test 110 done\n" << std::flush;
+        testFleetManager(); std::cout << "Test 111 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;
