@@ -2,6 +2,7 @@
 
 #include "../core/protocol.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -229,6 +230,8 @@ public:
     void purgeStaging();
 
 private:
+    void clearOwnOffer();   // withdraws the clipboard files this manager offered, never another manager's
+
     struct OutgoingState {
         uint32_t                      transferId = 0;
         std::vector<VirtualFileEntry> files;
@@ -264,7 +267,8 @@ private:
     std::condition_variable  chunkCv_;
     uint32_t                 lastSequenceNumber_ = 0;
     uint32_t                 nextTransferId_ = 1001;
-    std::wstring             stagingDir_;
+    std::wstring             stagingDir_;   // this manager's own folder: engines in one process must not purge each other's
+    std::atomic<uint64_t>    offerGeneration_{0};   // macOS/Linux: the clipboard offer this manager made
     SendPacketFn             activeSendFn_;
 
     OutgoingState            outgoing_;

@@ -2189,6 +2189,26 @@ void testNativeClipboardFileTransfer() {
         TEST_ASSERT(!std::filesystem::exists(std::filesystem::path(partFile)));
     }
 
+    // 5b. Several engines in one process: one manager's reset or teardown leaves another's partial file alone
+    {
+        ClipboardFileTransferManager mgrA;
+        const std::filesystem::path partA = std::filesystem::path(mgrA.stagingDirectory()) / L"transfer_1001_part_0.part";
+        std::filesystem::path dirB;
+        {
+            ClipboardFileTransferManager mgrB;
+            dirB = std::filesystem::path(mgrB.stagingDirectory());
+            TEST_ASSERT(mgrA.stagingDirectory() != mgrB.stagingDirectory());
+            std::ofstream(partA) << "partial";
+            std::ofstream(dirB / L"transfer_1001_part_0.part") << "other";
+            mgrB.reset();
+            TEST_ASSERT(std::filesystem::exists(partA));
+        }
+        TEST_ASSERT(std::filesystem::exists(partA));
+        TEST_ASSERT(!std::filesystem::exists(dirB));   // a manager removes its own folder when it goes
+        mgrA.reset();
+        TEST_ASSERT(!std::filesystem::exists(partA));
+    }
+
     // 6. Path Traversal & Directory Separator Sanitization in handleRemoteFileList
     {
         // Also test resolveConflictFilenameW

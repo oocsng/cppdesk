@@ -1220,27 +1220,54 @@ double FileTransferManager::aggregateActiveBandwidthBps() const {
 // ---------------- ClipboardFileTransferManager ----------------
 
 ClipboardFileTransferManager::ClipboardFileTransferManager() {
+    static std::atomic<uint32_t> instanceCount{0};
 #if defined(_WIN32)
     wchar_t tempPath[MAX_PATH] = {};
     GetTempPathW(MAX_PATH, tempPath);
-    stagingDir_ = std::wstring(tempPath) + L"CppDesk_Clipboard\\";
+    const std::wstring root = std::wstring(tempPath) + L"CppDesk_Clipboard\\";
+    const std::wstring ownPrefix = L"stg_" + std::to_wstring(GetCurrentProcessId()) + L"_";
+    stagingDir_ = root + ownPrefix + std::to_wstring(++instanceCount) + L"\\";
     lastSequenceNumber_ = GetClipboardSequenceNumber();
 #else
     const char* tmp = std::getenv("TMPDIR");
     if (!tmp) tmp = "/tmp";
     std::string s = std::string(tmp) + "/CppDesk_Clipboard/";
-    stagingDir_ = std::wstring(s.begin(), s.end());
+    const std::wstring root(s.begin(), s.end());
+    const std::wstring ownPrefix = L"stg_" + std::to_wstring(getpid()) + L"_";
+    stagingDir_ = root + ownPrefix + std::to_wstring(++instanceCount) + L"/";
     lastSequenceNumber_ = 1;
 #endif
     std::error_code ec;
+    // What a crashed run left behind (its staging folders, or loose .part files from older versions). Only day-old
+    // entries go, so another running CppDesk's live transfer is never touched.
+    try {
+        const auto cutoff = std::filesystem::file_time_type::clock::now() - std::chrono::hours(24);
+        for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
+            const std::wstring name = e.path().filename().wstring();
+            const bool leftover = (name.rfind(L"stg_", 0) == 0 && name.rfind(ownPrefix, 0) != 0) ||
+                                  e.path().extension() == ".part";
+            if (!leftover) continue;
+            const auto written = e.last_write_time(ec);
+            if (!ec && written < cutoff) std::filesystem::remove_all(e.path(), ec);
+        }
+    } catch (...) {}
     std::filesystem::create_directories(stagingDir_, ec);
 }
 
 ClipboardFileTransferManager::~ClipboardFileTransferManager() {
     reset();
-    purgeStaging();
+    std::error_code ec;
+    std::filesystem::remove_all(stagingDir_, ec);
 #if !defined(_WIN32)
-    ShellClipboard::clearClipboard();   // the offered files are fetched through this manager
+    clearOwnOffer();   // the offered files are fetched through this manager
+#endif
+}
+
+void ClipboardFileTransferManager::clearOwnOffer() {
+#if defined(_WIN32)
+    ShellClipboard::clearClipboard();
+#else
+    ShellClipboard::clearClipboardIfCurrent(offerGeneration_.load());
 #endif
 }
 
@@ -1366,9 +1393,16 @@ void ClipboardFileTransferManager::handleRemoteFileList(uint32_t transferId, con
         activeSendFn_ = sendPacket;
     }
 
-    ShellClipboard::setVirtualClipboardFiles(sanitizedFiles, [this](uint32_t fIndex, uint64_t off, uint32_t len, std::vector<uint8_t>& out) {
+    auto reader = [this](uint32_t fIndex, uint64_t off, uint32_t len, std::vector<uint8_t>& out) {
         return this->fetchChunk(fIndex, off, len, out);
-    });
+    };
+#if defined(_WIN32)
+    ShellClipboard::setVirtualClipboardFiles(sanitizedFiles, reader);
+#else
+    uint64_t generation = 0;
+    ShellClipboard::setVirtualClipboardFiles(sanitizedFiles, reader, &generation);
+    offerGeneration_.store(generation);
+#endif
 }
 
 bool ClipboardFileTransferManager::fetchChunk(uint32_t fileIndex, uint64_t offset, uint32_t length, std::vector<uint8_t>& outData) {
@@ -1526,7 +1560,7 @@ void ClipboardFileTransferManager::handleFileCancel(uint32_t transferId, uint32_
         pendingReq_.failed = true;
         chunkCv_.notify_all();
         purgeStaging();
-        ShellClipboard::clearClipboard();
+        clearOwnOffer();
     }
 }
 
@@ -1542,7 +1576,7 @@ void ClipboardFileTransferManager::cancelActiveTransfer(const SendPacketFn& send
         sendFn = sendPacket ? sendPacket : activeSendFn_;
         chunkCv_.notify_all();
         purgeStaging();
-        ShellClipboard::clearClipboard();
+        clearOwnOffer();
     }
 
     if (sendFn && tId > 0) {
