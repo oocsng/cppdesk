@@ -3548,8 +3548,14 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                                    hostPubBlob, viewerEcdh.localPublicKey()),
                     hostSig);
             }
-            const ViewerPairingDecision pairing = decideViewerPairing(
-                hostAdvertisesPairing, viewerHostKeyVerified_, identity_.findPairedHost(remoteId), viewerHostPairingKey_);
+            // A dialled desk ID is resolved over unauthenticated discovery: if it is pinned, the PC that answers must
+            // claim that same ID, or a rogue could answer for it under another ID and dodge the pin.
+            const bool pinnedIdAnsweredByOther =
+                targetDeskId > 0 && remoteId != targetDeskId && identity_.findPairedHost(targetDeskId).has_value();
+            const ViewerPairingDecision pairing = pinnedIdAnsweredByOther
+                ? ViewerPairingDecision::RefuseIdentityChanged
+                : decideViewerPairing(hostAdvertisesPairing, viewerHostKeyVerified_,
+                                      identity_.findPairedHost(remoteId), viewerHostPairingKey_);
             if (pairing == ViewerPairingDecision::RefuseIdentityChanged ||
                 pairing == ViewerPairingDecision::RefuseNoPairingSupport) {
                 if (!isReconnecting) {

@@ -9849,8 +9849,8 @@ void testPairedLogin() {
         const std::string target = "127.0.0.1:" + std::to_string(hostNet.hostListenPort());
 
         bool sawPrompt = false;   // the host ever asked for approval or a 2FA code
-        auto dial = [&]() {
-            viewerNet.connectToRemote(target, "");
+        auto dial = [&](const std::string& to, const std::string& password) {
+            viewerNet.connectToRemote(to, password);
             ViewerSessionStats st;
             for (int i = 0; i < 80; ++i) {
                 st = viewerNet.viewerStats();
@@ -9875,16 +9875,22 @@ void testPairedLogin() {
         };
         auto has = [](const ViewerSessionStats& st, const char* text) { return st.statusMessage.find(text) != std::string::npos; };
 
-        auto st = dial();
+        auto st = dial(target, "");
         TEST_ASSERT(st.state == ViewerConnectionState::Connected);
         TEST_ASSERT(st.pairedSession && st.hostAllowsNewPairing);
         TEST_ASSERT(hostPaired());
         hangUp();
 
         { AppSettings s = hostId.settings(); s.allowPairing = false; hostId.updateSettings(s); }
-        st = dial();
+        st = dial(target, "");
         TEST_ASSERT(st.state == ViewerConnectionState::Connected);
         TEST_ASSERT(st.pairedSession && !st.hostAllowsNewPairing);
+        TEST_ASSERT(hostPaired());
+        hangUp();
+
+        // A pinned host overrides a typed password: the session is still a paired one.
+        st = dial(target, "HostPw1");
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected && st.pairedSession);
         TEST_ASSERT(hostPaired());
         hangUp();
 
@@ -9896,32 +9902,44 @@ void testPairedLogin() {
             hostId.updateSettings(s);
         }
         TEST_ASSERT(hostId.totpManager().isConfigured());
-        st = dial();
+        st = dial(target, "");
         TEST_ASSERT(st.state == ViewerConnectionState::Connected && st.pairedSession);
         TEST_ASSERT(hostPaired());
         TEST_ASSERT(!sawPrompt);
         hangUp();
 
         TEST_ASSERT(hostId.removePairedViewer(viewerId.deskId()));
-        st = dial();
+        st = dial(target, "");
         TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "not paired"));
         hangUp();
 
         viewerId.addPairedHost({hostId.deskId(), "H", otherKey.publicKey(), 1});
-        st = dial();
+        st = dial(target, "");
         TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "doesn't match"));
         TEST_ASSERT(!hostNet.hostSessionStatus().active);
         hangUp();
 
-        // Bad paired logins count toward the per-IP lockout exactly like bad passwords.
+        // A pinned desk ID answered by a PC claiming another ID is refused, even though that other ID is pinned too.
+        // Dialling one's own desk ID connects to 127.0.0.1:<own listen port>, so pointing that port at the host makes
+        // the dialled ID (the viewer's) and the answering ID (the host's) differ.
         viewerId.addPairedHost({hostId.deskId(), "H", hostId.pairingKey().publicKey(), 1});
+        viewerId.addPairedHost({viewerId.deskId(), "X", otherKey.publicKey(), 1});
+        viewerId.setListenPort(hostNet.hostListenPort());
+        st = dial(viewerId.formattedDeskId(), "");
+        TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "doesn't match"));
+        TEST_ASSERT(!hostNet.hostSessionStatus().active);
+        hangUp();
+        viewerId.setListenPort(51011);
+        TEST_ASSERT(viewerId.removePairedHost(viewerId.deskId()));
+
+        // Bad paired logins count toward the per-IP lockout exactly like bad passwords.
         hostNet.clearRateLimitRecords();
         for (int i = 0; i < 5; ++i) {
-            st = dial();
+            st = dial(target, "");
             TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "not paired"));
             hangUp();
         }
-        st = dial();
+        st = dial(target, "");
         TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "Too many"));
         TEST_ASSERT(!sawPrompt);
         hangUp();
