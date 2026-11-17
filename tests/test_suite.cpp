@@ -10693,6 +10693,25 @@ void testPairingOfferEveryConnection() {
     for (const auto& c : cfgs) std::filesystem::remove(c, ec);
 }
 
+void testIdleFocusedFieldDoesNotSpin() {
+    std::cout << "[TEST 114] A focused text box on an idle dashboard does not keep the window repainting..." << std::endl;
+    std::error_code ec;
+    IdentityManager probe(4360);
+    std::filesystem::remove(probe.configFilePath(), ec);
+    {
+        IdentityManager id(4360);
+        TEST_ASSERT(id.loadOrCreate());
+        NetworkEngine net(id);
+        FakeShell shell;
+        AppUi app(id, net, shell, "");   // launches with the Desk ID box focused
+        ui::RecordingCanvas rc;
+        for (int i = 0; i < 240; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);   // past the 2 s startup timer
+        TEST_ASSERT(!app.wantsAnimationFrame());   // the idle tick repaints for the caret; no 60 fps loop
+        TEST_ASSERT(rc.serialize().find("Remote Desk") != std::string::npos);
+    }
+    std::filesystem::remove(probe.configFilePath(), ec);
+}
+
 void testEcdhKnownVector() {
     std::cout << "[TEST 88] ECDH fixed vector: both sides agree and the session key bytes are pinned..." << std::endl;
     auto hex = [](const std::string& h) {
@@ -12639,6 +12658,7 @@ int main(int argc, char** argv) {
         testFleetManager(); std::cout << "Test 111 done\n" << std::flush;
         testFleetUi(); std::cout << "Test 112 done\n" << std::flush;
         testPairingOfferEveryConnection(); std::cout << "Test 113 done\n" << std::flush;
+        testIdleFocusedFieldDoesNotSpin(); std::cout << "Test 114 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;
