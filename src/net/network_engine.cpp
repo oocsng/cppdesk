@@ -1095,6 +1095,7 @@ NetworkEngine::~NetworkEngine() {
 
 bool NetworkEngine::start() {
     if (running_.load()) return true;
+    viewerOnly_.store(false);
 
     uint16_t basePort = identity_.listenPort();
     SOCKET hs = INVALID_SOCKET;
@@ -1159,16 +1160,27 @@ bool NetworkEngine::start() {
     return true;
 }
 
+bool NetworkEngine::startViewerOnly() {
+    if (running_.load()) return viewerOnly_.load();
+    viewerOnly_.store(true);
+    clipboardSyncEnabled_.store(false);
+    running_.store(true);
+    return true;
+}
+
 void NetworkEngine::stop() {
     if (!running_.exchange(false)) return;
 
-    stopHostAudioCapture();
-    stopHostTerminal();
-    stopHostTunnelProxy();
-    destroyPrivacyCurtainWindow();
-    ScreenBlankManager::instance().setEmergencyWakeCallback(nullptr);
-    ScreenBlankManager::instance().disengageBlanking();
-    ScreenBlankManager::wakeDisplays();
+    // A viewer-only engine never hosted; the curtain and screen blanking are process-wide and belong to the host engine.
+    if (!viewerOnly_.load()) {
+        stopHostAudioCapture();
+        stopHostTerminal();
+        stopHostTunnelProxy();
+        destroyPrivacyCurtainWindow();
+        ScreenBlankManager::instance().setEmergencyWakeCallback(nullptr);
+        ScreenBlankManager::instance().disengageBlanking();
+        ScreenBlankManager::wakeDisplays();
+    }
     shutdownViewerAudioPlayback();
     stopViewerTunnelMultiplexer();
 
@@ -2200,12 +2212,16 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                 uint16_t sc = r.readU16();
                                 uint8_t isDown = r.readU8();
                                 uint8_t isExt = r.readU8();
-                                InputInjector::injectKeyEvent(vk, sc, isDown != 0, isExt != 0);
+                                std::lock_guard<std::mutex> sinkLock(hostKeySinkMutex_);
+                                if (hostKeySink_) hostKeySink_(vk, isDown != 0);
+                                else InputInjector::injectKeyEvent(vk, sc, isDown != 0, isExt != 0);
                             }
                             break;
                         }
                         case PacketType::INPUT_RELEASE_ALL: {
-                            InputInjector::releaseAllModifiers();
+                            std::lock_guard<std::mutex> sinkLock(hostKeySinkMutex_);
+                            if (hostKeySink_) hostKeySink_(0, false);
+                            else InputInjector::releaseAllModifiers();
                             break;
                         }
                         case PacketType::SYSTEM_ACTION: {
@@ -3841,8 +3857,11 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             !viewerStats_.pairedSession && !identity_.findPairedHost(remoteId);
                         pairingState_.store(PairingRequestState::Idle);
                     }
-                    identity_.addOrUpdateRecentSession(remoteId, remoteHost, targetInput);
-                    initViewerAudioPlayback();
+                    // Viewer-only engines share one identity across threads; its recents list and save() are unlocked.
+                    if (!viewerOnly_.load()) {
+                        identity_.addOrUpdateRecentSession(remoteId, remoteHost, targetInput);
+                        initViewerAudioPlayback();
+                    }
                     syncAudioControl();   // the host learns this viewer's mute and volume now, and again after a reconnect
                     startViewerTunnelMultiplexer();
 
@@ -4311,7 +4330,8 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         case PacketType::CLIPBOARD_FILE_LIST: {
                             uint32_t tid = 0;
                             std::vector<VirtualFileEntry> files;
-                            if (deserializeClipboardFileList(r.currentPtr(), r.remaining(), tid, files)) {
+                            // Viewer-only: the host's copied files never take over this PC's clipboard.
+                            if (!viewerOnly_.load() && deserializeClipboardFileList(r.currentPtr(), r.remaining(), tid, files)) {
                                 clipFileMgr_.handleRemoteFileList(tid, files, [this](PacketType t, const std::vector<uint8_t>& p) {
                                     return sendViewerEncryptedPacket(t, 0, p.data(), p.size());
                                 });
@@ -4410,7 +4430,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             break;
                         }
                         case PacketType::AUDIO_STREAM_CHUNK: {
-                            enqueueViewerAudioChunk(payload.data(), payload.size());
+                            if (!viewerOnly_.load()) enqueueViewerAudioChunk(payload.data(), payload.size());
                             break;
                         }
                         case PacketType::VOICE_INTERCOM_CHUNK: {

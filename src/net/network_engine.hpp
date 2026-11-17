@@ -224,12 +224,17 @@ public:
     ~NetworkEngine();
 
     bool start();
+    // Runs only the viewer half: no host listener, UDP discovery or relay; clipboard auto-sync off, host audio dropped.
+    // Several can share one IdentityManager.
+    bool startViewerOnly();
+    bool isViewerOnly() const { return viewerOnly_.load(); }
     bool isRunning() const { return running_.load(); }
     void stop();
 
     // Local IP & listening status
     std::string localIpAddress() const { return localIp_; }
     uint16_t hostListenPort() const { return identity_.listenPort(); }
+    bool hostListening() const { return hostListenSock_ != ~uintptr_t(0); }
 
     // Discovery
     std::vector<DiscoveredPeer> discoveredPeers() const;
@@ -377,6 +382,11 @@ public:
     bool isHostAudioSuspended() const;
     // True while the host's microphone is open because a viewer's voice arrived: the dashboard says so.
     bool isHostMicLive() const { return hostMicLive_.load(); }
+    // Test-only, host side: key events go to the sink instead of InputInjector; INPUT_RELEASE_ALL arrives as (0, false).
+    void setHostKeySinkForTest(std::function<void(uint16_t vk, bool isDown)> sink) {
+        std::lock_guard<std::mutex> lk(hostKeySinkMutex_);
+        hostKeySink_ = std::move(sink);
+    }
     void setHostMicLiveForTest(bool live) { hostMicLive_.store(live); }
     void injectVoiceChunkForTest(const uint8_t* payload, size_t len) { handleIncomingVoiceChunk(payload, len); }
     bool voiceOpenFailedForTest() const { return voiceOpenFailed_.load(); }
@@ -526,6 +536,9 @@ private:
     IdentityManager&            identity_;
     std::string                 localIp_ = "127.0.0.1";
     std::atomic<bool>           running_{false};
+    std::atomic<bool>           viewerOnly_{false};
+    std::mutex                  hostKeySinkMutex_;
+    std::function<void(uint16_t, bool)> hostKeySink_;   // test-only, see setHostKeySinkForTest
 
     // Discovery
     uintptr_t                   udpSock_ = ~uintptr_t(0);

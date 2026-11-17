@@ -10114,6 +10114,80 @@ void testPairingOffer() {
     }
 }
 
+void testViewerOnlyEngine() {
+    std::cout << "[TEST 110] Viewer-only engines: no listener or discovery, two at once on one identity, key sink..." << std::endl;
+
+    std::error_code ec;
+    std::vector<std::string> cfgs;
+    for (int inst : {4330, 4331, 4332}) {
+        IdentityManager probe(inst);
+        cfgs.push_back(probe.configFilePath());
+        std::filesystem::remove(cfgs.back(), ec);
+    }
+    {
+        IdentityManager hostAId(4330), hostBId(4331), viewerId(4332);
+        TEST_ASSERT(hostAId.loadOrCreate() && hostBId.loadOrCreate() && viewerId.loadOrCreate());
+        hostAId.setListenPort(51030);
+        hostBId.setListenPort(51032);
+        viewerId.setListenPort(51034);
+        for (IdentityManager* h : {&hostAId, &hostBId}) {
+            h->addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
+            viewerId.addPairedHost({h->deskId(), "H", h->pairingKey().publicKey(), 1});
+        }
+
+        NetworkEngine hostA(hostAId), hostB(hostBId);
+        TEST_ASSERT(hostA.start() && hostB.start());
+        TEST_ASSERT(!hostA.isViewerOnly() && hostA.hostListening());
+
+        NetworkEngine viewerA(viewerId), viewerB(viewerId);
+        TEST_ASSERT(viewerA.startViewerOnly() && viewerB.startViewerOnly());
+        TEST_ASSERT(viewerA.isRunning() && viewerA.isViewerOnly() && viewerB.isViewerOnly());
+        TEST_ASSERT(!viewerA.hostListening() && !viewerB.hostListening());
+        TEST_ASSERT(!viewerA.isClipboardSyncEnabled() && !viewerB.isClipboardSyncEnabled());
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        TEST_ASSERT(viewerA.discoveredPeers().empty() && viewerB.discoveredPeers().empty());
+
+        std::mutex keysMutex;
+        std::vector<std::pair<uint16_t, bool>> keys;
+        hostA.setHostKeySinkForTest([&](uint16_t vk, bool isDown) {
+            std::lock_guard<std::mutex> lk(keysMutex);
+            keys.emplace_back(vk, isDown);
+        });
+
+        // Both dial at once over the same viewer identity.
+        viewerA.connectToRemote("127.0.0.1:" + std::to_string(hostA.hostListenPort()), "");
+        viewerB.connectToRemote("127.0.0.1:" + std::to_string(hostB.hostListenPort()), "");
+        auto connected = [](NetworkEngine& v) {
+            auto st = v.viewerStats();
+            return st.state == ViewerConnectionState::Connected && st.pairedSession;
+        };
+        for (int i = 0; i < 80 && !(connected(viewerA) && connected(viewerB)); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        TEST_ASSERT(connected(viewerA) && connected(viewerB));
+
+        viewerA.sendKeyEvent(0x41, 0x1E, true, false);
+        viewerA.sendKeyEvent(0x41, 0x1E, false, false);
+        viewerA.sendReleaseAllModifiers();
+        auto keyCount = [&]() { std::lock_guard<std::mutex> lk(keysMutex); return keys.size(); };
+        for (int i = 0; i < 40 && keyCount() < 3; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        {
+            std::lock_guard<std::mutex> lk(keysMutex);
+            const std::vector<std::pair<uint16_t, bool>> expected{{0x41, true}, {0x41, false}, {0, false}};
+            TEST_ASSERT(keys == expected);
+        }
+
+        viewerA.stop();
+        TEST_ASSERT(!viewerA.isRunning());
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        TEST_ASSERT(connected(viewerB));
+
+        viewerB.stop();
+        hostA.setHostKeySinkForTest(nullptr);
+    }
+    for (const auto& c : cfgs) std::filesystem::remove(c, ec);
+}
+
 void testEcdhKnownVector() {
     std::cout << "[TEST 88] ECDH fixed vector: both sides agree and the session key bytes are pinned..." << std::endl;
     auto hex = [](const std::string& h) {
@@ -12056,6 +12130,7 @@ int main(int argc, char** argv) {
         testPairingStorage(); std::cout << "Test 107 done\n" << std::flush;
         testPairedLogin(); std::cout << "Test 108 done\n" << std::flush;
         testPairingOffer(); std::cout << "Test 109 done\n" << std::flush;
+        testViewerOnlyEngine(); std::cout << "Test 110 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;
