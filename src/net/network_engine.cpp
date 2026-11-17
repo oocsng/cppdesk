@@ -2887,7 +2887,10 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                 }
                             } catch (...) { wellFormed = false; }
                             const bool allowed = identity_.settings().allowPairing;   // checked now, not at login
-                            const bool accept = wellFormed && allowed;
+                            // viewerId is only a claim in a password login: it must not overwrite another PC's pinned key.
+                            const auto existing = identity_.findPairedViewer(viewerId);
+                            const bool replacesOtherKey = wellFormed && !pairedLogin && existing && existing->publicKey != viewerKey;
+                            const bool accept = wellFormed && allowed && !replacesOtherKey;
                             if (accept) {
                                 identity_.addPairedViewer({viewerId, viewerName, viewerKey, static_cast<uint64_t>(std::time(nullptr))});
                             }
@@ -2900,7 +2903,8 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             } else {
                                 pw.writeU16(0);
                             }
-                            pw.writeString(accept ? "Paired" : (!allowed ? "This PC is not accepting new pairings." : "Invalid pairing request."));
+                            pw.writeString(accept ? "Paired" : (!allowed ? "This PC is not accepting new pairings."
+                                : replacesOtherKey ? "Already paired; forget it on the host first." : "Invalid pairing request."));
                             enqueueHostPacket(PacketType::PAIR_RESULT, 0, pw.buffer(), false);
                             break;
                         }

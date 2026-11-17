@@ -10039,6 +10039,46 @@ void testPairingOffer() {
         TEST_ASSERT(!rig.hostId.findPairedViewer(rig.viewerId.deskId()));
         rig.hangUp();
     }
+    {
+        // A password holder claiming a paired PC's desk ID cannot replace that PC's pinned key.
+        Rig rig(4326, 51026, true);
+        TEST_ASSERT(rig.dial("HostPw1").offerPairing && rig.viewerNet.requestPairing());
+        TEST_ASSERT(rig.waitForAnswer() == PairingRequestState::Paired);
+        const auto original = rig.hostId.findPairedViewer(rig.viewerId.deskId());
+        TEST_ASSERT(original && original->publicKey == rig.viewerId.pairingKey().publicKey());
+        rig.hangUp();
+
+        IdentityManager attackerId(4328);
+        std::error_code e;
+        std::filesystem::remove(attackerId.configFilePath(), e);
+        { std::ofstream f(attackerId.configFilePath()); f << "desk_id=" << rig.viewerId.deskId() << "\n"; }
+        TEST_ASSERT(attackerId.loadOrCreate() && attackerId.deskId() == rig.viewerId.deskId());
+        TEST_ASSERT(attackerId.pairingKey().publicKey() != rig.viewerId.pairingKey().publicKey());
+        attackerId.setListenPort(51028);
+        {
+            NetworkEngine attackerNet(attackerId);
+            TEST_ASSERT(attackerNet.start());
+            attackerNet.connectToRemote(rig.target, "HostPw1");
+            ViewerSessionStats st;
+            for (int i = 0; i < 80; ++i) {
+                st = attackerNet.viewerStats();
+                if (st.state == ViewerConnectionState::Connected || st.state == ViewerConnectionState::Error) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            TEST_ASSERT(st.state == ViewerConnectionState::Connected && !st.pairedSession && st.offerPairing);
+            TEST_ASSERT(attackerNet.requestPairing());
+            for (int i = 0; i < 40 && attackerNet.pairingRequestState() == PairingRequestState::Pending; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            TEST_ASSERT(attackerNet.pairingRequestState() == PairingRequestState::Refused);
+            TEST_ASSERT(!attackerId.findPairedHost(rig.hostId.deskId()));
+            attackerNet.disconnectViewer();
+            rig.hostNet.disconnectHostClient();
+        }
+        const auto after = rig.hostId.findPairedViewer(rig.viewerId.deskId());
+        TEST_ASSERT(after && after->publicKey == original->publicKey && after->hostname == original->hostname);
+        TEST_ASSERT(rig.hostId.pairedViewers().size() == 1);
+        std::filesystem::remove(attackerId.configFilePath(), e);
+    }
 }
 
 void testEcdhKnownVector() {
