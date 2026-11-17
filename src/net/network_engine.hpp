@@ -257,7 +257,9 @@ public:
     void clearRateLimitRecords();
 
     // Viewer: Outgoing connection & remote session control
-    bool connectToRemote(const std::string& targetIdOrAddr, const std::string& password);
+    // requirePairedDeskId != 0: the host must prove it is that paired PC (pairing keys only, never a password or an
+    // unpaired login), else the connection is refused before any credential is sent. Used by the grid.
+    bool connectToRemote(const std::string& targetIdOrAddr, const std::string& password, uint64_t requirePairedDeskId = 0);
     void disconnectViewer();
     bool isViewerActive() const { return viewerActive_.load(); }
 
@@ -523,7 +525,7 @@ private:
     void relayRegistrationLoop();
     void hostAcceptLoop();
     void runHostSession(uintptr_t clientSock, std::string clientIp);
-    void runViewerSession(std::string targetInput, std::string password);
+    void runViewerSession(std::string targetInput, std::string password, uint64_t requirePairedDeskId);
 
     // Brute-force protection helpers
     bool isIpRateLimited(const std::string& ip);

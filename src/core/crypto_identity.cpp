@@ -28,6 +28,8 @@
 #include <iomanip>
 #include <filesystem>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 namespace cppdesk {
 
@@ -794,8 +796,17 @@ bool IdentityManager::loadOrCreate() {
 }
 
 bool IdentityManager::save() const {
-    std::ofstream out(configPath_, std::ios::trunc);
+    // Host, viewer and UI threads all save: one at a time, into a temp file renamed over the config, so it never tears.
+    std::lock_guard<std::mutex> saveLock(saveMutex_);
+    const std::string tmpPath = configPath_ + ".tmp";
+    std::ofstream out(tmpPath, std::ios::trunc);
     if (!out.is_open()) return false;
+    std::error_code ec;
+#ifndef _WIN32
+    // pair_key logs in to every paired host without a password: owner-only before any of it is written.
+    std::filesystem::permissions(tmpPath, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::replace, ec);
+#endif
 
     out << "# CppDesk Configuration (Salted SHA-256 Verifier Protected)\n";
     out << "desk_id=" << deskId_ << "\n";
@@ -871,10 +882,23 @@ bool IdentityManager::save() const {
                 << "|" << p.pairedAtUnix << "|" << sanitizeIniValue(p.hostname) << "\n";
         }
     };
-    std::lock_guard<std::mutex> pairLock(pairMutex_);
-    writePeers("paired_viewer", pairedViewers_);
-    writePeers("paired_host", pairedHosts_);
-    return true;
+    {
+        std::lock_guard<std::mutex> pairLock(pairMutex_);
+        writePeers("paired_viewer", pairedViewers_);
+        writePeers("paired_host", pairedHosts_);
+    }
+    out.close();
+    if (!out) {
+        std::filesystem::remove(tmpPath, ec);
+        return false;
+    }
+    for (int attempt = 0; attempt < 50; ++attempt) {   // a reader holding the config open on Windows blocks the replace briefly
+        std::filesystem::rename(tmpPath, configPath_, ec);
+        if (!ec) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::filesystem::remove(tmpPath, ec);
+    return false;
 }
 
 std::vector<PairedPeer> IdentityManager::pairedViewers() const {

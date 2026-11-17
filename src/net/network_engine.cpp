@@ -3138,7 +3138,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
 
 // ---------------- Viewer Session Client ----------------
 
-bool NetworkEngine::connectToRemote(const std::string& targetIdOrAddr, const std::string& password) {
+bool NetworkEngine::connectToRemote(const std::string& targetIdOrAddr, const std::string& password, uint64_t requirePairedDeskId) {
     disconnectViewer();
     std::lock_guard<std::mutex> vlk(viewerThreadMutex_);
     try {
@@ -3161,7 +3161,7 @@ bool NetworkEngine::connectToRemote(const std::string& targetIdOrAddr, const std
         viewerStats_.adaptiveFps = identity_.settings().adaptiveFps;
     }
 
-    viewerThread_ = std::thread(&NetworkEngine::runViewerSession, this, targetIdOrAddr, password);
+    viewerThread_ = std::thread(&NetworkEngine::runViewerSession, this, targetIdOrAddr, password, requirePairedDeskId);
     return true;
 }
 
@@ -3355,7 +3355,7 @@ void NetworkEngine::setOnFrameDecodedCallback(std::function<void()> cb) {
     onFrameDecoded_ = std::move(cb);
 }
 
-void NetworkEngine::runViewerSession(std::string targetInput, std::string password) {
+void NetworkEngine::runViewerSession(std::string targetInput, std::string password, uint64_t requirePairedDeskId) {
     auto setStatus = [&](ViewerConnectionState st, const std::string& msg) {
         std::lock_guard<std::mutex> lock(viewerStatsMutex_);
         viewerStats_.state = st;
@@ -3625,10 +3625,13 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
             // claim that same ID, or a rogue could answer for it under another ID and dodge the pin.
             const bool pinnedIdAnsweredByOther =
                 targetDeskId > 0 && remoteId != targetDeskId && identity_.findPairedHost(targetDeskId).has_value();
-            const ViewerPairingDecision pairing = pinnedIdAnsweredByOther
+            ViewerPairingDecision pairing = pinnedIdAnsweredByOther
                 ? ViewerPairingDecision::RefuseIdentityChanged
                 : decideViewerPairing(hostAdvertisesPairing, viewerHostKeyVerified_,
                                       identity_.findPairedHost(remoteId), viewerHostPairingKey_);
+            // A required paired PC (dialled by a spoofable ip:port) must be exactly that PC, logged in with its keys.
+            if (requirePairedDeskId != 0 && (remoteId != requirePairedDeskId || pairing == ViewerPairingDecision::Legacy))
+                pairing = ViewerPairingDecision::RefuseIdentityChanged;
             if (pairing == ViewerPairingDecision::RefuseIdentityChanged ||
                 pairing == ViewerPairingDecision::RefuseNoPairingSupport) {
                 if (!isReconnecting) {

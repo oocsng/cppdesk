@@ -60,7 +60,7 @@ private:
     struct Member;
     std::vector<std::shared_ptr<Member>> snapshot() const;
     std::shared_ptr<Member> find(uint64_t deskId) const;
-    static NetworkEngine* connected(const Member& m);       // the engine if it is Connected, else null
+    static NetworkEngine* connected(const Member& m);       // the engine if Connected to this very paired PC, else null
 
     IdentityManager& identity_;
     mutable std::mutex mutex_;

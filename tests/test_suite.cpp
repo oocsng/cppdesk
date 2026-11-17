@@ -9861,6 +9861,39 @@ void testPairingStorage() {
         TEST_ASSERT(!id.findPairedViewer(12) && !id.findPairedViewer(13));
         TEST_ASSERT(id.pairedViewers().empty() && id.pairedHosts().size() == 1);
     }
+    // Host, viewer and UI threads save at once: the file on disk is never torn and every entry lands.
+    {
+        IdentityManager id(4301);
+        TEST_ASSERT(id.loadOrCreate());
+        auto readCfg = [&](bool& opened) {
+            std::ifstream f(cfg, std::ios::binary);
+            opened = f.is_open();
+            return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        bool opened = false;
+        const std::string first = readCfg(opened);
+        const auto k = first.find("pair_key=");
+        TEST_ASSERT(k != std::string::npos);
+        const std::string keyLine = first.substr(k, first.find('\n', k) + 1 - k);
+        std::atomic<bool> torn{false};
+        std::thread a([&] { for (uint64_t i = 0; i < 60; ++i) id.addPairedViewer({500000000ULL + i, "V", vk.publicKey(), 1}); });
+        std::thread b([&] { for (uint64_t i = 0; i < 60; ++i) id.addPairedHost({600000000ULL + i, "H", hk.publicKey(), 1}); });
+        std::thread r([&] {
+            for (int i = 0; i < 200; ++i) {
+                bool ok = false;
+                const std::string s = readCfg(ok);   // Windows may refuse the open while the rename lands: not a torn file
+                if (ok && (s.rfind("# CppDesk", 0) != 0 || s.find(keyLine) == std::string::npos || s.back() != '\n')) torn = true;
+            }
+        });
+        a.join(); b.join(); r.join();
+        TEST_ASSERT(!torn.load());
+        TEST_ASSERT(!std::filesystem::exists(cfg + ".tmp"));
+    }
+    {
+        IdentityManager id(4301);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(id.pairedViewers().size() == 60 && id.pairedHosts().size() == 61);
+    }
     std::filesystem::remove(cfg, ec);
 }
 
@@ -10228,7 +10261,7 @@ void testFleetManager() {
 
     std::error_code ec;
     std::vector<std::string> cfgs;
-    for (int inst : {4340, 4341, 4342}) {
+    for (int inst : {4340, 4341, 4342, 4346, 4347, 4348, 4349}) {
         IdentityManager probe(inst);
         cfgs.push_back(probe.configFilePath());
         std::filesystem::remove(cfgs.back(), ec);
@@ -10356,6 +10389,54 @@ void testFleetManager() {
         TEST_ASSERT(fleet.size() == 0);
         hostA.setHostKeySinkForTest(nullptr);
         hostB.setHostKeySinkForTest(nullptr);
+    }
+
+    // fleetDialsOnlyThePairedPc: discovery's address is spoofable. Whoever answers there, an unpaired auto-accept PC or
+    // another paired PC, fails the tile and never gets a key, the clipboard or a file.
+    {
+        IdentityManager pId(4346), otherId(4347), rogueId(4348), vId(4349);
+        TEST_ASSERT(pId.loadOrCreate() && otherId.loadOrCreate() && rogueId.loadOrCreate() && vId.loadOrCreate());
+        otherId.setListenPort(51052);
+        rogueId.setListenPort(51054);
+        for (IdentityManager* h : {&pId, &otherId}) {
+            h->addPairedViewer({vId.deskId(), "V", vId.pairingKey().publicKey(), 1});
+            vId.addPairedHost({h->deskId(), "H", h->pairingKey().publicKey(), 1});
+        }
+        std::filesystem::create_directories(tmp / "o", ec);
+        std::filesystem::create_directories(tmp / "r", ec);
+        NetworkEngine other(otherId), rogue(rogueId);
+        rogue.setAutoAcceptIncoming(true);
+        other.fileTransferManager().setReceiveDirectory((tmp / "o").string());
+        rogue.fileTransferManager().setReceiveDirectory((tmp / "r").string());
+        TEST_ASSERT(other.start() && rogue.start());
+        KeyLog logO, logR;
+        other.setHostKeySinkForTest(logO.sink());
+        rogue.setHostKeySinkForTest(logR.sink());
+        const auto src = tmp / "spoof_payload.bin";
+        { std::ofstream out(src, std::ios::binary); out << "secret"; }
+        for (NetworkEngine* imposter : {&rogue, &other}) {
+            FleetManager fleet(vId);
+            TEST_ASSERT(fleet.open({{pId.deskId(), "P", "127.0.0.1:" + std::to_string(imposter->hostListenPort())}}) == 1);
+            bool everLive = false;
+            auto tile = [&] {
+                const auto t = fleet.status().at(0);
+                everLive = everLive || t.state == ViewerConnectionState::Connected;
+                return t;
+            };
+            TEST_ASSERT(waitFor([&] { return tile().state == ViewerConnectionState::Error; }, 4000));
+            TEST_ASSERT(!everLive && tile().statusMessage.find("identity") != std::string::npos);
+            fleet.sendKeyToAll(0x43, 0x2E, true, false);
+            fleet.sendKeyTo(pId.deskId(), 0x43, 0x2E, false, false);
+            fleet.pushClipboardToAll();
+            TEST_ASSERT(fleet.sendFileToAll(src.string()) == 0 && !fleet.sendFileTo(pId.deskId(), src.string()));
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            TEST_ASSERT(!imposter->hostSessionStatus().active);
+            fleet.closeAll();
+        }
+        TEST_ASSERT(logO.get().empty() && logR.get().empty());
+        TEST_ASSERT(!std::filesystem::exists(tmp / "o" / "spoof_payload.bin") && !std::filesystem::exists(tmp / "r" / "spoof_payload.bin"));
+        other.setHostKeySinkForTest(nullptr);
+        rogue.setHostKeySinkForTest(nullptr);
     }
     std::filesystem::remove_all(tmp, ec);
     for (const auto& c : cfgs) std::filesystem::remove(c, ec);

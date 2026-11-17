@@ -38,7 +38,7 @@ size_t FleetManager::open(const std::vector<FleetMember>& members) {
         m->info = fm;
         m->engine = std::make_unique<NetworkEngine>(identity_);
         m->engine->startViewerOnly();
-        m->engine->connectToRemote(fm.address, "");
+        m->engine->connectToRemote(fm.address, "", fm.deskId);   // discovery's address is spoofable: only that paired PC may answer
         std::lock_guard<std::mutex> lk(mutex_);
         if (members_.size() >= kMaxMembers || has()) continue;   // lost a race with another open(); m stops after lk unlocks
         members_.push_back(std::move(m));
@@ -168,7 +168,9 @@ std::shared_ptr<FleetManager::Member> FleetManager::find(uint64_t deskId) const 
 }
 
 NetworkEngine* FleetManager::connected(const Member& m) {
-    return m.engine && m.engine->viewerStats().state == ViewerConnectionState::Connected ? m.engine.get() : nullptr;
+    if (!m.engine) return nullptr;
+    const auto st = m.engine->viewerStats();
+    return st.state == ViewerConnectionState::Connected && st.pairedSession && st.remoteDeskId == m.info.deskId ? m.engine.get() : nullptr;
 }
 
 } // namespace cppdesk

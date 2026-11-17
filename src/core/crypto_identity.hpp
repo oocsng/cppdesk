@@ -398,6 +398,7 @@ private:
     std::string                     configPath_;
     PairingKey                      pairingKey_;         // Hex in the config file as pair_key
     mutable std::mutex              pairMutex_;          // Guards the two paired lists
+    mutable std::mutex              saveMutex_;          // Serialises save(); taken before pairMutex_, never after
     std::vector<PairedPeer>         pairedViewers_;
     std::vector<PairedPeer>         pairedHosts_;
 };
