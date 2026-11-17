@@ -1,7 +1,6 @@
 #include "fleet_manager.hpp"
 
 #include <algorithm>
-#include <atomic>
 
 namespace cppdesk {
 
@@ -9,7 +8,6 @@ struct FleetManager::Member {
     FleetMember info;
     std::unique_ptr<NetworkEngine> engine;   // null for a UI-snapshot placeholder
     ViewerConnectionState placeholderState = ViewerConnectionState::Disconnected;
-    std::atomic<bool> lowBandwidthAsked{false};   // reset whenever the member is not Connected
 };
 
 FleetManager::FleetManager(IdentityManager& identity) : identity_(identity) {}
@@ -86,9 +84,12 @@ std::vector<FleetTileStatus> FleetManager::status() const {
         const auto st = m->engine->viewerStats();
         t.state = st.state;
         t.statusMessage = st.statusMessage;
-        // The UI polls this every frame, so it is where a fresh connection (or a reconnect) gets its low-bandwidth ask.
-        if (st.state != ViewerConnectionState::Connected) m->lowBandwidthAsked.store(false);
-        else if (!m->lowBandwidthAsked.exchange(true)) m->engine->requestVideoSettings(QualityPreset::LowBandwidth, 0, true, 15);
+        t.qualityPreset = st.qualityPreset;
+        t.targetFps = st.targetFps;
+        // The UI polls this every frame. Checking the settings in effect (not a once-flag) also repairs the engine's own
+        // default request, which can land just after Connected; requestVideoSettings records them, so steady state sends nothing.
+        if (st.state == ViewerConnectionState::Connected && (st.qualityPreset != QualityPreset::LowBandwidth || st.targetFps != 15))
+            m->engine->requestVideoSettings(QualityPreset::LowBandwidth, 0, true, 15);
         for (const auto& item : m->engine->fileTransferManager().snapshotTransfers()) {
             if (item.isOutgoing) { t.lastOutgoing = item; break; }   // newest first
         }

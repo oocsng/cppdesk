@@ -10287,6 +10287,16 @@ void testFleetManager() {
         TEST_ASSERT(waitFor([&] { return stateOf(deskA) == C && stateOf(deskB) == C; }, 4000));
         auto tiles = fleet.status();
         TEST_ASSERT(tiles.size() == 2 && tiles[0].deskId == deskA && tiles[0].name == "A" && tiles[1].deskId == deskB);
+        TEST_ASSERT(fleet.open({{deskA, "A", "127.0.0.1:51040"}}) == 0 && fleet.size() == 2);
+        // Every member settles on LowBandwidth at 15 FPS, even after the engine's own default request on connect.
+        auto lowBandwidth = [&] {
+            for (const auto& t : fleet.status())
+                if (t.qualityPreset != QualityPreset::LowBandwidth || t.targetFps != 15) return false;
+            return true;
+        };
+        TEST_ASSERT(waitFor(lowBandwidth, 2000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        TEST_ASSERT(lowBandwidth());
 
         fleet.sendKeyToAll(0x41, 0x1E, true, false);
         fleet.sendKeyToAll(0x41, 0x1E, false, false);

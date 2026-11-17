@@ -19,11 +19,14 @@ struct FleetTileStatus {
     ViewerConnectionState state = ViewerConnectionState::Disconnected;
     std::string statusMessage;
     std::optional<FileTransferItem> lastOutgoing;   // newest outgoing transfer, for done/failed/progress
+    QualityPreset qualityPreset = QualityPreset::Balanced;   // video settings in effect (fleet keeps LowBandwidth/15)
+    uint8_t targetFps = 0;
 };
 
 // Drives one viewer-only NetworkEngine per paired PC, all on one shared IdentityManager (which must outlive this).
 // Thread-safe: the member list is only touched under mutex_; engine calls happen on a snapshot, outside the lock,
-// and only on members that are Connected, so a dropped PC never holds up the others.
+// and only on members that are Connected, so a dropped PC the engine has already noticed never holds up the others
+// (until then a call to it lasts as long as that engine's normal send).
 class FleetManager {
 public:
     static constexpr size_t kMaxMembers = 16;
@@ -34,11 +37,13 @@ public:
 
     // Paired hosts that discovery currently sees directly (not viaRelay), sorted by name.
     static std::vector<FleetMember> eligibleMembers(const IdentityManager& id, const std::vector<DiscoveredPeer>& peers);
-    size_t open(const std::vector<FleetMember>& members);   // opens at most kMaxMembers in all; returns how many
+    // Opens at most kMaxMembers in all; returns how many. A dropped member stays in the grid (and counts toward the
+    // cap) until close(); a deskId already open is skipped, so opening it again returns 0.
+    size_t open(const std::vector<FleetMember>& members);
     void close(uint64_t deskId);                            // release-all, disconnect, drop the engine
     void closeAll();
     size_t size() const;
-    // In open() order. Also asks each newly Connected member for LowBandwidth at 15 FPS, once per connection.
+    // In open() order. Also asks any Connected member not on LowBandwidth at 15 FPS to switch to it.
     std::vector<FleetTileStatus> status() const;
     bool copyFrame(uint64_t deskId, uint64_t& seq, std::vector<uint8_t>& bgra, int& w, int& h, CursorState& cursor);
     void sendKeyToAll(uint16_t vk, uint16_t scan, bool isDown, bool isExtended);
