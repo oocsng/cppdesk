@@ -18,6 +18,7 @@
 #include <functional>
 #include <atomic>
 #include <mutex>
+#include <optional>
 
 namespace cppdesk {
 
@@ -151,9 +152,13 @@ public:
     static bool getLocalClipboardFiles(std::vector<VirtualFileEntry>& outFiles, std::vector<std::wstring>& outFullPaths);
     // Offers the peer's files to other apps. Nothing is fetched until an app pastes; then every file is fetched
     // through chunkReader into a staging folder, which later pastes reuse.
-    static bool setVirtualClipboardFiles(const std::vector<VirtualFileEntry>& files, VirtualChunkReadFn chunkReader);
+    // outGeneration receives the offer's number, for clearClipboardIfCurrent.
+    static bool setVirtualClipboardFiles(const std::vector<VirtualFileEntry>& files, VirtualChunkReadFn chunkReader,
+                                         uint64_t* outGeneration = nullptr);
     // Withdraws the files offered by setVirtualClipboardFiles.
     static void clearClipboard();
+    // Withdraws them only while the offer numbered generation is still the current one (nullopt: always).
+    static bool clearClipboardIfCurrent(std::optional<uint64_t> generation);
 
     static std::string getLocalClipboardText();
     static bool setLocalClipboardText(const std::string& text);

@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <mutex>
+#include <optional>
 
 namespace cppdesk {
 
@@ -75,6 +77,9 @@ struct AppSettings {
     bool          privacyCloakEnabled = true;
     std::string   privacyCloakKeywords = "KeePass, Bitwarden, 1Password, Authenticator, Credential, Wallet, .env, Banking";
     uint8_t       privacyCloakStyle = 0; // 0 = Solid Charcoal, 1 = Mosaic
+
+    // LAN Fleet: lets other PCs pair with this one (config key allow_pairing); off until the user turns it on
+    bool          allowPairing = false;
 };
 
 class CryptoUtils {
@@ -123,6 +128,16 @@ public:
     static std::array<uint8_t, 32> bindChallengeResponse(
         const std::array<uint8_t, 32>& sessionKey,
         const std::array<uint8_t, 32>& digest);
+
+    // Digest a pairing signature covers: SHA-256 of "CPPDESK-PAIR-V1" | role ('H' host, 'V' viewer) | hostId u64 LE |
+    // viewerId u64 LE | nonce | u16 LE len + hostEcdhPub | u16 LE len + viewerEcdhPub.
+    static std::array<uint8_t, 32> pairingTranscript(
+        char role,
+        uint64_t hostId,
+        uint64_t viewerId,
+        const std::array<uint8_t, 32>& nonce,
+        const std::vector<uint8_t>& hostEcdhPub,
+        const std::vector<uint8_t>& viewerEcdhPub);
 
     // Derive a 256-bit session key from handshake parameters (supports ECDH shared secret)
     static std::array<uint8_t, 32> deriveSessionKey(
@@ -207,6 +222,43 @@ private:
     uintptr_t            hAlg_ = 0;
     uintptr_t            hKey_ = 0;
     std::vector<uint8_t> localPubBlob_;
+};
+
+// ---------------- PairingKey ----------------
+// A per-install ECDSA P-256 signing key. All byte strings are big-endian; signatures are raw r || s (not DER).
+class PairingKey {
+public:
+    using PublicKey = std::array<uint8_t, 64>;  // X || Y
+    using KeyPair   = std::array<uint8_t, 96>;  // X || Y || d
+    using Signature = std::array<uint8_t, 64>;  // r || s
+
+    PairingKey() = default;
+    ~PairingKey();
+
+    PairingKey(const PairingKey&) = delete;
+    PairingKey& operator=(const PairingKey&) = delete;
+
+    bool generate();
+    bool importKeyPair(const KeyPair& kp);
+    KeyPair exportKeyPair() const { return keyPair_; }
+    const PublicKey& publicKey() const { return pub_; }
+    bool isValid() const { return valid_; }
+
+    bool sign(const std::array<uint8_t, 32>& digest, Signature& out) const;
+    static bool verify(const PublicKey& pub, const std::array<uint8_t, 32>& digest, const Signature& sig);
+
+private:
+    bool      valid_ = false;
+    KeyPair   keyPair_{};
+    PublicKey pub_{};
+};
+
+// A PC this install has paired with: its desk ID, last known name and pinned signing key.
+struct PairedPeer {
+    uint64_t              deskId = 0;
+    std::string           hostname;
+    PairingKey::PublicKey publicKey{};
+    uint64_t              pairedAtUnix = 0;
 };
 
 // ---------------- AesGcmSessionCipher (Option 1A & 4A) ----------------
@@ -318,6 +370,17 @@ public:
 
     std::string configFilePath() const { return configPath_; }
 
+    // Pairing (thread-safe; getters return copies). The add/remove calls save the config.
+    const PairingKey& pairingKey() const { return pairingKey_; }       // created on first run
+    std::vector<PairedPeer> pairedViewers() const;                     // may enter this PC without a password
+    std::vector<PairedPeer> pairedHosts() const;                       // this PC may enter them; their key is pinned
+    std::optional<PairedPeer> findPairedViewer(uint64_t deskId) const;
+    std::optional<PairedPeer> findPairedHost(uint64_t deskId) const;
+    void addPairedViewer(const PairedPeer& p);                         // replaces an entry with the same deskId
+    void addPairedHost(const PairedPeer& p);
+    bool removePairedViewer(uint64_t deskId);
+    bool removePairedHost(uint64_t deskId);
+
 private:
     int                             instanceId_ = 1;
     uint64_t                        deskId_ = 0;
@@ -333,6 +396,11 @@ private:
     AppSettings                     settings_{};
     TotpManager                     totpManager_;
     std::string                     configPath_;
+    PairingKey                      pairingKey_;         // Hex in the config file as pair_key
+    mutable std::mutex              pairMutex_;          // Guards the two paired lists
+    mutable std::mutex              saveMutex_;          // Serialises save(); taken before pairMutex_, never after
+    std::vector<PairedPeer>         pairedViewers_;
+    std::vector<PairedPeer>         pairedHosts_;
 };
 
 } // namespace cppdesk

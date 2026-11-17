@@ -212,13 +212,15 @@ bool ShellClipboard::getLocalClipboardFiles(std::vector<VirtualFileEntry>& outFi
     return !outFiles.empty();
 }
 
-bool ShellClipboard::setVirtualClipboardFiles(const std::vector<VirtualFileEntry>& files, VirtualChunkReadFn chunkReader) {
+bool ShellClipboard::setVirtualClipboardFiles(const std::vector<VirtualFileEntry>& files, VirtualChunkReadFn chunkReader,
+                                              uint64_t* outGeneration) {
     if (files.empty()) return false;
     OfferedFiles& o = offered();
     uint64_t generation = 0;
     {
         std::lock_guard<std::mutex> lock(o.m);
         generation = ++o.generation;
+        if (outGeneration) *outGeneration = generation;
         o.files = files;
         o.reader = std::move(chunkReader);
         o.paths.reset();
@@ -235,9 +237,14 @@ bool ShellClipboard::setVirtualClipboardFiles(const std::vector<VirtualFileEntry
 }
 
 void ShellClipboard::clearClipboard() {
+    clearClipboardIfCurrent(std::nullopt);
+}
+
+bool ShellClipboard::clearClipboardIfCurrent(std::optional<uint64_t> generation) {
     OfferedFiles& o = offered();
     {
         std::lock_guard<std::mutex> lock(o.m);
+        if (generation && *generation != o.generation) return false;   // someone else's offer: leave it
         ++o.generation;
         o.files.clear();
         o.reader = nullptr;   // it calls into the transfer manager, which may be going away
@@ -248,6 +255,7 @@ void ShellClipboard::clearClipboard() {
 #elif defined(__linux__)
     X11Clipboard::instance().clearFiles();
 #endif
+    return true;
 }
 
 #endif

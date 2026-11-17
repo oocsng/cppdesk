@@ -1095,6 +1095,7 @@ NetworkEngine::~NetworkEngine() {
 
 bool NetworkEngine::start() {
     if (running_.load()) return true;
+    viewerOnly_.store(false);
 
     uint16_t basePort = identity_.listenPort();
     SOCKET hs = INVALID_SOCKET;
@@ -1159,16 +1160,27 @@ bool NetworkEngine::start() {
     return true;
 }
 
+bool NetworkEngine::startViewerOnly() {
+    if (running_.load()) return viewerOnly_.load();
+    viewerOnly_.store(true);
+    clipboardSyncEnabled_.store(false);
+    running_.store(true);
+    return true;
+}
+
 void NetworkEngine::stop() {
     if (!running_.exchange(false)) return;
 
-    stopHostAudioCapture();
-    stopHostTerminal();
-    stopHostTunnelProxy();
-    destroyPrivacyCurtainWindow();
-    ScreenBlankManager::instance().setEmergencyWakeCallback(nullptr);
-    ScreenBlankManager::instance().disengageBlanking();
-    ScreenBlankManager::wakeDisplays();
+    // A viewer-only engine never hosted; the curtain and screen blanking are process-wide and belong to the host engine.
+    if (!viewerOnly_.load()) {
+        stopHostAudioCapture();
+        stopHostTerminal();
+        stopHostTunnelProxy();
+        destroyPrivacyCurtainWindow();
+        ScreenBlankManager::instance().setEmergencyWakeCallback(nullptr);
+        ScreenBlankManager::instance().disengageBlanking();
+        ScreenBlankManager::wakeDisplays();
+    }
     shutdownViewerAudioPlayback();
     stopViewerTunnelMultiplexer();
 
@@ -1691,7 +1703,17 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                 w.writeBytes(hostEcdh.localPublicKey().data(), hostEcdh.localPublicKey().size());
             }
             w.writeString(CPP_DESK_VERSION);
-            w.writeU8(AUTH_CAP_BOUND_RESPONSE);
+            w.writeU8(AUTH_CAP_BOUND_RESPONSE | AUTH_CAP_PAIRING);
+            // Signed over this session (nonce + both ECDH keys) so a pinned viewer knows it reached the real PC.
+            const PairingKey& pk = identity_.pairingKey();
+            PairingKey::Signature hostSig{};
+            pk.sign(CryptoUtils::pairingTranscript('H', identity_.deskId(), viewerId, nonce,
+                                                   hostEcdh.localPublicKey(), viewerPubBlob), hostSig);
+            w.writeU8(identity_.settings().allowPairing ? PAIR_FLAG_ALLOW_NEW : 0);
+            w.writeU16(static_cast<uint16_t>(pk.publicKey().size()));
+            w.writeBytes(pk.publicKey().data(), pk.publicKey().size());
+            w.writeU16(static_cast<uint16_t>(hostSig.size()));
+            w.writeBytes(hostSig.data(), hostSig.size());
             if (!sendFrame(clientSock, PacketType::AUTH_CHALLENGE, 0, w.buffer().data(), w.buffer().size(), hostSendMutex_)) {
                 cleanup();
                 return;
@@ -1710,6 +1732,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         authReader.readBytes(clientDigest.data(), clientDigest.size());
 
         bool accepted = false;
+        bool pairedLogin = false;
         uint8_t grantedPerms = PERM_ALL;
         AuthResultCode resultCode = AuthResultCode::RejectedByUser;
         std::string resultMsg;
@@ -1735,6 +1758,29 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                 accepted = false;
                 resultCode = AuthResultCode::InvalidPassword;
                 resultMsg = "Invalid or expired reboot resume token";
+            }
+        } else if (hasPassword == AUTH_MODE_PAIRED) {
+            // Must stay before the password branch: a paired login never falls through to password checks.
+            PairingKey::Signature viewerSig{};
+            const bool sigPresent = authReader.hasRemaining(2 + viewerSig.size()) && authReader.readU16() == viewerSig.size();
+            if (sigPresent) authReader.readBytes(viewerSig.data(), viewerSig.size());
+            const auto peer = identity_.findPairedViewer(viewerId);
+            const bool pairedOk = sigPresent && peer && !viewerPubBlob.empty() &&
+                PairingKey::verify(peer->publicKey,
+                                   CryptoUtils::pairingTranscript('V', identity_.deskId(), viewerId, nonce,
+                                                                  hostEcdh.localPublicKey(), viewerPubBlob),
+                                   viewerSig);
+            recordAuthResultForIp(clientIp, pairedOk);
+            if (pairedOk) {
+                accepted = true;
+                pairedLogin = true;
+                grantedPerms = identity_.settings().defaultPermissions;
+                resultCode = AuthResultCode::Accepted;
+                resultMsg = "Authenticated via pairing";
+            } else {
+                accepted = false;
+                resultCode = AuthResultCode::InvalidPassword;
+                resultMsg = "This PC is not paired with the host.";
             }
         } else if (hasPassword != 0) {
             // Mode 3 binds the digest to the ECDH key so a passive observer cannot test password guesses offline.
@@ -1922,6 +1968,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
             hostStatus_.connectedSinceTickMs = nowTickMs();
             hostStatus_.securityFingerprint = sasFingerprint;
             hostStatus_.viewerAppVersion = viewerAppVersion;
+            hostStatus_.paired = pairedLogin;
         }
 
         // Auto-provision virtual display if host is headless
@@ -2165,12 +2212,16 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                 uint16_t sc = r.readU16();
                                 uint8_t isDown = r.readU8();
                                 uint8_t isExt = r.readU8();
-                                InputInjector::injectKeyEvent(vk, sc, isDown != 0, isExt != 0);
+                                std::lock_guard<std::mutex> sinkLock(hostKeySinkMutex_);
+                                if (hostKeySink_) hostKeySink_(vk, isDown != 0);
+                                else InputInjector::injectKeyEvent(vk, sc, isDown != 0, isExt != 0);
                             }
                             break;
                         }
                         case PacketType::INPUT_RELEASE_ALL: {
-                            InputInjector::releaseAllModifiers();
+                            std::lock_guard<std::mutex> sinkLock(hostKeySinkMutex_);
+                            if (hostKeySink_) hostKeySink_(0, false);
+                            else InputInjector::releaseAllModifiers();
                             break;
                         }
                         case PacketType::SYSTEM_ACTION: {
@@ -2838,6 +2889,41 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             }
                             break;
                         }
+                        case PacketType::PAIR_REQUEST: {
+                            // Reached only after login. The viewer offers its key; the ID it is filed under is the authenticated one.
+                            PairingKey::PublicKey viewerKey{};
+                            std::string viewerName;
+                            bool wellFormed = false;
+                            try {
+                                wellFormed = r.readU16() == viewerKey.size() && r.hasRemaining(viewerKey.size());
+                                if (wellFormed) {
+                                    r.readBytes(viewerKey.data(), viewerKey.size());
+                                    viewerName = r.readString();
+                                    wellFormed = viewerName.size() <= 255;
+                                }
+                            } catch (...) { wellFormed = false; }
+                            const bool allowed = identity_.settings().allowPairing;   // checked now, not at login
+                            // viewerId is only a claim in a password login: it must not overwrite another PC's pinned key.
+                            const auto existing = identity_.findPairedViewer(viewerId);
+                            const bool replacesOtherKey = wellFormed && !pairedLogin && existing && existing->publicKey != viewerKey;
+                            const bool accept = wellFormed && allowed && !replacesOtherKey;
+                            if (accept) {
+                                identity_.addPairedViewer({viewerId, viewerName, viewerKey, static_cast<uint64_t>(std::time(nullptr))});
+                            }
+                            ByteWriter pw;
+                            pw.writeU8(accept ? 1 : 0);
+                            if (accept) {
+                                const auto& hostKey = identity_.pairingKey().publicKey();
+                                pw.writeU16(static_cast<uint16_t>(hostKey.size()));
+                                pw.writeBytes(hostKey.data(), hostKey.size());
+                            } else {
+                                pw.writeU16(0);
+                            }
+                            pw.writeString(accept ? "Paired" : (!allowed ? "This PC is not accepting new pairings."
+                                : replacesOtherKey ? "Already paired; forget it on the host first." : "Invalid pairing request."));
+                            enqueueHostPacket(PacketType::PAIR_RESULT, 0, pw.buffer(), false);
+                            break;
+                        }
                         case PacketType::DISCONNECT:
                             sessionAlive.store(false);
                             break;
@@ -3052,7 +3138,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
 
 // ---------------- Viewer Session Client ----------------
 
-bool NetworkEngine::connectToRemote(const std::string& targetIdOrAddr, const std::string& password) {
+bool NetworkEngine::connectToRemote(const std::string& targetIdOrAddr, const std::string& password, uint64_t requirePairedDeskId) {
     disconnectViewer();
     std::lock_guard<std::mutex> vlk(viewerThreadMutex_);
     try {
@@ -3066,6 +3152,7 @@ bool NetworkEngine::connectToRemote(const std::string& targetIdOrAddr, const std
     {
         std::lock_guard<std::mutex> lock(viewerStatsMutex_);
         viewerStats_ = ViewerSessionStats{};
+        pairingState_.store(PairingRequestState::Idle);
         viewerStats_.state = ViewerConnectionState::ResolvingId;
         viewerStats_.statusMessage = "Resolving address...";
         viewerStats_.qualityPreset = identity_.settings().defaultQuality;
@@ -3074,7 +3161,7 @@ bool NetworkEngine::connectToRemote(const std::string& targetIdOrAddr, const std
         viewerStats_.adaptiveFps = identity_.settings().adaptiveFps;
     }
 
-    viewerThread_ = std::thread(&NetworkEngine::runViewerSession, this, targetIdOrAddr, password);
+    viewerThread_ = std::thread(&NetworkEngine::runViewerSession, this, targetIdOrAddr, password, requirePairedDeskId);
     return true;
 }
 
@@ -3164,6 +3251,27 @@ bool NetworkEngine::isWaitingForTotp() const {
     return viewerStats_.state == ViewerConnectionState::WaitingTotp;
 }
 
+bool NetworkEngine::requestPairing() {
+    {
+        std::lock_guard<std::mutex> lock(viewerStatsMutex_);
+        if (viewerStats_.state != ViewerConnectionState::Connected || !viewerStats_.offerPairing) return false;
+    }
+    const PairingKey& key = identity_.pairingKey();
+    if (!key.isValid()) return false;
+    PairingRequestState idleOrDone = pairingState_.load();
+    if (idleOrDone == PairingRequestState::Pending || idleOrDone == PairingRequestState::Paired) return false;
+    ByteWriter w;
+    w.writeU16(static_cast<uint16_t>(key.publicKey().size()));
+    w.writeBytes(key.publicKey().data(), key.publicKey().size());
+    w.writeString(identity_.hostname());
+    pairingState_.store(PairingRequestState::Pending);   // before the send: the answer may beat us back
+    if (!sendViewerEncryptedPacket(PacketType::PAIR_REQUEST, 0, w.buffer().data(), w.buffer().size())) {
+        pairingState_.store(PairingRequestState::Idle);
+        return false;
+    }
+    return true;
+}
+
 ViewerSessionStats NetworkEngine::viewerStats() const {
     std::lock_guard<std::mutex> lock(viewerStatsMutex_);
     ViewerSessionStats s = viewerStats_;
@@ -3247,7 +3355,7 @@ void NetworkEngine::setOnFrameDecodedCallback(std::function<void()> cb) {
     onFrameDecoded_ = std::move(cb);
 }
 
-void NetworkEngine::runViewerSession(std::string targetInput, std::string password) {
+void NetworkEngine::runViewerSession(std::string targetInput, std::string password, uint64_t requirePairedDeskId) {
     auto setStatus = [&](ViewerConnectionState st, const std::string& msg) {
         std::lock_guard<std::mutex> lock(viewerStatsMutex_);
         viewerStats_.state = st;
@@ -3496,6 +3604,46 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
             }
             const uint8_t hostAuthCaps = chalReader.hasRemaining(1) ? chalReader.readU8() : 0;
 
+            // Pairing: check the host's key and session signature before sending any credential.
+            const bool hostAdvertisesPairing = (hostAuthCaps & AUTH_CAP_PAIRING) != 0;
+            uint8_t pairFlags = 0;
+            viewerHostPairingKey_ = {};
+            viewerHostKeyVerified_ = false;
+            if (hostAdvertisesPairing && chalReader.hasRemaining(1 + 2 + 64 + 2 + 64)) {
+                PairingKey::Signature hostSig{};
+                pairFlags = chalReader.readU8();
+                bool lengthsOk = chalReader.readU16() == viewerHostPairingKey_.size();
+                chalReader.readBytes(viewerHostPairingKey_.data(), viewerHostPairingKey_.size());
+                lengthsOk = chalReader.readU16() == hostSig.size() && lengthsOk;
+                chalReader.readBytes(hostSig.data(), hostSig.size());
+                viewerHostKeyVerified_ = lengthsOk && PairingKey::verify(viewerHostPairingKey_,
+                    CryptoUtils::pairingTranscript('H', remoteId, identity_.deskId(), nonce,
+                                                   hostPubBlob, viewerEcdh.localPublicKey()),
+                    hostSig);
+            }
+            // A dialled desk ID is resolved over unauthenticated discovery: if it is pinned, the PC that answers must
+            // claim that same ID, or a rogue could answer for it under another ID and dodge the pin.
+            const bool pinnedIdAnsweredByOther =
+                targetDeskId > 0 && remoteId != targetDeskId && identity_.findPairedHost(targetDeskId).has_value();
+            ViewerPairingDecision pairing = pinnedIdAnsweredByOther
+                ? ViewerPairingDecision::RefuseIdentityChanged
+                : decideViewerPairing(hostAdvertisesPairing, viewerHostKeyVerified_,
+                                      identity_.findPairedHost(remoteId), viewerHostPairingKey_);
+            // A required paired PC (dialled by a spoofable ip:port) must be exactly that PC, logged in with its keys.
+            if (requirePairedDeskId != 0 && (remoteId != requirePairedDeskId || pairing == ViewerPairingDecision::Legacy))
+                pairing = ViewerPairingDecision::RefuseIdentityChanged;
+            if (pairing == ViewerPairingDecision::RefuseIdentityChanged ||
+                pairing == ViewerPairingDecision::RefuseNoPairingSupport) {
+                if (!isReconnecting) {
+                    setStatus(ViewerConnectionState::Error, pairing == ViewerPairingDecision::RefuseIdentityChanged
+                        ? "This PC's identity doesn't match the one you paired with, so the connection was refused. If it was reinstalled, forget the pairing and pair again."
+                        : "This PC no longer offers pairing, so the connection was refused. Forget the pairing to connect with a password.");
+                }
+                closeWinSock(vSock);
+                viewerSock_.store(~uintptr_t(0));
+                return false;
+            }
+
             // 3. Compute & send AUTH_RESPONSE
             {
                 ByteWriter w;
@@ -3506,7 +3654,25 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         tokenCopy = rebootResumeToken_;
                     }
                 }
-                if (!tokenCopy.empty()) {
+                if (pairing == ViewerPairingDecision::UsePaired) {
+                    // A pinned host overrides a typed password: the password is never sent to it.
+                    PairingKey::Signature sig{};
+                    if (!identity_.pairingKey().sign(
+                            CryptoUtils::pairingTranscript('V', remoteId, identity_.deskId(), nonce,
+                                                           hostPubBlob, viewerEcdh.localPublicKey()), sig)) {
+                        if (!isReconnecting) {
+                            setStatus(ViewerConnectionState::Error, "Failed to establish secure session.");
+                        }
+                        closeWinSock(vSock);
+                        viewerSock_.store(~uintptr_t(0));
+                        return false;
+                    }
+                    w.writeU8(AUTH_MODE_PAIRED);
+                    std::array<uint8_t, 32> zero{};
+                    w.writeBytes(zero.data(), zero.size());
+                    w.writeU16(static_cast<uint16_t>(sig.size()));
+                    w.writeBytes(sig.data(), sig.size());
+                } else if (!tokenCopy.empty()) {
                     w.writeU8(2);
                     auto tokenBytes = CryptoUtils::fromHex(tokenCopy);
                     if (tokenBytes.size() == 32) {
@@ -3688,9 +3854,17 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             viewerStats_.connectedSinceTickMs = nowTickMs();
                         }
                         viewerStats_.grantedPermissions = perms;
+                        viewerStats_.pairedSession = (pairing == ViewerPairingDecision::UsePaired);
+                        viewerStats_.hostAllowsNewPairing = hostAdvertisesPairing && (pairFlags & PAIR_FLAG_ALLOW_NEW);
+                        viewerStats_.offerPairing = viewerStats_.hostAllowsNewPairing && viewerHostKeyVerified_ &&
+                            !viewerStats_.pairedSession && !identity_.findPairedHost(remoteId);
+                        pairingState_.store(PairingRequestState::Idle);
                     }
-                    identity_.addOrUpdateRecentSession(remoteId, remoteHost, targetInput);
-                    initViewerAudioPlayback();
+                    // Viewer-only engines share one identity across threads; its recents list and save() are unlocked.
+                    if (!viewerOnly_.load()) {
+                        identity_.addOrUpdateRecentSession(remoteId, remoteHost, targetInput);
+                        initViewerAudioPlayback();
+                    }
                     syncAudioControl();   // the host learns this viewer's mute and volume now, and again after a reconnect
                     startViewerTunnelMultiplexer();
 
@@ -4094,6 +4268,36 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             }
                             break;
                         }
+                        case PacketType::PAIR_RESULT: {
+                            if (pairingState_.load() != PairingRequestState::Pending) break;   // nothing was asked
+                            bool stored = false;
+                            try {
+                                PairingKey::PublicKey hostKey{};
+                                const bool accepted = r.readU8() != 0;
+                                const bool keyLen = r.readU16() == hostKey.size() && r.hasRemaining(hostKey.size());
+                                if (accepted && keyLen) {
+                                    r.readBytes(hostKey.data(), hostKey.size());
+                                    // Only the key this host proved in the handshake is ever stored.
+                                    if (viewerHostKeyVerified_ && hostKey == viewerHostPairingKey_) {
+                                        uint64_t pairedId = 0;
+                                        std::string pairedName;
+                                        {
+                                            std::lock_guard<std::mutex> lock(viewerStatsMutex_);
+                                            pairedId = viewerStats_.remoteDeskId;
+                                            pairedName = viewerStats_.remoteHostname;
+                                        }
+                                        identity_.addPairedHost({pairedId, pairedName, hostKey, static_cast<uint64_t>(std::time(nullptr))});
+                                        stored = true;
+                                    }
+                                }
+                            } catch (...) {}
+                            if (stored) {
+                                std::lock_guard<std::mutex> lock(viewerStatsMutex_);
+                                viewerStats_.offerPairing = false;
+                            }
+                            pairingState_.store(stored ? PairingRequestState::Paired : PairingRequestState::Refused);
+                            break;
+                        }
                         case PacketType::PERMISSION_UPDATE: {
                             uint8_t newPerms = r.readU8();
                             std::lock_guard<std::mutex> lock(viewerStatsMutex_);
@@ -4129,7 +4333,8 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         case PacketType::CLIPBOARD_FILE_LIST: {
                             uint32_t tid = 0;
                             std::vector<VirtualFileEntry> files;
-                            if (deserializeClipboardFileList(r.currentPtr(), r.remaining(), tid, files)) {
+                            // Viewer-only: the host's copied files never take over this PC's clipboard.
+                            if (!viewerOnly_.load() && deserializeClipboardFileList(r.currentPtr(), r.remaining(), tid, files)) {
                                 clipFileMgr_.handleRemoteFileList(tid, files, [this](PacketType t, const std::vector<uint8_t>& p) {
                                     return sendViewerEncryptedPacket(t, 0, p.data(), p.size());
                                 });
@@ -4228,7 +4433,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             break;
                         }
                         case PacketType::AUDIO_STREAM_CHUNK: {
-                            enqueueViewerAudioChunk(payload.data(), payload.size());
+                            if (!viewerOnly_.load()) enqueueViewerAudioChunk(payload.data(), payload.size());
                             break;
                         }
                         case PacketType::VOICE_INTERCOM_CHUNK: {
@@ -5084,19 +5289,29 @@ void NetworkEngine::destroyPrivacyCurtainWindow() {
 }
 #endif
 
+// stop() and the host session's own cleanup both stop these workers. Moving the thread out under a lock gives exactly
+// one of them the join; two threads joining one std::thread is undefined (on Linux the second never returns).
+void NetworkEngine::joinHostWorker(std::thread& worker) {
+    std::thread mine;
+    {
+        std::lock_guard<std::mutex> lk(hostWorkerThreadMutex_);
+        mine = std::move(worker);
+    }
+    try {
+        if (mine.joinable()) mine.join();
+    } catch (...) {}
+}
+
 void NetworkEngine::startHostAudioCapture() {
     stopHostAudioCapture();
     hostAudioActive_.store(true);
+    std::lock_guard<std::mutex> lk(hostWorkerThreadMutex_);
     hostAudioThread_ = std::thread(&NetworkEngine::hostAudioCaptureLoop, this);
 }
 
 void NetworkEngine::stopHostAudioCapture() {
     hostAudioActive_.store(false);
-    try {
-        if (hostAudioThread_.joinable()) {
-            hostAudioThread_.join();
-        }
-    } catch (...) {}
+    joinHostWorker(hostAudioThread_);
 }
 
 void NetworkEngine::hostAudioCaptureLoop() {
@@ -5678,10 +5893,27 @@ void NetworkEngine::startHostTerminal(bool usePowerShell) {
         wcscpy_s(cmdLine, L"cmd.exe /Q /K");
     }
 
+    // Only the pipe ends reach the shell. Sockets are inheritable, and a shell holding a copy keeps a closed listener
+    // or connection open, so another engine in this process could never hang up on its host.
+    HANDLE inheritOnly[2] = {hStdinRead, hStdoutWrite};
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+    std::vector<uint8_t> attrBuf(attrSize);
+    auto* attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
+    const bool attrsInited = attrSize > 0 && InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize);
+    STARTUPINFOEXW six{};
+    six.StartupInfo = si;
+    six.StartupInfo.cb = sizeof(six);
+    if (attrsInited && UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inheritOnly,
+                                                 sizeof(inheritOnly), nullptr, nullptr)) {
+        six.lpAttributeList = attrs;
+    }
+
     BOOL created = CreateProcessW(
         nullptr, cmdLine, nullptr, nullptr, TRUE,
-        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi
+        CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &six.StartupInfo, &pi
     );
+    if (attrsInited) DeleteProcThreadAttributeList(attrs);
 
     CloseHandle(hStdinRead);
     CloseHandle(hStdoutWrite);
@@ -5698,16 +5930,13 @@ void NetworkEngine::startHostTerminal(bool usePowerShell) {
     hChildThread_ = pi.hThread;
 
     hostTerminalActive_.store(true);
+    std::lock_guard<std::mutex> lk(hostWorkerThreadMutex_);
     hostTerminalThread_ = std::thread(&NetworkEngine::hostTerminalReaderLoop, this);
 }
 
 void NetworkEngine::stopHostTerminal() {
     hostTerminalActive_.store(false);
-    try {
-        if (hostTerminalThread_.joinable()) {
-            hostTerminalThread_.join();
-        }
-    } catch (...) {}
+    joinHostWorker(hostTerminalThread_);
     if (hChildProcess_) {
         TerminateProcess(hChildProcess_, 0);
         CloseHandle(hChildProcess_);
@@ -5798,16 +6027,13 @@ void NetworkEngine::startHostTerminal(bool /*usePowerShell*/) {
     childPid_ = pid;
 
     hostTerminalActive_.store(true);
+    std::lock_guard<std::mutex> lk(hostWorkerThreadMutex_);
     hostTerminalThread_ = std::thread(&NetworkEngine::hostTerminalReaderLoop, this);
 }
 
 void NetworkEngine::stopHostTerminal() {
     hostTerminalActive_.store(false);
-    try {
-        if (hostTerminalThread_.joinable()) {
-            hostTerminalThread_.join();
-        }
-    } catch (...) {}
+    joinHostWorker(hostTerminalThread_);
     if (childStdinFd_ >= 0) { close(childStdinFd_); childStdinFd_ = -1; }
     if (childStdoutFd_ >= 0) { close(childStdoutFd_); childStdoutFd_ = -1; }
     if (childPid_ > 0) {
@@ -6107,16 +6333,13 @@ void NetworkEngine::viewerTunnelMultiplexerLoop() {
 void NetworkEngine::startHostTunnelProxy() {
     stopHostTunnelProxy();
     hostTunnelActive_.store(true);
+    std::lock_guard<std::mutex> lk(hostWorkerThreadMutex_);
     hostTunnelThread_ = std::thread(&NetworkEngine::hostTunnelProxyLoop, this);
 }
 
 void NetworkEngine::stopHostTunnelProxy() {
     hostTunnelActive_.store(false);
-    try {
-        if (hostTunnelThread_.joinable()) {
-            hostTunnelThread_.join();
-        }
-    } catch (...) {}
+    joinHostWorker(hostTunnelThread_);
     std::lock_guard<std::mutex> lk(tunnelMutex_);
     for (auto& kv : hostTunnels_) {
         closesocket(kv.second.sock);

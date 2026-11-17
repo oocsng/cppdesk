@@ -64,6 +64,7 @@ struct HostSessionStatus {
     uint64_t    connectedSinceTickMs = 0;
     std::string securityFingerprint;
     std::string viewerAppVersion;
+    bool        paired = false;   // the viewer logged in with its pinned pairing key
 };
 
 struct ChatMessageEntry {
@@ -129,7 +130,24 @@ struct ViewerSessionStats {
     float                 packetLossPercent = 0.0f;
     std::vector<float>    rttHistory;
     VirtualDisplayStatusPayload lastVirtualDisplayStatus{};
+    bool                  pairedSession = false;         // logged in with the pairing keys, no password
+    bool                  hostAllowsNewPairing = false;  // the host advertised PAIR_FLAG_ALLOW_NEW
+    bool                  offerPairing = false;          // hostAllowsNewPairing && !pairedSession && this host isn't pinned yet
 };
+
+enum class PairingRequestState { Idle, Pending, Paired, Refused };
+
+enum class ViewerPairingDecision { Legacy, UsePaired, RefuseIdentityChanged, RefuseNoPairingSupport };
+
+// A pinned host must prove it holds the pinned key; it is never silently re-paired or downgraded to a password.
+inline ViewerPairingDecision decideViewerPairing(bool hostAdvertisesPairing, bool hostSignatureValid,
+                                                 const std::optional<PairedPeer>& pinned,
+                                                 const PairingKey::PublicKey& advertisedHostKey) {
+    if (!pinned) return ViewerPairingDecision::Legacy;
+    if (!hostAdvertisesPairing) return ViewerPairingDecision::RefuseNoPairingSupport;
+    if (advertisedHostKey != pinned->publicKey || !hostSignatureValid) return ViewerPairingDecision::RefuseIdentityChanged;
+    return ViewerPairingDecision::UsePaired;
+}
 
 struct StunNatResult {
     bool        success = false;
@@ -206,12 +224,17 @@ public:
     ~NetworkEngine();
 
     bool start();
+    // Runs only the viewer half: no host listener, UDP discovery or relay; clipboard auto-sync off, host audio dropped.
+    // Several can share one IdentityManager.
+    bool startViewerOnly();
+    bool isViewerOnly() const { return viewerOnly_.load(); }
     bool isRunning() const { return running_.load(); }
     void stop();
 
     // Local IP & listening status
     std::string localIpAddress() const { return localIp_; }
     uint16_t hostListenPort() const { return identity_.listenPort(); }
+    bool hostListening() const { return hostListenSock_ != ~uintptr_t(0); }
 
     // Discovery
     std::vector<DiscoveredPeer> discoveredPeers() const;
@@ -234,7 +257,9 @@ public:
     void clearRateLimitRecords();
 
     // Viewer: Outgoing connection & remote session control
-    bool connectToRemote(const std::string& targetIdOrAddr, const std::string& password);
+    // requirePairedDeskId != 0: the host must prove it is that paired PC (pairing keys only, never a password or an
+    // unpaired login), else the connection is refused before any credential is sent. Used by the grid.
+    bool connectToRemote(const std::string& targetIdOrAddr, const std::string& password, uint64_t requirePairedDeskId = 0);
     void disconnectViewer();
     bool isViewerActive() const { return viewerActive_.load(); }
 
@@ -244,6 +269,10 @@ public:
     bool isWaitingForTotp() const;
 
     ViewerSessionStats viewerStats() const;
+
+    // Viewer: ask the connected host to pair with this PC. False unless connected and the host is offering it.
+    bool requestPairing();
+    PairingRequestState pairingRequestState() const { return pairingState_.load(); }
 
     // Screen sharing on a Wayland desktop. The notice says what the person should know (nothing unless something
     // needs saying); the restore token is the desktop's remembered answer: set it from the settings at start, and
@@ -355,6 +384,11 @@ public:
     bool isHostAudioSuspended() const;
     // True while the host's microphone is open because a viewer's voice arrived: the dashboard says so.
     bool isHostMicLive() const { return hostMicLive_.load(); }
+    // Test-only, host side: key events go to the sink instead of InputInjector; INPUT_RELEASE_ALL arrives as (0, false).
+    void setHostKeySinkForTest(std::function<void(uint16_t vk, bool isDown)> sink) {
+        std::lock_guard<std::mutex> lk(hostKeySinkMutex_);
+        hostKeySink_ = std::move(sink);
+    }
     void setHostMicLiveForTest(bool live) { hostMicLive_.store(live); }
     void injectVoiceChunkForTest(const uint8_t* payload, size_t len) { handleIncomingVoiceChunk(payload, len); }
     bool voiceOpenFailedForTest() const { return voiceOpenFailed_.load(); }
@@ -491,7 +525,7 @@ private:
     void relayRegistrationLoop();
     void hostAcceptLoop();
     void runHostSession(uintptr_t clientSock, std::string clientIp);
-    void runViewerSession(std::string targetInput, std::string password);
+    void runViewerSession(std::string targetInput, std::string password, uint64_t requirePairedDeskId);
 
     // Brute-force protection helpers
     bool isIpRateLimited(const std::string& ip);
@@ -504,6 +538,9 @@ private:
     IdentityManager&            identity_;
     std::string                 localIp_ = "127.0.0.1";
     std::atomic<bool>           running_{false};
+    std::atomic<bool>           viewerOnly_{false};
+    std::mutex                  hostKeySinkMutex_;
+    std::function<void(uint16_t, bool)> hostKeySink_;   // test-only, see setHostKeySinkForTest
 
     // Discovery
     uintptr_t                   udpSock_ = ~uintptr_t(0);
@@ -560,6 +597,9 @@ private:
     mutable std::mutex          viewerCipherMutex_;
     AesGcmSessionCipher         viewerCipher_;
     std::array<uint8_t, 32>     viewerSessionKey_{};
+    PairingKey::PublicKey       viewerHostPairingKey_{};         // the key the host advertised in this handshake
+    bool                        viewerHostKeyVerified_ = false;  // ...and it signed this session's transcript with it
+    std::atomic<PairingRequestState> pairingState_{PairingRequestState::Idle};
     uint64_t                    viewerSendSeq_ = 0;
     std::atomic<bool>           viewerEncrypted_{false};
 
@@ -611,6 +651,8 @@ private:
 
     // Audio Capture & Playback state
     std::thread             hostAudioThread_;
+    std::mutex              hostWorkerThreadMutex_;   // guards hostAudioThread_, hostTerminalThread_, hostTunnelThread_
+    void joinHostWorker(std::thread& worker);
     std::atomic<bool>       hostAudioActive_{false};
 #if defined(_WIN32)
     HWAVEOUT                hWaveOut_ = nullptr;

@@ -86,6 +86,15 @@ void AppUi::hardResetViewerUiState() {
 
 void AppUi::switchTab(ActiveTab newTab) {
     if (activeTab_ == newTab) return;
+    if (activeTab_ == ActiveTab::Fleet) {
+        // The grid lives only while it is on screen, except when a tile's Open hands one PC to a session tab
+        if (fleetKeepOnLeave_ && fleet_.size() > 0) {
+            fleet_.releaseModifiers(0);
+            fleetPressedDesk_ = 0;
+        } else {
+            closeFleetGrid();
+        }
+    }
     if (activeTab_ == ActiveTab::Settings && newTab != ActiveTab::Settings) {
         network_.stopVoiceMonitor();
         showAudioInputMenu_ = false;
@@ -221,6 +230,10 @@ bool AppUi::stepAnimations(float dt) {
     // 10. Address Book Edit Modal Spring
     float targetABModal = showAddressBookEditModal_ ? 1.0f : 0.0f;
     if (stepSpring(addressBookModalAnimT_, addressBookModalAnimVel_, targetABModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
+
+    float targetPairOfferModal = showPairOfferModal_ ? 1.0f : 0.0f;
+    if (stepSpring(pairOfferModalAnimT_, pairOfferModalAnimVel_, targetPairOfferModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
+    if (stepSpring(fleetPickerAnimT_, fleetPickerAnimVel_, showFleetPicker_ ? 1.0f : 0.0f, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 11. Mandatory Update Modal Spring (v3.0.0)
     float targetUpdateModal = showUpdateRequiredModal_ ? 1.0f : 0.0f;
@@ -756,6 +769,8 @@ void AppUi::drawFrame(float width, float height) {
         drawDashboardView(contentBounds, enterAlpha);
     } else if (activeTab_ == ActiveTab::RemoteSession) {
         drawRemoteSessionView(contentBounds, enterAlpha);
+    } else if (activeTab_ == ActiveTab::Fleet) {
+        drawFleetView(contentBounds, enterAlpha);
     } else {
         drawSettingsView(contentBounds, enterAlpha);
     }
@@ -812,6 +827,14 @@ void AppUi::drawFrame(float width, float height) {
     // Address Book Edit Sheet Modal
     if (addressBookModalAnimT_ > 0.004f) {
         drawAddressBookModal(width, height, addressBookModalAnimT_);
+    }
+
+    if (pairOfferModalAnimT_ > 0.004f) {
+        drawPairOfferModal(width, height, pairOfferModalAnimT_);
+    }
+
+    if (fleetPickerAnimT_ > 0.004f) {
+        drawFleetPickerModal(width, height, fleetPickerAnimT_);
     }
 
     // Mandatory Update Required Modal (v3.0.0)
@@ -1019,7 +1042,7 @@ void AppUi::drawTopNavBar(float width, float& outTopOffset) {
     float settLeft = (hasSession ? sessTab.right : dashTab.right) + 4.0f;
     UiRect settTab = { settLeft, 12.0f, settLeft + settW, 46.0f };
 
-    UiRect activeTargetRect = (activeTab_ == ActiveTab::Dashboard) ? dashTab :
+    UiRect activeTargetRect = (activeTab_ == ActiveTab::Dashboard || activeTab_ == ActiveTab::Fleet) ? dashTab :
                               (activeTab_ == ActiveTab::RemoteSession && hasSession) ? sessTab : settTab;
     targetPillLeft_ = activeTargetRect.left;
     targetPillRight_ = activeTargetRect.right;
@@ -1039,7 +1062,7 @@ void AppUi::drawTopNavBar(float width, float& outTopOffset) {
     fillRoundRect(slidingPill.offset(0.0f, 1.8f), 8.5f, withAlpha(COL_PRIMARY_ACCENT, 0.24f));
     fillRoundRect(slidingPill, 8.5f, COL_PRIMARY_ACCENT);
 
-    bool onDash = (activeTab_ == ActiveTab::Dashboard);
+    bool onDash = (activeTab_ == ActiveTab::Dashboard || activeTab_ == ActiveTab::Fleet);
     drawButton("tab_dash", dashTab, "Dashboard",
                rgba(255, 255, 255, 0.0f),
                onDash ? rgba(255, 255, 255, 0.08f) : COL_SEC_BTN_HV,
@@ -1353,7 +1376,21 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
     auto discovered = network_.discoveredPeers();
     auto recents = identity_.recentSessions();
 
-    drawText("Saved & Nearby Desks", { px, py, prx - 110.0f, py + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    // A grid kept alive by a tile's Open is one click away; otherwise the button starts a new one
+    const size_t fleetLive = fleet_.size();
+    const float fleetBtnW = fleetLive > 0 ? 130.0f : 110.0f;
+    drawText("Saved & Nearby Desks", { px, py, prx - 112.0f - fleetBtnW, py + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    UiRect fleetBtn = { prx - 102.0f - fleetBtnW, py - 2.0f, prx - 102.0f, py + 28.0f };
+    drawButton("dash_fleet", fleetBtn, fleetLive > 0 ? "Back to grid (" + std::to_string(fleetLive) + ")" : "Do it on all",
+               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
+                   if (fleet_.size() > 0) {
+                       focusedField_ = FocusedField::None;
+                       switchTab(ActiveTab::Fleet);
+                       return;
+                   }
+                   fleetPicked_.clear();
+                   showFleetPicker_ = true;
+               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
     UiRect refreshBtn = { prx - 92.0f, py - 2.0f, prx, py + 28.0f };
     drawButton("btn_refresh_lan", refreshBtn, "Refresh",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
@@ -1495,6 +1532,7 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
         float gap = 14.0f;
         float cardW = (prx - px - gap) / 2.0f;
         float cardH = 96.0f;
+        const auto pairedHostsNow = identity_.pairedHosts();
 
         for (size_t i = 0; i < cardItems.size(); ++i) {
             int row = static_cast<int>(i) / cols;
@@ -1520,17 +1558,29 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
                               0.5f, rgba(255, 255, 255, 0.28f * cardHover));
             }
 
+            float badgeEnd;
             if (cardItems[i].isLive) {
                 drawPulseDot(cardR.left + 19.0f, cardR.top + 18.0f, 3.4f, COL_SUCCESS, alpha);
                 std::string badge = cardItems[i].isFavorite ? "FAVORITE • ONLINE" : "ONLINE";
                 if (!cardItems[i].tag.empty()) badge += " • [" + cardItems[i].tag + "]";
                 drawText(badge, { cardR.left + 28.0f, cardR.top + 10.0f, cardR.right - 92.0f, cardR.top + 26.0f },
                          ui::FontRole::Small, cardItems[i].isFavorite ? COL_PRIMARY_ACCENT : COL_TEXT_SECONDARY);
+                badgeEnd = cardR.left + 28.0f + canvas_->measureTextBlock(badge, ui::FontRole::Small, cardW).x;
             } else {
                 std::string badge = cardItems[i].isFavorite ? "FAVORITE" : "RECENT";
                 if (!cardItems[i].tag.empty()) badge += " • [" + cardItems[i].tag + "]";
                 drawText(badge, { cardR.left + 14.0f, cardR.top + 10.0f, cardR.right - 92.0f, cardR.top + 26.0f },
                          ui::FontRole::Small, cardItems[i].isFavorite ? COL_PRIMARY_ACCENT : COL_TEXT_MUTED);
+                badgeEnd = cardR.left + 14.0f + canvas_->measureTextBlock(badge, ui::FontRole::Small, cardW).x;
+            }
+
+            // Pairing chip: this PC may enter that desk without a password
+            if (std::any_of(pairedHostsNow.begin(), pairedHostsNow.end(),
+                            [&](const PairedPeer& p) { return p.deskId == cardItems[i].deskId; }) &&
+                badgeEnd + 8.0f + 48.0f <= cardR.right - 124.0f) {
+                UiRect chip = { badgeEnd + 8.0f, cardR.top + 10.0f, badgeEnd + 56.0f, cardR.top + 26.0f };
+                fillRoundRect(chip, 8.0f, withAlpha(COL_PRIMARY_ACCENT, 0.14f));
+                drawText("Paired", chip, ui::FontRole::Small, COL_TEXT_ACCENT, ui::HAlign::Center, ui::VAlign::Center);
             }
 
             uint64_t peerId = cardItems[i].deskId;
@@ -2599,11 +2649,17 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
 
     // Right content pane calculation
     float sectionContentH = 340.0f;
+    std::vector<PairedPeer> pairedViewers, pairedHosts;   // copies; the lists can change under us
+    if (settingsSection_ == SettingsSection::Permissions) {
+        pairedViewers = identity_.pairedViewers();
+        pairedHosts = identity_.pairedHosts();
+    }
     switch (settingsSection_) {
         case SettingsSection::Appearance:     sectionContentH = 290.0f; break;
         case SettingsSection::DisplayQuality: sectionContentH = 550.0f; break;
         case SettingsSection::AudioVoice:     sectionContentH = 380.0f; break;
-        case SettingsSection::Permissions:    sectionContentH = 280.0f; break;
+        // 280 + the Allow pairing row (28) + two list boxes (46 + 28 per row, one row when empty)
+        case SettingsSection::Permissions:    sectionContentH = 308.0f + 92.0f + 28.0f * (std::max<size_t>(1, pairedViewers.size()) + std::max<size_t>(1, pairedHosts.size())); break;
         case SettingsSection::TwoFactorAuth:  sectionContentH = 360.0f; break;
         case SettingsSection::NetworkRelay:   sectionContentH = 320.0f; break;
         case SettingsSection::CurtainPrivacy: sectionContentH = 270.0f; break;
@@ -3116,7 +3172,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
-        UiRect permBox = { cx, cy, crx, cy + 172.0f };
+        UiRect permBox = { cx, cy, crx, cy + 200.0f };
         fillRoundRect(permBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(permBox, 12.0f, COL_BORDER);
 
@@ -3167,8 +3223,54 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                              ns.lockWorkstationOnDisconnect = !ns.lockWorkstationOnDisconnect;
                              identity_.updateSettings(ns);
                          }, "Immediately lock the host Windows desktop session upon client disconnection.");
+        py += 28.0f;
+
+        drawToggleSwitch("sett_allow_pairing", { permBox.left + 16.0f, py, permBox.right - 16.0f, py + 24.0f },
+                         s.allowPairing, "Allow pairing", [this]() {
+                             AppSettings ns = identity_.settings();
+                             ns.allowPairing = !ns.allowPairing;
+                             identity_.updateSettings(ns);
+                         }, "Let PCs that have logged in once come back without a password. Off by default.");
 
         cy = permBox.bottom + 12.0f;
+
+        auto drawPairedList = [&](const char* heading, const std::vector<PairedPeer>& peers, bool viewers) {
+            UiRect box = { cx, cy, crx, cy + 34.0f + 28.0f * static_cast<float>(std::max<size_t>(1, peers.size())) };
+            fillRoundRect(box, 12.0f, COL_BG_SUBTLE);
+            strokeRoundRect(box, 12.0f, COL_BORDER);
+            drawText(heading, { box.left + 16.0f, box.top + 8.0f, box.right - 16.0f, box.top + 22.0f },
+                     ui::FontRole::Small, COL_TEXT_ACCENT);
+            float ry = box.top + 26.0f;
+            if (peers.empty()) {
+                drawText("None yet", { box.left + 16.0f, ry, box.right - 16.0f, ry + 28.0f },
+                         ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Leading, ui::VAlign::Center);
+            }
+            for (const auto& p : peers) {
+                std::time_t when = static_cast<std::time_t>(p.pairedAtUnix);
+                std::tm tmUtc{};
+#ifdef _WIN32
+                gmtime_s(&tmUtc, &when);
+#else
+                gmtime_r(&when, &tmUtc);
+#endif
+                char date[16];
+                std::strftime(date, sizeof(date), "%Y-%m-%d", &tmUtc);
+                drawText(p.hostname + " \xC2\xB7 " + CryptoUtils::formatDeskId(p.deskId) + " \xC2\xB7 paired " + date,
+                         { box.left + 16.0f, ry, box.right - 96.0f, ry + 28.0f },
+                         ui::FontRole::Small, COL_TEXT_PRIMARY, ui::HAlign::Leading, ui::VAlign::Center);
+                uint64_t deskId = p.deskId;
+                drawButton((viewers ? "forget_viewer_" : "forget_host_") + std::to_string(deskId),
+                           { box.right - 80.0f, ry + 3.0f, box.right - 16.0f, ry + 25.0f }, "Forget",
+                           COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this, deskId, viewers]() {
+                               if (viewers) identity_.removePairedViewer(deskId);
+                               else identity_.removePairedHost(deskId);
+                           }, ui::FontRole::Small, true, COL_BORDER);
+                ry += 28.0f;
+            }
+            cy = box.bottom + 12.0f;
+        };
+        drawPairedList("PAIRED PCS", pairedViewers, true);
+        drawPairedList("PCS THIS ONE CAN ENTER", pairedHosts, false);
     }
     else if (settingsSection_ == SettingsSection::TwoFactorAuth) {
         drawText("Two-Factor Authentication", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
@@ -6112,6 +6214,328 @@ void AppUi::drawAddressBookModal(float width, float height, float modalProgress)
     canvas_->setTransform(ui::Transform2D::identity());
 }
 
+void AppUi::drawPairOfferModal(float width, float height, float modalProgress) {
+    if (!showPairOfferModal_ && modalProgress <= 0.01f) return;
+
+    float alpha = std::clamp(modalProgress, 0.0f, 1.0f);
+    fillRoundRect({ 0.0f, 0.0f, width, height }, 0.0f, rgba(28, 24, 20, 0.52f * alpha));
+
+    // The scrim swallows clicks but does not dismiss: closing is an explicit "Not now"
+    clickRegions_.push_back({ { 0.0f, 0.0f, width, height }, "modal_pair_scrim", []() {}, false });
+
+    float mw = 440.0f;
+    float mh = 190.0f;
+    UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
+
+    clickRegions_.push_back({ modal, "modal_pair_absorb", []() {}, false });
+
+    float scale = 0.90f + 0.10f * modalProgress;
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, modal.centerX(), modal.centerY()));
+
+    drawCardSurface(modal, 20.0f, alpha);
+
+    float mx = modal.left + 28.0f;
+    float mrx = modal.right - 28.0f;
+    float my = modal.top + 22.0f;
+
+    drawText("Pair with this PC?", { mx, my, mrx, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    my += 38.0f;
+
+    drawText("Next time you connect to " + pairOfferName_ + ", you'll go straight in, with no password.",
+             { mx, my, mrx, my + 48.0f }, ui::FontRole::Body, COL_TEXT_SECONDARY);
+    my += 66.0f;
+
+    float btnW = (mrx - mx - 12.0f) * 0.5f;
+    UiRect notNowBtn = { mx, my, mx + btnW, my + 36.0f };
+    drawButton("pair_not_now", notNowBtn, "Not now",
+               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
+                   showPairOfferModal_ = false;
+               }, ui::FontRole::Small, true, COL_BORDER);
+
+    UiRect pairBtn = { notNowBtn.right + 12.0f, my, mrx, my + 36.0f };
+    drawButton("pair_yes", pairBtn, "Pair",
+               COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
+                   network_.requestPairing();
+                   showPairOfferModal_ = false;
+               }, ui::FontRole::Small);
+
+    canvas_->setTransform(ui::Transform2D::identity());
+}
+
+std::vector<UiRect> fleetGridLayout(size_t count, const UiRect& area, float gap) {
+    std::vector<UiRect> out;
+    if (count == 0) return out;
+    const size_t cols = static_cast<size_t>(std::ceil(std::sqrt(static_cast<double>(count))));
+    const size_t rows = (count + cols - 1) / cols;
+    const float fc = static_cast<float>(cols), fr = static_cast<float>(rows);
+    const float w = std::max(0.0f, std::min((area.width() - gap * (fc - 1.0f)) / fc,
+                                            (area.height() - gap * (fr - 1.0f)) / fr * 16.0f / 9.0f));
+    const float h = w * 9.0f / 16.0f;
+    const float left = area.left + (area.width() - (w * fc + gap * (fc - 1.0f))) * 0.5f;
+    const float top = area.top + (area.height() - (h * fr + gap * (fr - 1.0f))) * 0.5f;
+    for (size_t i = 0; i < count; ++i) {
+        const float x = left + static_cast<float>(i % cols) * (w + gap);
+        const float y = top + static_cast<float>(i / cols) * (h + gap);
+        out.push_back({ x, y, x + w, y + h });
+    }
+    return out;
+}
+
+int fleetTileAt(const std::vector<UiRect>& tiles, float x, float y) {
+    for (size_t i = 0; i < tiles.size(); ++i)
+        if (tiles[i].contains(x, y)) return static_cast<int>(i);
+    return -1;
+}
+
+void AppUi::drawFleetPickerModal(float width, float height, float modalProgress) {
+    if (!showFleetPicker_ && modalProgress <= 0.01f) return;
+
+    float alpha = std::clamp(modalProgress, 0.0f, 1.0f);
+    fillRoundRect({ 0.0f, 0.0f, width, height }, 0.0f, rgba(28, 24, 20, 0.52f * alpha));
+    clickRegions_.push_back({ { 0.0f, 0.0f, width, height }, "fleet_pick_scrim", [this]() { showFleetPicker_ = false; }, false });
+
+    // Tickable: paired and seen directly on this network. Paired hosts discovery does not see are listed as offline.
+    const auto eligible = FleetManager::eligibleMembers(identity_, network_.discoveredPeers());
+    std::vector<PairedPeer> offline;
+    for (const auto& p : identity_.pairedHosts())
+        if (std::none_of(eligible.begin(), eligible.end(), [&](const FleetMember& m) { return m.deskId == p.deskId; }))
+            offline.push_back(p);
+    auto isPicked = [this](uint64_t id) { return std::find(fleetPicked_.begin(), fleetPicked_.end(), id) != fleetPicked_.end(); };
+    const size_t picked = static_cast<size_t>(std::count_if(eligible.begin(), eligible.end(),
+                                                            [&](const FleetMember& m) { return isPicked(m.deskId); }));
+
+    float mw = 460.0f;
+    const std::string emptyText = "No paired PCs found on this network. Pair with a PC first: connect to it once and choose Pair.";
+    const float emptyH = eligible.empty() ? canvas_->measureTextBlock(emptyText, ui::FontRole::Tooltip, mw - 56.0f).y + 12.0f : 0.0f;
+    const float rowH = 36.0f;
+    const float listH = emptyH + rowH * static_cast<float>(eligible.size() + offline.size());
+    // shortcut: rows past the window height are clipped, not scrolled; add scrolling if people pair that many PCs
+    float mh = std::min(height - 40.0f, 22.0f + 60.0f + listH + 16.0f + 36.0f + 24.0f);
+    UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
+    clickRegions_.push_back({ modal, "fleet_pick_absorb", []() {}, false });
+
+    float scale = 0.90f + 0.10f * modalProgress;
+    canvas_->setTransform(ui::Transform2D::scale(scale, scale, modal.centerX(), modal.centerY()));
+    drawCardSurface(modal, 20.0f, alpha);
+
+    float mx = modal.left + 28.0f;
+    float mrx = modal.right - 28.0f;
+    float my = modal.top + 22.0f;
+    drawText("Do it on all", { mx, my, mrx, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    my += 30.0f;
+    drawText("Paired PCs on this network", { mx, my, mrx, my + 20.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+    my += 30.0f;
+
+    const float btnTop = modal.bottom - 24.0f - 36.0f;
+    canvas_->pushClip({ modal.left, my, modal.right, btnTop - 8.0f });
+    if (eligible.empty()) {   // Tooltip is the font that wraps
+        drawText(emptyText, { mx, my, mrx, my + emptyH - 12.0f }, ui::FontRole::Tooltip, COL_TEXT_SECONDARY);
+        my += emptyH;
+    }
+    for (const auto& m : eligible) {
+        UiRect row = { mx, my, mrx, my + rowH };
+        const bool on = isPicked(m.deskId);
+        const bool can = on || picked < FleetManager::kMaxMembers;
+        UiRect box = { mx + 2.0f, row.centerY() - 9.0f, mx + 20.0f, row.centerY() + 9.0f };
+        if (on) {
+            fillRoundRect(box, 5.0f, COL_PRIMARY_ACCENT);
+            drawText("\xE2\x9C\x93", box, ui::FontRole::Small, COL_TEXT_ON_ACCENT, ui::HAlign::Center, ui::VAlign::Center);
+        } else {
+            strokeRoundRect(box, 5.0f, can ? COL_BORDER_ALT : COL_BORDER, 1.5f);
+        }
+        drawText(m.name, { mx + 32.0f, row.top, mrx - 120.0f, row.bottom }, ui::FontRole::Body,
+                 can ? COL_TEXT_PRIMARY : COL_TEXT_MUTED, ui::HAlign::Leading, ui::VAlign::Center);
+        drawText(CryptoUtils::formatDeskId(m.deskId), { mrx - 116.0f, row.top, mrx, row.bottom }, ui::FontRole::Small,
+                 COL_TEXT_SECONDARY, ui::HAlign::Trailing, ui::VAlign::Center);
+        if (can && row.bottom <= btnTop - 8.0f) {   // a clipped row is not clickable
+            clickRegions_.push_back({ row, "fleet_pick_" + std::to_string(m.deskId), [this, id = m.deskId]() {
+                auto it = std::find(fleetPicked_.begin(), fleetPicked_.end(), id);
+                if (it != fleetPicked_.end()) fleetPicked_.erase(it);
+                else fleetPicked_.push_back(id);
+            }, false });
+        }
+        my += rowH;
+    }
+    for (const auto& p : offline) {
+        UiRect row = { mx, my, mrx, my + rowH };
+        strokeRoundRect({ mx + 2.0f, row.centerY() - 9.0f, mx + 20.0f, row.centerY() + 9.0f }, 5.0f, COL_BORDER, 1.5f);
+        drawText(p.hostname, { mx + 32.0f, row.top, mrx - 120.0f, row.bottom }, ui::FontRole::Body, COL_TEXT_MUTED,
+                 ui::HAlign::Leading, ui::VAlign::Center);
+        drawText("Offline", { mrx - 116.0f, row.top, mrx, row.bottom }, ui::FontRole::Small, COL_TEXT_MUTED,
+                 ui::HAlign::Trailing, ui::VAlign::Center);
+        my += rowH;
+    }
+    canvas_->popClip();
+
+    float btnW = (mrx - mx - 12.0f) * 0.5f;
+    UiRect cancelBtn = { mx, btnTop, mx + btnW, btnTop + 36.0f };
+    drawButton("fleet_pick_cancel", cancelBtn, "Cancel",
+               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
+                   showFleetPicker_ = false;
+               }, ui::FontRole::Small, true, COL_BORDER);
+
+    UiRect openBtn = { cancelBtn.right + 12.0f, btnTop, mrx, btnTop + 36.0f };
+    const std::string openLabel = "Open grid (" + std::to_string(picked) + ")";
+    if (picked == 0) {   // disabled: nothing ticked
+        fillRoundRect(openBtn, 8.0f, COL_SEC_BTN_BG);
+        drawText(openLabel, openBtn, ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center, ui::VAlign::Center);
+    } else {
+        std::vector<FleetMember> chosen;
+        for (const auto& m : eligible)
+            if (isPicked(m.deskId)) chosen.push_back(m);
+        drawButton("fleet_pick_open", openBtn, openLabel,
+                   COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this, chosen]() {
+                       showFleetPicker_ = false;
+                       fleetPicked_.clear();
+                       openFleetGrid(chosen);
+                   }, ui::FontRole::Small);
+    }
+
+    canvas_->setTransform(ui::Transform2D::identity());
+}
+
+void AppUi::openFleetGrid(const std::vector<FleetMember>& members) {
+    fleet_.open(members);
+    fleetFocused_ = members.empty() ? 0 : members.front().deskId;
+    focusedField_ = FocusedField::None;   // keys belong to the PCs now, not a text field
+    switchTab(ActiveTab::Fleet);
+}
+
+void AppUi::closeFleetGrid() {
+    // shortcut: closeAll() runs on the UI thread and can hold it a few seconds per PC still dialling an unreachable
+    // address; move it to a worker thread if that shows up in use.
+    fleet_.closeAll();
+    for (auto& [id, img] : fleetImages_) releaseImage(img.image);
+    fleetImages_.clear();
+    fleetTileIds_.clear();
+    fleetTileRects_.clear();
+    fleetFrameRects_.clear();
+    fleetFocused_ = 0;
+    fleetPressedDesk_ = 0;
+    fleetTypeAll_ = false;
+}
+
+void AppUi::drawFleetView(const UiRect& bounds, float alpha) {
+    if (alpha <= 0.01f) return;
+    const float pad = 24.0f;
+    const float lx = bounds.left + pad, rx = bounds.right - pad, y = bounds.top + 18.0f;
+
+    // Toolbar
+    drawText("Do it on all", { lx, y, rx - 460.0f, y + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    drawText(fleetTypeAll_ ? "Typing goes to every PC." : "Typing goes to the highlighted PC. Click a PC to pick it.",
+             { lx, y + 26.0f, rx - 460.0f, y + 44.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+    UiRect closeBtn = { rx - 80.0f, y + 4.0f, rx, y + 36.0f };
+    drawButton("fleet_close", closeBtn, "Close",
+               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
+                   switchTab(ActiveTab::Dashboard);   // closes every PC in the grid on the way out
+               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+    UiRect sendBtn = { closeBtn.left - 120.0f, y + 4.0f, closeBtn.left - 10.0f, y + 36.0f };
+    drawButton("fleet_send", sendBtn, "Send file\xE2\x80\xA6",
+               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
+                   shell_->chooseOpenFile("Send File to All", "All Files", "*.*", [this](std::optional<std::string> path) {
+                       if (!path) return;
+                       const size_t n = fleet_.sendFileToAll(*path);
+                       if (n > 0) showToast("Sending to " + std::to_string(n) + " PC(s)");
+                       else showToast("No PC in the grid is live yet", true);
+                   });
+               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+    drawToggleSwitch("fleet_type_all", { sendBtn.left - 170.0f, y + 8.0f, sendBtn.left - 20.0f, y + 32.0f },
+                     fleetTypeAll_, "Type into all", [this]() {
+                         fleetTypeAll_ = !fleetTypeAll_;
+                         if (!fleetTypeAll_) fleet_.releaseModifiers(0);   // no PC keeps a held Ctrl or Shift
+                     });
+
+    // Grid. status() also keeps each live PC on the low-bandwidth preset, so it is asked every frame.
+    auto tiles = fleet_.status();
+    if (snapshotFleetTiles_) snapshotFleetTiles_(tiles);
+    const UiRect area = { lx, y + 58.0f, rx, bounds.bottom - pad };
+    fleetTileRects_ = fleetGridLayout(tiles.size(), area, 12.0f);
+    if (!tiles.empty() && std::none_of(tiles.begin(), tiles.end(), [&](const FleetTileStatus& t) { return t.deskId == fleetFocused_; }))
+        fleetFocused_ = tiles.front().deskId;   // the focused PC was handed to a session tab
+    fleetTileIds_.clear();
+    fleetFrameRects_.clear();
+    const float barH = 40.0f;
+    for (size_t i = 0; i < tiles.size(); ++i) {
+        const FleetTileStatus& t = tiles[i];
+        const UiRect& tr = fleetTileRects_[i];
+        fleetTileIds_.push_back(t.deskId);
+        fillRoundRect(tr, 10.0f, COL_BG_CARD);
+
+        // The PC's screen, fitted into the space above the bar
+        UiRect fa = { tr.left + 1.0f, tr.top + 1.0f, tr.right - 1.0f, tr.bottom - barH };
+        fillRoundRect(fa, 9.0f, COL_BG_SUBTLE);
+        UiRect fr = fa;
+        FleetTileImage& img = fleetImages_[t.deskId];
+        if (canvas_ && fleet_.copyFrame(t.deskId, img.seq, img.bgra, img.w, img.h, img.cursor) && img.w > 0 && img.h > 0) {
+            if (!img.image.valid() || img.imageW != img.w || img.imageH != img.h) {
+                releaseImage(img.image);
+                img.image = canvas_->createImage(img.w, img.h, true);
+                img.imageW = img.w;
+                img.imageH = img.h;
+            }
+            canvas_->updateImage(img.image, img.bgra.data(), img.w * 4,
+                                 ui::Rect{ 0.0f, 0.0f, static_cast<float>(img.w), static_cast<float>(img.h) });
+        }
+        if (img.image.valid() && img.imageW > 0 && img.imageH > 0) {
+            const float sc = std::min(fa.width() / static_cast<float>(img.imageW), fa.height() / static_cast<float>(img.imageH));
+            const float dw = static_cast<float>(img.imageW) * sc * 0.5f, dh = static_cast<float>(img.imageH) * sc * 0.5f;
+            fr = { fa.centerX() - dw, fa.centerY() - dh, fa.centerX() + dw, fa.centerY() + dh };
+            canvas_->drawImage(img.image, fr, alpha);
+        }
+        fleetFrameRects_.push_back(fr);
+
+        const bool focused = (t.deskId == fleetFocused_);
+        strokeRoundRect(tr, 10.0f, focused ? COL_PRIMARY_ACCENT : COL_BORDER, focused ? 2.0f : 1.0f);
+
+        // Name, state and the newest send; Open hands the PC to a normal session tab
+        const float bx = tr.left + 10.0f, by = tr.bottom - barH;
+        UiRect openBtn = { tr.right - 64.0f, by + 8.0f, tr.right - 10.0f, by + 32.0f };
+        drawText(t.name.empty() ? CryptoUtils::formatDeskId(t.deskId) : t.name, { bx, by + 3.0f, openBtn.left - 6.0f, by + 20.0f },
+                 ui::FontRole::Small, COL_TEXT_PRIMARY);
+        std::string state = "Connecting\xE2\x80\xA6";
+        ui::Color stateCol = COL_TEXT_SECONDARY;
+        if (t.state == ViewerConnectionState::Connected) {
+            state = "Live";
+            stateCol = COL_SUCCESS;
+        } else if (t.state == ViewerConnectionState::Error) {
+            const bool busy = t.statusMessage.find("already in an active remote session") != std::string::npos;   // HostBusy
+            state = busy ? "Busy" : "Failed: " + t.statusMessage;
+            stateCol = busy ? COL_WARNING : COL_DANGER;
+        }
+        const float stateW = canvas_->measureTextBlock(state, ui::FontRole::Small, openBtn.left - 6.0f - bx).x;
+        drawText(state, { bx, by + 20.0f, openBtn.left - 6.0f, by + 37.0f }, ui::FontRole::Small, stateCol);
+        if (t.lastOutgoing && bx + stateW + 10.0f < openBtn.left - 6.0f) {
+            std::string sent;
+            ui::Color sentCol = COL_TEXT_SECONDARY;
+            switch (t.lastOutgoing->status) {
+                case TransferStatus::InProgress:
+                    sent = "Sending " + std::to_string(static_cast<int>(t.lastOutgoing->progressFraction() * 100.0f)) + "%";
+                    break;
+                case TransferStatus::Completed: sent = "\xE2\x9C\x93 Sent"; sentCol = COL_SUCCESS; break;
+                default: sent = "\xE2\x9C\x97 Failed"; sentCol = COL_DANGER; break;
+            }
+            drawText(sent, { bx + stateW + 10.0f, by + 20.0f, openBtn.left - 6.0f, by + 37.0f }, ui::FontRole::Small, sentCol);
+        }
+        drawButton("fleet_open_" + std::to_string(t.deskId), openBtn, "Open",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this, deskId = t.deskId]() {
+                       if (fleetOpenDesk_ != 0) return;   // one hand-over at a time
+                       fleet_.close(deskId);
+                       // The host frees its session ~125 ms after the hang-up; onTick dials once it has
+                       fleetOpenDesk_ = deskId;
+                       fleetOpenAtMs_ = shell_->nowMs() + 300;
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+    }
+    // Images of PCs no longer in the grid
+    for (auto it = fleetImages_.begin(); it != fleetImages_.end();) {
+        if (std::find(fleetTileIds_.begin(), fleetTileIds_.end(), it->first) == fleetTileIds_.end()) {
+            releaseImage(it->second.image);
+            it = fleetImages_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void AppUi::navigateFilePane(int pane, const std::string& path) {
     if (pane == 0) {
         std::vector<FileBrowserItemEntry> entries;
@@ -7754,7 +8178,8 @@ void AppUi::drawAudioVolumePopup(float anchorX, float anchorY) {
 
 bool AppUi::anyModalActive() const {
     return modalAnimT_ > 0.004f || shortcutsModalAnimT_ > 0.004f || portForwardModalAnimT_ > 0.004f ||
-           addressBookModalAnimT_ > 0.004f || totpModalAnimT_ > 0.004f || omnibarModalAnimT_ > 0.004f ||
+           addressBookModalAnimT_ > 0.004f || pairOfferModalAnimT_ > 0.004f || fleetPickerAnimT_ > 0.004f ||
+           totpModalAnimT_ > 0.004f || omnibarModalAnimT_ > 0.004f ||
            recordingPlayerModalAnimT_ > 0.004f || updateModalAnimT_ > 0.004f ||
            rebootModalAnimT_ > 0.004f || hwAccelModalAnimT_ > 0.004f || showPeerMismatchModal_ ||
            runTaskModalAnimT_ > 0.004f || fileBrowserModalAnimT_ > 0.004f ||
@@ -8014,6 +8439,23 @@ void AppUi::onMouseButton(MouseButtonId btn, bool isDown, float x, float y) {
         return; // Block all other interaction while mandatory update is pending
     }
 
+    // Grid tiles: a press goes to the PC under it only, and its release to that same PC, wherever the pointer is now
+    auto fleetPoint = [&](uint64_t desk, float& nx, float& ny) {
+        auto it = std::find(fleetTileIds_.begin(), fleetTileIds_.end(), desk);
+        if (it == fleetTileIds_.end()) return false;
+        const UiRect& r = fleetFrameRects_[static_cast<size_t>(it - fleetTileIds_.begin())];
+        nx = std::clamp((x - r.left) / std::max(1.0f, r.width()), 0.0f, 1.0f);
+        ny = std::clamp((y - r.top) / std::max(1.0f, r.height()), 0.0f, 1.0f);
+        return true;
+    };
+    if (!isDown && fleetPressedDesk_ != 0) {
+        float nx = 0.0f, ny = 0.0f;
+        if (fleetPoint(fleetPressedDesk_, nx, ny)) fleet_.sendMouseButtonTo(fleetPressedDesk_, btn, false, nx, ny);
+        fleetPressedDesk_ = 0;
+        if (btn == MouseButtonId::Left) mouseLeftDown_ = false;
+        return;
+    }
+
     bool insideDrawer = false;
     if (drawerAnimT_ > 0.004f) {
         float w = clientSizeDips().width;
@@ -8079,6 +8521,23 @@ void AppUi::onMouseButton(MouseButtonId btn, bool isDown, float x, float y) {
             }
         }
     } else if (insideDrawer) {
+        return;
+    }
+
+    if (activeTab_ == ActiveTab::Fleet && isDown && !anyModalActive()) {
+        const int i = fleetTileAt(fleetFrameRects_, x, y);
+        float nx = 0.0f, ny = 0.0f;
+        if (i >= 0 && fleetPoint(fleetTileIds_[static_cast<size_t>(i)], nx, ny)) {
+            const uint64_t desk = fleetTileIds_[static_cast<size_t>(i)];
+            if (desk != fleetFocused_) {
+                if (fleetFocused_ != 0) fleet_.releaseModifiers(fleetFocused_);
+                fleetFocused_ = desk;
+            }
+            fleet_.sendMouseMoveTo(desk, nx, ny);
+            fleet_.sendMouseButtonTo(desk, btn, true, nx, ny);
+            fleetPressedDesk_ = desk;
+            shell_->invalidate();
+        }
         return;
     }
 
@@ -8404,7 +8863,7 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
             }
         }
 
-        if (vk == VK_F1 || (vk == 0xBF /* VK_OEM_2 /? */ && shell_->isKeyDown(VK_SHIFT))) {
+        if (vk == VK_F1 || (vk == 0xBF /* VK_OEM_2 /? */ && shell_->isKeyDown(VK_SHIFT) && activeTab_ != ActiveTab::Fleet)) {
             toggleShortcutsModal();
             return;
         }
@@ -8463,6 +8922,16 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
             }
             if (showAddressBookEditModal_) {
                 showAddressBookEditModal_ = false;
+                shell_->invalidate();
+                return;
+            }
+            if (showPairOfferModal_) {
+                showPairOfferModal_ = false;
+                shell_->invalidate();
+                return;
+            }
+            if (showFleetPicker_) {
+                showFleetPicker_ = false;
                 shell_->invalidate();
                 return;
             }
@@ -8601,6 +9070,17 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
     if (activeTab_ == ActiveTab::RemoteSession && focusedField_ == FocusedField::RemoteCanvas && remoteInputEnabled_ && !anyModalActive()) {
         flushPendingMouseMove();
         network_.sendKeyEvent(vk, scan, isDown, isExtended);
+    }
+
+    // Key-ups always reach the PCs, so a modal opening mid-keystroke never leaves a key held on them
+    if (activeTab_ == ActiveTab::Fleet && (!isDown || !anyModalActive())) {
+        if (fleetTypeAll_) {
+            // Ctrl+V pastes this PC's clipboard everywhere: each PC gets the text before the V arrives
+            if (isDown && vk == 'V' && shell_->isKeyDown(VK_CONTROL)) fleet_.pushClipboardToAll();
+            fleet_.sendKeyToAll(vk, scan, isDown, isExtended);
+        } else if (fleetFocused_ != 0) {
+            fleet_.sendKeyTo(fleetFocused_, vk, scan, isDown, isExtended);
+        }
     }
 }
 
@@ -9222,6 +9702,7 @@ void AppUi::onFocusChanged(bool focused) {
         draggingSettingsScrollbar_ = false;
         pressedWidgetId_.clear();
         network_.sendReleaseAllModifiers();
+        fleet_.releaseModifiers(0);
         shell_->invalidate();
         return;
     }
@@ -9296,6 +9777,13 @@ void AppUi::onTick() {
             shell_->invalidate();
         }
     }
+    if (fleetOpenDesk_ != 0 && tickNow >= fleetOpenAtMs_) {   // a tile's Open: dial it in a session tab, keep the rest
+        remoteIdInput_ = CryptoUtils::formatDeskId(fleetOpenDesk_);
+        fleetOpenDesk_ = 0;
+        fleetKeepOnLeave_ = true;
+        initiateConnection();
+        fleetKeepOnLeave_ = false;
+    }
     if (remoteFilePane_.expireLoading(tickNow)) {
         showToast(remoteFilePane_.statusMessage, true);
         shell_->invalidate();
@@ -9304,6 +9792,8 @@ void AppUi::onTick() {
     if (vStats.state == ViewerConnectionState::Connected &&
         prevViewerState_ != ViewerConnectionState::Connected) {
         switchTab(ActiveTab::RemoteSession);
+        // A new connection gets its own pairing offer, even when no tick saw the old one end
+        pairOfferShown_ = showPairOfferModal_ = false;
         scaleMode_ = static_cast<ScaleMode>(std::clamp<int>(identity_.settings().defaultScaleMode, 0, 3));
         if (vStats.remoteAddress.find("127.0.0.1") != std::string::npos ||
             vStats.remoteDeskId == identity_.deskId()) {
@@ -9379,8 +9869,32 @@ void AppUi::onTick() {
     }
     prevViewerState_ = vStats.state;
 
+    // Pairing: offer it once per connection, then report the host's answer
+    if (vStats.state != ViewerConnectionState::Connected) {
+        if (pairOfferShown_) {
+            pairOfferShown_ = false;
+            showPairOfferModal_ = false;
+        }
+    } else if (vStats.offerPairing && !pairOfferShown_) {
+        pairOfferShown_ = showPairOfferModal_ = true;
+        pairOfferName_ = vStats.remoteHostname.empty() ? CryptoUtils::formatDeskId(vStats.remoteDeskId) : vStats.remoteHostname;
+        shell_->invalidate();
+    }
+    const PairingRequestState pairState = network_.pairingRequestState();
+    if (pairState != prevPairingState_) {
+        if (pairState == PairingRequestState::Paired) showToast("Paired with " + pairOfferName_);
+        else if (pairState == PairingRequestState::Refused) showToast(pairOfferName_ + " didn't allow pairing", true);
+        prevPairingState_ = pairState;
+    }
+
     // Host session disconnect detection
     auto hostStatus = network_.hostSessionStatus();
+    if (hostStatus.active && !prevHostActive_ && hostStatus.paired && notificationMgr_) {
+        std::string caller = hostStatus.viewerHostname.empty() ? "Remote User" : hostStatus.viewerHostname;
+        notificationMgr_->notify(NotificationType::IncomingConnection, "Paired PC connected",
+                                 caller + " (" + CryptoUtils::formatDeskId(hostStatus.viewerDeskId) + ") connected without a password (paired).",
+                                 identity_.settings());
+    }
     if (prevHostActive_ && !hostStatus.active) {
         if (notificationMgr_) {
             std::string cName = prevHostClientName_.empty() ? "Remote Client" : prevHostClientName_;
@@ -9468,7 +9982,7 @@ void AppUi::onTick() {
 
     ++idleTickCounter_;
     bool micMonitoringActive = (activeTab_ == ActiveTab::Settings && settingsSection_ == SettingsSection::AudioVoice && network_.isVoiceMonitoring());
-    if (inLiveSession || toastActive || micMonitoringActive || (idleTickCounter_ % 4 == 0)) {
+    if (inLiveSession || toastActive || micMonitoringActive || activeTab_ == ActiveTab::Fleet || (idleTickCounter_ % 4 == 0)) {
         shell_->invalidate();
     }
 }
@@ -9489,6 +10003,7 @@ void AppUi::onGraphicsLost() {
     bitmapH_ = 0;
     recordingPlayerBitmapW_ = 0;
     recordingPlayerBitmapH_ = 0;
+    for (auto& [id, img] : fleetImages_) img = {};   // seq 0 fetches the frame again for a new image
 }
 
 void AppUi::onCloseRequested() {
@@ -9503,6 +10018,7 @@ void AppUi::onWindowDestroyed() {
     if (notificationMgr_) {
         notificationMgr_->shutdown();
     }
+    fleet_.closeAll();
     network_.disconnectViewer();
     hardResetViewerUiState();
 }
@@ -9623,6 +10139,7 @@ AppUi::AppUi(IdentityManager& identity, NetworkEngine& network, ui::PlatformShel
     : identity_(identity)
     , network_(network)
     , autoConnectTarget_(autoConnectTarget)
+    , fleet_(identity)
 {
     shell_ = &shell;
     const auto& s = identity_.settings();
@@ -9667,6 +10184,7 @@ AppUi::~AppUi() {
     if (notificationMgr_) {
         notificationMgr_->shutdown();
     }
+    fleet_.closeAll();
 }
 
 unsigned AppUi::uiDpi() const {
@@ -9706,6 +10224,7 @@ std::vector<std::string> AppUi::snapshotStateNames() {
              "settings_system", "settings_about", "session_view", "session_tabs_3", "drawer_file_transfer",
              "drawer_file_manager", "drawer_sync", "chat_long_text", "modal_approval", "modal_totp", "modal_run_task",
              "modal_address_book", "modal_recording_player", "modal_omnibar", "toast", "tooltip",
+             "modal_pair_offer", "settings_permissions_paired", "fleet_picker", "fleet_grid",
              "dashboard_mac_permissions", "dashboard_mac_restart", "dashboard_wayland_denied", "dashboard_wayland_view_only",
              "dashboard_mic_on" };
 }
@@ -9748,6 +10267,17 @@ void AppUi::applySnapshotState(const std::string& name) {
         { "settings_privacy", SettingsSection::CurtainPrivacy }, { "settings_system", SettingsSection::SystemService },
         { "settings_about", SettingsSection::About },
     };
+
+    // Pairing states seed these two peers; clear them so no other state shows them
+    constexpr uint64_t kSeedViewer = 555000111, kSeedHost = 555000222;
+    identity_.removePairedViewer(kSeedViewer);
+    identity_.removePairedHost(kSeedHost);
+    showPairOfferModal_ = false;
+    pairOfferShown_ = false;
+    showFleetPicker_ = false;
+    fleetPicked_.clear();
+    fleet_.closeAll();
+    snapshotFleetTiles_ = nullptr;
 
     setDark(false);
     network_.injectViewerFrameForTest({}, 0, 0);
@@ -9817,6 +10347,54 @@ void AppUi::applySnapshotState(const std::string& name) {
         showAddressBookEditModal_ = true;
         editingDeskId_ = 111222333;
         editAliasInput_ = "Office Workstation";
+    } else if (name == "modal_pair_offer") {
+        showPairOfferModal_ = true;
+        pairOfferName_ = "Office";
+    } else if (name == "settings_permissions_paired") {
+        activeTab_ = ActiveTab::Settings;
+        settingsSection_ = SettingsSection::Permissions;
+        PairedPeer p;
+        p.hostname = "Office";
+        p.pairedAtUnix = 1700000000;   // 2023-11-14, fixed so the render is stable
+        p.deskId = kSeedViewer;
+        identity_.addPairedViewer(p);
+        p.hostname = "Build Server";
+        p.deskId = kSeedHost;
+        identity_.addPairedHost(p);
+    } else if (name == "fleet_picker") {
+        activeTab_ = ActiveTab::Dashboard;
+        showFleetPicker_ = true;
+        PairedPeer p;   // paired, but discovery does not see it: listed as offline
+        p.hostname = "Build Server";
+        p.pairedAtUnix = 1700000000;
+        p.deskId = kSeedHost;
+        identity_.addPairedHost(p);
+    } else if (name == "fleet_grid") {
+        activeTab_ = ActiveTab::Fleet;
+        fleet_.addPlaceholderForSnapshot(555000301, "Office", ViewerConnectionState::Connected);
+        fleet_.addPlaceholderForSnapshot(555000302, "Reception", ViewerConnectionState::ConnectingTcp);
+        fleet_.addPlaceholderForSnapshot(555000303, "Lab 1", ViewerConnectionState::Error);
+        fleet_.addPlaceholderForSnapshot(555000304, "Lab 2", ViewerConnectionState::Connected);
+        fleetFocused_ = 555000301;
+        // Placeholders have no engine, so the details a live grid would show are filled in here
+        snapshotFleetTiles_ = [](std::vector<FleetTileStatus>& tiles) {
+            for (auto& t : tiles) {
+                FileTransferItem item;
+                item.isOutgoing = true;
+                item.fileName = "setup.exe";
+                item.totalBytes = 100;
+                if (t.deskId == 555000301) {
+                    item.transferredBytes = 42;
+                    t.lastOutgoing = item;
+                } else if (t.deskId == 555000303) {
+                    t.statusMessage = "Connection timed out";
+                } else if (t.deskId == 555000304) {
+                    item.transferredBytes = 100;
+                    item.status = TransferStatus::Completed;
+                    t.lastOutgoing = item;
+                }
+            }
+        };
     } else if (name == "modal_recording_player") {
         showRecordingPlayer_ = true;
     } else if (name == "modal_omnibar") {
@@ -9845,6 +10423,15 @@ void AppUi::applySnapshotState(const std::string& name) {
 }
 
 void AppUi::onFilesDropped(const std::vector<std::string>& paths, float dropX, float dropY) {
+    if (activeTab_ == ActiveTab::Fleet) {   // onto a tile: that PC only; anywhere else in the grid: every PC
+        const int i = fleetTileAt(fleetTileRects_, dropX, dropY);
+        size_t sent = 0;
+        for (const auto& path : paths)
+            sent += (i >= 0) ? (fleet_.sendFileTo(fleetTileIds_[static_cast<size_t>(i)], path) ? 1 : 0) : fleet_.sendFileToAll(path);
+        if (sent > 0) showToast("Sending " + std::to_string(paths.size()) + " file(s) to " + (i >= 0 ? "1 PC" : "every live PC"));
+        else showToast("No PC in the grid is live yet", true);
+        return;
+    }
     float nx = 0.0f, ny = 0.0f;
     bool droppedOnCanvas = (activeTab_ == ActiveTab::RemoteSession &&
                             renderedCanvasRect_.contains(dropX, dropY) &&

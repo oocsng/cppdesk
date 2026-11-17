@@ -16,6 +16,7 @@
 #include "../src/net/updater.hpp"
 #include "../src/net/connection_limiter.hpp"
 #include "../src/net/relay_owner.hpp"
+#include "../src/net/fleet_manager.hpp"
 #include "../src/core/win_compat.hpp"
 #include "../src/ui/recording_canvas.hpp"
 #include "../src/ui/app_ui.hpp"
@@ -2187,6 +2188,26 @@ void testNativeClipboardFileTransfer() {
 
         mgr.cancelActiveTransfer(sendFn);
         TEST_ASSERT(!std::filesystem::exists(std::filesystem::path(partFile)));
+    }
+
+    // 5b. Several engines in one process: one manager's reset or teardown leaves another's partial file alone
+    {
+        ClipboardFileTransferManager mgrA;
+        const std::filesystem::path partA = std::filesystem::path(mgrA.stagingDirectory()) / L"transfer_1001_part_0.part";
+        std::filesystem::path dirB;
+        {
+            ClipboardFileTransferManager mgrB;
+            dirB = std::filesystem::path(mgrB.stagingDirectory());
+            TEST_ASSERT(mgrA.stagingDirectory() != mgrB.stagingDirectory());
+            std::ofstream(partA) << "partial";
+            std::ofstream(dirB / L"transfer_1001_part_0.part") << "other";
+            mgrB.reset();
+            TEST_ASSERT(std::filesystem::exists(partA));
+        }
+        TEST_ASSERT(std::filesystem::exists(partA));
+        TEST_ASSERT(!std::filesystem::exists(dirB));   // a manager removes its own folder when it goes
+        mgrA.reset();
+        TEST_ASSERT(!std::filesystem::exists(partA));
     }
 
     // 6. Path Traversal & Directory Separator Sanitization in handleRemoteFileList
@@ -9315,6 +9336,39 @@ void testAppUiRendersEveryScreenHeadless() {
     TEST_ASSERT(approval.find("|Connection Request") != std::string::npos);
     std::string dash = renderAppState(id, net, shell, "dashboard_light");
     TEST_ASSERT(dash.find("|" + CryptoUtils::formatDeskId(id.deskId())) != std::string::npos);
+
+    // Pairing UI: the offer modal, the setting, and the two lists with their Forget buttons.
+    TEST_ASSERT(std::find(names.begin(), names.end(), "modal_pair_offer") != names.end());
+    TEST_ASSERT(std::find(names.begin(), names.end(), "settings_permissions_paired") != names.end());
+    std::string offer = renderAppState(id, net, shell, "modal_pair_offer");
+    TEST_ASSERT(offer.find("|Pair with this PC?") != std::string::npos);
+    TEST_ASSERT(offer.find("|Not now") != std::string::npos);
+    TEST_ASSERT(offer.find("|Pair\n") != std::string::npos);
+    std::string paired = renderAppState(id, net, shell, "settings_permissions_paired");
+    TEST_ASSERT(paired.find("|Allow pairing") != std::string::npos);
+    TEST_ASSERT(paired.find("|PAIRED PCS") != std::string::npos);
+    TEST_ASSERT(paired.find("|PCS THIS ONE CAN ENTER") != std::string::npos);
+    TEST_ASSERT(paired.find("|Forget") != std::string::npos);
+    TEST_ASSERT(paired.find("|Office \xC2\xB7 555 000 111 \xC2\xB7 paired 2023-11-14") != std::string::npos);
+    TEST_ASSERT(paired.find("None yet") == std::string::npos);
+    // The seeded peers never leak into another state, and the lists are empty by default.
+    std::string plain = renderAppState(id, net, shell, "settings_permissions");
+    TEST_ASSERT(plain.find("|Forget") == std::string::npos);
+    TEST_ASSERT(plain.find("|None yet") != std::string::npos);
+
+    // A desk this PC is paired with gets the Paired chip in the recent list.
+    TEST_ASSERT(renderAppState(id, net, shell, "dashboard_light").find("|Paired") == std::string::npos);
+    PairedPeer host;
+    host.deskId = 123123123;
+    host.hostname = "Lab";
+    host.pairedAtUnix = 1700000000;
+    id.addOrUpdateRecentSession(host.deskId, host.hostname, "10.0.0.9:7878");
+    id.addPairedHost(host);
+    TEST_ASSERT(renderAppState(id, net, shell, "dashboard_light").find("|Paired") != std::string::npos);
+    id.removePairedHost(host.deskId);
+    id.removeRecentSession(host.deskId);
+    TEST_ASSERT(renderAppState(id, net, shell, "dashboard_light").find("|Paired") == std::string::npos);
+
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
 }
@@ -9717,6 +9771,926 @@ void testWaylandShareNoticeUi() {
     }
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
+}
+
+void testPairingKeyCrypto() {
+    std::cout << "[TEST 106] Pairing key: ECDSA P-256 sign/verify, key round trip, RFC 6979 vector, handshake transcript..." << std::endl;
+    PairingKey a; TEST_ASSERT(a.generate()); TEST_ASSERT(a.isValid());
+    auto d = CryptoUtils::sha256(std::string("hello"));
+    PairingKey::Signature sig{}; TEST_ASSERT(a.sign(d, sig));
+    TEST_ASSERT(PairingKey::verify(a.publicKey(), d, sig));
+    auto d2 = d; d2[0] ^= 1; TEST_ASSERT(!PairingKey::verify(a.publicKey(), d2, sig));
+    auto bad = sig; bad[10] ^= 1; TEST_ASSERT(!PairingKey::verify(a.publicKey(), d, bad));
+    PairingKey b; TEST_ASSERT(b.generate()); TEST_ASSERT(!PairingKey::verify(b.publicKey(), d, sig));
+    PairingKey c; TEST_ASSERT(c.importKeyPair(a.exportKeyPair()));
+    TEST_ASSERT(c.publicKey() == a.publicKey());
+    TEST_ASSERT(c.sign(d, sig) && PairingKey::verify(a.publicKey(), d, sig));
+
+    // Known answer, RFC 6979 A.2.5 (P-256, SHA-256, message "sample"): pins the r||s and X||Y wire format on every platform.
+    PairingKey::PublicKey rfcPub{};
+    PairingKey::Signature rfcSig{};
+    auto ux = CryptoUtils::fromHex("60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6");
+    auto uy = CryptoUtils::fromHex("7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299");
+    auto rr = CryptoUtils::fromHex("EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716");
+    auto ss = CryptoUtils::fromHex("F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8");
+    std::copy(ux.begin(), ux.end(), rfcPub.begin());
+    std::copy(uy.begin(), uy.end(), rfcPub.begin() + 32);
+    std::copy(rr.begin(), rr.end(), rfcSig.begin());
+    std::copy(ss.begin(), ss.end(), rfcSig.begin() + 32);
+    TEST_ASSERT(PairingKey::verify(rfcPub, CryptoUtils::sha256(std::string("sample")), rfcSig));
+
+    // Transcript: role and every field change the digest
+    std::array<uint8_t,32> n{}; std::vector<uint8_t> hp(65, 1), vp(65, 2);
+    auto t = CryptoUtils::pairingTranscript('H', 1, 2, n, hp, vp);
+    TEST_ASSERT(t != CryptoUtils::pairingTranscript('V', 1, 2, n, hp, vp));
+    TEST_ASSERT(t != CryptoUtils::pairingTranscript('H', 1, 3, n, hp, vp));
+    TEST_ASSERT(t != CryptoUtils::pairingTranscript('H', 1, 2, n, vp, hp));
+}
+
+void testPairingStorage() {
+    std::cout << "[TEST 107] Pairing storage: key, allow-pairing default, paired lists round trip, bad lines skipped..." << std::endl;
+    std::string cfg;
+    {
+        IdentityManager probe(4301);
+        cfg = probe.configFilePath();
+    }
+    std::error_code ec;
+    std::filesystem::remove(cfg, ec);
+
+    PairingKey vk, hk;
+    TEST_ASSERT(vk.generate() && hk.generate());
+    PairingKey::PublicKey firstPub{};
+    {
+        IdentityManager id(4301);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(!id.settings().allowPairing);
+        TEST_ASSERT(id.pairingKey().isValid());
+        TEST_ASSERT(id.pairedViewers().empty() && id.pairedHosts().empty());
+        firstPub = id.pairingKey().publicKey();
+        id.addPairedViewer({111222333ULL, "Office-PC", vk.publicKey(), 1700000000ULL});
+        id.addPairedHost({444555666ULL, "Lab|PC", hk.publicKey(), 1700000001ULL});
+    }
+    {
+        IdentityManager id(4301);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(id.pairingKey().publicKey() == firstPub);
+        auto v = id.findPairedViewer(111222333ULL);
+        TEST_ASSERT(v && v->publicKey == vk.publicKey() && v->hostname == "Office-PC" && v->pairedAtUnix == 1700000000ULL);
+        auto h = id.findPairedHost(444555666ULL);
+        TEST_ASSERT(h && h->hostname == "Lab PC" && h->publicKey == hk.publicKey());
+        TEST_ASSERT(!id.findPairedViewer(444555666ULL) && !id.findPairedHost(111222333ULL));
+
+        id.addPairedViewer({111222333ULL, "Renamed", vk.publicKey(), 1700000002ULL});
+        TEST_ASSERT(id.pairedViewers().size() == 1 && id.pairedViewers()[0].hostname == "Renamed");
+
+        TEST_ASSERT(id.removePairedViewer(111222333ULL));
+        TEST_ASSERT(!id.removePairedViewer(111222333ULL));
+    }
+    {
+        IdentityManager id(4301);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(id.pairedViewers().empty() && id.pairedHosts().size() == 1);
+    }
+    {
+        std::ofstream f(cfg, std::ios::app);
+        f << "paired_viewer=12|zz|1|x\n" << "paired_viewer=13|abcd|1|x\n" << "paired_viewer=notanumber\n" << "paired_host=\n";
+    }
+    {
+        IdentityManager id(4301);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(!id.findPairedViewer(12) && !id.findPairedViewer(13));
+        TEST_ASSERT(id.pairedViewers().empty() && id.pairedHosts().size() == 1);
+    }
+    // Host, viewer and UI threads save at once: the file on disk is never torn and every entry lands.
+    {
+        IdentityManager id(4301);
+        TEST_ASSERT(id.loadOrCreate());
+        auto readCfg = [&](bool& opened) {
+            std::ifstream f(cfg, std::ios::binary);
+            opened = f.is_open();
+            return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        bool opened = false;
+        const std::string first = readCfg(opened);
+        const auto k = first.find("pair_key=");
+        TEST_ASSERT(k != std::string::npos);
+        const std::string keyLine = first.substr(k, first.find('\n', k) + 1 - k);
+        std::atomic<bool> torn{false};
+        std::thread a([&] { for (uint64_t i = 0; i < 60; ++i) id.addPairedViewer({500000000ULL + i, "V", vk.publicKey(), 1}); });
+        std::thread b([&] { for (uint64_t i = 0; i < 60; ++i) id.addPairedHost({600000000ULL + i, "H", hk.publicKey(), 1}); });
+        std::thread r([&] {
+            for (int i = 0; i < 200; ++i) {
+                bool ok = false;
+                const std::string s = readCfg(ok);   // Windows may refuse the open while the rename lands: not a torn file
+                if (ok && (s.rfind("# CppDesk", 0) != 0 || s.find(keyLine) == std::string::npos || s.back() != '\n')) torn = true;
+            }
+        });
+        a.join(); b.join(); r.join();
+        TEST_ASSERT(!torn.load());
+        TEST_ASSERT(!std::filesystem::exists(cfg + ".tmp"));
+    }
+    {
+        IdentityManager id(4301);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(id.pairedViewers().size() == 60 && id.pairedHosts().size() == 61);
+    }
+    std::filesystem::remove(cfg, ec);
+}
+
+void testPairedLogin() {
+    std::cout << "[TEST 108] Paired login: decision table, password-free paired session, refusals and lockout..." << std::endl;
+
+    PairingKey pinnedKey, otherKey;
+    TEST_ASSERT(pinnedKey.generate() && otherKey.generate());
+    const std::optional<PairedPeer> pin = PairedPeer{42, "H", pinnedKey.publicKey(), 1};
+    TEST_ASSERT(decideViewerPairing(true, true, std::nullopt, otherKey.publicKey()) == ViewerPairingDecision::Legacy);
+    TEST_ASSERT(decideViewerPairing(false, false, pin, PairingKey::PublicKey{}) == ViewerPairingDecision::RefuseNoPairingSupport);
+    TEST_ASSERT(decideViewerPairing(true, true, pin, otherKey.publicKey()) == ViewerPairingDecision::RefuseIdentityChanged);
+    TEST_ASSERT(decideViewerPairing(true, false, pin, pinnedKey.publicKey()) == ViewerPairingDecision::RefuseIdentityChanged);
+    TEST_ASSERT(decideViewerPairing(true, true, pin, pinnedKey.publicKey()) == ViewerPairingDecision::UsePaired);
+
+    std::error_code ec;
+    std::vector<std::string> cfgs;
+    for (int inst : {4310, 4311}) {
+        IdentityManager probe(inst);
+        cfgs.push_back(probe.configFilePath());
+        std::filesystem::remove(cfgs.back(), ec);
+    }
+    {
+        IdentityManager hostId(4310);
+        TEST_ASSERT(hostId.loadOrCreate());
+        hostId.setListenPort(51010);
+        hostId.setUnattendedEnabled(true);
+        hostId.setUnattendedPassword("HostPw1");
+        { AppSettings s = hostId.settings(); s.allowPairing = true; hostId.updateSettings(s); }
+        IdentityManager viewerId(4311);
+        TEST_ASSERT(viewerId.loadOrCreate());
+        viewerId.setListenPort(51011);
+        hostId.addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
+        viewerId.addPairedHost({hostId.deskId(), "H", hostId.pairingKey().publicKey(), 1});
+
+        NetworkEngine hostNet(hostId);
+        NetworkEngine viewerNet(viewerId);
+        TEST_ASSERT(hostNet.start());
+        TEST_ASSERT(viewerNet.start());
+        const std::string target = "127.0.0.1:" + std::to_string(hostNet.hostListenPort());
+
+        bool sawPrompt = false;   // the host ever asked for approval or a 2FA code
+        auto dial = [&](const std::string& to, const std::string& password) {
+            viewerNet.connectToRemote(to, password);
+            ViewerSessionStats st;
+            for (int i = 0; i < 80; ++i) {
+                st = viewerNet.viewerStats();
+                if (st.state == ViewerConnectionState::WaitingApproval || st.state == ViewerConnectionState::WaitingTotp) sawPrompt = true;
+                if (st.state == ViewerConnectionState::Connected || st.state == ViewerConnectionState::Error) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            return st;
+        };
+        auto hostPaired = [&]() {
+            for (int i = 0; i < 40; ++i) {
+                auto hs = hostNet.hostSessionStatus();
+                if (hs.active) return hs.paired;
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+            return false;
+        };
+        auto hangUp = [&]() {
+            viewerNet.disconnectViewer();
+            hostNet.disconnectHostClient();
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        };
+        auto has = [](const ViewerSessionStats& st, const char* text) { return st.statusMessage.find(text) != std::string::npos; };
+
+        auto st = dial(target, "");
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected);
+        TEST_ASSERT(st.pairedSession && st.hostAllowsNewPairing);
+        TEST_ASSERT(hostPaired());
+        hangUp();
+
+        { AppSettings s = hostId.settings(); s.allowPairing = false; hostId.updateSettings(s); }
+        st = dial(target, "");
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected);
+        TEST_ASSERT(st.pairedSession && !st.hostAllowsNewPairing);
+        TEST_ASSERT(hostPaired());
+        hangUp();
+
+        // A pinned host overrides a typed password: the session is still a paired one.
+        st = dial(target, "HostPw1");
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected && st.pairedSession);
+        TEST_ASSERT(hostPaired());
+        hangUp();
+
+        {
+            AppSettings s = hostId.settings();
+            s.totpEnabled = true;
+            hostId.totpManager().generateNewSecret();
+            s.totpSecret = hostId.totpManager().getSecretBase32();
+            hostId.updateSettings(s);
+        }
+        TEST_ASSERT(hostId.totpManager().isConfigured());
+        st = dial(target, "");
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected && st.pairedSession);
+        TEST_ASSERT(hostPaired());
+        TEST_ASSERT(!sawPrompt);
+        hangUp();
+
+        TEST_ASSERT(hostId.removePairedViewer(viewerId.deskId()));
+        st = dial(target, "");
+        TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "not paired"));
+        hangUp();
+
+        viewerId.addPairedHost({hostId.deskId(), "H", otherKey.publicKey(), 1});
+        st = dial(target, "");
+        TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "doesn't match"));
+        TEST_ASSERT(!hostNet.hostSessionStatus().active);
+        hangUp();
+
+        // A pinned desk ID answered by a PC claiming another ID is refused, even though that other ID is pinned too.
+        // Dialling one's own desk ID connects to 127.0.0.1:<own listen port>, so pointing that port at the host makes
+        // the dialled ID (the viewer's) and the answering ID (the host's) differ.
+        viewerId.addPairedHost({hostId.deskId(), "H", hostId.pairingKey().publicKey(), 1});
+        viewerId.addPairedHost({viewerId.deskId(), "X", otherKey.publicKey(), 1});
+        viewerId.setListenPort(hostNet.hostListenPort());
+        st = dial(viewerId.formattedDeskId(), "");
+        TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "doesn't match"));
+        TEST_ASSERT(!hostNet.hostSessionStatus().active);
+        hangUp();
+        viewerId.setListenPort(51011);
+        TEST_ASSERT(viewerId.removePairedHost(viewerId.deskId()));
+
+        // Bad paired logins count toward the per-IP lockout exactly like bad passwords.
+        hostNet.clearRateLimitRecords();
+        for (int i = 0; i < 5; ++i) {
+            st = dial(target, "");
+            TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "not paired"));
+            hangUp();
+        }
+        st = dial(target, "");
+        TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "Too many"));
+        TEST_ASSERT(!sawPrompt);
+        hangUp();
+    }
+    for (const auto& c : cfgs) std::filesystem::remove(c, ec);
+}
+
+void testPairingOffer() {
+    std::cout << "[TEST 109] Pairing offer: pair after a password login, then password-free; refused when switched off..." << std::endl;
+
+    // One host and one viewer on loopback, host unattended with a password.
+    struct Rig {
+        IdentityManager hostId, viewerId;
+        NetworkEngine hostNet, viewerNet;
+        std::string target;
+        Rig(int inst, int port, bool allowPairing)
+            : hostId(inst), viewerId(inst + 1), hostNet(hostId), viewerNet(viewerId) {
+            std::error_code e;
+            std::filesystem::remove(hostId.configFilePath(), e);
+            std::filesystem::remove(viewerId.configFilePath(), e);
+            TEST_ASSERT(hostId.loadOrCreate() && viewerId.loadOrCreate());
+            hostId.setListenPort(port);
+            viewerId.setListenPort(port + 1);
+            hostId.setUnattendedEnabled(true);
+            hostId.setUnattendedPassword("HostPw1");
+            setAllowPairing(allowPairing);
+            TEST_ASSERT(hostNet.start() && viewerNet.start());
+            target = "127.0.0.1:" + std::to_string(hostNet.hostListenPort());
+        }
+        ~Rig() {
+            std::error_code e;
+            std::filesystem::remove(hostId.configFilePath(), e);
+            std::filesystem::remove(viewerId.configFilePath(), e);
+        }
+        void setAllowPairing(bool on) { AppSettings s = hostId.settings(); s.allowPairing = on; hostId.updateSettings(s); }
+        ViewerSessionStats dial(const std::string& password) {
+            viewerNet.connectToRemote(target, password);
+            ViewerSessionStats st;
+            for (int i = 0; i < 80; ++i) {
+                st = viewerNet.viewerStats();
+                if (st.state == ViewerConnectionState::Connected || st.state == ViewerConnectionState::Error) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            return st;
+        }
+        void hangUp() {
+            viewerNet.disconnectViewer();
+            hostNet.disconnectHostClient();
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        PairingRequestState waitForAnswer() {
+            for (int i = 0; i < 40 && viewerNet.pairingRequestState() == PairingRequestState::Pending; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            return viewerNet.pairingRequestState();
+        }
+    };
+
+    {
+        Rig rig(4320, 51020, true);
+        auto st = rig.dial("HostPw1");
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected && !st.pairedSession);
+        TEST_ASSERT(st.hostAllowsNewPairing && st.offerPairing);
+        TEST_ASSERT(rig.viewerNet.pairingRequestState() == PairingRequestState::Idle);
+        TEST_ASSERT(rig.viewerNet.requestPairing());
+        TEST_ASSERT(rig.waitForAnswer() == PairingRequestState::Paired);
+        auto h = rig.viewerId.findPairedHost(rig.hostId.deskId());
+        auto v = rig.hostId.findPairedViewer(rig.viewerId.deskId());
+        TEST_ASSERT(h && h->publicKey == rig.hostId.pairingKey().publicKey());
+        TEST_ASSERT(v && v->publicKey == rig.viewerId.pairingKey().publicKey());
+        TEST_ASSERT(!rig.viewerNet.viewerStats().offerPairing && !rig.viewerNet.requestPairing());
+        rig.hangUp();
+
+        st = rig.dial("");
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected && st.pairedSession);
+        TEST_ASSERT(!st.offerPairing && !rig.viewerNet.requestPairing());
+        TEST_ASSERT(rig.viewerNet.pairingRequestState() == PairingRequestState::Idle);   // reset by the new connection
+        rig.hangUp();
+    }
+    {
+        Rig rig(4322, 51022, false);
+        auto st = rig.dial("HostPw1");
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected);
+        TEST_ASSERT(!st.hostAllowsNewPairing && !st.offerPairing);
+        TEST_ASSERT(!rig.viewerNet.requestPairing());
+        TEST_ASSERT(rig.viewerNet.pairingRequestState() == PairingRequestState::Idle);
+        rig.hangUp();
+    }
+    {
+        // Switched off between login and request: the host decides at the time of the request.
+        Rig rig(4324, 51024, true);
+        auto st = rig.dial("HostPw1");
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected && st.offerPairing);
+        rig.setAllowPairing(false);
+        TEST_ASSERT(rig.viewerNet.requestPairing());
+        TEST_ASSERT(rig.waitForAnswer() == PairingRequestState::Refused);
+        TEST_ASSERT(!rig.viewerId.findPairedHost(rig.hostId.deskId()));
+        TEST_ASSERT(!rig.hostId.findPairedViewer(rig.viewerId.deskId()));
+        rig.hangUp();
+    }
+    {
+        // A password holder claiming a paired PC's desk ID cannot replace that PC's pinned key.
+        Rig rig(4326, 51026, true);
+        TEST_ASSERT(rig.dial("HostPw1").offerPairing && rig.viewerNet.requestPairing());
+        TEST_ASSERT(rig.waitForAnswer() == PairingRequestState::Paired);
+        const auto original = rig.hostId.findPairedViewer(rig.viewerId.deskId());
+        TEST_ASSERT(original && original->publicKey == rig.viewerId.pairingKey().publicKey());
+        rig.hangUp();
+
+        IdentityManager attackerId(4328);
+        std::error_code e;
+        std::filesystem::remove(attackerId.configFilePath(), e);
+        { std::ofstream f(attackerId.configFilePath()); f << "desk_id=" << rig.viewerId.deskId() << "\n"; }
+        TEST_ASSERT(attackerId.loadOrCreate() && attackerId.deskId() == rig.viewerId.deskId());
+        TEST_ASSERT(attackerId.pairingKey().publicKey() != rig.viewerId.pairingKey().publicKey());
+        attackerId.setListenPort(51028);
+        {
+            NetworkEngine attackerNet(attackerId);
+            TEST_ASSERT(attackerNet.start());
+            attackerNet.connectToRemote(rig.target, "HostPw1");
+            ViewerSessionStats st;
+            for (int i = 0; i < 80; ++i) {
+                st = attackerNet.viewerStats();
+                if (st.state == ViewerConnectionState::Connected || st.state == ViewerConnectionState::Error) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            TEST_ASSERT(st.state == ViewerConnectionState::Connected && !st.pairedSession && st.offerPairing);
+            TEST_ASSERT(attackerNet.requestPairing());
+            for (int i = 0; i < 40 && attackerNet.pairingRequestState() == PairingRequestState::Pending; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            TEST_ASSERT(attackerNet.pairingRequestState() == PairingRequestState::Refused);
+            TEST_ASSERT(!attackerId.findPairedHost(rig.hostId.deskId()));
+            attackerNet.disconnectViewer();
+            rig.hostNet.disconnectHostClient();
+        }
+        const auto after = rig.hostId.findPairedViewer(rig.viewerId.deskId());
+        TEST_ASSERT(after && after->publicKey == original->publicKey && after->hostname == original->hostname);
+        TEST_ASSERT(rig.hostId.pairedViewers().size() == 1);
+        std::filesystem::remove(attackerId.configFilePath(), e);
+    }
+}
+
+void testViewerOnlyEngine() {
+    std::cout << "[TEST 110] Viewer-only engines: no listener or discovery, two at once on one identity, key sink..." << std::endl;
+
+    std::error_code ec;
+    std::vector<std::string> cfgs;
+    for (int inst : {4330, 4331, 4332}) {
+        IdentityManager probe(inst);
+        cfgs.push_back(probe.configFilePath());
+        std::filesystem::remove(cfgs.back(), ec);
+    }
+    {
+        IdentityManager hostAId(4330), hostBId(4331), viewerId(4332);
+        TEST_ASSERT(hostAId.loadOrCreate() && hostBId.loadOrCreate() && viewerId.loadOrCreate());
+        hostAId.setListenPort(51030);
+        hostBId.setListenPort(51032);
+        viewerId.setListenPort(51034);
+        for (IdentityManager* h : {&hostAId, &hostBId}) {
+            h->addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
+            viewerId.addPairedHost({h->deskId(), "H", h->pairingKey().publicKey(), 1});
+        }
+
+        NetworkEngine hostA(hostAId), hostB(hostBId);
+        TEST_ASSERT(hostA.start() && hostB.start());
+        TEST_ASSERT(!hostA.isViewerOnly() && hostA.hostListening());
+
+        NetworkEngine viewerA(viewerId), viewerB(viewerId);
+        TEST_ASSERT(viewerA.startViewerOnly() && viewerB.startViewerOnly());
+        TEST_ASSERT(viewerA.isRunning() && viewerA.isViewerOnly() && viewerB.isViewerOnly());
+        TEST_ASSERT(!viewerA.hostListening() && !viewerB.hostListening());
+        TEST_ASSERT(!viewerA.isClipboardSyncEnabled() && !viewerB.isClipboardSyncEnabled());
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        TEST_ASSERT(viewerA.discoveredPeers().empty() && viewerB.discoveredPeers().empty());
+
+        std::mutex keysMutex;
+        std::vector<std::pair<uint16_t, bool>> keys;
+        hostA.setHostKeySinkForTest([&](uint16_t vk, bool isDown) {
+            std::lock_guard<std::mutex> lk(keysMutex);
+            keys.emplace_back(vk, isDown);
+        });
+
+        // Both dial at once over the same viewer identity.
+        viewerA.connectToRemote("127.0.0.1:" + std::to_string(hostA.hostListenPort()), "");
+        viewerB.connectToRemote("127.0.0.1:" + std::to_string(hostB.hostListenPort()), "");
+        auto connected = [](NetworkEngine& v) {
+            auto st = v.viewerStats();
+            return st.state == ViewerConnectionState::Connected && st.pairedSession;
+        };
+        for (int i = 0; i < 80 && !(connected(viewerA) && connected(viewerB)); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        TEST_ASSERT(connected(viewerA) && connected(viewerB));
+
+        viewerA.sendKeyEvent(0x41, 0x1E, true, false);
+        viewerA.sendKeyEvent(0x41, 0x1E, false, false);
+        viewerA.sendReleaseAllModifiers();
+        auto keyCount = [&]() { std::lock_guard<std::mutex> lk(keysMutex); return keys.size(); };
+        for (int i = 0; i < 40 && keyCount() < 3; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        {
+            std::lock_guard<std::mutex> lk(keysMutex);
+            const std::vector<std::pair<uint16_t, bool>> expected{{0x41, true}, {0x41, false}, {0, false}};
+            TEST_ASSERT(keys == expected);
+        }
+
+        viewerA.stop();
+        TEST_ASSERT(!viewerA.isRunning());
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        TEST_ASSERT(connected(viewerB));
+
+        viewerB.stop();
+        hostA.setHostKeySinkForTest(nullptr);
+    }
+    for (const auto& c : cfgs) std::filesystem::remove(c, ec);
+}
+
+void testFleetManager() {
+    std::cout << "[TEST 111] FleetManager: eligible PCs, 16 cap, keys and files to all, survives a drop, releases modifiers, close frees the host..." << std::endl;
+    using Clock = std::chrono::steady_clock;
+    using Keys = std::vector<std::pair<uint16_t, bool>>;
+    auto waitFor = [](const std::function<bool()>& cond, int ms) {
+        for (int i = 0; i < ms / 50 && !cond(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return cond();
+    };
+    struct KeyLog {
+        std::mutex m;
+        Keys v;
+        Keys get() { std::lock_guard<std::mutex> lk(m); return v; }
+        void clear() { std::lock_guard<std::mutex> lk(m); v.clear(); }
+        bool has(std::pair<uint16_t, bool> k) { std::lock_guard<std::mutex> lk(m); return std::find(v.begin(), v.end(), k) != v.end(); }
+        std::function<void(uint16_t, bool)> sink() { return [this](uint16_t vk, bool d) { std::lock_guard<std::mutex> lk(m); v.emplace_back(vk, d); }; }
+    };
+
+    std::error_code ec;
+    std::vector<std::string> cfgs;
+    for (int inst : {4340, 4341, 4342, 4346, 4347, 4348, 4349}) {
+        IdentityManager probe(inst);
+        cfgs.push_back(probe.configFilePath());
+        std::filesystem::remove(cfgs.back(), ec);
+    }
+    const auto tmp = std::filesystem::temp_directory_path() / "CppDesk_Test_Fleet";
+    std::filesystem::remove_all(tmp, ec);
+    std::filesystem::create_directories(tmp / "a", ec);
+    std::filesystem::create_directories(tmp / "b", ec);
+    {
+        IdentityManager hostAId(4340), hostBId(4341), viewerId(4342);
+        TEST_ASSERT(hostAId.loadOrCreate() && hostBId.loadOrCreate() && viewerId.loadOrCreate());
+        hostAId.setListenPort(51040);
+        hostBId.setListenPort(51042);
+        viewerId.setListenPort(51044);
+        for (IdentityManager* h : {&hostAId, &hostBId}) {
+            h->addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
+            viewerId.addPairedHost({h->deskId(), "H", h->pairingKey().publicKey(), 1});
+        }
+        const uint64_t deskA = hostAId.deskId(), deskB = hostBId.deskId();
+
+        // Only paired PCs seen directly on the LAN, sorted by name.
+        std::vector<DiscoveredPeer> peers{{deskA, "A", "10.0.0.5", 6001, 0, false},
+                                          {deskB, "B", "10.0.0.6", 6002, 0, true},
+                                          {123456789, "C", "10.0.0.7", 6003, 0, false}};
+        auto el = FleetManager::eligibleMembers(viewerId, peers);
+        TEST_ASSERT(el.size() == 1 && el[0].deskId == deskA && el[0].name == "A" && el[0].address == "10.0.0.5:6001");
+        peers[1].viaRelay = false;
+        peers[1].hostname = "0B";
+        el = FleetManager::eligibleMembers(viewerId, peers);
+        TEST_ASSERT(el.size() == 2 && el[0].deskId == deskB && el[1].deskId == deskA);
+
+        KeyLog logA, logB;
+        NetworkEngine hostA(hostAId), hostB(hostBId);
+        FleetManager fleet(viewerId);
+
+        // At most 16 at once.
+        std::vector<FleetMember> fakes;
+        for (uint64_t i = 0; i < 20; ++i) fakes.push_back({900000000 + i, "Fake" + std::to_string(i), "127.0.0.1:51059"});
+        TEST_ASSERT(fleet.open(fakes) == 16 && fleet.size() == 16);
+        fleet.closeAll();
+        TEST_ASSERT(fleet.size() == 0);
+
+        hostA.fileTransferManager().setReceiveDirectory((tmp / "a").string());
+        hostB.fileTransferManager().setReceiveDirectory((tmp / "b").string());
+        TEST_ASSERT(hostA.start() && hostB.start());
+        hostA.setHostKeySinkForTest(logA.sink());
+        hostB.setHostKeySinkForTest(logB.sink());
+
+        TEST_ASSERT(fleet.open({{deskA, "A", "127.0.0.1:51040"}, {deskB, "B", "127.0.0.1:51042"}}) == 2);
+        auto stateOf = [&](uint64_t id) {
+            for (const auto& t : fleet.status())
+                if (t.deskId == id) return t.state;
+            return ViewerConnectionState::Disconnected;
+        };
+        const auto C = ViewerConnectionState::Connected;
+        TEST_ASSERT(waitFor([&] { return stateOf(deskA) == C && stateOf(deskB) == C; }, 10000));
+        auto tiles = fleet.status();
+        TEST_ASSERT(tiles.size() == 2 && tiles[0].deskId == deskA && tiles[0].name == "A" && tiles[1].deskId == deskB);
+        TEST_ASSERT(fleet.open({{deskA, "A", "127.0.0.1:51040"}}) == 0 && fleet.size() == 2);
+        // Every member settles on LowBandwidth at 15 FPS, even after the engine's own default request on connect.
+        auto lowBandwidth = [&] {
+            for (const auto& t : fleet.status())
+                if (t.qualityPreset != QualityPreset::LowBandwidth || t.targetFps != 15) return false;
+            return true;
+        };
+        TEST_ASSERT(waitFor(lowBandwidth, 2000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        TEST_ASSERT(lowBandwidth());
+
+        fleet.sendKeyToAll(0x41, 0x1E, true, false);
+        fleet.sendKeyToAll(0x41, 0x1E, false, false);
+        const Keys aDownUp{{0x41, true}, {0x41, false}};
+        TEST_ASSERT(waitFor([&] { return logA.get() == aDownUp && logB.get() == aDownUp; }, 2000));
+
+        // The same file lands on both PCs.
+        const auto src = tmp / "fleet_payload.bin";
+        std::string payload(100000, '\0');
+        for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>('a' + i % 23);
+        { std::ofstream out(src, std::ios::binary); out.write(payload.data(), static_cast<std::streamsize>(payload.size())); }
+        TEST_ASSERT(fleet.sendFileToAll(src.string()) == 2);
+        auto landed = [&](const char* dir) {
+            std::ifstream in(tmp / dir / "fleet_payload.bin", std::ios::binary);
+            std::string got((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            return CryptoUtils::sha256Hex(got) == CryptoUtils::sha256Hex(payload);
+        };
+        auto sentToAll = [&] {
+            for (const auto& t : fleet.status())
+                if (!t.lastOutgoing || t.lastOutgoing->status != TransferStatus::Completed) return false;
+            return true;
+        };
+        TEST_ASSERT(waitFor([&] { return landed("a") && landed("b") && sentToAll(); }, 5000));
+
+        // fleetSurvivesMemberDrop
+        hostA.stop();
+        TEST_ASSERT(waitFor([&] { return stateOf(deskA) != C; }, 3000));
+        logB.clear();
+        const auto t0 = Clock::now();
+        fleet.sendKeyToAll(0x42, 0x30, true, false);
+        const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+        fleet.sendKeyToAll(0x42, 0x30, false, false);
+        TEST_ASSERT(took < 200);
+        const Keys bDownUp{{0x42, true}, {0x42, false}};
+        TEST_ASSERT(waitFor([&] { return logB.get() == bDownUp; }, 2000));
+
+        // fleetReleasesModifiers
+        logB.clear();
+        fleet.releaseModifiers(0);
+        TEST_ASSERT(waitFor([&] { return logB.has({0, false}); }, 2000));
+        logB.clear();
+        fleet.close(deskB);
+        TEST_ASSERT(fleet.size() == 1);
+        TEST_ASSERT(waitFor([&] { return logB.has({0, false}); }, 2000));
+
+        // fleetCloseFreesHost: the host ends the session on its own side, then takes a normal viewer.
+        TEST_ASSERT(waitFor([&] { return !hostB.hostSessionStatus().active; }, 4000));
+        {
+            NetworkEngine normal(viewerId);
+            TEST_ASSERT(normal.start());
+            normal.connectToRemote("127.0.0.1:51042", "");
+            TEST_ASSERT(waitFor([&] { return normal.viewerStats().state == C; }, 4000));
+            normal.stop();
+        }
+
+        fleet.closeAll();
+        TEST_ASSERT(fleet.size() == 0);
+        hostA.setHostKeySinkForTest(nullptr);
+        hostB.setHostKeySinkForTest(nullptr);
+    }
+
+    // fleetDialsOnlyThePairedPc: discovery's address is spoofable. Whoever answers there, an unpaired auto-accept PC or
+    // another paired PC, fails the tile and never gets a key, the clipboard or a file.
+    {
+        IdentityManager pId(4346), otherId(4347), rogueId(4348), vId(4349);
+        TEST_ASSERT(pId.loadOrCreate() && otherId.loadOrCreate() && rogueId.loadOrCreate() && vId.loadOrCreate());
+        otherId.setListenPort(51052);
+        rogueId.setListenPort(51054);
+        for (IdentityManager* h : {&pId, &otherId}) {
+            h->addPairedViewer({vId.deskId(), "V", vId.pairingKey().publicKey(), 1});
+            vId.addPairedHost({h->deskId(), "H", h->pairingKey().publicKey(), 1});
+        }
+        std::filesystem::create_directories(tmp / "o", ec);
+        std::filesystem::create_directories(tmp / "r", ec);
+        NetworkEngine other(otherId), rogue(rogueId);
+        rogue.setAutoAcceptIncoming(true);
+        other.fileTransferManager().setReceiveDirectory((tmp / "o").string());
+        rogue.fileTransferManager().setReceiveDirectory((tmp / "r").string());
+        TEST_ASSERT(other.start() && rogue.start());
+        KeyLog logO, logR;
+        other.setHostKeySinkForTest(logO.sink());
+        rogue.setHostKeySinkForTest(logR.sink());
+        const auto src = tmp / "spoof_payload.bin";
+        { std::ofstream out(src, std::ios::binary); out << "secret"; }
+        for (NetworkEngine* imposter : {&rogue, &other}) {
+            FleetManager fleet(vId);
+            TEST_ASSERT(fleet.open({{pId.deskId(), "P", "127.0.0.1:" + std::to_string(imposter->hostListenPort())}}) == 1);
+            bool everLive = false;
+            auto tile = [&] {
+                const auto t = fleet.status().at(0);
+                everLive = everLive || t.state == ViewerConnectionState::Connected;
+                return t;
+            };
+            TEST_ASSERT(waitFor([&] { return tile().state == ViewerConnectionState::Error; }, 4000));
+            TEST_ASSERT(!everLive && tile().statusMessage.find("identity") != std::string::npos);
+            fleet.sendKeyToAll(0x43, 0x2E, true, false);
+            fleet.sendKeyTo(pId.deskId(), 0x43, 0x2E, false, false);
+            fleet.pushClipboardToAll();
+            TEST_ASSERT(fleet.sendFileToAll(src.string()) == 0 && !fleet.sendFileTo(pId.deskId(), src.string()));
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            TEST_ASSERT(!imposter->hostSessionStatus().active);
+            fleet.closeAll();
+        }
+        TEST_ASSERT(logO.get().empty() && logR.get().empty());
+        TEST_ASSERT(!std::filesystem::exists(tmp / "o" / "spoof_payload.bin") && !std::filesystem::exists(tmp / "r" / "spoof_payload.bin"));
+        other.setHostKeySinkForTest(nullptr);
+        rogue.setHostKeySinkForTest(nullptr);
+    }
+    std::filesystem::remove_all(tmp, ec);
+    for (const auto& c : cfgs) std::filesystem::remove(c, ec);
+}
+
+void testFleetUi() {
+    std::cout << "[TEST 112] Do it on all: grid layout, tile hit test, picker and grid screens..." << std::endl;
+    const UiRect area{ 0.0f, 0.0f, 1000.0f, 600.0f };
+    auto inside = [&](const UiRect& r) {
+        return r.left >= area.left && r.top >= area.top && r.right <= area.right && r.bottom <= area.bottom;
+    };
+    auto overlap = [](const UiRect& a, const UiRect& b) {
+        return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+    };
+    const auto four = fleetGridLayout(4, area, 8.0f);
+    TEST_ASSERT(four.size() == 4);
+    TEST_ASSERT(four[0].top == four[1].top && four[1].top < four[2].top);   // 2 columns
+    TEST_ASSERT(four[0].left == four[2].left && four[0].left < four[1].left);
+    for (size_t i = 0; i < four.size(); ++i) {
+        TEST_ASSERT(inside(four[i]));
+        TEST_ASSERT(four[i].width() > 0.0f && std::fabs(four[i].width() * 9.0f - four[i].height() * 16.0f) < 0.1f);
+        for (size_t j = i + 1; j < four.size(); ++j) TEST_ASSERT(!overlap(four[i], four[j]));
+    }
+    const auto sixteen = fleetGridLayout(16, area, 8.0f);
+    TEST_ASSERT(sixteen.size() == 16);
+    TEST_ASSERT(sixteen[3].top == sixteen[0].top && sixteen[4].top > sixteen[0].top);   // 4 columns
+    for (const auto& r : sixteen) TEST_ASSERT(inside(r));
+    TEST_ASSERT(fleetGridLayout(0, area, 8.0f).empty());
+
+    TEST_ASSERT(fleetTileAt(four, four[3].centerX(), four[3].centerY()) == 3);
+    TEST_ASSERT(fleetTileAt(four, (four[0].right + four[1].left) * 0.5f, four[0].centerY()) == -1);   // the gap
+    TEST_ASSERT(fleetTileAt({}, 10.0f, 10.0f) == -1);
+
+    IdentityManager id(4252);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    FakeShell shell;
+    const auto names = AppUi::snapshotStateNames();
+    TEST_ASSERT(std::find(names.begin(), names.end(), "fleet_picker") != names.end());
+    TEST_ASSERT(std::find(names.begin(), names.end(), "fleet_grid") != names.end());
+    const std::string picker = renderAppState(id, net, shell, "fleet_picker");
+    TEST_ASSERT(picker.find("|Do it on all") != std::string::npos);
+    TEST_ASSERT(picker.find("|Paired PCs on this network") != std::string::npos);
+    TEST_ASSERT(picker.find("|Offline") != std::string::npos);      // a paired PC discovery does not see
+    TEST_ASSERT(picker.find("|Open grid (0)") != std::string::npos);
+    const std::string grid = renderAppState(id, net, shell, "fleet_grid");
+    TEST_ASSERT(grid.find("|Type into all") != std::string::npos);
+    TEST_ASSERT(grid.find("|Live") != std::string::npos);
+    TEST_ASSERT(grid.find("|\xE2\x9C\x93 Sent") != std::string::npos);
+    TEST_ASSERT(grid.find("|Failed") != std::string::npos);
+    TEST_ASSERT(grid.find("|Connecting\xE2\x80\xA6") != std::string::npos);
+    TEST_ASSERT(grid.find("|Send file\xE2\x80\xA6") != std::string::npos);
+    TEST_ASSERT(grid.find("|Open") != std::string::npos);
+    // The dashboard offers the picker; the picker's seeded PC never leaks into another state.
+    TEST_ASSERT(renderAppState(id, net, shell, "dashboard_light").find("|Do it on all") != std::string::npos);
+    TEST_ASSERT(renderAppState(id, net, shell, "settings_permissions").find("|Forget") == std::string::npos);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+
+    // Keys on a live grid: Shift+/ is typed into the PC (not the help sheet), and a modal opening while Shift is held
+    // still lets the Shift release through, so no key stays down on the PC.
+    std::vector<std::string> cfgs;
+    for (int inst : {4343, 4344, 4345}) {
+        IdentityManager probe(inst);
+        cfgs.push_back(probe.configFilePath());
+        std::filesystem::remove(cfgs.back(), ec);
+    }
+    {
+        IdentityManager hostId(4343), viewerId(4344), hostBId(4345);
+        TEST_ASSERT(hostId.loadOrCreate() && viewerId.loadOrCreate() && hostBId.loadOrCreate());
+        hostId.setListenPort(51046);
+        viewerId.setListenPort(51048);
+        hostBId.setListenPort(51050);
+        for (IdentityManager* h : {&hostId, &hostBId}) {
+            h->addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
+            viewerId.addPairedHost({h->deskId(), "H", h->pairingKey().publicKey(), 1});
+        }
+        std::mutex m;
+        std::vector<std::pair<uint16_t, bool>> keys;
+        auto saw = [&](uint16_t vk, bool down) {
+            std::lock_guard<std::mutex> lk(m);
+            return std::find(keys.begin(), keys.end(), std::make_pair(vk, down)) != keys.end();
+        };
+        auto waitFor = [](const std::function<bool()>& cond, int ms) {
+            for (int i = 0; i < ms / 50 && !cond(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            return cond();
+        };
+        NetworkEngine host(hostId);
+        TEST_ASSERT(host.start());
+        host.setHostKeySinkForTest([&](uint16_t vk, bool down) { std::lock_guard<std::mutex> lk(m); keys.emplace_back(vk, down); });
+        NetworkEngine viewerNet(viewerId);
+        struct ShiftHeldShell : FakeShell {
+            bool isKeyDown(uint16_t vk) const override { return vk == VK_SHIFT; }
+        } shiftShell;
+        {
+            AppUi app(viewerId, viewerNet, shiftShell, "");
+            ui::RecordingCanvas rc;
+            app.openFleetGrid({{hostId.deskId(), "H", "127.0.0.1:51046"}});
+            TEST_ASSERT(waitFor([&] {
+                app.render(rc, 1280, 800, 1.0 / 60.0);
+                return rc.serialize().find("|Live") != std::string::npos;
+            }, 4000));
+            app.onKey({VK_SHIFT, 0x2A, true, false});
+            app.onKey({0xBF, 0x35, true, false});   // Shift+/ is "?" on the PC
+            app.onKey({0xBF, 0x35, false, false});
+            app.onKey({VK_F1, 0x3B, true, false});  // the help sheet opens while Shift is still held
+            for (int i = 0; i < 10; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);
+            TEST_ASSERT(rc.serialize().find("|Keyboard Shortcuts") != std::string::npos);   // a modal is up
+            app.onKey({VK_F1, 0x3B, false, false});
+            app.onKey({VK_SHIFT, 0x2A, false, false});
+            TEST_ASSERT(waitFor([&] { return saw(VK_SHIFT, true) && saw(0xBF, true) && saw(0xBF, false) && saw(VK_SHIFT, false); }, 2000));
+            TEST_ASSERT(!saw(VK_F1, true));   // the app kept F1 for its help sheet
+        }
+        host.setHostKeySinkForTest(nullptr);
+
+        // Open on a tile hands that PC to a session tab after the host has freed it, and keeps the others connected;
+        // the dashboard then leads back to the grid. Open on the last PC closes the grid.
+        TEST_ASSERT(waitFor([&] { return !host.hostSessionStatus().active; }, 4000));   // the grid above has let go
+        NetworkEngine hostB(hostBId);
+        TEST_ASSERT(hostB.start());
+        const uint64_t deskA = hostId.deskId(), deskB = hostBId.deskId();
+        auto count = [](const std::string& ops, const std::string& text) {
+            size_t n = 0;
+            const std::string needle = "|" + text + "\n";
+            for (size_t at = ops.find(needle); at != std::string::npos; at = ops.find(needle, at + 1)) ++n;
+            return n;
+        };
+        auto clickText = [](AppUi& app, const std::string& ops, const std::string& text) {   // the nth=0 button labelled text
+            std::istringstream in(ops);
+            for (std::string line; std::getline(in, line);) {
+                if (line.rfind("drawText ", 0) != 0 || line.size() < text.size() + 1 ||
+                    line.compare(line.size() - text.size() - 1, std::string::npos, "|" + text) != 0) continue;
+                float l = 0, t = 0, r = 0, b = 0;
+                std::istringstream(line.substr(9)) >> l >> t >> r >> b;
+                app.onMouseMove((l + r) * 0.5f, (t + b) * 0.5f);
+                app.onMouseButton(MouseButtonId::Left, true, (l + r) * 0.5f, (t + b) * 0.5f);
+                app.onMouseButton(MouseButtonId::Left, false, (l + r) * 0.5f, (t + b) * 0.5f);
+                return true;
+            }
+            return false;
+        };
+        FakeShell plainShell;
+        {
+            AppUi app(viewerId, viewerNet, plainShell, "");
+            ui::RecordingCanvas rc;
+            auto frame = [&] { app.render(rc, 1280, 800, 1.0 / 60.0); return rc.serialize(); };
+            app.openFleetGrid({{deskA, "Alpha", "127.0.0.1:51046"}, {deskB, "Bravo", "127.0.0.1:51050"}});
+            TEST_ASSERT(waitFor([&] { return count(frame(), "Live") == 2; }, 4000));
+
+            std::string ops = frame();
+            TEST_ASSERT(clickText(app, ops, "Open"));   // tiles are in open order: Alpha's Open comes first
+            ops = frame();
+            TEST_ASSERT(count(ops, "Alpha") == 0 && count(ops, "Bravo") == 1 && count(ops, "Live") == 1);
+            TEST_ASSERT(clickText(app, ops, "Open"));   // Bravo's Open inside the 300 ms window: ignored
+            app.onTick();                               // the deadline has not passed yet
+            ops = frame();
+            TEST_ASSERT(count(ops, "Bravo") == 1 && count(ops, "Live") == 1);
+            TEST_ASSERT(count(ops, "Do it on all") == 1);   // still on the grid (its heading), not handed over yet
+            TEST_ASSERT(waitFor([&] { return !host.hostSessionStatus().active; }, 4000));   // Alpha's host is free
+
+            plainShell.clock += 301;
+            app.onTick();   // dials Alpha in a session tab; leaving the grid keeps Bravo
+            TEST_ASSERT(count(frame(), "Type into all") == 0);   // off the grid
+            TEST_ASSERT(hostB.hostSessionStatus().active);
+            TEST_ASSERT(clickText(app, frame(), "Dashboard"));
+            ops = frame();
+            TEST_ASSERT(count(ops, "Back to grid (1)") == 1 && count(ops, "Do it on all") == 0);
+            TEST_ASSERT(clickText(app, ops, "Back to grid (1)"));
+            ops = frame();   // straight back to the same live connection: no re-dial, so no "Connecting..."
+            TEST_ASSERT(count(ops, "Type into all") == 1 && count(ops, "Bravo") == 1 && count(ops, "Live") == 1);
+            TEST_ASSERT(count(ops, "Connecting\xE2\x80\xA6") == 0 && hostB.hostSessionStatus().active);
+
+            TEST_ASSERT(clickText(app, ops, "Open"));   // Open on the last PC
+            TEST_ASSERT(waitFor([&] { return !hostB.hostSessionStatus().active; }, 4000));
+            plainShell.clock += 301;
+            app.onTick();
+            frame();
+            TEST_ASSERT(clickText(app, frame(), "Dashboard"));
+            ops = frame();
+            TEST_ASSERT(count(ops, "Do it on all") == 1 && ops.find("|Back to grid") == std::string::npos);
+        }
+        viewerNet.disconnectViewer();
+    }
+    for (const auto& c : cfgs) std::filesystem::remove(c, ec);
+}
+
+void testPairingOfferEveryConnection() {
+    std::cout << "[TEST 113] Pairing offer: asked again on a new connection dialled while the last one was up..." << std::endl;
+    std::error_code ec;
+    std::vector<std::string> cfgs;
+    for (int inst : {4350, 4351, 4352}) {
+        IdentityManager probe(inst);
+        cfgs.push_back(probe.configFilePath());
+        std::filesystem::remove(cfgs.back(), ec);
+    }
+    {
+        IdentityManager hostAId(4350), hostBId(4351), viewerId(4352);
+        TEST_ASSERT(hostAId.loadOrCreate() && hostBId.loadOrCreate() && viewerId.loadOrCreate());
+        hostAId.setListenPort(51080);
+        hostBId.setListenPort(51082);
+        viewerId.setListenPort(51084);
+        for (IdentityManager* h : {&hostAId, &hostBId}) {   // unpaired, offering pairing, no password to type
+            AppSettings s = h->settings();
+            s.allowPairing = true;
+            s.autoAcceptIncoming = true;
+            h->updateSettings(s);
+        }
+        NetworkEngine hostA(hostAId), hostB(hostBId), viewerNet(viewerId);
+        TEST_ASSERT(hostA.start() && hostB.start() && viewerNet.start());
+        FakeShell shell;
+        AppUi app(viewerId, viewerNet, shell, "127.0.0.1:51080");
+        ui::RecordingCanvas rc;
+        auto frame = [&] {
+            for (int i = 0; i < 60; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);   // long enough for a modal to settle
+            return rc.serialize();
+        };
+        auto offered = [&] { return frame().find("|Pair with this PC?") != std::string::npos; };
+        auto connected = [&] { return viewerNet.viewerStats().state == ViewerConnectionState::Connected; };
+        auto waitFor = [](const std::function<bool()>& cond, int ms) {
+            for (int i = 0; i < ms / 50 && !cond(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            return cond();
+        };
+        auto clickText = [&](const std::string& text) {
+            std::istringstream in(frame());
+            for (std::string line; std::getline(in, line);) {
+                if (line.rfind("drawText ", 0) != 0 || line.size() < text.size() + 1 ||
+                    line.compare(line.size() - text.size() - 1, std::string::npos, "|" + text) != 0) continue;
+                float l = 0, t = 0, r = 0, b = 0;
+                std::istringstream(line.substr(9)) >> l >> t >> r >> b;
+                app.onMouseMove((l + r) * 0.5f, (t + b) * 0.5f);
+                app.onMouseButton(MouseButtonId::Left, true, (l + r) * 0.5f, (t + b) * 0.5f);
+                app.onMouseButton(MouseButtonId::Left, false, (l + r) * 0.5f, (t + b) * 0.5f);
+                return true;
+            }
+            return false;
+        };
+
+        app.startAutoConnect();
+        TEST_ASSERT(waitFor([&] { app.onTick(); return connected() && offered(); }, 4000));   // host A: offered
+        TEST_ASSERT(clickText("Not now"));
+        TEST_ASSERT(!offered());
+
+        // Back on the dashboard with A still connected, dial B. The UI does not tick until B is up, as when a quick
+        // LAN handshake (or a busy message queue) beats the next timer tick: B still gets its own offer.
+        TEST_ASSERT(clickText("Dashboard") && connected());
+        app.onText(std::string(40, '\b') + "127.0.0.1:51082");
+        TEST_ASSERT(clickText("Connect"));
+        TEST_ASSERT(waitFor([&] { return connected() && viewerNet.viewerStats().remoteDeskId == hostBId.deskId(); }, 4000));
+        TEST_ASSERT(viewerNet.viewerStats().offerPairing);
+        app.onTick();
+        TEST_ASSERT(offered());
+        viewerNet.disconnectViewer();
+    }
+    for (const auto& c : cfgs) std::filesystem::remove(c, ec);
 }
 
 void testEcdhKnownVector() {
@@ -11657,6 +12631,14 @@ int main(int argc, char** argv) {
 #endif
         testMuteStateAndHostMicSign(); std::cout << "Test 101 done\n" << std::flush;
         testClipboardFileNamesOnTheWire(); std::cout << "Test 104 done\n" << std::flush;
+        testPairingKeyCrypto(); std::cout << "Test 106 done\n" << std::flush;
+        testPairingStorage(); std::cout << "Test 107 done\n" << std::flush;
+        testPairedLogin(); std::cout << "Test 108 done\n" << std::flush;
+        testPairingOffer(); std::cout << "Test 109 done\n" << std::flush;
+        testViewerOnlyEngine(); std::cout << "Test 110 done\n" << std::flush;
+        testFleetManager(); std::cout << "Test 111 done\n" << std::flush;
+        testFleetUi(); std::cout << "Test 112 done\n" << std::flush;
+        testPairingOfferEveryConnection(); std::cout << "Test 113 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;
