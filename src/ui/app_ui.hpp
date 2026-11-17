@@ -162,6 +162,8 @@ public:
     // Fixed UI states for snapshot and headless tests; applySnapshotState sets one up.
     static std::vector<std::string> snapshotStateNames();
     void applySnapshotState(const std::string& name);
+    // Opens the "Do it on all" grid on these PCs: the picker's Open grid, and tests.
+    void openFleetGrid(const std::vector<FleetMember>& members);
 
     // Input, already translated by the shell. Coordinates are DIPs.
     void onMouseMove(float x, float y);
@@ -649,6 +651,9 @@ private:
     bool                    fleetTypeAll_ = false;
     uint64_t                fleetFocused_ = 0;
     uint64_t                fleetPressedDesk_ = 0;     // the tile a mouse button went down on, for its release
+    uint64_t                fleetOpenDesk_ = 0;        // a tile's Open waiting for its host to free the session
+    uint64_t                fleetOpenAtMs_ = 0;
+    bool                    fleetKeepOnLeave_ = false; // leaving Fleet through Open keeps the other PCs connected
     struct FleetTileImage {
         ui::ImageId image{};
         int imageW = 0, imageH = 0;            // size of image

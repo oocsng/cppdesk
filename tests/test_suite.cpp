@@ -10414,6 +10414,61 @@ void testFleetUi() {
     TEST_ASSERT(renderAppState(id, net, shell, "settings_permissions").find("|Forget") == std::string::npos);
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
+
+    // Keys on a live grid: Shift+/ is typed into the PC (not the help sheet), and a modal opening while Shift is held
+    // still lets the Shift release through, so no key stays down on the PC.
+    std::vector<std::string> cfgs;
+    for (int inst : {4343, 4344}) {
+        IdentityManager probe(inst);
+        cfgs.push_back(probe.configFilePath());
+        std::filesystem::remove(cfgs.back(), ec);
+    }
+    {
+        IdentityManager hostId(4343), viewerId(4344);
+        TEST_ASSERT(hostId.loadOrCreate() && viewerId.loadOrCreate());
+        hostId.setListenPort(51046);
+        viewerId.setListenPort(51048);
+        hostId.addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
+        viewerId.addPairedHost({hostId.deskId(), "H", hostId.pairingKey().publicKey(), 1});
+        std::mutex m;
+        std::vector<std::pair<uint16_t, bool>> keys;
+        auto saw = [&](uint16_t vk, bool down) {
+            std::lock_guard<std::mutex> lk(m);
+            return std::find(keys.begin(), keys.end(), std::make_pair(vk, down)) != keys.end();
+        };
+        auto waitFor = [](const std::function<bool()>& cond, int ms) {
+            for (int i = 0; i < ms / 50 && !cond(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            return cond();
+        };
+        NetworkEngine host(hostId);
+        TEST_ASSERT(host.start());
+        host.setHostKeySinkForTest([&](uint16_t vk, bool down) { std::lock_guard<std::mutex> lk(m); keys.emplace_back(vk, down); });
+        NetworkEngine viewerNet(viewerId);
+        struct ShiftHeldShell : FakeShell {
+            bool isKeyDown(uint16_t vk) const override { return vk == VK_SHIFT; }
+        } shiftShell;
+        {
+            AppUi app(viewerId, viewerNet, shiftShell, "");
+            ui::RecordingCanvas rc;
+            app.openFleetGrid({{hostId.deskId(), "H", "127.0.0.1:51046"}});
+            TEST_ASSERT(waitFor([&] {
+                app.render(rc, 1280, 800, 1.0 / 60.0);
+                return rc.serialize().find("|Live") != std::string::npos;
+            }, 4000));
+            app.onKey({VK_SHIFT, 0x2A, true, false});
+            app.onKey({0xBF, 0x35, true, false});   // Shift+/ is "?" on the PC
+            app.onKey({0xBF, 0x35, false, false});
+            app.onKey({VK_F1, 0x3B, true, false});  // the help sheet opens while Shift is still held
+            for (int i = 0; i < 10; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);
+            TEST_ASSERT(rc.serialize().find("|Keyboard Shortcuts") != std::string::npos);   // a modal is up
+            app.onKey({VK_F1, 0x3B, false, false});
+            app.onKey({VK_SHIFT, 0x2A, false, false});
+            TEST_ASSERT(waitFor([&] { return saw(VK_SHIFT, true) && saw(0xBF, true) && saw(0xBF, false) && saw(VK_SHIFT, false); }, 2000));
+            TEST_ASSERT(!saw(VK_F1, true));   // the app kept F1 for its help sheet
+        }
+        host.setHostKeySinkForTest(nullptr);
+    }
+    for (const auto& c : cfgs) std::filesystem::remove(c, ec);
 }
 
 void testEcdhKnownVector() {

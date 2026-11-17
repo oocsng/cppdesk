@@ -86,7 +86,15 @@ void AppUi::hardResetViewerUiState() {
 
 void AppUi::switchTab(ActiveTab newTab) {
     if (activeTab_ == newTab) return;
-    if (activeTab_ == ActiveTab::Fleet) closeFleetGrid();   // the grid lives only while it is on screen
+    if (activeTab_ == ActiveTab::Fleet) {
+        // The grid lives only while it is on screen, except when a tile's Open hands one PC to a session tab
+        if (fleetKeepOnLeave_ && fleet_.size() > 0) {
+            fleet_.releaseModifiers(0);
+            fleetPressedDesk_ = 0;
+        } else {
+            closeFleetGrid();
+        }
+    }
     if (activeTab_ == ActiveTab::Settings && newTab != ActiveTab::Settings) {
         network_.stopVoiceMonitor();
         showAudioInputMenu_ = false;
@@ -1368,10 +1376,18 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
     auto discovered = network_.discoveredPeers();
     auto recents = identity_.recentSessions();
 
-    drawText("Saved & Nearby Desks", { px, py, prx - 222.0f, py + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
-    UiRect fleetBtn = { prx - 212.0f, py - 2.0f, prx - 102.0f, py + 28.0f };
-    drawButton("dash_fleet", fleetBtn, "Do it on all",
+    // A grid kept alive by a tile's Open is one click away; otherwise the button starts a new one
+    const size_t fleetLive = fleet_.size();
+    const float fleetBtnW = fleetLive > 0 ? 130.0f : 110.0f;
+    drawText("Saved & Nearby Desks", { px, py, prx - 112.0f - fleetBtnW, py + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    UiRect fleetBtn = { prx - 102.0f - fleetBtnW, py - 2.0f, prx - 102.0f, py + 28.0f };
+    drawButton("dash_fleet", fleetBtn, fleetLive > 0 ? "Back to grid (" + std::to_string(fleetLive) + ")" : "Do it on all",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
+                   if (fleet_.size() > 0) {
+                       focusedField_ = FocusedField::None;
+                       switchTab(ActiveTab::Fleet);
+                       return;
+                   }
                    fleetPicked_.clear();
                    showFleetPicker_ = true;
                }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
@@ -6371,14 +6387,18 @@ void AppUi::drawFleetPickerModal(float width, float height, float modalProgress)
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this, chosen]() {
                        showFleetPicker_ = false;
                        fleetPicked_.clear();
-                       fleet_.open(chosen);
-                       fleetFocused_ = chosen.front().deskId;
-                       focusedField_ = FocusedField::None;   // keys belong to the PCs now, not a text field
-                       switchTab(ActiveTab::Fleet);
+                       openFleetGrid(chosen);
                    }, ui::FontRole::Small);
     }
 
     canvas_->setTransform(ui::Transform2D::identity());
+}
+
+void AppUi::openFleetGrid(const std::vector<FleetMember>& members) {
+    fleet_.open(members);
+    fleetFocused_ = members.empty() ? 0 : members.front().deskId;
+    focusedField_ = FocusedField::None;   // keys belong to the PCs now, not a text field
+    switchTab(ActiveTab::Fleet);
 }
 
 void AppUi::closeFleetGrid() {
@@ -6430,6 +6450,8 @@ void AppUi::drawFleetView(const UiRect& bounds, float alpha) {
     if (snapshotFleetTiles_) snapshotFleetTiles_(tiles);
     const UiRect area = { lx, y + 58.0f, rx, bounds.bottom - pad };
     fleetTileRects_ = fleetGridLayout(tiles.size(), area, 12.0f);
+    if (!tiles.empty() && std::none_of(tiles.begin(), tiles.end(), [&](const FleetTileStatus& t) { return t.deskId == fleetFocused_; }))
+        fleetFocused_ = tiles.front().deskId;   // the focused PC was handed to a session tab
     fleetTileIds_.clear();
     fleetFrameRects_.clear();
     const float barH = 40.0f;
@@ -6496,9 +6518,11 @@ void AppUi::drawFleetView(const UiRect& bounds, float alpha) {
         }
         drawButton("fleet_open_" + std::to_string(t.deskId), openBtn, "Open",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this, deskId = t.deskId]() {
-                       fleet_.close(deskId);   // the host takes one session: free it before the normal tab dials
-                       remoteIdInput_ = CryptoUtils::formatDeskId(deskId);
-                       initiateConnection();   // leaving the grid closes the other PCs
+                       if (fleetOpenDesk_ != 0) return;   // one hand-over at a time
+                       fleet_.close(deskId);
+                       // The host frees its session ~125 ms after the hang-up; onTick dials once it has
+                       fleetOpenDesk_ = deskId;
+                       fleetOpenAtMs_ = shell_->nowMs() + 300;
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
     }
     // Images of PCs no longer in the grid
@@ -8839,7 +8863,7 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
             }
         }
 
-        if (vk == VK_F1 || (vk == 0xBF /* VK_OEM_2 /? */ && shell_->isKeyDown(VK_SHIFT))) {
+        if (vk == VK_F1 || (vk == 0xBF /* VK_OEM_2 /? */ && shell_->isKeyDown(VK_SHIFT) && activeTab_ != ActiveTab::Fleet)) {
             toggleShortcutsModal();
             return;
         }
@@ -9048,7 +9072,8 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
         network_.sendKeyEvent(vk, scan, isDown, isExtended);
     }
 
-    if (activeTab_ == ActiveTab::Fleet && !anyModalActive()) {
+    // Key-ups always reach the PCs, so a modal opening mid-keystroke never leaves a key held on them
+    if (activeTab_ == ActiveTab::Fleet && (!isDown || !anyModalActive())) {
         if (fleetTypeAll_) {
             // Ctrl+V pastes this PC's clipboard everywhere: each PC gets the text before the V arrives
             if (isDown && vk == 'V' && shell_->isKeyDown(VK_CONTROL)) fleet_.pushClipboardToAll();
@@ -9751,6 +9776,13 @@ void AppUi::onTick() {
         if (before.screenRecording != hostPerms_.screenRecording || before.accessibility != hostPerms_.accessibility) {
             shell_->invalidate();
         }
+    }
+    if (fleetOpenDesk_ != 0 && tickNow >= fleetOpenAtMs_) {   // a tile's Open: dial it in a session tab, keep the rest
+        remoteIdInput_ = CryptoUtils::formatDeskId(fleetOpenDesk_);
+        fleetOpenDesk_ = 0;
+        fleetKeepOnLeave_ = true;
+        initiateConnection();
+        fleetKeepOnLeave_ = false;
     }
     if (remoteFilePane_.expireLoading(tickNow)) {
         showToast(remoteFilePane_.statusMessage, true);
