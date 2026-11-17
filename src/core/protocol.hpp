@@ -335,9 +335,13 @@ constexpr uint8_t AUTH_MODE_NONE           = 0;
 constexpr uint8_t AUTH_MODE_PASSWORD       = 1; // legacy: digest computable from public values, testable offline by an eavesdropper
 constexpr uint8_t AUTH_MODE_REBOOT_TOKEN   = 2;
 constexpr uint8_t AUTH_MODE_PASSWORD_BOUND = 3; // digest bound to the ECDH session key (CryptoUtils::bindChallengeResponse)
+constexpr uint8_t AUTH_MODE_PAIRED         = 4; // 32 zero bytes, u16 64 + viewer signature of the 'V' pairing transcript
 
 // Optional trailing byte of AUTH_CHALLENGE; older viewers stop reading before it
 constexpr uint8_t AUTH_CAP_BOUND_RESPONSE  = 0x01;
+// After the caps byte: u8 pairFlags, u16 64 + host pairing public key, u16 64 + host signature of the 'H' transcript
+constexpr uint8_t AUTH_CAP_PAIRING         = 0x02;
+constexpr uint8_t PAIR_FLAG_ALLOW_NEW      = 0x01;
 
 #pragma pack(push, 1)
 struct FrameHeader {

@@ -1691,7 +1691,17 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                 w.writeBytes(hostEcdh.localPublicKey().data(), hostEcdh.localPublicKey().size());
             }
             w.writeString(CPP_DESK_VERSION);
-            w.writeU8(AUTH_CAP_BOUND_RESPONSE);
+            w.writeU8(AUTH_CAP_BOUND_RESPONSE | AUTH_CAP_PAIRING);
+            // Signed over this session (nonce + both ECDH keys) so a pinned viewer knows it reached the real PC.
+            const PairingKey& pk = identity_.pairingKey();
+            PairingKey::Signature hostSig{};
+            pk.sign(CryptoUtils::pairingTranscript('H', identity_.deskId(), viewerId, nonce,
+                                                   hostEcdh.localPublicKey(), viewerPubBlob), hostSig);
+            w.writeU8(identity_.settings().allowPairing ? PAIR_FLAG_ALLOW_NEW : 0);
+            w.writeU16(static_cast<uint16_t>(pk.publicKey().size()));
+            w.writeBytes(pk.publicKey().data(), pk.publicKey().size());
+            w.writeU16(static_cast<uint16_t>(hostSig.size()));
+            w.writeBytes(hostSig.data(), hostSig.size());
             if (!sendFrame(clientSock, PacketType::AUTH_CHALLENGE, 0, w.buffer().data(), w.buffer().size(), hostSendMutex_)) {
                 cleanup();
                 return;
@@ -1710,6 +1720,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         authReader.readBytes(clientDigest.data(), clientDigest.size());
 
         bool accepted = false;
+        bool pairedLogin = false;
         uint8_t grantedPerms = PERM_ALL;
         AuthResultCode resultCode = AuthResultCode::RejectedByUser;
         std::string resultMsg;
@@ -1735,6 +1746,29 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                 accepted = false;
                 resultCode = AuthResultCode::InvalidPassword;
                 resultMsg = "Invalid or expired reboot resume token";
+            }
+        } else if (hasPassword == AUTH_MODE_PAIRED) {
+            // Must stay before the password branch: a paired login never falls through to password checks.
+            PairingKey::Signature viewerSig{};
+            const bool sigPresent = authReader.hasRemaining(2 + viewerSig.size()) && authReader.readU16() == viewerSig.size();
+            if (sigPresent) authReader.readBytes(viewerSig.data(), viewerSig.size());
+            const auto peer = identity_.findPairedViewer(viewerId);
+            const bool pairedOk = sigPresent && peer && !viewerPubBlob.empty() &&
+                PairingKey::verify(peer->publicKey,
+                                   CryptoUtils::pairingTranscript('V', identity_.deskId(), viewerId, nonce,
+                                                                  hostEcdh.localPublicKey(), viewerPubBlob),
+                                   viewerSig);
+            recordAuthResultForIp(clientIp, pairedOk);
+            if (pairedOk) {
+                accepted = true;
+                pairedLogin = true;
+                grantedPerms = identity_.settings().defaultPermissions;
+                resultCode = AuthResultCode::Accepted;
+                resultMsg = "Authenticated via pairing";
+            } else {
+                accepted = false;
+                resultCode = AuthResultCode::InvalidPassword;
+                resultMsg = "This PC is not paired with the host.";
             }
         } else if (hasPassword != 0) {
             // Mode 3 binds the digest to the ECDH key so a passive observer cannot test password guesses offline.
@@ -1922,6 +1956,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
             hostStatus_.connectedSinceTickMs = nowTickMs();
             hostStatus_.securityFingerprint = sasFingerprint;
             hostStatus_.viewerAppVersion = viewerAppVersion;
+            hostStatus_.paired = pairedLogin;
         }
 
         // Auto-provision virtual display if host is headless
@@ -3496,6 +3531,37 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
             }
             const uint8_t hostAuthCaps = chalReader.hasRemaining(1) ? chalReader.readU8() : 0;
 
+            // Pairing: check the host's key and session signature before sending any credential.
+            const bool hostAdvertisesPairing = (hostAuthCaps & AUTH_CAP_PAIRING) != 0;
+            uint8_t pairFlags = 0;
+            viewerHostPairingKey_ = {};
+            viewerHostKeyVerified_ = false;
+            if (hostAdvertisesPairing && chalReader.hasRemaining(1 + 2 + 64 + 2 + 64)) {
+                PairingKey::Signature hostSig{};
+                pairFlags = chalReader.readU8();
+                bool lengthsOk = chalReader.readU16() == viewerHostPairingKey_.size();
+                chalReader.readBytes(viewerHostPairingKey_.data(), viewerHostPairingKey_.size());
+                lengthsOk = chalReader.readU16() == hostSig.size() && lengthsOk;
+                chalReader.readBytes(hostSig.data(), hostSig.size());
+                viewerHostKeyVerified_ = lengthsOk && PairingKey::verify(viewerHostPairingKey_,
+                    CryptoUtils::pairingTranscript('H', remoteId, identity_.deskId(), nonce,
+                                                   hostPubBlob, viewerEcdh.localPublicKey()),
+                    hostSig);
+            }
+            const ViewerPairingDecision pairing = decideViewerPairing(
+                hostAdvertisesPairing, viewerHostKeyVerified_, identity_.findPairedHost(remoteId), viewerHostPairingKey_);
+            if (pairing == ViewerPairingDecision::RefuseIdentityChanged ||
+                pairing == ViewerPairingDecision::RefuseNoPairingSupport) {
+                if (!isReconnecting) {
+                    setStatus(ViewerConnectionState::Error, pairing == ViewerPairingDecision::RefuseIdentityChanged
+                        ? "This PC's identity doesn't match the one you paired with, so the connection was refused. If it was reinstalled, forget the pairing and pair again."
+                        : "This PC no longer offers pairing, so the connection was refused. Forget the pairing to connect with a password.");
+                }
+                closeWinSock(vSock);
+                viewerSock_.store(~uintptr_t(0));
+                return false;
+            }
+
             // 3. Compute & send AUTH_RESPONSE
             {
                 ByteWriter w;
@@ -3506,7 +3572,25 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         tokenCopy = rebootResumeToken_;
                     }
                 }
-                if (!tokenCopy.empty()) {
+                if (pairing == ViewerPairingDecision::UsePaired) {
+                    // A pinned host overrides a typed password: the password is never sent to it.
+                    PairingKey::Signature sig{};
+                    if (!identity_.pairingKey().sign(
+                            CryptoUtils::pairingTranscript('V', remoteId, identity_.deskId(), nonce,
+                                                           hostPubBlob, viewerEcdh.localPublicKey()), sig)) {
+                        if (!isReconnecting) {
+                            setStatus(ViewerConnectionState::Error, "Failed to establish secure session.");
+                        }
+                        closeWinSock(vSock);
+                        viewerSock_.store(~uintptr_t(0));
+                        return false;
+                    }
+                    w.writeU8(AUTH_MODE_PAIRED);
+                    std::array<uint8_t, 32> zero{};
+                    w.writeBytes(zero.data(), zero.size());
+                    w.writeU16(static_cast<uint16_t>(sig.size()));
+                    w.writeBytes(sig.data(), sig.size());
+                } else if (!tokenCopy.empty()) {
                     w.writeU8(2);
                     auto tokenBytes = CryptoUtils::fromHex(tokenCopy);
                     if (tokenBytes.size() == 32) {
@@ -3688,6 +3772,8 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             viewerStats_.connectedSinceTickMs = nowTickMs();
                         }
                         viewerStats_.grantedPermissions = perms;
+                        viewerStats_.pairedSession = (pairing == ViewerPairingDecision::UsePaired);
+                        viewerStats_.hostAllowsNewPairing = hostAdvertisesPairing && (pairFlags & PAIR_FLAG_ALLOW_NEW);
                     }
                     identity_.addOrUpdateRecentSession(remoteId, remoteHost, targetInput);
                     initViewerAudioPlayback();

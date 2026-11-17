@@ -64,6 +64,7 @@ struct HostSessionStatus {
     uint64_t    connectedSinceTickMs = 0;
     std::string securityFingerprint;
     std::string viewerAppVersion;
+    bool        paired = false;   // the viewer logged in with its pinned pairing key
 };
 
 struct ChatMessageEntry {
@@ -129,7 +130,21 @@ struct ViewerSessionStats {
     float                 packetLossPercent = 0.0f;
     std::vector<float>    rttHistory;
     VirtualDisplayStatusPayload lastVirtualDisplayStatus{};
+    bool                  pairedSession = false;         // logged in with the pairing keys, no password
+    bool                  hostAllowsNewPairing = false;  // the host advertised PAIR_FLAG_ALLOW_NEW
 };
+
+enum class ViewerPairingDecision { Legacy, UsePaired, RefuseIdentityChanged, RefuseNoPairingSupport };
+
+// A pinned host must prove it holds the pinned key; it is never silently re-paired or downgraded to a password.
+inline ViewerPairingDecision decideViewerPairing(bool hostAdvertisesPairing, bool hostSignatureValid,
+                                                 const std::optional<PairedPeer>& pinned,
+                                                 const PairingKey::PublicKey& advertisedHostKey) {
+    if (!pinned) return ViewerPairingDecision::Legacy;
+    if (!hostAdvertisesPairing) return ViewerPairingDecision::RefuseNoPairingSupport;
+    if (advertisedHostKey != pinned->publicKey || !hostSignatureValid) return ViewerPairingDecision::RefuseIdentityChanged;
+    return ViewerPairingDecision::UsePaired;
+}
 
 struct StunNatResult {
     bool        success = false;
@@ -560,6 +575,8 @@ private:
     mutable std::mutex          viewerCipherMutex_;
     AesGcmSessionCipher         viewerCipher_;
     std::array<uint8_t, 32>     viewerSessionKey_{};
+    PairingKey::PublicKey       viewerHostPairingKey_{};         // the key the host advertised in this handshake
+    bool                        viewerHostKeyVerified_ = false;  // ...and it signed this session's transcript with it
     uint64_t                    viewerSendSeq_ = 0;
     std::atomic<bool>           viewerEncrypted_{false};
 

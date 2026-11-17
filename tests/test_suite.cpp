@@ -9810,6 +9810,125 @@ void testPairingStorage() {
     std::filesystem::remove(cfg, ec);
 }
 
+void testPairedLogin() {
+    std::cout << "[TEST 108] Paired login: decision table, password-free paired session, refusals and lockout..." << std::endl;
+
+    PairingKey pinnedKey, otherKey;
+    TEST_ASSERT(pinnedKey.generate() && otherKey.generate());
+    const std::optional<PairedPeer> pin = PairedPeer{42, "H", pinnedKey.publicKey(), 1};
+    TEST_ASSERT(decideViewerPairing(true, true, std::nullopt, otherKey.publicKey()) == ViewerPairingDecision::Legacy);
+    TEST_ASSERT(decideViewerPairing(false, false, pin, PairingKey::PublicKey{}) == ViewerPairingDecision::RefuseNoPairingSupport);
+    TEST_ASSERT(decideViewerPairing(true, true, pin, otherKey.publicKey()) == ViewerPairingDecision::RefuseIdentityChanged);
+    TEST_ASSERT(decideViewerPairing(true, false, pin, pinnedKey.publicKey()) == ViewerPairingDecision::RefuseIdentityChanged);
+    TEST_ASSERT(decideViewerPairing(true, true, pin, pinnedKey.publicKey()) == ViewerPairingDecision::UsePaired);
+
+    std::error_code ec;
+    std::vector<std::string> cfgs;
+    for (int inst : {4310, 4311}) {
+        IdentityManager probe(inst);
+        cfgs.push_back(probe.configFilePath());
+        std::filesystem::remove(cfgs.back(), ec);
+    }
+    {
+        IdentityManager hostId(4310);
+        TEST_ASSERT(hostId.loadOrCreate());
+        hostId.setListenPort(51010);
+        hostId.setUnattendedEnabled(true);
+        hostId.setUnattendedPassword("HostPw1");
+        { AppSettings s = hostId.settings(); s.allowPairing = true; hostId.updateSettings(s); }
+        IdentityManager viewerId(4311);
+        TEST_ASSERT(viewerId.loadOrCreate());
+        viewerId.setListenPort(51011);
+        hostId.addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
+        viewerId.addPairedHost({hostId.deskId(), "H", hostId.pairingKey().publicKey(), 1});
+
+        NetworkEngine hostNet(hostId);
+        NetworkEngine viewerNet(viewerId);
+        TEST_ASSERT(hostNet.start());
+        TEST_ASSERT(viewerNet.start());
+        const std::string target = "127.0.0.1:" + std::to_string(hostNet.hostListenPort());
+
+        bool sawPrompt = false;   // the host ever asked for approval or a 2FA code
+        auto dial = [&]() {
+            viewerNet.connectToRemote(target, "");
+            ViewerSessionStats st;
+            for (int i = 0; i < 80; ++i) {
+                st = viewerNet.viewerStats();
+                if (st.state == ViewerConnectionState::WaitingApproval || st.state == ViewerConnectionState::WaitingTotp) sawPrompt = true;
+                if (st.state == ViewerConnectionState::Connected || st.state == ViewerConnectionState::Error) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            return st;
+        };
+        auto hostPaired = [&]() {
+            for (int i = 0; i < 40; ++i) {
+                auto hs = hostNet.hostSessionStatus();
+                if (hs.active) return hs.paired;
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+            return false;
+        };
+        auto hangUp = [&]() {
+            viewerNet.disconnectViewer();
+            hostNet.disconnectHostClient();
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        };
+        auto has = [](const ViewerSessionStats& st, const char* text) { return st.statusMessage.find(text) != std::string::npos; };
+
+        auto st = dial();
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected);
+        TEST_ASSERT(st.pairedSession && st.hostAllowsNewPairing);
+        TEST_ASSERT(hostPaired());
+        hangUp();
+
+        { AppSettings s = hostId.settings(); s.allowPairing = false; hostId.updateSettings(s); }
+        st = dial();
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected);
+        TEST_ASSERT(st.pairedSession && !st.hostAllowsNewPairing);
+        TEST_ASSERT(hostPaired());
+        hangUp();
+
+        {
+            AppSettings s = hostId.settings();
+            s.totpEnabled = true;
+            hostId.totpManager().generateNewSecret();
+            s.totpSecret = hostId.totpManager().getSecretBase32();
+            hostId.updateSettings(s);
+        }
+        TEST_ASSERT(hostId.totpManager().isConfigured());
+        st = dial();
+        TEST_ASSERT(st.state == ViewerConnectionState::Connected && st.pairedSession);
+        TEST_ASSERT(hostPaired());
+        TEST_ASSERT(!sawPrompt);
+        hangUp();
+
+        TEST_ASSERT(hostId.removePairedViewer(viewerId.deskId()));
+        st = dial();
+        TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "not paired"));
+        hangUp();
+
+        viewerId.addPairedHost({hostId.deskId(), "H", otherKey.publicKey(), 1});
+        st = dial();
+        TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "doesn't match"));
+        TEST_ASSERT(!hostNet.hostSessionStatus().active);
+        hangUp();
+
+        // Bad paired logins count toward the per-IP lockout exactly like bad passwords.
+        viewerId.addPairedHost({hostId.deskId(), "H", hostId.pairingKey().publicKey(), 1});
+        hostNet.clearRateLimitRecords();
+        for (int i = 0; i < 5; ++i) {
+            st = dial();
+            TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "not paired"));
+            hangUp();
+        }
+        st = dial();
+        TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "Too many"));
+        TEST_ASSERT(!sawPrompt);
+        hangUp();
+    }
+    for (const auto& c : cfgs) std::filesystem::remove(c, ec);
+}
+
 void testEcdhKnownVector() {
     std::cout << "[TEST 88] ECDH fixed vector: both sides agree and the session key bytes are pinned..." << std::endl;
     auto hex = [](const std::string& h) {
@@ -11750,6 +11869,7 @@ int main(int argc, char** argv) {
         testClipboardFileNamesOnTheWire(); std::cout << "Test 104 done\n" << std::flush;
         testPairingKeyCrypto(); std::cout << "Test 106 done\n" << std::flush;
         testPairingStorage(); std::cout << "Test 107 done\n" << std::flush;
+        testPairedLogin(); std::cout << "Test 108 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;
