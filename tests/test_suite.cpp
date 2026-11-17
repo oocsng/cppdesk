@@ -10684,6 +10684,47 @@ void testGlideLayout() {
     std::filesystem::remove(cfg, ec);
 }
 
+void testGlideEdges() {
+    std::cout << "[TEST 115] Glide edges: 1 px edge band, 10 % corner dead zones, 250 ms dwell once per rest, home arming, entry and return points..." << std::endl;
+    const ui::Rect b{0, 0, 1920, 1080};
+    TEST_ASSERT(glideEdgeAt(b, {1919, 540}) == GlideEdge::Right && glideEdgeAt(b, {0, 540}) == GlideEdge::Left);
+    TEST_ASSERT(glideEdgeAt(b, {960, 0}) == GlideEdge::Top && glideEdgeAt(b, {960, 1079}) == GlideEdge::Bottom);
+    TEST_ASSERT(glideEdgeAt(b, {960, 540}) == GlideEdge::None);
+    TEST_ASSERT(glideEdgeAt(b, {1919, 100}) == GlideEdge::None && glideEdgeAt(b, {1919, 1000}) == GlideEdge::None);
+    TEST_ASSERT(glideEdgeAt(b, {100, 0}) == GlideEdge::None && glideEdgeAt(b, {1919, 110}) == GlideEdge::Right);
+    TEST_ASSERT(glideEdgeAt(ui::Rect{-1920, 0, 0, 1080}, {-1920, 540}) == GlideEdge::Left);
+
+    GlideDwell d;
+    TEST_ASSERT(d.update(GlideEdge::Right, 0) == GlideEdge::None && d.update(GlideEdge::Right, 249) == GlideEdge::None);
+    TEST_ASSERT(d.update(GlideEdge::Right, 250) == GlideEdge::Right && d.update(GlideEdge::Right, 400) == GlideEdge::None);
+    TEST_ASSERT(d.update(GlideEdge::None, 500) == GlideEdge::None && d.update(GlideEdge::Right, 600) == GlideEdge::None);
+    TEST_ASSERT(d.update(GlideEdge::Right, 850) == GlideEdge::Right);
+    d.reset();
+    TEST_ASSERT(d.update(GlideEdge::Right, 0) == GlideEdge::None && d.update(GlideEdge::None, 100) == GlideEdge::None);
+    TEST_ASSERT(d.update(GlideEdge::Right, 200) == GlideEdge::None && d.update(GlideEdge::Right, 400) == GlideEdge::None);
+    TEST_ASSERT(d.update(GlideEdge::Right, 450) == GlideEdge::Right);
+
+    GlideHome h;
+    h.arrive(GlideEdge::Left);
+    TEST_ASSERT(!h.update(b, {2, 540}, 0) && !h.update(b, {2, 540}, 1000));
+    TEST_ASSERT(!h.update(b, {60, 540}, 1500));
+    TEST_ASSERT(!h.update(b, {0, 540}, 2000) && h.update(b, {0, 540}, 2250));
+    TEST_ASSERT(!h.update(b, {0, 540}, 2300));
+    h.arrive(GlideEdge::Left);
+    TEST_ASSERT(!h.update(b, {60, 540}, 3000));
+    TEST_ASSERT(!h.update(b, {0, 50}, 3100) && !h.update(b, {0, 50}, 4100));
+
+    TEST_ASSERT(glidePaused(true, false, false, true) && glidePaused(false, true, false, true));
+    TEST_ASSERT(glidePaused(false, false, true, true) && glidePaused(false, false, false, false));
+    TEST_ASSERT(!glidePaused(false, false, false, true));
+
+    ui::Point e = glideEntryPoint(b, GlideEdge::Right, 0.5f);
+    TEST_ASSERT(e.x == 2.0f && e.y == 540.0f);
+    ui::Point r = glideReturnPoint(b, GlideEdge::Right, 0.5f);
+    TEST_ASSERT(r.x == 1917.0f && r.y == 540.0f);
+    TEST_ASSERT(glideAlong(b, GlideEdge::Right, {1919, 270}) == 0.25f);
+}
+
 void testPairingOfferEveryConnection() {
     std::cout << "[TEST 113] Pairing offer: asked again on a new connection dialled while the last one was up..." << std::endl;
     std::error_code ec;
