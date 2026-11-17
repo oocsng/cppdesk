@@ -12742,6 +12742,7 @@ int main(int argc, char** argv) {
         testFleetUi(); std::cout << "Test 112 done\n" << std::flush;
         testPairingOfferEveryConnection(); std::cout << "Test 113 done\n" << std::flush;
         testGlideLayout(); std::cout << "Test 114 done\n" << std::flush;
+        testGlideEdges(); std::cout << "Test 115 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;
