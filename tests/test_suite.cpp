@@ -9753,6 +9753,63 @@ void testPairingKeyCrypto() {
     TEST_ASSERT(t != CryptoUtils::pairingTranscript('H', 1, 2, n, vp, hp));
 }
 
+void testPairingStorage() {
+    std::cout << "[TEST 107] Pairing storage: key, allow-pairing default, paired lists round trip, bad lines skipped..." << std::endl;
+    std::string cfg;
+    {
+        IdentityManager probe(4301);
+        cfg = probe.configFilePath();
+    }
+    std::error_code ec;
+    std::filesystem::remove(cfg, ec);
+
+    PairingKey vk, hk;
+    TEST_ASSERT(vk.generate() && hk.generate());
+    PairingKey::PublicKey firstPub{};
+    {
+        IdentityManager id(4301);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(!id.settings().allowPairing);
+        TEST_ASSERT(id.pairingKey().isValid());
+        TEST_ASSERT(id.pairedViewers().empty() && id.pairedHosts().empty());
+        firstPub = id.pairingKey().publicKey();
+        id.addPairedViewer({111222333ULL, "Office-PC", vk.publicKey(), 1700000000ULL});
+        id.addPairedHost({444555666ULL, "Lab|PC", hk.publicKey(), 1700000001ULL});
+    }
+    {
+        IdentityManager id(4301);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(id.pairingKey().publicKey() == firstPub);
+        auto v = id.findPairedViewer(111222333ULL);
+        TEST_ASSERT(v && v->publicKey == vk.publicKey() && v->hostname == "Office-PC" && v->pairedAtUnix == 1700000000ULL);
+        auto h = id.findPairedHost(444555666ULL);
+        TEST_ASSERT(h && h->hostname == "Lab PC" && h->publicKey == hk.publicKey());
+        TEST_ASSERT(!id.findPairedViewer(444555666ULL) && !id.findPairedHost(111222333ULL));
+
+        id.addPairedViewer({111222333ULL, "Renamed", vk.publicKey(), 1700000002ULL});
+        TEST_ASSERT(id.pairedViewers().size() == 1 && id.pairedViewers()[0].hostname == "Renamed");
+
+        TEST_ASSERT(id.removePairedViewer(111222333ULL));
+        TEST_ASSERT(!id.removePairedViewer(111222333ULL));
+    }
+    {
+        IdentityManager id(4301);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(id.pairedViewers().empty() && id.pairedHosts().size() == 1);
+    }
+    {
+        std::ofstream f(cfg, std::ios::app);
+        f << "paired_viewer=12|zz|1|x\n" << "paired_viewer=13|abcd|1|x\n" << "paired_viewer=notanumber\n" << "paired_host=\n";
+    }
+    {
+        IdentityManager id(4301);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(!id.findPairedViewer(12) && !id.findPairedViewer(13));
+        TEST_ASSERT(id.pairedViewers().empty() && id.pairedHosts().size() == 1);
+    }
+    std::filesystem::remove(cfg, ec);
+}
+
 void testEcdhKnownVector() {
     std::cout << "[TEST 88] ECDH fixed vector: both sides agree and the session key bytes are pinned..." << std::endl;
     auto hex = [](const std::string& h) {
@@ -11692,6 +11749,7 @@ int main(int argc, char** argv) {
         testMuteStateAndHostMicSign(); std::cout << "Test 101 done\n" << std::flush;
         testClipboardFileNamesOnTheWire(); std::cout << "Test 104 done\n" << std::flush;
         testPairingKeyCrypto(); std::cout << "Test 106 done\n" << std::flush;
+        testPairingStorage(); std::cout << "Test 107 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;

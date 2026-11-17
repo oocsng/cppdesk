@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <mutex>
+#include <optional>
 
 namespace cppdesk {
 
@@ -75,6 +77,9 @@ struct AppSettings {
     bool          privacyCloakEnabled = true;
     std::string   privacyCloakKeywords = "KeePass, Bitwarden, 1Password, Authenticator, Credential, Wallet, .env, Banking";
     uint8_t       privacyCloakStyle = 0; // 0 = Solid Charcoal, 1 = Mosaic
+
+    // LAN Fleet: lets other PCs pair with this one (config key allow_pairing); off until the user turns it on
+    bool          allowPairing = false;
 };
 
 class CryptoUtils {
@@ -248,6 +253,14 @@ private:
     PublicKey pub_{};
 };
 
+// A PC this install has paired with: its desk ID, last known name and pinned signing key.
+struct PairedPeer {
+    uint64_t              deskId = 0;
+    std::string           hostname;
+    PairingKey::PublicKey publicKey{};
+    uint64_t              pairedAtUnix = 0;
+};
+
 // ---------------- AesGcmSessionCipher (Option 1A & 4A) ----------------
 // Hardware AES-NI accelerated AES-256-GCM AEAD cipher with 16-byte auth tags and anti-replay protection
 class AesGcmSessionCipher {
@@ -357,6 +370,17 @@ public:
 
     std::string configFilePath() const { return configPath_; }
 
+    // Pairing (thread-safe; getters return copies). The add/remove calls save the config.
+    const PairingKey& pairingKey() const { return pairingKey_; }       // created on first run
+    std::vector<PairedPeer> pairedViewers() const;                     // may enter this PC without a password
+    std::vector<PairedPeer> pairedHosts() const;                       // this PC may enter them; their key is pinned
+    std::optional<PairedPeer> findPairedViewer(uint64_t deskId) const;
+    std::optional<PairedPeer> findPairedHost(uint64_t deskId) const;
+    void addPairedViewer(const PairedPeer& p);                         // replaces an entry with the same deskId
+    void addPairedHost(const PairedPeer& p);
+    bool removePairedViewer(uint64_t deskId);
+    bool removePairedHost(uint64_t deskId);
+
 private:
     int                             instanceId_ = 1;
     uint64_t                        deskId_ = 0;
@@ -372,6 +396,10 @@ private:
     AppSettings                     settings_{};
     TotpManager                     totpManager_;
     std::string                     configPath_;
+    PairingKey                      pairingKey_;         // Hex in the config file as pair_key
+    mutable std::mutex              pairMutex_;          // Guards the two paired lists
+    std::vector<PairedPeer>         pairedViewers_;
+    std::vector<PairedPeer>         pairedHosts_;
 };
 
 } // namespace cppdesk

@@ -19,6 +19,7 @@
 #include <openssl/param_build.h>
 #endif
 
+#include <cctype>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -460,6 +461,56 @@ uint64_t CryptoUtils::parseDeskId(const std::string& input) {
 
 // ---------------- IdentityManager ----------------
 
+namespace {
+
+// "<deskId>|<pub 128 hex>|<pairedAtUnix>|<hostname>"; false (entry skipped) on anything malformed.
+bool parsePairedPeer(const std::string& val, PairedPeer& out) {
+    auto number = [](const std::string& s, uint64_t& n) {
+        if (s.empty() || s.size() > 19) return false;
+        n = 0;
+        for (char c : s) {
+            if (c < '0' || c > '9') return false;
+            n = n * 10 + static_cast<uint64_t>(c - '0');
+        }
+        return true;
+    };
+    size_t b1 = val.find('|');
+    size_t b2 = b1 == std::string::npos ? b1 : val.find('|', b1 + 1);
+    size_t b3 = b2 == std::string::npos ? b2 : val.find('|', b2 + 1);
+    if (b3 == std::string::npos) return false;
+    std::string hex = val.substr(b1 + 1, b2 - b1 - 1);
+    if (hex.size() != out.publicKey.size() * 2) return false;
+    for (char c : hex) if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
+    if (!number(val.substr(0, b1), out.deskId) || out.deskId == 0) return false;
+    if (!number(val.substr(b2 + 1, b3 - b2 - 1), out.pairedAtUnix)) return false;
+    auto key = CryptoUtils::fromHex(hex);
+    if (key.size() != out.publicKey.size()) return false;
+    std::copy(key.begin(), key.end(), out.publicKey.begin());
+    out.hostname = val.substr(b3 + 1);
+    return true;
+}
+
+void upsertPeer(std::vector<PairedPeer>& list, const PairedPeer& p) {
+    for (auto& e : list) {
+        if (e.deskId == p.deskId) { e = p; return; }
+    }
+    list.push_back(p);
+}
+
+std::optional<PairedPeer> findPeer(const std::vector<PairedPeer>& list, uint64_t deskId) {
+    for (const auto& p : list) if (p.deskId == deskId) return p;
+    return std::nullopt;
+}
+
+bool erasePeer(std::vector<PairedPeer>& list, uint64_t deskId) {
+    auto it = std::remove_if(list.begin(), list.end(), [&](const PairedPeer& p) { return p.deskId == deskId; });
+    if (it == list.end()) return false;
+    list.erase(it, list.end());
+    return true;
+}
+
+} // namespace
+
 IdentityManager::IdentityManager(int instanceId)
     : instanceId_(std::max(1, instanceId))
 {
@@ -535,6 +586,9 @@ bool IdentityManager::loadOrCreate() {
     if (in.is_open()) {
         std::string line;
         recentSessions_.clear();
+        std::lock_guard<std::mutex> pairLock(pairMutex_);
+        pairedViewers_.clear();
+        pairedHosts_.clear();
         while (std::getline(in, line)) {
             if (line.empty() || line[0] == '#') continue;
             auto eq = line.find('=');
@@ -647,6 +701,18 @@ bool IdentityManager::loadOrCreate() {
                 settings_.privacyCloakKeywords = val;
             } else if (key == "privacy_cloak_style") {
                 settings_.privacyCloakStyle = static_cast<uint8_t>(std::atoi(val.c_str()));
+            } else if (key == "allow_pairing") {
+                settings_.allowPairing = (val == "1" || val == "true");
+            } else if (key == "pair_key") {
+                auto bytes = CryptoUtils::fromHex(val);
+                PairingKey::KeyPair kp{};
+                if (val.size() == kp.size() * 2 && bytes.size() == kp.size()) {
+                    std::copy(bytes.begin(), bytes.end(), kp.begin());
+                    pairingKey_.importKeyPair(kp);
+                }
+            } else if (key == "paired_viewer" || key == "paired_host") {
+                PairedPeer peer;
+                if (parsePairedPeer(val, peer)) upsertPeer(key == "paired_viewer" ? pairedViewers_ : pairedHosts_, peer);
             } else if (key == "recent") {
                 // Backward-compatible pipe format:
                 // 3 fields: deskId|hostname|address
@@ -703,6 +769,11 @@ bool IdentityManager::loadOrCreate() {
 
     if (!CryptoUtils::isUsableKey(relayOwnerKey_)) {
         CryptoUtils::randomBytes(relayOwnerKey_.data(), relayOwnerKey_.size());
+        modified = true;
+    }
+
+    if (!pairingKey_.isValid()) {
+        pairingKey_.generate();
         modified = true;
     }
 
@@ -783,12 +854,71 @@ bool IdentityManager::save() const {
     out << "privacy_cloak_enabled=" << (settings_.privacyCloakEnabled ? "1" : "0") << "\n";
     out << "privacy_cloak_keywords=" << sanitizeIniValue(settings_.privacyCloakKeywords) << "\n";
     out << "privacy_cloak_style=" << static_cast<int>(settings_.privacyCloakStyle) << "\n";
+    out << "allow_pairing=" << (settings_.allowPairing ? "1" : "0") << "\n";
+    if (pairingKey_.isValid()) {
+        auto kp = pairingKey_.exportKeyPair();
+        out << "pair_key=" << CryptoUtils::toHex(kp.data(), kp.size()) << "\n";
+        CryptoUtils::secureZero(kp.data(), kp.size());
+    }
 
     for (const auto& r : recentSessions_) {
         out << "recent=" << r.deskId << "|" << sanitizeIniValue(r.hostname) << "|" << sanitizeIniValue(r.address) << "|" << (r.isFavorite ? "1" : "0")
             << "|" << sanitizeIniValue(r.alias) << "|" << sanitizeIniValue(r.tag) << "|" << sanitizeIniValue(r.notes) << "\n";
     }
+    auto writePeers = [&](const char* name, const std::vector<PairedPeer>& list) {
+        for (const auto& p : list) {
+            out << name << "=" << p.deskId << "|" << CryptoUtils::toHex(p.publicKey.data(), p.publicKey.size())
+                << "|" << p.pairedAtUnix << "|" << sanitizeIniValue(p.hostname) << "\n";
+        }
+    };
+    std::lock_guard<std::mutex> pairLock(pairMutex_);
+    writePeers("paired_viewer", pairedViewers_);
+    writePeers("paired_host", pairedHosts_);
     return true;
+}
+
+std::vector<PairedPeer> IdentityManager::pairedViewers() const {
+    std::lock_guard<std::mutex> lock(pairMutex_);
+    return pairedViewers_;
+}
+
+std::vector<PairedPeer> IdentityManager::pairedHosts() const {
+    std::lock_guard<std::mutex> lock(pairMutex_);
+    return pairedHosts_;
+}
+
+std::optional<PairedPeer> IdentityManager::findPairedViewer(uint64_t deskId) const {
+    std::lock_guard<std::mutex> lock(pairMutex_);
+    return findPeer(pairedViewers_, deskId);
+}
+
+std::optional<PairedPeer> IdentityManager::findPairedHost(uint64_t deskId) const {
+    std::lock_guard<std::mutex> lock(pairMutex_);
+    return findPeer(pairedHosts_, deskId);
+}
+
+void IdentityManager::addPairedViewer(const PairedPeer& p) {
+    { std::lock_guard<std::mutex> lock(pairMutex_); upsertPeer(pairedViewers_, p); }
+    save();
+}
+
+void IdentityManager::addPairedHost(const PairedPeer& p) {
+    { std::lock_guard<std::mutex> lock(pairMutex_); upsertPeer(pairedHosts_, p); }
+    save();
+}
+
+bool IdentityManager::removePairedViewer(uint64_t deskId) {
+    bool removed;
+    { std::lock_guard<std::mutex> lock(pairMutex_); removed = erasePeer(pairedViewers_, deskId); }
+    if (removed) save();
+    return removed;
+}
+
+bool IdentityManager::removePairedHost(uint64_t deskId) {
+    bool removed;
+    { std::lock_guard<std::mutex> lock(pairMutex_); removed = erasePeer(pairedHosts_, deskId); }
+    if (removed) save();
+    return removed;
 }
 
 void IdentityManager::setUnattendedEnabled(bool enabled) {
