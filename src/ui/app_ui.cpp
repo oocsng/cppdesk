@@ -9792,6 +9792,8 @@ void AppUi::onTick() {
     if (vStats.state == ViewerConnectionState::Connected &&
         prevViewerState_ != ViewerConnectionState::Connected) {
         switchTab(ActiveTab::RemoteSession);
+        // A new connection gets its own pairing offer, even when no tick saw the old one end
+        pairOfferShown_ = showPairOfferModal_ = false;
         scaleMode_ = static_cast<ScaleMode>(std::clamp<int>(identity_.settings().defaultScaleMode, 0, 3));
         if (vStats.remoteAddress.find("127.0.0.1") != std::string::npos ||
             vStats.remoteDeskId == identity_.deskId()) {

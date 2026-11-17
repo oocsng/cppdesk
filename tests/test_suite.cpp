@@ -10623,6 +10623,76 @@ void testFleetUi() {
     for (const auto& c : cfgs) std::filesystem::remove(c, ec);
 }
 
+void testPairingOfferEveryConnection() {
+    std::cout << "[TEST 113] Pairing offer: asked again on a new connection dialled while the last one was up..." << std::endl;
+    std::error_code ec;
+    std::vector<std::string> cfgs;
+    for (int inst : {4350, 4351, 4352}) {
+        IdentityManager probe(inst);
+        cfgs.push_back(probe.configFilePath());
+        std::filesystem::remove(cfgs.back(), ec);
+    }
+    {
+        IdentityManager hostAId(4350), hostBId(4351), viewerId(4352);
+        TEST_ASSERT(hostAId.loadOrCreate() && hostBId.loadOrCreate() && viewerId.loadOrCreate());
+        hostAId.setListenPort(51080);
+        hostBId.setListenPort(51082);
+        viewerId.setListenPort(51084);
+        for (IdentityManager* h : {&hostAId, &hostBId}) {   // unpaired, offering pairing, no password to type
+            AppSettings s = h->settings();
+            s.allowPairing = true;
+            s.autoAcceptIncoming = true;
+            h->updateSettings(s);
+        }
+        NetworkEngine hostA(hostAId), hostB(hostBId), viewerNet(viewerId);
+        TEST_ASSERT(hostA.start() && hostB.start() && viewerNet.start());
+        FakeShell shell;
+        AppUi app(viewerId, viewerNet, shell, "127.0.0.1:51080");
+        ui::RecordingCanvas rc;
+        auto frame = [&] {
+            for (int i = 0; i < 60; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);   // long enough for a modal to settle
+            return rc.serialize();
+        };
+        auto offered = [&] { return frame().find("|Pair with this PC?") != std::string::npos; };
+        auto connected = [&] { return viewerNet.viewerStats().state == ViewerConnectionState::Connected; };
+        auto waitFor = [](const std::function<bool()>& cond, int ms) {
+            for (int i = 0; i < ms / 50 && !cond(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            return cond();
+        };
+        auto clickText = [&](const std::string& text) {
+            std::istringstream in(frame());
+            for (std::string line; std::getline(in, line);) {
+                if (line.rfind("drawText ", 0) != 0 || line.size() < text.size() + 1 ||
+                    line.compare(line.size() - text.size() - 1, std::string::npos, "|" + text) != 0) continue;
+                float l = 0, t = 0, r = 0, b = 0;
+                std::istringstream(line.substr(9)) >> l >> t >> r >> b;
+                app.onMouseMove((l + r) * 0.5f, (t + b) * 0.5f);
+                app.onMouseButton(MouseButtonId::Left, true, (l + r) * 0.5f, (t + b) * 0.5f);
+                app.onMouseButton(MouseButtonId::Left, false, (l + r) * 0.5f, (t + b) * 0.5f);
+                return true;
+            }
+            return false;
+        };
+
+        app.startAutoConnect();
+        TEST_ASSERT(waitFor([&] { app.onTick(); return connected() && offered(); }, 4000));   // host A: offered
+        TEST_ASSERT(clickText("Not now"));
+        TEST_ASSERT(!offered());
+
+        // Back on the dashboard with A still connected, dial B. The UI does not tick until B is up, as when a quick
+        // LAN handshake (or a busy message queue) beats the next timer tick: B still gets its own offer.
+        TEST_ASSERT(clickText("Dashboard") && connected());
+        app.onText(std::string(40, '\b') + "127.0.0.1:51082");
+        TEST_ASSERT(clickText("Connect"));
+        TEST_ASSERT(waitFor([&] { return connected() && viewerNet.viewerStats().remoteDeskId == hostBId.deskId(); }, 4000));
+        TEST_ASSERT(viewerNet.viewerStats().offerPairing);
+        app.onTick();
+        TEST_ASSERT(offered());
+        viewerNet.disconnectViewer();
+    }
+    for (const auto& c : cfgs) std::filesystem::remove(c, ec);
+}
+
 void testEcdhKnownVector() {
     std::cout << "[TEST 88] ECDH fixed vector: both sides agree and the session key bytes are pinned..." << std::endl;
     auto hex = [](const std::string& h) {
@@ -12568,6 +12638,7 @@ int main(int argc, char** argv) {
         testViewerOnlyEngine(); std::cout << "Test 110 done\n" << std::flush;
         testFleetManager(); std::cout << "Test 111 done\n" << std::flush;
         testFleetUi(); std::cout << "Test 112 done\n" << std::flush;
+        testPairingOfferEveryConnection(); std::cout << "Test 113 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;
