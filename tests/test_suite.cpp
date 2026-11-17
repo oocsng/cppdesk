@@ -23,6 +23,7 @@
 #include "../src/ui/vk_codes.hpp"
 #include "../src/ui/platform_shell.hpp"
 #include "../src/ui/host_permissions.hpp"
+#include "../src/ui/glide.hpp"
 #if defined(__APPLE__)
 #include "../src/ui/canvas_cg.hpp"
 #include "mac_test_driver.hpp"
@@ -10623,6 +10624,66 @@ void testFleetUi() {
     for (const auto& c : cfgs) std::filesystem::remove(c, ec);
 }
 
+void testGlideLayout() {
+    std::cout << "[TEST 114] Glide layout: one edge per PC, saved, cleared when a pairing is forgotten, bad lines ignored..." << std::endl;
+    AppSettings s;
+    for (GlideEdge e : {GlideEdge::Left, GlideEdge::Right, GlideEdge::Top, GlideEdge::Bottom}) TEST_ASSERT(glidePcAt(s, e) == 0);
+    TEST_ASSERT(glidePcAt(s, GlideEdge::None) == 0);
+    glidePlace(s, GlideEdge::Right, 111);
+    glidePlace(s, GlideEdge::Left, 111);
+    TEST_ASSERT(glidePcAt(s, GlideEdge::Right) == 0 && glidePcAt(s, GlideEdge::Left) == 111);
+    TEST_ASSERT(glideEdgeOf(s, 111) == GlideEdge::Left && glideEdgeOf(s, 999) == GlideEdge::None);
+    glidePlace(s, GlideEdge::Left, 222);
+    TEST_ASSERT(glidePcAt(s, GlideEdge::Left) == 222 && glideEdgeOf(s, 111) == GlideEdge::None);
+    glidePlace(s, GlideEdge::Left, 0);
+    TEST_ASSERT(glidePcAt(s, GlideEdge::Left) == 0);
+    TEST_ASSERT(glideOpposite(GlideEdge::Right) == GlideEdge::Left && glideOpposite(GlideEdge::Left) == GlideEdge::Right);
+    TEST_ASSERT(glideOpposite(GlideEdge::Top) == GlideEdge::Bottom && glideOpposite(GlideEdge::Bottom) == GlideEdge::Top);
+    TEST_ASSERT(glideOpposite(GlideEdge::None) == GlideEdge::None);
+
+    std::string cfg;
+    { IdentityManager probe(4253); cfg = probe.configFilePath(); }
+    std::error_code ec;
+    std::filesystem::remove(cfg, ec);
+    PairingKey hk;
+    TEST_ASSERT(hk.generate());
+    {
+        IdentityManager id(4253);
+        TEST_ASSERT(id.loadOrCreate());
+        AppSettings a = id.settings();
+        glidePlace(a, GlideEdge::Top, 111);
+        id.updateSettings(a);
+        id.save();
+    }
+    {
+        IdentityManager id(4253);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Top) == 111);
+        id.addPairedHost({333ULL, "Lab", hk.publicKey(), 1700000001ULL});
+        AppSettings a = id.settings();
+        glidePlace(a, GlideEdge::Bottom, 333);
+        id.updateSettings(a);
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Bottom) == 333);
+        TEST_ASSERT(id.removePairedHost(333));
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Bottom) == 0 && glidePcAt(id.settings(), GlideEdge::Top) == 111);
+    }
+    {
+        IdentityManager id(4253);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Bottom) == 0 && glidePcAt(id.settings(), GlideEdge::Top) == 111);
+    }
+    {
+        std::ofstream f(cfg, std::ios::app);
+        f << "glide_right=abc\n";
+    }
+    {
+        IdentityManager id(4253);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Right) == 0);
+    }
+    std::filesystem::remove(cfg, ec);
+}
+
 void testPairingOfferEveryConnection() {
     std::cout << "[TEST 113] Pairing offer: asked again on a new connection dialled while the last one was up..." << std::endl;
     std::error_code ec;
@@ -12639,6 +12700,7 @@ int main(int argc, char** argv) {
         testFleetManager(); std::cout << "Test 111 done\n" << std::flush;
         testFleetUi(); std::cout << "Test 112 done\n" << std::flush;
         testPairingOfferEveryConnection(); std::cout << "Test 113 done\n" << std::flush;
+        testGlideLayout(); std::cout << "Test 114 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;
