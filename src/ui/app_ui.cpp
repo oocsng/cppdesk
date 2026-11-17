@@ -9086,7 +9086,7 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
                 shell_->invalidate();
                 return;
             }
-            if (isFullscreen_) {
+            if (isFullscreen_ && !(glide_ && glide_->inside)) {   // in a glide, Esc goes to the remote PC
                 toggleFullscreen();
                 return;
             }
@@ -9193,7 +9193,7 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
     }
 }
 
-void AppUi::switchToSessionTab(uint32_t tabId, bool force) {
+void AppUi::switchToSessionTab(uint32_t tabId, bool force, bool silent) {
     if (tabId == 0) return;
     if (!force && tabId == sessionTabs_.activeTabId()) return;
 
@@ -9263,7 +9263,7 @@ void AppUi::switchToSessionTab(uint32_t tabId, bool force) {
 
     switchTab(ActiveTab::RemoteSession);
     std::string toastTitle = newTab->title.empty() ? (newTab->targetInput.empty() ? ("Desk " + std::to_string(newTab->deskId)) : newTab->targetInput) : newTab->title;
-    showToast("Switched to tab: " + toastTitle);
+    if (!silent) showToast("Switched to tab: " + toastTitle);
     shell_->invalidate();
 }
 
@@ -9321,6 +9321,11 @@ void AppUi::initiateConnection() {
     if (remoteIdInput_.empty()) {
         showToast("Enter a 9-digit Desk ID", true);
         return;
+    }
+
+    if (glide_) {   // a glide never turns into a normal session: drop it before looking for a tab to reuse
+        closeSessionTab(glide_->tabId);
+        glide_.reset();
     }
 
     uint64_t targetDeskId = CryptoUtils::parseDeskId(remoteIdInput_);
@@ -9703,20 +9708,48 @@ void AppUi::drawOmnibarModal(float width, float height, float modalProgress) {
 }
 
 void AppUi::toggleFullscreen() {
+    if (glide_ && glide_->inside) {   // in a glide, leaving full screen and going home are the same thing
+        glideHomeNow(shell_->nowMs());
+        return;
+    }
     if (shell_->setFullscreen(!isFullscreen_)) {
         isFullscreen_ = !isFullscreen_;
     }
 }
 
-void AppUi::glideTick(uint64_t nowMs) {
+void AppUi::glideTick(uint64_t nowMs, const ViewerSessionStats& viewer, bool hosting) {
+    if (glide_ && glide_->inside) {
+        const SessionTab* tab = sessionTabs_.getTab(glide_->tabId);
+        // Failed or ended (Error can come before any frame): slide home. Reconnecting and connecting are left alone.
+        if (!tab || viewer.state == ViewerConnectionState::Error || viewer.state == ViewerConnectionState::Disconnected) {
+            const auto host = identity_.findPairedHost(glide_->deskId);
+            const std::string name = host ? host->hostname : CryptoUtils::formatDeskId(glide_->deskId);
+            std::string toast = name + ": " + viewer.statusMessage;
+            if (viewer.statusMessage.find("already in an active remote session") != std::string::npos)   // HostBusy
+                toast = name + " is in use by someone else";
+            else if (viewer.statusMessage.find("not paired with the host") != std::string::npos)
+                toast = name + " no longer trusts this PC; pair again by connecting normally";
+            if (tab) closeSessionTab(glide_->tabId);   // no live session left to release modifiers on
+            glideHomeNow(nowMs, toast);
+            glide_.reset();
+        } else if (glideHome_.update(ui::Rect{0.0f, 0.0f, frameWidth_, frameHeight_}, ui::Point{mouseX_, mouseY_}, nowMs)) {
+            glideHomeNow(nowMs);
+        }
+        return;
+    }
     if (glide_ && !sessionTabs_.getTab(glide_->tabId)) glide_.reset();   // its tab was closed
-    if (glide_ && glide_->inside) return;
+    if (glide_ && nowMs - glide_->homeSinceMs >= 60000) {   // home and idle for a minute: disconnect
+        closeSessionTab(glide_->tabId);
+        glide_.reset();
+    }
+    const AppSettings& gs = identity_.settings();
+    if (!glide_ && !gs.glideLeft && !gs.glideRight && !gs.glideTop && !gs.glideBottom) return;   // nothing placed
     const std::optional<ui::Point> cursor = shell_->cursorScreenPos();
     const uint32_t glideTab = glide_ ? glide_->tabId : 0;
     const auto& tabs = sessionTabs_.tabs();
     const bool otherSession = std::any_of(tabs.begin(), tabs.end(), [&](const SessionTab& t) { return t.id != glideTab; }) ||
                               (network_.isViewerActive() && !glide_);
-    if (glidePaused(otherSession, fleet_.size() > 0, network_.hostSessionStatus().active, cursor.has_value())) {
+    if (glidePaused(otherSession, fleet_.size() > 0, hosting, cursor.has_value())) {
         glideDwell_.reset();
         return;
     }
@@ -9763,12 +9796,25 @@ void AppUi::glideOut(GlideEdge edge, ui::Point cursor, uint64_t nowMs) {
     const SessionTab* open = glide_ ? sessionTabs_.getTab(glide_->tabId) : nullptr;
     const uint32_t tabId = open ? open->id : sessionTabs_.createTab(deskId, target->address, target->name);
     if (!open) sessionTabs_.getTab(tabId)->requirePairedDeskId = deskId;   // empty password: never a password fallback
-    switchToSessionTab(tabId, true);   // skips the reconnect when still connected to this PC
+    switchToSessionTab(tabId, true, true);   // skips the reconnect when still connected to this PC
 
     glideHome_.arrive(glideOpposite(edge));
     glideSlideT_ = 0.0f;
     glideSlideVel_ = 0.0f;
     glide_ = GlideState{ deskId, edge, tabId, true, 0, prevPresence, glideAlong(shell_->desktopBounds(), edge, cursor) };
+    shell_->invalidate();
+}
+
+void AppUi::glideHomeNow(uint64_t nowMs, const std::string& toast) {
+    network_.sendReleaseAllModifiers();   // first: no key stays held on the PC left behind
+    switchTab(ActiveTab::Dashboard);      // the remote picture slides out
+    if (isFullscreen_ && shell_->setFullscreen(false)) isFullscreen_ = false;   // macOS: before minimising or hiding
+    shell_->setWindowPresence(glide_->prevPresence);
+    shell_->warpCursor(glideReturnPoint(shell_->desktopBounds(), glide_->edge, glide_->along));
+    glide_->inside = false;
+    glide_->homeSinceMs = nowMs;
+    glideDwell_.reset();
+    if (!toast.empty()) showToast(toast, true);
     shell_->invalidate();
 }
 
@@ -10153,7 +10199,7 @@ void AppUi::onTick() {
         flushPendingMouseMove();
     }
 
-    glideTick(tickNow);
+    glideTick(tickNow, vStats, hostStatus.active);
 
     ++idleTickCounter_;
     bool micMonitoringActive = (activeTab_ == ActiveTab::Settings && settingsSection_ == SettingsSection::AudioVoice && network_.isVoiceMonitoring());
@@ -10182,6 +10228,7 @@ void AppUi::onGraphicsLost() {
 }
 
 void AppUi::onCloseRequested() {
+    if (glide_ && glide_->inside) glideHomeNow(shell_->nowMs());   // leave full screen and restore the window first
     network_.disconnectViewer();
     hardResetViewerUiState();
 }

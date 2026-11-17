@@ -9263,7 +9263,7 @@ public:
     std::optional<ui::Point> cursorScreenPos() const override { return cursor; }
     ui::Rect desktopBounds() const override { return desktop; }
     ui::Rect monitorBoundsAt(ui::Point) const override { return desktop; }
-    void warpCursor(ui::Point p) override { warps.push_back(p); }
+    void warpCursor(ui::Point p) override { warps.push_back(p); cursor = p; }
     void moveWindowToMonitorAt(ui::Point) override {}
     ui::WindowPresence windowPresence() const override { return presence; }
     void setWindowPresence(ui::WindowPresence p) override { presence = p; }
@@ -10917,6 +10917,193 @@ void testGlideOut() {
     net.disconnectViewer();
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
+}
+
+void testGlideHome() {
+    std::cout << "[TEST 118] Glide home: push back or F11 goes home and releases modifiers; failures go home with a toast; idle glide sessions close after a minute; a normal session drops the glide..." << std::endl;
+    std::error_code ec;
+    std::vector<std::string> cfgs;
+    for (int inst : {4255, 4355, 4356, 4357}) {
+        IdentityManager probe(inst);
+        cfgs.push_back(probe.configFilePath());
+        std::filesystem::remove(cfgs.back(), ec);
+    }
+    {
+        // P (right) and Q (left) are paired loopback hosts; R (bottom) has forgotten this PC; nothing listens for F (top).
+        IdentityManager id(4255), pId(4355), qId(4356), rId(4357);
+        TEST_ASSERT(id.loadOrCreate() && pId.loadOrCreate() && qId.loadOrCreate() && rId.loadOrCreate());
+        pId.setListenPort(51090);
+        qId.setListenPort(51092);
+        rId.setListenPort(51094);
+        for (IdentityManager* h : {&pId, &qId}) h->addPairedViewer({id.deskId(), "V", id.pairingKey().publicKey(), 1});
+        const uint64_t P = pId.deskId(), Q = qId.deskId(), R = rId.deskId(), F = 555000502;
+        id.addPairedHost({P, "Reception", pId.pairingKey().publicKey(), 1});
+        id.addPairedHost({Q, "Lab", qId.pairingKey().publicKey(), 1});
+        id.addPairedHost({R, "Office", rId.pairingKey().publicKey(), 1});
+        id.addPairedHost({F, "Kiosk", PairingKey::PublicKey{}, 1});
+        AppSettings s = id.settings();
+        glidePlace(s, GlideEdge::Right, P);
+        glidePlace(s, GlideEdge::Left, Q);
+        glidePlace(s, GlideEdge::Bottom, R);
+        glidePlace(s, GlideEdge::Top, F);
+        id.updateSettings(s);
+
+        NetworkEngine hostP(pId), hostQ(qId), hostR(rId), net(id);
+        TEST_ASSERT(hostP.start() && hostQ.start() && hostR.start() && net.startViewerOnly());
+        struct Seen { uint64_t desk; const char* name; uint16_t port; };
+        for (const Seen& seen : {Seen{P, "Reception", 51090}, Seen{Q, "Lab", 51092}, Seen{R, "Office", 51094}, Seen{F, "Kiosk", 1}}) {
+            DiscoveredPeer peer;
+            peer.deskId = seen.desk;
+            peer.hostname = seen.name;
+            peer.ip = "127.0.0.1";
+            peer.port = seen.port;
+            peer.viaRelay = false;
+            net.injectDiscoveredPeerForTest(peer);
+        }
+        std::mutex m;
+        std::vector<std::pair<uint16_t, bool>> keys;
+        hostP.setHostKeySinkForTest([&](uint16_t vk, bool down) { std::lock_guard<std::mutex> lk(m); keys.emplace_back(vk, down); });
+        auto releasedAll = [&] {
+            std::lock_guard<std::mutex> lk(m);
+            return std::find(keys.begin(), keys.end(), std::make_pair(uint16_t(0), false)) != keys.end();
+        };
+        auto waitFor = [](const std::function<bool()>& cond, int ms) {
+            for (int i = 0; i < ms / 50 && !cond(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            return cond();
+        };
+
+        struct Run { FakeShell shell; std::unique_ptr<AppUi> app; };   // app goes first, then its shell
+        auto fresh = [&] {
+            auto r = std::make_unique<Run>();
+            r->shell.presence = ui::WindowPresence::Minimized;
+            r->shell.cursor = ui::Point{1000, 540};
+            r->app = std::make_unique<AppUi>(id, net, r->shell, "");
+            return r;
+        };
+        auto tick = [](Run& r, uint64_t ms) { r.shell.clock = ms; r.app->onTick(); };
+        auto tabs = [](Run& r) { return r.app->sessionTabsForTest().tabCount(); };
+        auto frontTab = [](Run& r) { return r.app->sessionTabsForTest().tabs().front(); };
+        auto push = [&](Run& r, ui::Point edge, uint64_t ms) { r.shell.cursor = edge; tick(r, ms); tick(r, ms + 300); };
+        auto connected = [&](Run& r) { r.app->onTick(); return net.viewerStats().state == ViewerConnectionState::Connected; };
+        auto wentHome = [&](Run& r) { r.app->onTick(); return !r.app->isGlidingForTest(); };
+        auto f11 = [](Run& r) { r.app->onKey({VK_F11, 0x57, true, false}); r.app->onKey({VK_F11, 0x57, false, false}); };
+        auto atHome = [](Run& r, ui::Point back) {
+            return !r.app->isGlidingForTest() && !r.shell.fullscreen && r.shell.presence == ui::WindowPresence::Minimized &&
+                   !r.shell.warps.empty() && r.shell.warps.back().x == back.x && r.shell.warps.back().y == back.y;
+        };
+        auto toastShown = [](Run& r, const std::string& text) {
+            ui::RecordingCanvas rc;
+            for (int i = 0; i < 30; ++i) r.app->render(rc, 1280, 800, 1.0 / 60.0);
+            return rc.serialize().find("|" + text) != std::string::npos;
+        };
+        const ui::Point right{1919, 540}, left{0, 540}, top{960, 0}, bottom{960, 1079}, backRight{1917, 540};
+
+        {   // F11 with no glide: the existing full-screen toggle.
+            auto r = fresh();
+            f11(*r);
+            TEST_ASSERT(r->shell.fullscreen);
+            f11(*r);
+            TEST_ASSERT(!r->shell.fullscreen && tabs(*r) == 0);
+        }
+        {
+            auto r = fresh();
+            push(*r, right, 0);
+            TEST_ASSERT(r->app->isGlidingForTest() && r->shell.fullscreen && r->shell.presence == ui::WindowPresence::Shown);
+            TEST_ASSERT(tabs(*r) == 1);
+            const uint32_t tabP = frontTab(*r).id;
+            TEST_ASSERT(waitFor([&] { return connected(*r); }, 5000));
+
+            // glideHomeReleasesModifiers: Ctrl held, F11 goes home and the PC sees release-all.
+            { std::lock_guard<std::mutex> lk(m); keys.clear(); }
+            r->app->onKey({VK_CONTROL, 0x1D, true, false});
+            f11(*r);
+            TEST_ASSERT(atHome(*r, backRight));
+            TEST_ASSERT(waitFor(releasedAll, 2000));
+            r->app->onKey({VK_CONTROL, 0x1D, false, false});
+            TEST_ASSERT(tabs(*r) == 1);   // the session stays open for a quick return
+
+            // Quick return within the minute: the same tab, still connected, no new tab.
+            push(*r, right, 5000);
+            TEST_ASSERT(r->app->isGlidingForTest() && r->shell.fullscreen);
+            TEST_ASSERT(tabs(*r) == 1 && frontTab(*r).id == tabP);
+            TEST_ASSERT(net.viewerStats().state == ViewerConnectionState::Connected);
+
+            // Home edge: resting at the entry point does not go home; moving away arms it, 250 ms back at the edge does.
+            r->app->onMouseMove(2, 540);
+            for (uint64_t ms = 5400; ms <= 6400; ms += 100) tick(*r, ms);
+            TEST_ASSERT(r->app->isGlidingForTest());
+            r->app->onMouseMove(60, 540);
+            tick(*r, 6500);
+            r->app->onMouseMove(0, 540);
+            for (uint64_t ms = 6600; ms <= 6900; ms += 50) tick(*r, ms);
+            TEST_ASSERT(atHome(*r, backRight));
+
+            // Idle: home at T, the tab lives until T+60 s.
+            push(*r, right, 7000);
+            TEST_ASSERT(r->app->isGlidingForTest() && tabs(*r) == 1 && frontTab(*r).id == tabP);
+            f11(*r);   // T = 7300
+            tick(*r, 7300 + 59999);
+            TEST_ASSERT(tabs(*r) == 1);
+            tick(*r, 7300 + 60000);
+            TEST_ASSERT(tabs(*r) == 0);
+            TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active; }, 4000));
+
+            // Switch edge: Q on the left; going there drops P's glide session first.
+            push(*r, right, 70000);
+            const uint32_t tabP2 = frontTab(*r).id;
+            TEST_ASSERT(tabP2 != tabP && waitFor([&] { return connected(*r); }, 5000));
+            f11(*r);
+            r->shell.cursor = left;
+            tick(*r, 71000);
+            tick(*r, 71300);
+            TEST_ASSERT(r->app->isGlidingForTest() && tabs(*r) == 1);
+            TEST_ASSERT(!r->app->sessionTabsForTest().getTab(tabP2) && frontTab(*r).requirePairedDeskId == Q);
+            TEST_ASSERT(waitFor([&] { return connected(*r) && net.viewerStats().remoteDeskId == Q; }, 5000));
+
+            // glideDroppedByNormalSession: a normal connect closes the glide tab and ends the glide.
+            f11(*r);
+            const uint32_t tabQ = frontTab(*r).id;
+            r->app->onText(std::string("\x01") + "123456789\r");
+            TEST_ASSERT(!r->app->isGlidingForTest() && tabs(*r) == 1);
+            TEST_ASSERT(!r->app->sessionTabsForTest().getTab(tabQ) && frontTab(*r).requirePairedDeskId == 0);
+            net.disconnectViewer();
+        }
+        TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active && !hostQ.hostSessionStatus().active; }, 4000));
+        {   // glideFailureGoesHome: nothing listens. Closing the window mid-glide also goes home first.
+            auto r = fresh();
+            push(*r, top, 0);
+            TEST_ASSERT(r->app->isGlidingForTest());
+            r->app->onCloseRequested();
+            TEST_ASSERT(atHome(*r, ui::Point{960, 2}));
+            push(*r, top, 1000);
+            TEST_ASSERT(r->app->isGlidingForTest() && r->shell.fullscreen);
+            TEST_ASSERT(waitFor([&] { return wentHome(*r); }, 5000));
+            TEST_ASSERT(atHome(*r, ui::Point{960, 2}) && tabs(*r) == 0);
+            TEST_ASSERT(toastShown(*r, "Kiosk: "));
+        }
+        {   // The host has forgotten this PC.
+            auto r = fresh();
+            push(*r, bottom, 0);
+            TEST_ASSERT(waitFor([&] { return wentHome(*r); }, 5000));
+            TEST_ASSERT(tabs(*r) == 0 && !r->shell.fullscreen);
+            TEST_ASSERT(toastShown(*r, "Office no longer trusts this PC; pair again by connecting normally"));
+        }
+        {   // Busy: the same paired viewer holds P's one session from elsewhere.
+            NetworkEngine other(id);
+            TEST_ASSERT(other.startViewerOnly());
+            other.connectToRemote("127.0.0.1:51090", "", P);
+            TEST_ASSERT(waitFor([&] { return other.viewerStats().state == ViewerConnectionState::Connected; }, 5000));
+            auto r = fresh();
+            push(*r, right, 0);
+            TEST_ASSERT(waitFor([&] { return wentHome(*r); }, 5000));
+            TEST_ASSERT(tabs(*r) == 0 && !r->shell.fullscreen);
+            TEST_ASSERT(toastShown(*r, "Reception is in use by someone else"));
+            other.disconnectViewer();
+        }
+        net.disconnectViewer();
+        hostP.setHostKeySinkForTest(nullptr);
+    }
+    for (const auto& c : cfgs) std::filesystem::remove(c, ec);
 }
 
 
@@ -12940,6 +13127,7 @@ int main(int argc, char** argv) {
         testGlideEdges(); std::cout << "Test 115 done\n" << std::flush;
         testGlideSettingsUi(); std::cout << "Test 116 done\n" << std::flush;
         testGlideOut(); std::cout << "Test 117 done\n" << std::flush;
+        testGlideHome(); std::cout << "Test 118 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;

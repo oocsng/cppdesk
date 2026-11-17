@@ -364,7 +364,7 @@ private:
     void toggleShortcutsModal();
     void openRecordingPlayer(const std::string& filePath = "");
     void closeRecordingPlayer();
-    void switchToSessionTab(uint32_t tabId, bool force = false);
+    void switchToSessionTab(uint32_t tabId, bool force = false, bool silent = false);
     void closeSessionTab(uint32_t tabId);
     void hardResetViewerUiState();
     void showToast(const std::string& message, bool isError = false, uint32_t durationMs = 3000);
@@ -665,7 +665,8 @@ private:
     std::map<uint64_t, uint64_t> glideOfflineNotifiedMs_;   // desk ID -> when "offline" was last said
     float                   glideSlideT_ = 1.0f;       // 0 -> 1: the session view slides in from the pushed edge
     float                   glideSlideVel_ = 0.0f;
-    void glideTick(uint64_t nowMs);                    // called from onTick()
+    void glideTick(uint64_t nowMs, const ViewerSessionStats& viewer, bool hosting);   // called from onTick()
+    void glideHomeNow(uint64_t nowMs, const std::string& toast = "");
     void glideOut(GlideEdge edge, ui::Point cursor, uint64_t nowMs);
     std::vector<uint64_t>   fleetPicked_;              // desk IDs ticked in the picker
     bool                    fleetTypeAll_ = false;
