@@ -16,6 +16,7 @@ struct SessionTab {
     std::string             title;
     std::string             remoteHostname;
     std::string             password;
+    uint64_t                requirePairedDeskId = 0;   // non-zero: dial targetInput (ip:port) with pairing keys only
     ViewerConnectionState   state = ViewerConnectionState::Disconnected;
     std::string             statusMessage;
 

@@ -20,10 +20,12 @@
 #include "notification_manager.hpp"
 #include "host_permissions.hpp"
 #include "../net/updater.hpp"
+#include "glide.hpp"
 
 #include <string>
 #include <vector>
 #include <array>
+#include <map>
 #include <unordered_map>
 #include <functional>
 #include <optional>
@@ -65,7 +67,8 @@ enum class SettingsSection : uint8_t {
     NetworkRelay    = 5,
     CurtainPrivacy  = 6,
     SystemService   = 7,
-    About           = 8
+    About           = 8,
+    Glide           = 9
 };
 
 enum class FocusedField : uint8_t {
@@ -204,6 +207,12 @@ public:
     void onPeerVersionMismatch(const std::string& hostVer, const std::string& viewerVer);
     void onVersionUpgradeNotice(const std::string& senderVersion);
 
+    // Tests.
+    const SessionTabManager& sessionTabsForTest() const { return sessionTabs_; }
+    bool isGlidingForTest() const { return glide_ && glide_->inside; }
+    ActiveTab activeTabForTest() const { return activeTab_; }
+    void switchTabForTest(ActiveTab t) { switchTab(t); }
+
 private:
     // WinShell implements services that need the UI state (update download, service actions).
     friend class WinShell;
@@ -268,6 +277,7 @@ private:
     void drawSessionTabBar(const UiRect& bounds, float alpha = 1.0f);
     void drawRemoteSessionView(const UiRect& bounds, float alpha = 1.0f);
     void drawSettingsView(const UiRect& bounds, float alpha = 1.0f);
+    void drawGlideSettings(float cx, float crx, float& cy);
     void drawFileTransferDrawer(const UiRect& bounds, float slideProgress);
     void drawFileManagerDrawer(const UiRect& contentRect);
     void drawSyncDrawer(const UiRect& contentRect);
@@ -356,8 +366,8 @@ private:
     void toggleShortcutsModal();
     void openRecordingPlayer(const std::string& filePath = "");
     void closeRecordingPlayer();
-    void switchToSessionTab(uint32_t tabId, bool force = false);
-    void closeSessionTab(uint32_t tabId);
+    void switchToSessionTab(uint32_t tabId, bool force = false, bool silent = false);
+    void closeSessionTab(uint32_t tabId, bool quiet = false);   // quiet: no view switch or toast
     void hardResetViewerUiState();
     void showToast(const std::string& message, bool isError = false, uint32_t durationMs = 3000);
     bool anyModalActive() const;
@@ -647,6 +657,21 @@ private:
     bool                    showFleetPicker_ = false;
     float                   fleetPickerAnimT_ = 0.0f;
     float                   fleetPickerAnimVel_ = 0.0f;
+    uint64_t                glidePickedDesk_ = 0;      // paired PC picked in Settings > Glide, waiting for an edge click
+    // Glide: the paired PC whose session tab this window shows full screen after a push off a screen edge.
+    struct GlideState { uint64_t deskId = 0; GlideEdge edge = GlideEdge::Off; uint32_t tabId = 0;
+                        bool inside = false; uint64_t homeSinceMs = 0; ui::WindowPresence prevPresence{}; float along = 0.5f;
+                        bool seenShown = false;   // the shell has reported the glide window shown at least once
+                        ui::Rect monitor{}; };     // the monitor the glide window fills: its home edge is where the cursor goes home
+    std::optional<GlideState> glide_;
+    GlideDwell              glideDwell_;
+    GlideHome               glideHome_;
+    std::map<uint64_t, uint64_t> glideOfflineNotifiedMs_;   // desk ID -> when "offline" was last said
+    float                   glideSlideT_ = 1.0f;       // 0 -> 1: the session view slides in from the pushed edge
+    float                   glideSlideVel_ = 0.0f;
+    void glideTick(uint64_t nowMs, const ViewerSessionStats& viewer, bool hosting);   // called from onTick()
+    void glideHomeNow(uint64_t nowMs, const std::string& toast = "");
+    void glideOut(GlideEdge edge, ui::Point cursor, uint64_t nowMs);
     std::vector<uint64_t>   fleetPicked_;              // desk IDs ticked in the picker
     bool                    fleetTypeAll_ = false;
     uint64_t                fleetFocused_ = 0;

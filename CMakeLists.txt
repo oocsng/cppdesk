@@ -45,6 +45,7 @@ set(CORE_SOURCES
     src/ui/recording_canvas.cpp
     src/ui/app_ui.cpp
     src/ui/theme.cpp
+    src/ui/glide.cpp
 )
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)

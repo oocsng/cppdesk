@@ -581,6 +581,62 @@ public:
         [NSApp activateIgnoringOtherApps:YES];
         [w_->window makeKeyAndOrderFront:nil];
     }
+    // Points, top-left origin of the primary screen: Quartz's global display space, which CGWarpMouseCursorPosition takes.
+    std::optional<ui::Point> cursorScreenPos() const override {
+        if (!w_) return std::nullopt;
+        const NSPoint p = [NSEvent mouseLocation];
+        return ui::Point{ static_cast<float>(p.x), static_cast<float>(primaryHeight() - p.y) };
+    }
+    ui::Rect desktopBounds() const override {
+        NSArray<NSScreen*>* all = NSScreen.screens;
+        if (all.count == 0) return {};
+        ui::Rect r = flipped(all[0].frame);
+        for (NSScreen* s in all) {
+            const ui::Rect m = flipped(s.frame);
+            r.left = std::min(r.left, m.left);
+            r.top = std::min(r.top, m.top);
+            r.right = std::max(r.right, m.right);
+            r.bottom = std::max(r.bottom, m.bottom);
+        }
+        return r;
+    }
+    ui::Rect monitorBoundsAt(ui::Point p) const override {
+        NSScreen* s = screenAt(p);
+        return s ? flipped(s.frame) : ui::Rect{};
+    }
+    void warpCursor(ui::Point p) override {
+        if (!live()) return;
+        CGWarpMouseCursorPosition(CGPointMake(p.x, p.y));
+        CGAssociateMouseAndMouseCursorPosition(true);   // ends the short freeze a warp puts on mouse movement
+    }
+    // To the top-left of the screen's work area (below the menu bar), keeping the size; the caller goes fullscreen.
+    void moveWindowToMonitorAt(ui::Point p) override {
+        NSScreen* s = live() ? screenAt(p) : nil;
+        if (!s) return;
+        const NSRect work = s.visibleFrame;
+        const NSSize size = w_->window.frame.size;
+        [w_->window setFrame:NSMakeRect(work.origin.x, NSMaxY(work) - size.height, size.width, size.height) display:YES];
+    }
+    ui::WindowPresence windowPresence() const override {
+        if (!live()) return ui::WindowPresence::Hidden;
+        if (w_->window.isMiniaturized) return ui::WindowPresence::Minimized;
+        return w_->window.isVisible ? ui::WindowPresence::Shown : ui::WindowPresence::Hidden;
+    }
+    void setWindowPresence(ui::WindowPresence p) override {
+        if (!live()) return;
+        switch (p) {
+            case ui::WindowPresence::Shown:
+                w_->hiddenInTray = false;
+                if (w_->window.isMiniaturized) [w_->window deminiaturize:nil];
+                bringToFront();
+                break;
+            case ui::WindowPresence::Minimized: [w_->window miniaturize:nil]; break;
+            case ui::WindowPresence::Hidden:   // in the menu bar, as hideToTrayIfWanted leaves it
+                [w_->window orderOut:nil];
+                w_->hiddenInTray = true;
+                break;
+        }
+    }
     // AppKit keeps sending a drag's events to the view that started it, outside the window too.
     void setMouseCapture(bool) override {}
     bool isKeyDown(uint16_t vk) const override { return w_ && vk < 256 && w_->keys[vk]; }
@@ -630,6 +686,33 @@ public:
 
 private:
     bool live() const { return w_ && w_->window && !w_->closed; }
+
+    // Cocoa's screen space has its origin at the primary screen's bottom-left, y up; flip it against that screen.
+    static CGFloat primaryHeight() {
+        NSScreen* primary = NSScreen.screens.firstObject;
+        return primary ? primary.frame.size.height : 0;
+    }
+    static ui::Rect flipped(NSRect f) {
+        const CGFloat h = primaryHeight();
+        return { static_cast<float>(f.origin.x), static_cast<float>(h - NSMaxY(f)), static_cast<float>(NSMaxX(f)),
+                 static_cast<float>(h - f.origin.y) };
+    }
+    // The screen containing p (right/bottom exclusive), else the nearest one; nil with no screens.
+    static NSScreen* screenAt(ui::Point p) {
+        NSScreen* best = nil;
+        float bestDist = 0.0f;
+        for (NSScreen* s in NSScreen.screens) {
+            const ui::Rect r = flipped(s.frame);
+            const float dx = p.x < r.left ? r.left - p.x : p.x >= r.right ? p.x - r.right + 1.0f : 0.0f;
+            const float dy = p.y < r.top ? r.top - p.y : p.y >= r.bottom ? p.y - r.bottom + 1.0f : 0.0f;
+            const float d = dx * dx + dy * dy;
+            if (!best || d < bestDist) {
+                best = s;
+                bestDist = d;
+            }
+        }
+        return best;
+    }
 
     CppDeskWindowMacImpl* w_ = nullptr;
     bool snapshotMode_ = false;
