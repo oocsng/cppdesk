@@ -170,6 +170,9 @@ struct NetworkDiagnosticResult {
     StunNatResult    stun;
 };
 
+// Test switch: while on, NetworkEngine::start() and RelayServer::start() bind port 0 and report the port the OS gave.
+void setOsAssignedPortsForTest(bool on);
+
 class RelayServer {
 public:
     RelayServer();
@@ -244,6 +247,7 @@ public:
     bool startLocalRelayServer(uint16_t port = DEFAULT_RELAY_PORT);
     void stopLocalRelayServer();
     bool isLocalRelayRunning() const { return localRelay_.isRunning(); }
+    uint16_t localRelayPort() const { return localRelay_.port(); }
     size_t localRelayPeerCount() const { return localRelay_.registeredPeerCount(); }
 
     // Host: Incoming connection approval & active host session control

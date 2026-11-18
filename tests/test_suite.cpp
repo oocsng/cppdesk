@@ -13144,6 +13144,32 @@ void testMacAudioPaths() {
 
 } // namespace
 
+void testOsAssignedPorts() {
+    std::cout << "[TEST 120] Test listeners: OS-assigned ports are recorded and reachable; a configured port 0 reports the real port..." << std::endl;
+    setOsAssignedPortsForTest(true);
+    {
+        IdentityManager id(4370);
+        id.setListenPort(DEFAULT_HOST_PORT);            // ignored while the switch is on
+        NetworkEngine e(id);
+        TEST_ASSERT(e.start());
+        TEST_ASSERT(e.hostListenPort() != 0 && e.hostListenPort() == id.listenPort());
+        TEST_ASSERT(e.startLocalRelayServer(DEFAULT_RELAY_PORT));
+        TEST_ASSERT(e.localRelayPort() != 0);
+        TEST_ASSERT(NetworkEngine::probeRelayServer("127.0.0.1:" + std::to_string(e.localRelayPort()), 1000).reachable);
+        e.stop();
+    }
+    setOsAssignedPortsForTest(false);
+    {
+        IdentityManager id(4371);
+        id.setListenPort(0);                            // product path: port 0 must not be advertised as 0
+        NetworkEngine e(id);
+        TEST_ASSERT(e.start());
+        TEST_ASSERT(e.hostListenPort() != 0 && e.hostListenPort() == id.listenPort());
+        e.stop();
+    }
+    setOsAssignedPortsForTest(true);                    // main() runs the suite with it on
+}
+
 int main(int argc, char** argv) {
     try {
 #if defined(__linux__)
@@ -13308,6 +13334,7 @@ int main(int argc, char** argv) {
 #if defined(_WIN32)
         testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;
 #endif
+        testOsAssignedPorts(); std::cout << "Test 120 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
