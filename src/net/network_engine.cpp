@@ -703,6 +703,19 @@ void NetworkEngine::clearRateLimitRecords() {
 
 // ---------------- RelayServer ----------------
 
+namespace {
+std::atomic<bool> g_osAssignedPorts{false};
+
+uint16_t boundPortOf(SOCKET s, uint16_t fallback) {
+    sockaddr_in a{};
+    socklen_t len = sizeof(a);
+    if (getsockname(s, reinterpret_cast<sockaddr*>(&a), &len) == 0 && a.sin_port != 0) return ntohs(a.sin_port);
+    return fallback;
+}
+} // namespace
+
+void setOsAssignedPortsForTest(bool on) { g_osAssignedPorts.store(on); }
+
 RelayServer::RelayServer() = default;
 
 RelayServer::~RelayServer() {
@@ -722,7 +735,7 @@ bool RelayServer::start(uint16_t port) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
+    addr.sin_port = htons(g_osAssignedPorts.load() ? uint16_t(0) : port);
 
     if (bind(ls, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR ||
         listen(ls, SOMAXCONN) == SOCKET_ERROR) {
@@ -730,7 +743,7 @@ bool RelayServer::start(uint16_t port) {
         return false;
     }
 
-    port_ = port;
+    port_ = boundPortOf(ls, port);
     listenSock_ = fromWinSock(ls);
     running_.store(true);
     acceptThread_ = std::thread(&RelayServer::acceptLoop, this);
@@ -1101,7 +1114,7 @@ bool NetworkEngine::start() {
     if (running_.load()) return true;
     viewerOnly_.store(false);
 
-    uint16_t basePort = identity_.listenPort();
+    uint16_t basePort = g_osAssignedPorts.load() ? uint16_t(0) : identity_.listenPort();
     SOCKET hs = INVALID_SOCKET;
     uint16_t boundPort = basePort;
 
@@ -1118,7 +1131,7 @@ bool NetworkEngine::start() {
         if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
             listen(s, SOMAXCONN) == 0) {
             hs = s;
-            boundPort = candidate;
+            boundPort = boundPortOf(s, candidate);
             break;
         }
         closesocket(s);
