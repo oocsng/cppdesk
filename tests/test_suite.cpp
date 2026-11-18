@@ -7752,6 +7752,11 @@ void testRelayDeskOwnership() {
     TEST_ASSERT(second.challengeMode == MODE_PROVE);
     TEST_ASSERT(answer(again, computeProof(ownerKey, deskId, second.nonce)) == 1);
     TEST_ASSERT(lookup(deskId) == "owner-host-2");
+    // The takeover wakes the stale registration's thread. That thread must not close a handle a later connection has
+    // been given (handle numbers are reused at once on Linux), so a burst of fresh connections all still get answers.
+    bool burstOk = true;
+    for (int i = 0; i < 60 && burstOk; ++i) burstOk = lookup(deskId) == "owner-host-2";
+    TEST_ASSERT(burstOk);
 
     // 6. A host from before this feature still registers an ID nobody owns.
     uintptr_t legacy = dial();
