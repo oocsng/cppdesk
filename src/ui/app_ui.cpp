@@ -2,6 +2,7 @@
 #include "theme.hpp"
 #include "../core/win_compat.hpp"
 #include "vk_codes.hpp"
+#include "glide.hpp"
 
 #include <algorithm>
 #include <ctime>
@@ -152,6 +153,7 @@ bool AppUi::stepAnimations(float dt) {
                            (activeTab_ == ActiveTab::RemoteSession) ? 1.0f : 2.0f;
     if (stepSpring(viewportPos_, viewportVel_, targetViewport, 25.0f, 0.82f, dt)) active = true;
     if (stepSpring(tabEnterStaggerT_, tabEnterStaggerVel_, 1.0f, 22.0f, 0.78f, dt)) active = true;
+    if (stepSpring(glideSlideT_, glideSlideVel_, 1.0f, theme::motion::panel.omega, theme::motion::panel.zeta, dt)) active = true;
 
     // 2. Liquid macOS Segmented Control Pill (leading edge moves faster than trailing edge)
     if (navPillInit_) {
@@ -760,9 +762,22 @@ void AppUi::drawFrame(float width, float height) {
     float viewScale = 0.982f + 0.018f * std::clamp(tabEnterStaggerT_, 0.0f, 1.08f);
     float enterAlpha = std::clamp(0.30f + 0.70f * smoothStepEase(tabEnterStaggerT_), 0.0f, 1.0f);
 
-    if (std::fabs(slideX) > 0.15f || std::fabs(viewScale - 1.0f) > 0.001f) {
+    // A glide slides the remote screen in from the edge it was pushed through.
+    float glideX = 0.0f, glideY = 0.0f;
+    if (glide_ && activeTab_ == ActiveTab::RemoteSession) {
+        const float o = 1.0f - glideSlideT_;
+        switch (glide_->edge) {
+            case GlideEdge::Right:  glideX = o * width;   break;
+            case GlideEdge::Left:   glideX = -o * width;  break;
+            case GlideEdge::Bottom: glideY = o * height;  break;
+            case GlideEdge::Top:    glideY = -o * height; break;
+            default: break;
+        }
+    }
+
+    if (std::fabs(slideX) > 0.15f || std::fabs(viewScale - 1.0f) > 0.001f || glideX != 0.0f || glideY != 0.0f) {
         ui::Point center = ui::Point{contentBounds.centerX(), contentBounds.centerY()};
-        canvas_->setTransform(ui::Transform2D::scale(viewScale, viewScale, (center).x, (center).y) * ui::Transform2D::translation(slideX, 0.0f));
+        canvas_->setTransform(ui::Transform2D::scale(viewScale, viewScale, (center).x, (center).y) * ui::Transform2D::translation(slideX + glideX, glideY));
     }
 
     if (activeTab_ == ActiveTab::Dashboard) {
@@ -2580,6 +2595,95 @@ void AppUi::drawRemoteSessionView(const UiRect& bounds, float alpha) {
     }
 }
 
+// Settings > Glide: click a paired PC to pick it, then an edge slot to place it there (or an occupied slot with nothing picked to clear it).
+void AppUi::drawGlideSettings(float cx, float crx, float& cy) {
+    drawText("Glide", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    cy += 25.0f;
+    drawText("Push your mouse off a screen edge to control the paired PC you put there.",
+             { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+    cy += 22.0f;
+
+    const bool cursorKnown = shell_->cursorScreenPos().has_value();
+    const char* note = nullptr;
+    if (!cursorKnown) note = "Glide needs X11. On Wayland, other PCs can still glide to this one.";
+    else if (glidePaused(sessionTabs_.tabCount() > 0, fleet_.size() > 0, false, true))
+        note = "Glide is paused while a session or the Do it on all grid is open.";
+    if (note) {
+        drawText(note, { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_WARNING);
+        cy += 22.0f;
+    }
+
+    const std::vector<PairedPeer> hosts = identity_.pairedHosts();
+    if (hosts.empty()) {
+        drawText("Pair with a PC first: connect to it normally and choose Pair.",
+                 { cx, cy + 6.0f, crx, cy + 26.0f }, ui::FontRole::Body, COL_TEXT_SECONDARY);
+        return;
+    }
+    if (std::none_of(hosts.begin(), hosts.end(), [&](const PairedPeer& h) { return h.deskId == glidePickedDesk_; }))
+        glidePickedDesk_ = 0;   // forgotten while picked
+
+    const auto eligible = FleetManager::eligibleMembers(identity_, network_.discoveredPeers());
+    auto online = [&](uint64_t id) {
+        return std::any_of(eligible.begin(), eligible.end(), [&](const FleetMember& m) { return m.deskId == id; });
+    };
+    auto nameOf = [&](uint64_t id) {
+        for (const auto& h : hosts) if (h.deskId == id) return h.hostname;
+        return std::string();
+    };
+    const AppSettings s = identity_.settings();
+
+    // Left: "This PC" with an edge slot on each side
+    // shortcut: a hostname wider than the slot is clipped, not shortened; add an ellipsis helper if long names matter
+    const float slotW = 136.0f, slotH = 46.0f, diaW = 460.0f, diaH = 250.0f;
+    UiRect dia = { cx, cy, cx + diaW, cy + diaH };
+    fillRoundRect(dia, 12.0f, COL_BG_SUBTLE);
+    strokeRoundRect(dia, 12.0f, COL_BORDER);
+    UiRect me = { dia.centerX() - 60.0f, dia.centerY() - 28.0f, dia.centerX() + 60.0f, dia.centerY() + 28.0f };
+    fillRoundRect(me, 10.0f, COL_BG_CARD);
+    strokeRoundRect(me, 10.0f, COL_BORDER_ALT);
+    drawText("This PC", me, ui::FontRole::BodyBold, COL_TEXT_PRIMARY, ui::HAlign::Center, ui::VAlign::Center);
+
+    struct Slot { GlideEdge edge; const char* id; UiRect rect; };
+    const Slot slots[] = {
+        { GlideEdge::Top,    "glide_slot_top",    { dia.centerX() - slotW * 0.5f, dia.top + 16.0f, dia.centerX() + slotW * 0.5f, dia.top + 16.0f + slotH } },
+        { GlideEdge::Bottom, "glide_slot_bottom", { dia.centerX() - slotW * 0.5f, dia.bottom - 16.0f - slotH, dia.centerX() + slotW * 0.5f, dia.bottom - 16.0f } },
+        { GlideEdge::Left,   "glide_slot_left",   { dia.left + 16.0f, dia.centerY() - slotH * 0.5f, dia.left + 16.0f + slotW, dia.centerY() + slotH * 0.5f } },
+        { GlideEdge::Right,  "glide_slot_right",  { dia.right - 16.0f - slotW, dia.centerY() - slotH * 0.5f, dia.right - 16.0f, dia.centerY() + slotH * 0.5f } },
+    };
+    for (const auto& sl : slots) {
+        const uint64_t at = glidePcAt(s, sl.edge);
+        const bool filled = at != 0 && !nameOf(at).empty();
+        drawButton(sl.id, sl.rect, filled ? nameOf(at) : "Empty",
+                   filled ? COL_SEC_BTN_BG : COL_BG_SUBTLE, COL_SEC_BTN_HV,
+                   filled && online(at) ? COL_TEXT_PRIMARY : COL_TEXT_MUTED,
+                   8.0f, [this, e = sl.edge]() {
+                       AppSettings ns = identity_.settings();
+                       glidePlace(ns, e, glidePickedDesk_);   // nothing picked: clears the slot
+                       glidePickedDesk_ = 0;
+                       identity_.updateSettings(ns);
+                   }, ui::FontRole::Small, true, glidePickedDesk_ ? COL_PRIMARY_ACCENT : COL_BORDER);
+    }
+
+    // Right: the paired PCs
+    const float rowH = 38.0f;
+    UiRect list = { dia.right + 14.0f, cy, crx, cy + std::max(diaH, 46.0f + rowH * static_cast<float>(hosts.size()) + 8.0f) };
+    fillRoundRect(list, 12.0f, COL_BG_SUBTLE);
+    strokeRoundRect(list, 12.0f, COL_BORDER);
+    drawText("Pick a PC, then click an edge.", { list.left + 16.0f, list.top + 12.0f, list.right - 16.0f, list.top + 30.0f },
+             ui::FontRole::Small, COL_TEXT_ACCENT);
+    float ry = list.top + 40.0f;
+    for (const auto& h : hosts) {
+        const bool picked = h.deskId == glidePickedDesk_;
+        drawButton("glide_pc_" + std::to_string(h.deskId), { list.left + 12.0f, ry, list.right - 12.0f, ry + rowH - 6.0f }, h.hostname,
+                   picked ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG, picked ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                   picked ? COL_TEXT_ON_ACCENT : (online(h.deskId) ? COL_TEXT_PRIMARY : COL_TEXT_MUTED),
+                   8.0f, [this, id = h.deskId]() { glidePickedDesk_ = (glidePickedDesk_ == id) ? 0 : id; },
+                   ui::FontRole::Small, !picked, COL_BORDER);
+        ry += rowH;
+    }
+    cy = list.bottom + 14.0f;
+}
+
 void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
     if (alpha <= 0.01f) return;
 
@@ -2617,6 +2721,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         { SettingsSection::CurtainPrivacy, "sett_sec_priv",   "Curtain & Privacy" },
         { SettingsSection::SystemService,  "sett_sec_svc",    "System & Service" },
         { SettingsSection::About,          "sett_sec_about",  "About & Data" },
+        { SettingsSection::Glide,          "sett_sec_glide",  "Glide" },
     };
 
     for (const auto& item : navItems) {
@@ -2665,6 +2770,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         case SettingsSection::CurtainPrivacy: sectionContentH = 270.0f; break;
         case SettingsSection::SystemService:  sectionContentH = 360.0f; break;
         case SettingsSection::About:          sectionContentH = 350.0f; break;
+        case SettingsSection::Glide:          sectionContentH = 330.0f + 38.0f * identity_.pairedHosts().size(); break;
     }
 
     float availContentH = navCard.height();
@@ -3973,6 +4079,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ON_ACCENT);
 
         cy = maintBox.bottom + 12.0f;
+    }
+    else if (settingsSection_ == SettingsSection::Glide) {
+        drawGlideSettings(cx, crx, cy);
     }
 
     // Clamp hit-test regions inside contentPane viewport
@@ -8977,7 +9086,7 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
                 shell_->invalidate();
                 return;
             }
-            if (isFullscreen_) {
+            if (isFullscreen_ && !(glide_ && glide_->inside)) {   // in a glide, Esc goes to the remote PC
                 toggleFullscreen();
                 return;
             }
@@ -9084,7 +9193,7 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
     }
 }
 
-void AppUi::switchToSessionTab(uint32_t tabId, bool force) {
+void AppUi::switchToSessionTab(uint32_t tabId, bool force, bool silent) {
     if (tabId == 0) return;
     if (!force && tabId == sessionTabs_.activeTabId()) return;
 
@@ -9148,17 +9257,17 @@ void AppUi::switchToSessionTab(uint32_t tabId, bool force) {
         network_.disconnectViewer();
         hardResetViewerUiState();
         if (!newTab->targetInput.empty()) {
-            network_.connectToRemote(newTab->targetInput, newTab->password);
+            network_.connectToRemote(newTab->targetInput, newTab->password, newTab->requirePairedDeskId);
         }
     }
 
     switchTab(ActiveTab::RemoteSession);
     std::string toastTitle = newTab->title.empty() ? (newTab->targetInput.empty() ? ("Desk " + std::to_string(newTab->deskId)) : newTab->targetInput) : newTab->title;
-    showToast("Switched to tab: " + toastTitle);
+    if (!silent) showToast("Switched to tab: " + toastTitle);
     shell_->invalidate();
 }
 
-void AppUi::closeSessionTab(uint32_t tabId) {
+void AppUi::closeSessionTab(uint32_t tabId, bool quiet) {
     if (tabId == 0) return;
 
     bool wasActive = (tabId == sessionTabs_.activeTabId());
@@ -9184,10 +9293,10 @@ void AppUi::closeSessionTab(uint32_t tabId) {
     sessionTabs_.closeTab(tabId);
 
     if (sessionTabs_.tabCount() > 0) {
-        if (wasActive) {
+        if (wasActive && !quiet) {
             switchToSessionTab(sessionTabs_.activeTabId(), true);
         }
-        showToast("Closed tab: " + tabName);
+        if (!quiet) showToast("Closed tab: " + tabName);
     } else {
         frameBufferBgra_.clear();
         frameBufferW_ = 0;
@@ -9196,8 +9305,10 @@ void AppUi::closeSessionTab(uint32_t tabId) {
         releaseImage(remoteBitmap_);
         bitmapW_ = 0;
         bitmapH_ = 0;
-        switchTab(ActiveTab::Dashboard);
-        showToast("All session tabs closed");
+        if (!quiet) {
+            switchTab(ActiveTab::Dashboard);
+            showToast("All session tabs closed");
+        }
     }
 
     shell_->invalidate();
@@ -9212,6 +9323,11 @@ void AppUi::initiateConnection() {
     if (remoteIdInput_.empty()) {
         showToast("Enter a 9-digit Desk ID", true);
         return;
+    }
+
+    if (glide_) {   // a glide never turns into a normal session: drop it before looking for a tab to reuse
+        closeSessionTab(glide_->tabId);
+        glide_.reset();
     }
 
     uint64_t targetDeskId = CryptoUtils::parseDeskId(remoteIdInput_);
@@ -9594,9 +9710,129 @@ void AppUi::drawOmnibarModal(float width, float height, float modalProgress) {
 }
 
 void AppUi::toggleFullscreen() {
+    if (glide_ && glide_->inside) {   // in a glide, leaving full screen and going home are the same thing
+        glideHomeNow(shell_->nowMs());
+        return;
+    }
     if (shell_->setFullscreen(!isFullscreen_)) {
         isFullscreen_ = !isFullscreen_;
     }
+}
+
+void AppUi::glideTick(uint64_t nowMs, const ViewerSessionStats& viewer, bool hosting) {
+    if (glide_ && glide_->inside) {
+        const SessionTab* tab = sessionTabs_.getTab(glide_->tabId);
+        // Failed or ended (Error can come before any frame): slide home. Reconnecting and connecting are left alone.
+        if (!tab || viewer.state == ViewerConnectionState::Error || viewer.state == ViewerConnectionState::Disconnected) {
+            const auto host = identity_.findPairedHost(glide_->deskId);
+            const std::string name = host ? host->hostname : CryptoUtils::formatDeskId(glide_->deskId);
+            std::string toast = name + ": " + viewer.statusMessage;
+            if (viewer.statusMessage.find("already in an active remote session") != std::string::npos)   // HostBusy
+                toast = name + " is in use by someone else";
+            else if (viewer.statusMessage.find("not paired with the host") != std::string::npos)
+                toast = name + " no longer trusts this PC; pair again by connecting normally";
+            if (tab) closeSessionTab(glide_->tabId);   // no live session left to release modifiers on
+            glideHomeNow(nowMs, toast);
+            glide_.reset();
+            return;
+        }
+        // Minimised or hidden (tray, Win+D) mid-glide: go home and leave the window as the user put it. Only once the
+        // window has been seen shown, since a shell may report the restore after glideOut late.
+        const ui::WindowPresence presence = shell_->windowPresence();
+        if (presence == ui::WindowPresence::Shown) glide_->seenShown = true;
+        if (presence != ui::WindowPresence::Shown && glide_->seenShown) {
+            glide_->prevPresence = presence;
+            glideHomeNow(nowMs);
+        } else if (const std::optional<ui::Point> c = shell_->cursorScreenPos()) {
+            // The window fills one monitor, so its home edge may be a seam the cursor crosses: a point past the edge
+            // counts as on it. Polled, since a warp sends no motion event.
+            const ui::Rect& m = glide_->monitor;
+            const ui::Point p{std::clamp(c->x, m.left, m.right - 1), std::clamp(c->y, m.top, m.bottom - 1)};
+            if (glideHome_.update(m, p, nowMs)) glideHomeNow(nowMs);
+        }
+        return;
+    }
+    if (glide_ && !sessionTabs_.getTab(glide_->tabId)) glide_.reset();   // its tab was closed
+    // Looking at the live session from the tab bar is not idle.
+    if (glide_ && activeTab_ == ActiveTab::RemoteSession && sessionTabs_.activeTabId() == glide_->tabId) glide_->homeSinceMs = nowMs;
+    if (glide_ && nowMs - glide_->homeSinceMs >= 60000) {   // home and idle for a minute: disconnect
+        closeSessionTab(glide_->tabId, activeTab_ != ActiveTab::RemoteSession);   // never yank someone out of Settings
+        glide_.reset();
+    }
+    const AppSettings& gs = identity_.settings();
+    if (!glide_ && !gs.glideLeft && !gs.glideRight && !gs.glideTop && !gs.glideBottom) return;   // nothing placed
+    const std::optional<ui::Point> cursor = shell_->cursorScreenPos();
+    const uint32_t glideTab = glide_ ? glide_->tabId : 0;
+    const auto& tabs = sessionTabs_.tabs();
+    const bool otherSession = std::any_of(tabs.begin(), tabs.end(), [&](const SessionTab& t) { return t.id != glideTab; }) ||
+                              (network_.isViewerActive() && !glide_);
+    if (glidePaused(otherSession, fleet_.size() > 0, hosting, cursor.has_value())) {
+        glideDwell_.reset();
+        return;
+    }
+    const ui::Rect desk = shell_->desktopBounds();
+    GlideEdge edge = GlideEdge::Off;
+    // glideEdgeAt has no outer bound: a stale or off-desktop position (beyond 1 px) must never count as an edge.
+    if (cursor->x >= desk.left - 1 && cursor->x <= desk.right && cursor->y >= desk.top - 1 && cursor->y <= desk.bottom)
+        edge = glideEdgeAt(desk, *cursor);
+    if (glidePcAt(identity_.settings(), edge) == 0) edge = GlideEdge::Off;
+    if (const GlideEdge fired = glideDwell_.update(edge, nowMs); fired != GlideEdge::Off) glideOut(fired, *cursor, nowMs);
+}
+
+void AppUi::glideOut(GlideEdge edge, ui::Point cursor, uint64_t nowMs) {
+    const uint64_t deskId = glidePcAt(identity_.settings(), edge);
+    // Discovery's address is spoofable: only a paired PC seen directly, dialled with its desk ID required.
+    const auto members = FleetManager::eligibleMembers(identity_, network_.discoveredPeers());
+    const auto target = std::find_if(members.begin(), members.end(), [&](const FleetMember& m) { return m.deskId == deskId; });
+    if (target == members.end()) {
+        const auto said = glideOfflineNotifiedMs_.find(deskId);
+        if (said != glideOfflineNotifiedMs_.end() && nowMs - said->second < 60000) return;
+        glideOfflineNotifiedMs_[deskId] = nowMs;
+        const auto host = identity_.findPairedHost(deskId);
+        const std::string name = host ? host->hostname : CryptoUtils::formatDeskId(deskId);
+        if (notificationMgr_) notificationMgr_->notify(NotificationType::GeneralInfo, "Glide", name + " is offline", identity_.settings());
+        return;
+    }
+    if (glide_ && glide_->deskId != deskId) {   // the window holds one connection
+        closeSessionTab(glide_->tabId);
+        glide_.reset();
+    }
+
+    const ui::WindowPresence prevPresence = shell_->windowPresence();
+    shell_->setWindowPresence(ui::WindowPresence::Shown);
+    // shortcut: the shell cannot say which monitor the window is on, so a windowed window always moves to the cursor's
+    // monitor's top-left (also where it returns to); add a window-monitor query to the shell if that bothers people.
+    if (!isFullscreen_) {   // macOS: a full-screen window must never be moved
+        shell_->moveWindowToMonitorAt(cursor);
+        toggleFullscreen();
+    }
+    shell_->bringToFront();
+    const ui::Rect monitor = shell_->monitorBoundsAt(cursor);
+    shell_->warpCursor(glideEntryPoint(monitor, edge, glideAlong(monitor, edge, cursor)));
+
+    const SessionTab* open = glide_ ? sessionTabs_.getTab(glide_->tabId) : nullptr;
+    const uint32_t tabId = open ? open->id : sessionTabs_.createTab(deskId, target->address, target->name);
+    if (!open) sessionTabs_.getTab(tabId)->requirePairedDeskId = deskId;   // empty password: never a password fallback
+    switchToSessionTab(tabId, true, true);   // skips the reconnect when still connected to this PC
+
+    glideHome_.arrive(glideOpposite(edge));
+    glideSlideT_ = 0.0f;
+    glideSlideVel_ = 0.0f;
+    glide_ = GlideState{ deskId, edge, tabId, true, 0, prevPresence, glideAlong(shell_->desktopBounds(), edge, cursor), false, monitor };
+    shell_->invalidate();
+}
+
+void AppUi::glideHomeNow(uint64_t nowMs, const std::string& toast) {
+    network_.sendReleaseAllModifiers();   // first: no key stays held on the PC left behind
+    switchTab(ActiveTab::Dashboard);      // the remote picture slides out
+    if (isFullscreen_ && shell_->setFullscreen(false)) isFullscreen_ = false;   // macOS: before minimising or hiding
+    shell_->setWindowPresence(glide_->prevPresence);
+    shell_->warpCursor(glideReturnPoint(shell_->desktopBounds(), glide_->edge, glide_->along));
+    glide_->inside = false;
+    glide_->homeSinceMs = nowMs;
+    glideDwell_.reset();
+    if (!toast.empty()) showToast(toast, true);
+    shell_->invalidate();
 }
 
 void AppUi::applyWindowThemeAttribute() {
@@ -9791,17 +10027,18 @@ void AppUi::onTick() {
     auto vStats = network_.viewerStats();
     if (vStats.state == ViewerConnectionState::Connected &&
         prevViewerState_ != ViewerConnectionState::Connected) {
-        switchTab(ActiveTab::RemoteSession);
+        const bool glideHome = glide_ && !glide_->inside;   // sent home before it connected: stay where the user is
+        if (!glideHome) switchTab(ActiveTab::RemoteSession);
         // A new connection gets its own pairing offer, even when no tick saw the old one end
         pairOfferShown_ = showPairOfferModal_ = false;
         scaleMode_ = static_cast<ScaleMode>(std::clamp<int>(identity_.settings().defaultScaleMode, 0, 3));
         if (vStats.remoteAddress.find("127.0.0.1") != std::string::npos ||
             vStats.remoteDeskId == identity_.deskId()) {
             remoteInputEnabled_ = false;
-            showToast("Connected on same PC. View-Only enabled (F8 to toggle).");
+            if (!glideHome) showToast("Connected on same PC. View-Only enabled (F8 to toggle).");
         } else {
             remoteInputEnabled_ = true;
-            showToast("Connected to " + vStats.remoteHostname);
+            if (!glideHome) showToast("Connected to " + vStats.remoteHostname);
         }
 
         SessionTab* activeTab = sessionTabs_.activeTab();
@@ -9980,6 +10217,8 @@ void AppUi::onTick() {
         flushPendingMouseMove();
     }
 
+    glideTick(tickNow, vStats, hostStatus.active);
+
     ++idleTickCounter_;
     bool micMonitoringActive = (activeTab_ == ActiveTab::Settings && settingsSection_ == SettingsSection::AudioVoice && network_.isVoiceMonitoring());
     if (inLiveSession || toastActive || micMonitoringActive || activeTab_ == ActiveTab::Fleet || (idleTickCounter_ % 4 == 0)) {
@@ -10007,6 +10246,7 @@ void AppUi::onGraphicsLost() {
 }
 
 void AppUi::onCloseRequested() {
+    if (glide_ && glide_->inside) glideHomeNow(shell_->nowMs());   // leave full screen and restore the window first
     network_.disconnectViewer();
     hardResetViewerUiState();
 }
@@ -10221,7 +10461,7 @@ void AppUi::ensureAppIconImage() {
 std::vector<std::string> AppUi::snapshotStateNames() {
     return { "dashboard_light", "dashboard_dark", "theme_mid_blend", "settings_appearance", "settings_display",
              "settings_audio", "settings_permissions", "settings_2fa", "settings_network", "settings_privacy",
-             "settings_system", "settings_about", "session_view", "session_tabs_3", "drawer_file_transfer",
+             "settings_system", "settings_about", "settings_glide", "session_view", "session_tabs_3", "drawer_file_transfer",
              "drawer_file_manager", "drawer_sync", "chat_long_text", "modal_approval", "modal_totp", "modal_run_task",
              "modal_address_book", "modal_recording_player", "modal_omnibar", "toast", "tooltip",
              "modal_pair_offer", "settings_permissions_paired", "fleet_picker", "fleet_grid",
@@ -10265,7 +10505,7 @@ void AppUi::applySnapshotState(const std::string& name) {
         { "settings_audio", SettingsSection::AudioVoice }, { "settings_permissions", SettingsSection::Permissions },
         { "settings_2fa", SettingsSection::TwoFactorAuth }, { "settings_network", SettingsSection::NetworkRelay },
         { "settings_privacy", SettingsSection::CurtainPrivacy }, { "settings_system", SettingsSection::SystemService },
-        { "settings_about", SettingsSection::About },
+        { "settings_about", SettingsSection::About }, { "settings_glide", SettingsSection::Glide },
     };
 
     // Pairing states seed these two peers; clear them so no other state shows them

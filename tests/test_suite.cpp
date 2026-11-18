@@ -23,6 +23,7 @@
 #include "../src/ui/vk_codes.hpp"
 #include "../src/ui/platform_shell.hpp"
 #include "../src/ui/host_permissions.hpp"
+#include "../src/ui/glide.hpp"
 #if defined(__APPLE__)
 #include "../src/ui/canvas_cg.hpp"
 #include "mac_test_driver.hpp"
@@ -9246,13 +9247,31 @@ public:
     void showNotification(const std::string&, const std::string&) override {}
     void setTrayStatus(const std::string&) override {}
     void setFrameIntervalMs(unsigned) override {}
-    bool setFullscreen(bool) override { return true; }
+    bool fullscreen = false;
+    bool setFullscreen(bool on) override { fullscreen = on; return true; }
     void setDarkTitleBar(bool) override {}
     void quitApp() override {}
     bool relaunchElevated() override { return false; }
     void playAlertSound() override {}
     bool isWindowForeground() const override { return true; }
-    void bringToFront() override {}
+    int fronts = 0;
+    void bringToFront() override { ++fronts; }
+    std::optional<ui::Point> cursor;
+    ui::Rect desktop{0, 0, 1920, 1080};
+    std::vector<ui::Point> warps;
+    ui::WindowPresence presence = ui::WindowPresence::Shown;
+    std::optional<ui::Point> cursorScreenPos() const override { return cursor; }
+    ui::Rect desktopBounds() const override { return desktop; }
+    std::vector<ui::Rect> monitors;   // empty: the desktop is one monitor
+    ui::Rect monitorBoundsAt(ui::Point p) const override {
+        for (const ui::Rect& m : monitors)
+            if (p.x >= m.left && p.x < m.right && p.y >= m.top && p.y < m.bottom) return m;
+        return desktop;
+    }
+    void warpCursor(ui::Point p) override { warps.push_back(p); cursor = p; }
+    void moveWindowToMonitorAt(ui::Point) override {}
+    ui::WindowPresence windowPresence() const override { return presence; }
+    void setWindowPresence(ui::WindowPresence p) override { presence = p; }
     void setMouseCapture(bool) override {}
     bool isKeyDown(uint16_t) const override { return false; }
     void trackMouseLeave() override {}
@@ -10622,6 +10641,546 @@ void testFleetUi() {
     }
     for (const auto& c : cfgs) std::filesystem::remove(c, ec);
 }
+
+void testGlideLayout() {
+    std::cout << "[TEST 114] Glide layout: one edge per PC, saved, cleared when a pairing is forgotten, bad lines ignored..." << std::endl;
+    AppSettings s;
+    for (GlideEdge e : {GlideEdge::Left, GlideEdge::Right, GlideEdge::Top, GlideEdge::Bottom}) TEST_ASSERT(glidePcAt(s, e) == 0);
+    TEST_ASSERT(glidePcAt(s, GlideEdge::Off) == 0);
+    glidePlace(s, GlideEdge::Right, 111);
+    glidePlace(s, GlideEdge::Left, 111);
+    TEST_ASSERT(glidePcAt(s, GlideEdge::Right) == 0 && glidePcAt(s, GlideEdge::Left) == 111);
+    TEST_ASSERT(glideEdgeOf(s, 111) == GlideEdge::Left && glideEdgeOf(s, 999) == GlideEdge::Off);
+    glidePlace(s, GlideEdge::Left, 222);
+    TEST_ASSERT(glidePcAt(s, GlideEdge::Left) == 222 && glideEdgeOf(s, 111) == GlideEdge::Off);
+    glidePlace(s, GlideEdge::Left, 0);
+    TEST_ASSERT(glidePcAt(s, GlideEdge::Left) == 0);
+    TEST_ASSERT(glideOpposite(GlideEdge::Right) == GlideEdge::Left && glideOpposite(GlideEdge::Left) == GlideEdge::Right);
+    TEST_ASSERT(glideOpposite(GlideEdge::Top) == GlideEdge::Bottom && glideOpposite(GlideEdge::Bottom) == GlideEdge::Top);
+    TEST_ASSERT(glideOpposite(GlideEdge::Off) == GlideEdge::Off);
+
+    std::string cfg;
+    { IdentityManager probe(4253); cfg = probe.configFilePath(); }
+    std::error_code ec;
+    std::filesystem::remove(cfg, ec);
+    PairingKey hk;
+    TEST_ASSERT(hk.generate());
+    {
+        IdentityManager id(4253);
+        TEST_ASSERT(id.loadOrCreate());
+        AppSettings a = id.settings();
+        glidePlace(a, GlideEdge::Top, 111);
+        id.updateSettings(a);
+        id.save();
+    }
+    {
+        IdentityManager id(4253);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Top) == 111);
+        id.addPairedHost({333ULL, "Lab", hk.publicKey(), 1700000001ULL});
+        AppSettings a = id.settings();
+        glidePlace(a, GlideEdge::Bottom, 333);
+        id.updateSettings(a);
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Bottom) == 333);
+        TEST_ASSERT(id.removePairedHost(333));
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Bottom) == 0 && glidePcAt(id.settings(), GlideEdge::Top) == 111);
+    }
+    {
+        IdentityManager id(4253);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Bottom) == 0 && glidePcAt(id.settings(), GlideEdge::Top) == 111);
+    }
+    {
+        std::ofstream f(cfg, std::ios::app);
+        f << "glide_right=abc\n";
+    }
+    {
+        IdentityManager id(4253);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Right) == 0);
+    }
+    std::filesystem::remove(cfg, ec);
+}
+
+void testGlideEdges() {
+    std::cout << "[TEST 115] Glide edges: 1 px edge band, 10 % corner dead zones, 250 ms dwell once per rest, home arming, entry and return points..." << std::endl;
+    const ui::Rect b{0, 0, 1920, 1080};
+    TEST_ASSERT(glideEdgeAt(b, {1919, 540}) == GlideEdge::Right && glideEdgeAt(b, {0, 540}) == GlideEdge::Left);
+    TEST_ASSERT(glideEdgeAt(b, {960, 0}) == GlideEdge::Top && glideEdgeAt(b, {960, 1079}) == GlideEdge::Bottom);
+    TEST_ASSERT(glideEdgeAt(b, {960, 540}) == GlideEdge::Off);
+    TEST_ASSERT(glideEdgeAt(b, {1919, 100}) == GlideEdge::Off && glideEdgeAt(b, {1919, 1000}) == GlideEdge::Off);
+    TEST_ASSERT(glideEdgeAt(b, {100, 0}) == GlideEdge::Off && glideEdgeAt(b, {1919, 110}) == GlideEdge::Right);
+    TEST_ASSERT(glideEdgeAt(ui::Rect{-1920, 0, 0, 1080}, {-1920, 540}) == GlideEdge::Left);
+
+    GlideDwell d;
+    TEST_ASSERT(d.update(GlideEdge::Right, 0) == GlideEdge::Off && d.update(GlideEdge::Right, 249) == GlideEdge::Off);
+    TEST_ASSERT(d.update(GlideEdge::Right, 250) == GlideEdge::Right && d.update(GlideEdge::Right, 400) == GlideEdge::Off);
+    TEST_ASSERT(d.update(GlideEdge::Off, 500) == GlideEdge::Off && d.update(GlideEdge::Right, 600) == GlideEdge::Off);
+    TEST_ASSERT(d.update(GlideEdge::Right, 850) == GlideEdge::Right);
+    d.reset();
+    TEST_ASSERT(d.update(GlideEdge::Right, 0) == GlideEdge::Off && d.update(GlideEdge::Off, 100) == GlideEdge::Off);
+    TEST_ASSERT(d.update(GlideEdge::Right, 200) == GlideEdge::Off && d.update(GlideEdge::Right, 400) == GlideEdge::Off);
+    TEST_ASSERT(d.update(GlideEdge::Right, 450) == GlideEdge::Right);
+
+    GlideHome h;
+    h.arrive(GlideEdge::Left);
+    TEST_ASSERT(!h.update(b, {2, 540}, 0) && !h.update(b, {2, 540}, 1000));
+    TEST_ASSERT(!h.update(b, {60, 540}, 1500));
+    TEST_ASSERT(!h.update(b, {0, 540}, 2000) && h.update(b, {0, 540}, 2250));
+    TEST_ASSERT(!h.update(b, {0, 540}, 2300));
+    h.arrive(GlideEdge::Left);
+    TEST_ASSERT(!h.update(b, {60, 540}, 3000));
+    TEST_ASSERT(!h.update(b, {0, 50}, 3100) && !h.update(b, {0, 50}, 4100));
+
+    TEST_ASSERT(glidePaused(true, false, false, true) && glidePaused(false, true, false, true));
+    TEST_ASSERT(glidePaused(false, false, true, true) && glidePaused(false, false, false, false));
+    TEST_ASSERT(!glidePaused(false, false, false, true));
+
+    ui::Point e = glideEntryPoint(b, GlideEdge::Right, 0.5f);
+    TEST_ASSERT(e.x == 2.0f && e.y == 540.0f);
+    ui::Point r = glideReturnPoint(b, GlideEdge::Right, 0.5f);
+    TEST_ASSERT(r.x == 1917.0f && r.y == 540.0f);
+    TEST_ASSERT(glideAlong(b, GlideEdge::Right, {1919, 270}) == 0.25f);
+}
+
+void testGlideSettingsUi() {
+    std::cout << "[TEST 116] Glide settings: section renders the paired PCs and edge slots, Wayland note..." << std::endl;
+    IdentityManager id(4253);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    FakeShell shell;
+    shell.cursor = ui::Point{ 100.0f, 100.0f };
+    PairedPeer p;
+    p.hostname = "Office-PC-3";
+    p.deskId = 555000401;
+    p.pairedAtUnix = 1700000000;
+    id.addPairedHost(p);
+    p.hostname = "Reception";
+    p.deskId = 555000402;
+    id.addPairedHost(p);
+    AppSettings s = id.settings();
+    glidePlace(s, GlideEdge::Right, 555000402);
+    id.updateSettings(s);
+
+    const auto names = AppUi::snapshotStateNames();
+    TEST_ASSERT(std::find(names.begin(), names.end(), "settings_glide") != names.end());
+    const std::string glide = renderAppState(id, net, shell, "settings_glide");
+    TEST_ASSERT(glide.find("|Glide\n") != std::string::npos);
+    TEST_ASSERT(glide.find("|Push your mouse off a screen edge to control the paired PC you put there.") != std::string::npos);
+    TEST_ASSERT(glide.find("|Office-PC-3") != std::string::npos);
+    TEST_ASSERT(glide.find("|Reception") != std::string::npos);
+    TEST_ASSERT(glide.find("|Empty") != std::string::npos);
+    TEST_ASSERT(glide.find("|Pick a PC, then click an edge.") != std::string::npos);
+    TEST_ASSERT(glide.find("Glide needs X11.") == std::string::npos);
+    TEST_ASSERT(glide.find("Pair with a PC first") == std::string::npos);
+
+    {   // Click a PC, then an edge: it moves there; clicking an occupied edge with nothing picked clears it.
+        AppUi app(id, net, shell, "");
+        ui::RecordingCanvas rc;
+        app.applySnapshotState("settings_glide");
+        auto settle = [&] { for (int i = 0; i < 150; ++i) app.render(rc, 1280, 800, 1.0 / 60.0); };
+        auto click = [&](float x, float y) {
+            settle();
+            app.onMouseMove(x, y);
+            settle();
+            app.onMouseButton(MouseButtonId::Left, true, x, y);
+            settle();
+            app.onMouseButton(MouseButtonId::Left, false, x, y);
+            settle();
+        };
+        const float rowX = 990.0f, officeY = 198.0f, receptionY = 237.0f, leftX = 350.0f, slotY = 267.0f;
+        click(rowX, officeY);
+        click(leftX, slotY);
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Left) == 555000401);
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Right) == 555000402);
+        click(rowX, receptionY);
+        click(leftX, slotY);
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Left) == 555000402 && glidePcAt(id.settings(), GlideEdge::Right) == 0);
+        click(leftX, slotY);
+        TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Left) == 0);
+    }
+
+    shell.cursor = std::nullopt;
+    TEST_ASSERT(renderAppState(id, net, shell, "settings_glide")
+                    .find("|Glide needs X11. On Wayland, other PCs can still glide to this one.") != std::string::npos);
+
+    id.removePairedHost(555000401);
+    id.removePairedHost(555000402);
+    TEST_ASSERT(renderAppState(id, net, shell, "settings_glide")
+                    .find("|Pair with a PC first: connect to it normally and choose Pair.") != std::string::npos);
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
+void testGlideOut() {
+    std::cout << "[TEST 117] Glide out: a 250 ms push off a placed edge opens that paired PC full screen, dialled strictly; corners, short rests, unknown cursor, offline PCs and open sessions do not..." << std::endl;
+    IdentityManager id(4254);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    const uint64_t P = 555000501;
+    const uint16_t closedPort = 1;
+    const std::string target = "127.0.0.1:" + std::to_string(closedPort);
+    id.addPairedHost({P, "Reception", PairingKey::PublicKey{}, 1700000000ULL});
+    AppSettings s = id.settings();
+    glidePlace(s, GlideEdge::Right, P);
+    id.updateSettings(s);
+    DiscoveredPeer peer;
+    peer.deskId = P;
+    peer.hostname = "Reception";
+    peer.ip = "127.0.0.1";
+    peer.port = closedPort;
+    peer.viaRelay = false;
+    net.injectDiscoveredPeerForTest(peer);
+
+    struct Run { FakeShell shell; std::unique_ptr<AppUi> app; };   // app goes first, then its shell
+    auto fresh = [&](std::optional<ui::Point> cursor) {
+        auto r = std::make_unique<Run>();
+        r->shell.cursor = cursor;
+        r->app = std::make_unique<AppUi>(id, net, r->shell, "");
+        return r;
+    };
+    auto tick = [](Run& r, uint64_t ms) { r.shell.clock = ms; r.app->onTick(); };
+    auto tabs = [](Run& r) { return r.app->sessionTabsForTest().tabCount(); };
+
+    {   // Rest 250 ms on the right edge: full screen, in front, one strict tab, cursor 2 px inside the remote's left edge.
+        auto r = fresh(ui::Point{1919, 540});
+        tick(*r, 0);
+        TEST_ASSERT(tabs(*r) == 0 && !r->shell.fullscreen);
+        tick(*r, 300);
+        TEST_ASSERT(r->shell.fullscreen);
+        TEST_ASSERT(r->shell.fronts >= 1);
+        TEST_ASSERT(r->app->isGlidingForTest());
+        TEST_ASSERT(tabs(*r) == 1);
+        const SessionTab& t = r->app->sessionTabsForTest().tabs().front();
+        TEST_ASSERT(t.targetInput == target);
+        TEST_ASSERT(t.requirePairedDeskId == P);
+        TEST_ASSERT(t.password.empty());
+        TEST_ASSERT(!r->shell.warps.empty() && r->shell.warps.back().x == 2 && r->shell.warps.back().y == 540);
+        net.disconnectViewer();   // the engine is shared with the runs below
+    }
+    {   // A corner never triggers.
+        auto r = fresh(ui::Point{1919, 50});
+        for (uint64_t ms : {0, 300, 600, 1000}) tick(*r, ms);
+        TEST_ASSERT(tabs(*r) == 0 && !r->shell.fullscreen && r->shell.warps.empty());
+    }
+    {   // Leaving before 250 ms cancels.
+        auto r = fresh(ui::Point{1919, 540});
+        tick(*r, 0);
+        tick(*r, 200);
+        r->shell.cursor = ui::Point{1000, 540};
+        tick(*r, 300);
+        tick(*r, 600);
+        TEST_ASSERT(tabs(*r) == 0 && !r->shell.fullscreen);
+    }
+    {   // No cursor position (Wayland): never.
+        auto r = fresh(std::nullopt);
+        tick(*r, 0);
+        tick(*r, 300);
+        TEST_ASSERT(tabs(*r) == 0 && !r->shell.fullscreen);
+    }
+    {   // A normal session open: Glide pauses.
+        auto r = fresh(ui::Point{1919, 540});
+        r->app->applySnapshotState("session_tabs_3");
+        tick(*r, 0);
+        tick(*r, 300);
+        TEST_ASSERT(tabs(*r) == 3 && !r->shell.fullscreen && !r->app->isGlidingForTest());
+    }
+    {   // Bounds are read every tick: a screen added on the right moves the edge.
+        auto r = fresh(ui::Point{1000, 540});
+        tick(*r, 0);
+        r->shell.desktop = ui::Rect{0, 0, 3840, 1080};
+        r->shell.cursor = ui::Point{1919, 540};
+        tick(*r, 100);
+        tick(*r, 400);
+        TEST_ASSERT(tabs(*r) == 0);
+        r->shell.cursor = ui::Point{3839, 540};
+        tick(*r, 500);
+        tick(*r, 800);
+        TEST_ASSERT(tabs(*r) == 1 && r->shell.fullscreen);
+    }
+    {   // Seen only through the relay: offline, notified once a minute at most, mouse stays home.
+        peer.viaRelay = true;
+        net.injectDiscoveredPeerForTest(peer);
+        auto r = fresh(ui::Point{1919, 540});
+        r->app->setNotificationManager(std::make_unique<NotificationManager>());
+        NotificationManager& n = *r->app->notifications();
+        n.setMuted(true);
+        n.notify(NotificationType::ChatMessage, "", "", id.settings());   // marker: a glide notice replaces it
+        tick(*r, 0);
+        tick(*r, 300);
+        TEST_ASSERT(tabs(*r) == 0 && !r->shell.fullscreen && r->shell.warps.empty());
+        TEST_ASSERT(n.lastNotificationType() == NotificationType::GeneralInfo);
+        n.notify(NotificationType::ChatMessage, "", "", id.settings());
+        r->shell.cursor = ui::Point{1000, 540};
+        tick(*r, 400);
+        r->shell.cursor = ui::Point{1919, 540};
+        tick(*r, 10000);
+        tick(*r, 10300);
+        TEST_ASSERT(tabs(*r) == 0);
+        TEST_ASSERT(n.lastNotificationType() == NotificationType::ChatMessage);
+    }
+    net.disconnectViewer();
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
+void testGlideHome() {
+    std::cout << "[TEST 118] Glide home: push back or F11 goes home and releases modifiers; failures go home with a toast; idle glide sessions close after a minute; a normal session drops the glide..." << std::endl;
+    std::error_code ec;
+    std::vector<std::string> cfgs;
+    for (int inst : {4255, 4355, 4356, 4357}) {
+        IdentityManager probe(inst);
+        cfgs.push_back(probe.configFilePath());
+        std::filesystem::remove(cfgs.back(), ec);
+    }
+    {
+        // P (right) and Q (left) are paired loopback hosts; R (bottom) has forgotten this PC; nothing listens for F (top).
+        IdentityManager id(4255), pId(4355), qId(4356), rId(4357);
+        TEST_ASSERT(id.loadOrCreate() && pId.loadOrCreate() && qId.loadOrCreate() && rId.loadOrCreate());
+        pId.setListenPort(51090);
+        qId.setListenPort(51092);
+        rId.setListenPort(51094);
+        for (IdentityManager* h : {&pId, &qId}) h->addPairedViewer({id.deskId(), "V", id.pairingKey().publicKey(), 1});
+        const uint64_t P = pId.deskId(), Q = qId.deskId(), R = rId.deskId(), F = 555000502;
+        id.addPairedHost({P, "Reception", pId.pairingKey().publicKey(), 1});
+        id.addPairedHost({Q, "Lab", qId.pairingKey().publicKey(), 1});
+        id.addPairedHost({R, "Office", rId.pairingKey().publicKey(), 1});
+        id.addPairedHost({F, "Kiosk", PairingKey::PublicKey{}, 1});
+        AppSettings s = id.settings();
+        glidePlace(s, GlideEdge::Right, P);
+        glidePlace(s, GlideEdge::Left, Q);
+        glidePlace(s, GlideEdge::Bottom, R);
+        glidePlace(s, GlideEdge::Top, F);
+        id.updateSettings(s);
+
+        NetworkEngine hostP(pId), hostQ(qId), hostR(rId), net(id);
+        TEST_ASSERT(hostP.start() && hostQ.start() && hostR.start() && net.startViewerOnly());
+        struct Seen { uint64_t desk; const char* name; uint16_t port; };
+        for (const Seen& seen : {Seen{P, "Reception", 51090}, Seen{Q, "Lab", 51092}, Seen{R, "Office", 51094}, Seen{F, "Kiosk", 1}}) {
+            DiscoveredPeer peer;
+            peer.deskId = seen.desk;
+            peer.hostname = seen.name;
+            peer.ip = "127.0.0.1";
+            peer.port = seen.port;
+            peer.viaRelay = false;
+            net.injectDiscoveredPeerForTest(peer);
+        }
+        std::mutex m;
+        std::vector<std::pair<uint16_t, bool>> keys;
+        hostP.setHostKeySinkForTest([&](uint16_t vk, bool down) { std::lock_guard<std::mutex> lk(m); keys.emplace_back(vk, down); });
+        auto releasedAll = [&] {
+            std::lock_guard<std::mutex> lk(m);
+            return std::find(keys.begin(), keys.end(), std::make_pair(uint16_t(0), false)) != keys.end();
+        };
+        auto waitFor = [](const std::function<bool()>& cond, int ms) {
+            for (int i = 0; i < ms / 50 && !cond(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            return cond();
+        };
+
+        struct Run { FakeShell shell; std::unique_ptr<AppUi> app; };   // app goes first, then its shell
+        auto fresh = [&] {
+            auto r = std::make_unique<Run>();
+            r->shell.presence = ui::WindowPresence::Minimized;
+            r->shell.cursor = ui::Point{1000, 540};
+            r->app = std::make_unique<AppUi>(id, net, r->shell, "");
+            return r;
+        };
+        auto tick = [](Run& r, uint64_t ms) { r.shell.clock = ms; r.app->onTick(); };
+        auto tabs = [](Run& r) { return r.app->sessionTabsForTest().tabCount(); };
+        auto frontTab = [](Run& r) { return r.app->sessionTabsForTest().tabs().front(); };
+        auto push = [&](Run& r, ui::Point edge, uint64_t ms) { r.shell.cursor = edge; tick(r, ms); tick(r, ms + 300); };
+        auto connected = [&](Run& r) { r.app->onTick(); return net.viewerStats().state == ViewerConnectionState::Connected; };
+        auto wentHome = [&](Run& r) { r.app->onTick(); return !r.app->isGlidingForTest(); };
+        auto f11 = [](Run& r) { r.app->onKey({VK_F11, 0x57, true, false}); r.app->onKey({VK_F11, 0x57, false, false}); };
+        auto atHome = [](Run& r, ui::Point back) {
+            return !r.app->isGlidingForTest() && !r.shell.fullscreen && r.shell.presence == ui::WindowPresence::Minimized &&
+                   !r.shell.warps.empty() && r.shell.warps.back().x == back.x && r.shell.warps.back().y == back.y;
+        };
+        auto toastShown = [](Run& r, const std::string& text) {
+            ui::RecordingCanvas rc;
+            for (int i = 0; i < 30; ++i) r.app->render(rc, 1280, 800, 1.0 / 60.0);
+            return rc.serialize().find("|" + text) != std::string::npos;
+        };
+        const ui::Point right{1919, 540}, left{0, 540}, top{960, 0}, bottom{960, 1079}, backRight{1917, 540};
+
+        {   // F11 with no glide: the existing full-screen toggle.
+            auto r = fresh();
+            f11(*r);
+            TEST_ASSERT(r->shell.fullscreen);
+            f11(*r);
+            TEST_ASSERT(!r->shell.fullscreen && tabs(*r) == 0);
+        }
+        {
+            auto r = fresh();
+            push(*r, right, 0);
+            TEST_ASSERT(r->app->isGlidingForTest() && r->shell.fullscreen && r->shell.presence == ui::WindowPresence::Shown);
+            TEST_ASSERT(tabs(*r) == 1);
+            const uint32_t tabP = frontTab(*r).id;
+            TEST_ASSERT(waitFor([&] { return connected(*r); }, 5000));
+
+            // glideHomeReleasesModifiers: Ctrl held, F11 goes home and the PC sees release-all.
+            { std::lock_guard<std::mutex> lk(m); keys.clear(); }
+            r->app->onKey({VK_CONTROL, 0x1D, true, false});
+            f11(*r);
+            TEST_ASSERT(atHome(*r, backRight));
+            TEST_ASSERT(waitFor(releasedAll, 2000));
+            r->app->onKey({VK_CONTROL, 0x1D, false, false});
+            TEST_ASSERT(tabs(*r) == 1);   // the session stays open for a quick return
+
+            // Quick return within the minute: the same tab, still connected, no new tab.
+            push(*r, right, 5000);
+            TEST_ASSERT(r->app->isGlidingForTest() && r->shell.fullscreen);
+            TEST_ASSERT(tabs(*r) == 1 && frontTab(*r).id == tabP);
+            TEST_ASSERT(net.viewerStats().state == ViewerConnectionState::Connected);
+
+            // Home edge: resting at the entry point does not go home; moving away arms it, 250 ms back at the edge does.
+            r->shell.cursor = ui::Point{2, 540};
+            for (uint64_t ms = 5400; ms <= 6400; ms += 100) tick(*r, ms);
+            TEST_ASSERT(r->app->isGlidingForTest());
+            r->shell.cursor = ui::Point{60, 540};
+            tick(*r, 6500);
+            r->shell.cursor = ui::Point{0, 540};
+            for (uint64_t ms = 6600; ms <= 6900; ms += 50) tick(*r, ms);
+            TEST_ASSERT(atHome(*r, backRight));
+
+            // Hidden mid-glide (tray, Win+D): home, modifiers released, and the window stays hidden.
+            push(*r, right, 7000);
+            TEST_ASSERT(r->app->isGlidingForTest() && r->shell.fullscreen && frontTab(*r).id == tabP);
+            tick(*r, 7305);   // the window is seen shown
+            { std::lock_guard<std::mutex> lk(m); keys.clear(); }
+            r->shell.presence = ui::WindowPresence::Hidden;
+            tick(*r, 7310);
+            TEST_ASSERT(!r->app->isGlidingForTest() && !r->shell.fullscreen && r->shell.presence == ui::WindowPresence::Hidden);
+            TEST_ASSERT(tabs(*r) == 1 && waitFor(releasedAll, 2000));
+            // Minimised mid-glide; a minimised state the shell reports late, before the window was ever seen shown, is ignored.
+            push(*r, right, 7400);
+            TEST_ASSERT(r->app->isGlidingForTest() && r->shell.presence == ui::WindowPresence::Shown);
+            r->shell.presence = ui::WindowPresence::Minimized;
+            tick(*r, 7710);
+            TEST_ASSERT(r->app->isGlidingForTest());
+            r->shell.presence = ui::WindowPresence::Shown;
+            tick(*r, 7720);
+            r->shell.presence = ui::WindowPresence::Minimized;
+            tick(*r, 7730);
+            TEST_ASSERT(!r->app->isGlidingForTest() && !r->shell.fullscreen && r->shell.presence == ui::WindowPresence::Minimized);
+            TEST_ASSERT(tabs(*r) == 1 && frontTab(*r).id == tabP);
+
+            // Idle: home at T, the tab lives until T+60 s.
+            push(*r, right, 8000);
+            TEST_ASSERT(r->app->isGlidingForTest() && tabs(*r) == 1 && frontTab(*r).id == tabP);
+            f11(*r);   // T = 8300
+            tick(*r, 8300 + 59999);
+            TEST_ASSERT(tabs(*r) == 1);
+            tick(*r, 8300 + 60000);
+            TEST_ASSERT(tabs(*r) == 0);
+            TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active; }, 4000));
+
+            // Switch edge: Q on the left; going there drops P's glide session first.
+            push(*r, right, 70000);
+            const uint32_t tabP2 = frontTab(*r).id;
+            TEST_ASSERT(tabP2 != tabP && waitFor([&] { return connected(*r); }, 5000));
+            f11(*r);
+            r->shell.cursor = left;
+            tick(*r, 71000);
+            tick(*r, 71300);
+            TEST_ASSERT(r->app->isGlidingForTest() && tabs(*r) == 1);
+            TEST_ASSERT(!r->app->sessionTabsForTest().getTab(tabP2) && frontTab(*r).requirePairedDeskId == Q);
+            TEST_ASSERT(waitFor([&] { return connected(*r) && net.viewerStats().remoteDeskId == Q; }, 5000));
+
+            // glideDroppedByNormalSession: a normal connect closes the glide tab and ends the glide.
+            f11(*r);
+            const uint32_t tabQ = frontTab(*r).id;
+            r->app->onText(std::string("\x01") + "123456789\r");
+            TEST_ASSERT(!r->app->isGlidingForTest() && tabs(*r) == 1);
+            TEST_ASSERT(!r->app->sessionTabsForTest().getTab(tabQ) && frontTab(*r).requirePairedDeskId == 0);
+            net.disconnectViewer();
+        }
+        TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active && !hostQ.hostSessionStatus().active; }, 4000));
+        {   // glideFailureGoesHome: nothing listens. Closing the window mid-glide also goes home first.
+            auto r = fresh();
+            push(*r, top, 0);
+            TEST_ASSERT(r->app->isGlidingForTest());
+            r->app->onCloseRequested();
+            TEST_ASSERT(atHome(*r, ui::Point{960, 2}));
+            push(*r, top, 1000);
+            TEST_ASSERT(r->app->isGlidingForTest() && r->shell.fullscreen);
+            TEST_ASSERT(waitFor([&] { return wentHome(*r); }, 5000));
+            TEST_ASSERT(atHome(*r, ui::Point{960, 2}) && tabs(*r) == 0);
+            TEST_ASSERT(toastShown(*r, "Kiosk: "));
+        }
+        {   // The host has forgotten this PC.
+            auto r = fresh();
+            push(*r, bottom, 0);
+            TEST_ASSERT(waitFor([&] { return wentHome(*r); }, 5000));
+            TEST_ASSERT(tabs(*r) == 0 && !r->shell.fullscreen);
+            TEST_ASSERT(toastShown(*r, "Office no longer trusts this PC; pair again by connecting normally"));
+        }
+        {   // Busy: the same paired viewer holds P's one session from elsewhere.
+            NetworkEngine other(id);
+            TEST_ASSERT(other.startViewerOnly());
+            other.connectToRemote("127.0.0.1:51090", "", P);
+            TEST_ASSERT(waitFor([&] { return other.viewerStats().state == ViewerConnectionState::Connected; }, 5000));
+            auto r = fresh();
+            push(*r, right, 0);
+            TEST_ASSERT(waitFor([&] { return wentHome(*r); }, 5000));
+            TEST_ASSERT(tabs(*r) == 0 && !r->shell.fullscreen);
+            TEST_ASSERT(toastShown(*r, "Reception is in use by someone else"));
+            other.disconnectViewer();
+        }
+        TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active; }, 4000));
+        {   // Two monitors: the glide window fills the right one, so going home means crossing the seam into the left one.
+            auto r = fresh();
+            r->shell.desktop = ui::Rect{0, 0, 3840, 1080};
+            r->shell.monitors = {ui::Rect{0, 0, 1920, 1080}, ui::Rect{1920, 0, 3840, 1080}};
+            r->app->onMouseMove(1000, 500);   // stale window-relative position must not arm the home edge
+            push(*r, ui::Point{3839, 540}, 0);
+            TEST_ASSERT(r->app->isGlidingForTest() && r->shell.warps.back().x == 1922);
+            for (uint64_t ms = 400; ms <= 1400; ms += 100) tick(*r, ms);
+            TEST_ASSERT(r->app->isGlidingForTest());   // resting at the entry point does not bounce back
+            r->shell.cursor = ui::Point{2200, 540};
+            tick(*r, 1500);
+            r->shell.cursor = ui::Point{1900, 540};   // past the seam, nowhere near the window's own edge
+            for (uint64_t ms = 1600; ms <= 1900; ms += 50) tick(*r, ms);
+            TEST_ASSERT(atHome(*r, ui::Point{3837, 540}));
+            net.disconnectViewer();
+        }
+        TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active; }, 4000));
+        {   // Sent home before the connection finished: it must not pull the window back to the live session.
+            auto r = fresh();
+            push(*r, right, 0);
+            f11(*r);
+            TEST_ASSERT(!r->app->isGlidingForTest());
+            TEST_ASSERT(waitFor([&] { return connected(*r); }, 5000));
+            r->app->onTick();
+            r->app->onTick();
+            TEST_ASSERT(r->app->activeTabForTest() == ActiveTab::Dashboard);
+            TEST_ASSERT(!toastShown(*r, "Connected on same PC") && !toastShown(*r, "Connected to"));
+            net.disconnectViewer();
+        }
+        TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active; }, 4000));
+        {   // Idle close: watching the live session counts as use, and closing never throws someone out of Settings.
+            auto r = fresh();
+            push(*r, right, 0);
+            TEST_ASSERT(waitFor([&] { return connected(*r); }, 5000));
+            f11(*r);   // home at 300
+            r->app->switchTabForTest(ActiveTab::RemoteSession);
+            tick(*r, 59000);
+            r->app->switchTabForTest(ActiveTab::Settings);
+            tick(*r, 61000);
+            TEST_ASSERT(tabs(*r) == 1);   // without the refresh it would have closed at 60300
+            tick(*r, 118999);
+            TEST_ASSERT(tabs(*r) == 1);
+            tick(*r, 119000);
+            TEST_ASSERT(tabs(*r) == 0 && r->app->activeTabForTest() == ActiveTab::Settings);
+            TEST_ASSERT(!toastShown(*r, "All session tabs closed"));
+            net.disconnectViewer();
+        }
+        net.disconnectViewer();
+        hostP.setHostKeySinkForTest(nullptr);
+    }
+    for (const auto& c : cfgs) std::filesystem::remove(c, ec);
+}
+
 
 void testPairingOfferEveryConnection() {
     std::cout << "[TEST 113] Pairing offer: asked again on a new connection dialled while the last one was up..." << std::endl;
@@ -12639,6 +13198,11 @@ int main(int argc, char** argv) {
         testFleetManager(); std::cout << "Test 111 done\n" << std::flush;
         testFleetUi(); std::cout << "Test 112 done\n" << std::flush;
         testPairingOfferEveryConnection(); std::cout << "Test 113 done\n" << std::flush;
+        testGlideLayout(); std::cout << "Test 114 done\n" << std::flush;
+        testGlideEdges(); std::cout << "Test 115 done\n" << std::flush;
+        testGlideSettingsUi(); std::cout << "Test 116 done\n" << std::flush;
+        testGlideOut(); std::cout << "Test 117 done\n" << std::flush;
+        testGlideHome(); std::cout << "Test 118 done\n" << std::flush;
 #if defined(__APPLE__)
         testMacCaptureStreamStart(); std::cout << "Test 85 done\n" << std::flush;
         testMacAudioPaths(); std::cout << "Test 102 done\n" << std::flush;

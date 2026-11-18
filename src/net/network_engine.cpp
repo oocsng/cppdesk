@@ -1227,6 +1227,13 @@ std::vector<DiscoveredPeer> NetworkEngine::discoveredPeers() const {
     return active;
 }
 
+void NetworkEngine::injectDiscoveredPeerForTest(const DiscoveredPeer& p) {
+    std::lock_guard<std::mutex> lock(peersMutex_);
+    std::erase_if(peers_, [&](const DiscoveredPeer& e) { return e.deskId == p.deskId; });
+    peers_.push_back(p);
+    peers_.back().lastSeenTickMs = nowTickMs();
+}
+
 void NetworkEngine::sendDiscoveryQuery(uint64_t targetDeskId) {
     SOCKET us = toWinSock(udpSock_);
     if (us == INVALID_SOCKET) return;

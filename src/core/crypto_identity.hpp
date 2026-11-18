@@ -80,6 +80,9 @@ struct AppSettings {
 
     // LAN Fleet: lets other PCs pair with this one (config key allow_pairing); off until the user turns it on
     bool          allowPairing = false;
+
+    // Glide: desk ID of the paired PC placed past each screen edge (config keys glide_left/right/top/bottom); 0 = nothing placed
+    uint64_t      glideLeft = 0, glideRight = 0, glideTop = 0, glideBottom = 0;
 };
 
 class CryptoUtils {

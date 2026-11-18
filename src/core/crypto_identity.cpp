@@ -705,6 +705,14 @@ bool IdentityManager::loadOrCreate() {
                 settings_.privacyCloakStyle = static_cast<uint8_t>(std::atoi(val.c_str()));
             } else if (key == "allow_pairing") {
                 settings_.allowPairing = (val == "1" || val == "true");
+            } else if (key == "glide_left") {
+                try { settings_.glideLeft = std::stoull(val); } catch (...) {}
+            } else if (key == "glide_right") {
+                try { settings_.glideRight = std::stoull(val); } catch (...) {}
+            } else if (key == "glide_top") {
+                try { settings_.glideTop = std::stoull(val); } catch (...) {}
+            } else if (key == "glide_bottom") {
+                try { settings_.glideBottom = std::stoull(val); } catch (...) {}
             } else if (key == "pair_key") {
                 auto bytes = CryptoUtils::fromHex(val);
                 PairingKey::KeyPair kp{};
@@ -866,6 +874,10 @@ bool IdentityManager::save() const {
     out << "privacy_cloak_keywords=" << sanitizeIniValue(settings_.privacyCloakKeywords) << "\n";
     out << "privacy_cloak_style=" << static_cast<int>(settings_.privacyCloakStyle) << "\n";
     out << "allow_pairing=" << (settings_.allowPairing ? "1" : "0") << "\n";
+    out << "glide_left=" << settings_.glideLeft << "\n";
+    out << "glide_right=" << settings_.glideRight << "\n";
+    out << "glide_top=" << settings_.glideTop << "\n";
+    out << "glide_bottom=" << settings_.glideBottom << "\n";
     if (pairingKey_.isValid()) {
         auto kp = pairingKey_.exportKeyPair();
         out << "pair_key=" << CryptoUtils::toHex(kp.data(), kp.size()) << "\n";
@@ -941,7 +953,11 @@ bool IdentityManager::removePairedViewer(uint64_t deskId) {
 bool IdentityManager::removePairedHost(uint64_t deskId) {
     bool removed;
     { std::lock_guard<std::mutex> lock(pairMutex_); removed = erasePeer(pairedHosts_, deskId); }
-    if (removed) save();
+    if (removed) {
+        for (uint64_t* g : {&settings_.glideLeft, &settings_.glideRight, &settings_.glideTop, &settings_.glideBottom})
+            if (*g == deskId) *g = 0;
+        save();
+    }
     return removed;
 }
 
