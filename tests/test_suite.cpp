@@ -13119,6 +13119,39 @@ void testMacAudioPaths() {
 
 } // namespace
 
+void testRecentCardButtonsClickable() {
+    std::cout << "[TEST 121] Dashboard: the remove button on a recent-desk card removes it instead of connecting..." << std::endl;
+    std::error_code ec;
+    IdentityManager id(4371);
+    std::filesystem::remove(id.configFilePath(), ec);
+    TEST_ASSERT(id.loadOrCreate());
+    id.addOrUpdateRecentSession(987654321ull, "Office", "127.0.0.1:1");   // fixed-port-ok: nothing may be dialled
+    NetworkEngine net(id);
+    FakeShell shell;
+    AppUi app(id, net, shell);
+    ui::RecordingCanvas rc;
+    auto frame = [&] { for (int i = 0; i < 30; ++i) app.render(rc, 1280, 800, 1.0 / 60.0); return rc.serialize(); };
+    float t = 0, r = 0;
+    std::istringstream in(frame());
+    for (std::string line; std::getline(in, line);) {   // the card's own Connect button is 86 wide, unlike the Remote Desk one
+        const std::string tail = "|Connect";
+        if (line.rfind("drawText ", 0) != 0 || line.size() < tail.size() ||
+            line.compare(line.size() - tail.size(), std::string::npos, tail) != 0) continue;
+        float l = 0, tt = 0, rr = 0, b = 0;
+        std::istringstream(line.substr(9)) >> l >> tt >> rr >> b;
+        if (std::fabs((rr - l) - 86.0f) < 1.0f) { t = tt; r = rr; }
+    }
+    TEST_ASSERT(r > 0.0f);
+    const float x = r - 10.0f, y = t - 21.0f;   // centre of the card's X button
+    app.onMouseMove(x, y);
+    frame();
+    app.onMouseButton(MouseButtonId::Left, true, x, y);
+    app.onMouseButton(MouseButtonId::Left, false, x, y);
+    frame();
+    TEST_ASSERT(id.recentSessions().empty());
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
 void testOsAssignedPorts() {
     std::cout << "[TEST 120] Test listeners: OS-assigned ports are recorded and reachable; a configured port 0 reports the real port..." << std::endl;
     setOsAssignedPortsForTest(true);
@@ -13311,6 +13344,7 @@ int main(int argc, char** argv) {
         testD2DCanvas(); std::cout << "Test 68 done\n" << std::flush;
 #endif
         testOsAssignedPorts(); std::cout << "Test 120 done\n" << std::flush;
+        testRecentCardButtonsClickable(); std::cout << "Test 121 done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
