@@ -4449,6 +4449,7 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
                        network_.pushLocalClipboardNow();
                        showToast("Clipboard synced");
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+        y += 42.0f;
         double activeBw = network_.fileTransferManager().aggregateActiveBandwidthBps();
         std::string xferHeader = "TRANSFERS";
         if (activeBw > 0.0) {

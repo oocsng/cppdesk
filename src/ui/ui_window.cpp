@@ -340,7 +340,7 @@ public:
     void showNotification(const std::string&, const std::string&) override {}
     void setTrayStatus(const std::string&) override {}
 
-    bool has(ui::Capability) const override { return true; }
+    bool has(ui::Capability c) const override { return c != ui::Capability::HostPermissions; }   // macOS-only
 
 private:
     CppDeskWindow& w_;
