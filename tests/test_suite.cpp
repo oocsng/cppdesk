@@ -320,7 +320,9 @@ void testEndToEndSessionAndFileTransfer() {
     TEST_ASSERT(viewerNet.start());
 
     // Wait briefly for UDP LAN discovery / Relay registration
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
+    // dial once it is registered, not after a fixed pause.
+    for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Connect Viewer -> Host using the formatted 9-digit Desk ID ("XXX XXX XXX") and Unattended Password
     std::string targetIdStr = hostIdentity.formattedDeskId();
@@ -12274,7 +12276,9 @@ void testHostEndsSessionWhenSharingEnds() {
         TEST_ASSERT(hostNet.start());
         hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
         TEST_ASSERT(viewerNet.start());
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
+        // dial once it is registered, not after a fixed pause.
+        for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
         TEST_ASSERT(viewerNet.connectToRemote(hostId.formattedDeskId(), "TestPass99"));
 
         if (endAfterFrames) {   // the desktop ends the sharing while the viewer watches
@@ -12846,7 +12850,9 @@ void testHostSoundOverTheSession() {
         TEST_ASSERT(hostNet.start());
         hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
         TEST_ASSERT(viewerNet.start());
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
+        // dial once it is registered, not after a fixed pause.
+        for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
         TEST_ASSERT(viewerNet.connectToRemote(hostId->formattedDeskId(), "TestPass99"));
 
         auto framesPlayed = [&] {
@@ -12934,7 +12940,9 @@ void testHostSoundOverTheSession() {
         TEST_ASSERT(hostNet.start());
         hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
         TEST_ASSERT(viewerNet.start());
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
+        // dial once it is registered, not after a fixed pause.
+        for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
         TEST_ASSERT(viewerNet.connectToRemote(hostId->formattedDeskId(), "TestPass99"));
         uint64_t seq = 0;
         std::vector<uint8_t> frame;
@@ -12979,7 +12987,9 @@ void testMuteStateAndHostMicSign() {
     TEST_ASSERT(hostNet.start());
     hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
     TEST_ASSERT(viewerNet.start());
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
+    // dial once it is registered, not after a fixed pause.
+    for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     auto connected = [&] { return viewerNet.viewerStats().state == ViewerConnectionState::Connected; };
     auto sessionEnded = [&] { return !hostNet.hostSessionStatus().active; };
