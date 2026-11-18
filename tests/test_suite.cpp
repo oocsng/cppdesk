@@ -12317,7 +12317,10 @@ void testHostEndsSessionWhenSharingEnds() {
             int w = 0, h = 0;
             CursorState cur{};
             TEST_ASSERT(waitUntil([&] { return viewerNet.copyLatestViewerFrame(seq, frame, w, h, cur) && w > 0; }, 10000));
-            mark("first frame seen; emitSessionClosed");
+            // Frames can start before the portal dialog is answered (the test source does not wait for it), so a first frame
+            // does not mean the portal session exists yet. End it only once it is running, or there is nothing to end.
+            TEST_ASSERT(waitUntil([&] { return hostNet.shareNotice().state == ShareState::Running; }, 10000));
+            mark("first frame seen and sharing running; emitSessionClosed");
             fake.emitSessionClosed();
         }
         // The viewer is told why and stays disconnected: it does not reconnect (which would ask the host's desktop again)
