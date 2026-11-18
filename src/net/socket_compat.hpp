@@ -53,6 +53,11 @@ inline void socket_close(socket_t s) {
     }
 }
 
+// Wakes a thread blocked on the socket without releasing the handle; the thread that owns it closes it.
+inline void socket_shutdown(socket_t s) {
+    if (s != INVALID_SOCKET_VAL) shutdown(s, SD_BOTH);
+}
+
 inline bool socket_set_nonblocking(socket_t s, bool nonblock) {
     u_long mode = nonblock ? 1 : 0;
     return ioctlsocket(s, FIONBIO, &mode) == 0;
@@ -96,6 +101,11 @@ inline void socket_close(socket_t s) {
         shutdown(s, SHUT_RDWR);
         close(s);
     }
+}
+
+// Wakes a thread blocked on the socket without releasing the handle; the thread that owns it closes it.
+inline void socket_shutdown(socket_t s) {
+    if (s != INVALID_SOCKET_VAL) shutdown(s, SHUT_RDWR);
 }
 
 inline bool socket_set_nonblocking(socket_t s, bool nonblock) {

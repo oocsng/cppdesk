@@ -742,8 +742,10 @@ void RelayServer::stop() {
     closeWinSock(listenSock_);
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // Only wake each host thread: it closes its own socket when it leaves, and a second close here could land on a
+        // handle another connection has been given since.
         for (auto& h : hosts_) {
-            closeWinSock(h.controlSock);
+            socket_shutdown(toWinSock(h.controlSock));
         }
         hosts_.clear();
         for (auto& b : bridges_) {
@@ -873,7 +875,9 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
                 hosts_.erase(
                     std::remove_if(hosts_.begin(), hosts_.end(), [&](RegisteredHost& h) {
                         if (h.deskId == deskId) {
-                            closeWinSock(h.controlSock);
+                            // Wake the old registration's thread but leave the close to it: closing here too would hit
+                            // whatever connection has reused that handle number by the time the thread wakes.
+                            socket_shutdown(toWinSock(h.controlSock));
                             return true;
                         }
                         return false;
