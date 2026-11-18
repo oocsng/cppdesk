@@ -29,3 +29,7 @@ __pycache__/
 *_running.exe
 *_prev.exe
 docs/superpowers/
+
+# Windows build output (shipped through Releases, not git)
+CppDesk.exe
+CppDeskTests.exe

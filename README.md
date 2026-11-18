@@ -176,7 +176,7 @@ cmake --build build --config Release
 ## Project structure
 
 ```text
-├── CppDesk.exe                   # Standalone portable Windows executable
+├── CppDesk.exe                   # Windows build output of build.ps1 (not in git; download it from Releases)
 ├── build.ps1                     # Windows build and test automation script
 ├── CMakeLists.txt                # Cross-platform CMake build configuration
 ├── src/
