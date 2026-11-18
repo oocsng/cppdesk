@@ -320,7 +320,9 @@ void testEndToEndSessionAndFileTransfer() {
     TEST_ASSERT(viewerNet.start());
 
     // Wait briefly for UDP LAN discovery / Relay registration
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
+    // dial once it is registered, not after a fixed pause.
+    for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Connect Viewer -> Host using the formatted 9-digit Desk ID ("XXX XXX XXX") and Unattended Password
     std::string targetIdStr = hostIdentity.formattedDeskId();
@@ -1311,7 +1313,7 @@ void testAutoUpdaterAndProtocolV3() {
     TEST_ASSERT(PROTOCOL_MAGIC == 0x43505044); // "CPPD"
     TEST_ASSERT(RELAY_MAGIC == 0x4344534B);    // "CDSK"
     TEST_ASSERT(PROTOCOL_VERSION == 3);
-    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.11.0");
+    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.11.1");
     TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030800);
 
     // 2. Semantic Version Triad Parsing
@@ -12274,8 +12276,40 @@ void testHostEndsSessionWhenSharingEnds() {
         TEST_ASSERT(hostNet.start());
         hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
         TEST_ASSERT(viewerNet.start());
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+        // Failure diagnostics. This test fails now and then on Linux CI for a reason not yet found, so keep a timeline of
+        // what the viewer, the host and the fake portal were doing and print it only if an assertion here fails.
+        const int failedBefore = g_failed;
+        const auto t0 = std::chrono::steady_clock::now();
+        std::mutex timelineMu;
+        std::vector<std::string> timeline;
+        auto mark = [&](const std::string& what) {
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+            std::lock_guard<std::mutex> lock(timelineMu);
+            timeline.push_back(std::to_string(ms) + " ms  " + what);
+        };
+        std::atomic<bool> sampling{true};
+        std::thread sampler([&] {
+            std::string last;
+            while (sampling.load()) {
+                const auto vs = viewerNet.viewerStats();
+                std::ostringstream o;
+                o << "viewer=" << static_cast<int>(vs.state) << " \"" << vs.statusMessage << "\""
+                  << "  host.active=" << hostNet.hostSessionStatus().active
+                  << " host.notice=" << static_cast<int>(hostNet.shareNotice().state)
+                  << " portal.Start=" << fake.count("org.freedesktop.portal.RemoteDesktop", "Start")
+                  << " relayPeers=" << hostNet.localRelayPeerCount();
+                if (o.str() != last) { last = o.str(); mark(last); }
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+        });
+
+        // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
+        // dial once it is registered, not after a fixed pause.
+        for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        mark("dialling");
         TEST_ASSERT(viewerNet.connectToRemote(hostId.formattedDeskId(), "TestPass99"));
+        mark("connectToRemote returned");
 
         if (endAfterFrames) {   // the desktop ends the sharing while the viewer watches
             uint64_t seq = 0;
@@ -12283,6 +12317,10 @@ void testHostEndsSessionWhenSharingEnds() {
             int w = 0, h = 0;
             CursorState cur{};
             TEST_ASSERT(waitUntil([&] { return viewerNet.copyLatestViewerFrame(seq, frame, w, h, cur) && w > 0; }, 10000));
+            // Frames can start before the portal dialog is answered (the test source does not wait for it), so a first frame
+            // does not mean the portal session exists yet. End it only once it is running, or there is nothing to end.
+            TEST_ASSERT(waitUntil([&] { return hostNet.shareNotice().state == ShareState::Running; }, 10000));
+            mark("first frame seen and sharing running; emitSessionClosed");
             fake.emitSessionClosed();
         }
         // The viewer is told why and stays disconnected: it does not reconnect (which would ask the host's desktop again)
@@ -12290,11 +12328,21 @@ void testHostEndsSessionWhenSharingEnds() {
             auto st = viewerNet.viewerStats();
             return st.state == ViewerConnectionState::Error && st.statusMessage.find(expectInStatus) != std::string::npos;
         }, 10000));
+        mark("wait for the viewer's reason finished");
         std::this_thread::sleep_for(std::chrono::milliseconds(3500));   // longer than the viewer's first reconnect wait
+        mark("3.5 s pause finished");
         TEST_ASSERT(viewerNet.viewerStats().state == ViewerConnectionState::Error);
         TEST_ASSERT(fake.count("org.freedesktop.portal.RemoteDesktop", "Start") == 1);
         TEST_ASSERT(waitUntil([&] { return !hostNet.hostSessionStatus().active; }));
         TEST_ASSERT(hostNet.shareNotice().state == expectNotice);              // the host can still see why
+        mark("assertions finished");
+        sampling.store(false);
+        sampler.join();
+        if (g_failed > failedBefore) {
+            std::cerr << "[DIAG test 96, scenario expecting \"" << expectInStatus << "\"] timeline:\n";
+            for (const auto& line : timeline) std::cerr << "  " << line << "\n";
+            for (const auto& c : fake.calls()) std::cerr << "  portal call: " << c.iface << "." << c.method << " " << c.args.substr(0, 120) << "\n";
+        }
         viewerNet.disconnectViewer();
         hostNet.disconnectHostClient();
         std::error_code ec;
@@ -12846,7 +12894,9 @@ void testHostSoundOverTheSession() {
         TEST_ASSERT(hostNet.start());
         hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
         TEST_ASSERT(viewerNet.start());
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
+        // dial once it is registered, not after a fixed pause.
+        for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
         TEST_ASSERT(viewerNet.connectToRemote(hostId->formattedDeskId(), "TestPass99"));
 
         auto framesPlayed = [&] {
@@ -12934,7 +12984,9 @@ void testHostSoundOverTheSession() {
         TEST_ASSERT(hostNet.start());
         hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
         TEST_ASSERT(viewerNet.start());
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
+        // dial once it is registered, not after a fixed pause.
+        for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
         TEST_ASSERT(viewerNet.connectToRemote(hostId->formattedDeskId(), "TestPass99"));
         uint64_t seq = 0;
         std::vector<uint8_t> frame;
@@ -12979,7 +13031,9 @@ void testMuteStateAndHostMicSign() {
     TEST_ASSERT(hostNet.start());
     hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
     TEST_ASSERT(viewerNet.start());
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
+    // dial once it is registered, not after a fixed pause.
+    for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     auto connected = [&] { return viewerNet.viewerStats().state == ViewerConnectionState::Connected; };
     auto sessionEnded = [&] { return !hostNet.hostSessionStatus().active; };
