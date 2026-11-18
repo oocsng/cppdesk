@@ -339,9 +339,7 @@ bool AppUi::stepAnimations(float dt) {
         }
     }
 
-    if (focusedField_ != FocusedField::None && focusedField_ != FocusedField::RemoteCanvas) {
-        active = true;
-    }
+    // A focused text box does not ask for continuous frames: the idle tick repaints it for the caret blink.
     // 8. Settings Hover Tooltip Spring
     bool hasTooltipHover = false;
     for (const auto& tr : activeTooltips_) {
@@ -10439,6 +10437,8 @@ void AppUi::render(ui::Canvas& canvas, float widthDip, float heightDip, double d
         lastDt_ = std::clamp(static_cast<float>(dtSec), 0.001f, 0.04f);
         inlineAnimActive_ = false;
         lastAnimMoving_ = stepAnimations(lastDt_);
+        // Idle frames are sparse (the step above is capped): keep the caret and pulse on wall-clock time
+        animTimeSec_ += std::min(0.5f, std::max(0.0f, static_cast<float>(dtSec) - lastDt_));
     }
     if (snapshotPerFrame_) snapshotPerFrame_(*this);
     if (snapshotFrozen_) animTimeSec_ = 10.0f;
