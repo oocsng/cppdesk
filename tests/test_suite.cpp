@@ -12336,12 +12336,9 @@ void testHostEndsSessionWhenSharingEnds() {
         sampling.store(false);
         sampler.join();
         if (g_failed > failedBefore) {
-            std::cerr << "[DIAG test 96, scenario expecting \"" << expectInStatus << "\"] timeline:
-";
-            for (const auto& line : timeline) std::cerr << "  " << line << "
-";
-            for (const auto& c : fake.calls()) std::cerr << "  portal call: " << c.iface << "." << c.method << " " << c.args.substr(0, 120) << "
-";
+            std::cerr << "[DIAG test 96, scenario expecting \"" << expectInStatus << "\"] timeline:\n";
+            for (const auto& line : timeline) std::cerr << "  " << line << "\n";
+            for (const auto& c : fake.calls()) std::cerr << "  portal call: " << c.iface << "." << c.method << " " << c.args.substr(0, 120) << "\n";
         }
         viewerNet.disconnectViewer();
         hostNet.disconnectHostClient();
