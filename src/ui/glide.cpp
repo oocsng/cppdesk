@@ -21,7 +21,7 @@ GlideEdge glideOpposite(GlideEdge e) {
         case GlideEdge::Right:  return GlideEdge::Left;
         case GlideEdge::Top:    return GlideEdge::Bottom;
         case GlideEdge::Bottom: return GlideEdge::Top;
-        default:                return GlideEdge::None;
+        default:                return GlideEdge::Off;
     }
 }
 
@@ -31,9 +31,9 @@ uint64_t glidePcAt(const AppSettings& s, GlideEdge e) {
 }
 
 GlideEdge glideEdgeOf(const AppSettings& s, uint64_t deskId) {
-    if (deskId == 0) return GlideEdge::None;
+    if (deskId == 0) return GlideEdge::Off;
     for (GlideEdge e : kEdges) if (glidePcAt(s, e) == deskId) return e;
-    return GlideEdge::None;
+    return GlideEdge::Off;
 }
 
 void glidePlace(AppSettings& s, GlideEdge e, uint64_t deskId) {
@@ -63,12 +63,12 @@ GlideEdge glideEdgeAt(const ui::Rect& b, ui::Point p) {
         float along = glideAlong(b, e, p);
         if (dist <= 1.0f && along >= 0.1f && along <= 0.9f) return e;
     }
-    return GlideEdge::None;
+    return GlideEdge::Off;
 }
 
 GlideEdge GlideDwell::update(GlideEdge edgeNow, uint64_t nowMs) {
     if (edgeNow != edge_) { edge_ = edgeNow; startMs_ = nowMs; fired_ = false; }
-    if (edge_ == GlideEdge::None || fired_ || nowMs - startMs_ < kDwellMs) return GlideEdge::None;
+    if (edge_ == GlideEdge::Off || fired_ || nowMs - startMs_ < kDwellMs) return GlideEdge::Off;
     fired_ = true;
     return edge_;
 }
@@ -76,7 +76,7 @@ GlideEdge GlideDwell::update(GlideEdge edgeNow, uint64_t nowMs) {
 void GlideHome::arrive(GlideEdge homeEdge) { home_ = homeEdge; armed_ = false; dwell_.reset(); }
 
 bool GlideHome::update(const ui::Rect& w, ui::Point p, uint64_t nowMs) {
-    if (home_ == GlideEdge::None) return false;
+    if (home_ == GlideEdge::Off) return false;
     if (!armed_) {
         float away = home_ == GlideEdge::Left ? p.x - w.left : home_ == GlideEdge::Right ? w.right - p.x
                    : home_ == GlideEdge::Top ? p.y - w.top : w.bottom - p.y;
@@ -84,7 +84,7 @@ bool GlideHome::update(const ui::Rect& w, ui::Point p, uint64_t nowMs) {
         return false;
     }
     GlideEdge at = glideEdgeAt(w, p);
-    return dwell_.update(at == home_ ? at : GlideEdge::None, nowMs) != GlideEdge::None;
+    return dwell_.update(at == home_ ? at : GlideEdge::Off, nowMs) != GlideEdge::Off;
 }
 
 ui::Point glideEntryPoint(const ui::Rect& m, GlideEdge pushed, float along) {

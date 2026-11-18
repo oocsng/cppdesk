@@ -9771,12 +9771,12 @@ void AppUi::glideTick(uint64_t nowMs, const ViewerSessionStats& viewer, bool hos
         return;
     }
     const ui::Rect desk = shell_->desktopBounds();
-    GlideEdge edge = GlideEdge::None;
+    GlideEdge edge = GlideEdge::Off;
     // glideEdgeAt has no outer bound: a stale or off-desktop position (beyond 1 px) must never count as an edge.
     if (cursor->x >= desk.left - 1 && cursor->x <= desk.right && cursor->y >= desk.top - 1 && cursor->y <= desk.bottom)
         edge = glideEdgeAt(desk, *cursor);
-    if (glidePcAt(identity_.settings(), edge) == 0) edge = GlideEdge::None;
-    if (const GlideEdge fired = glideDwell_.update(edge, nowMs); fired != GlideEdge::None) glideOut(fired, *cursor, nowMs);
+    if (glidePcAt(identity_.settings(), edge) == 0) edge = GlideEdge::Off;
+    if (const GlideEdge fired = glideDwell_.update(edge, nowMs); fired != GlideEdge::Off) glideOut(fired, *cursor, nowMs);
 }
 
 void AppUi::glideOut(GlideEdge edge, ui::Point cursor, uint64_t nowMs) {

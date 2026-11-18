@@ -10646,18 +10646,18 @@ void testGlideLayout() {
     std::cout << "[TEST 114] Glide layout: one edge per PC, saved, cleared when a pairing is forgotten, bad lines ignored..." << std::endl;
     AppSettings s;
     for (GlideEdge e : {GlideEdge::Left, GlideEdge::Right, GlideEdge::Top, GlideEdge::Bottom}) TEST_ASSERT(glidePcAt(s, e) == 0);
-    TEST_ASSERT(glidePcAt(s, GlideEdge::None) == 0);
+    TEST_ASSERT(glidePcAt(s, GlideEdge::Off) == 0);
     glidePlace(s, GlideEdge::Right, 111);
     glidePlace(s, GlideEdge::Left, 111);
     TEST_ASSERT(glidePcAt(s, GlideEdge::Right) == 0 && glidePcAt(s, GlideEdge::Left) == 111);
-    TEST_ASSERT(glideEdgeOf(s, 111) == GlideEdge::Left && glideEdgeOf(s, 999) == GlideEdge::None);
+    TEST_ASSERT(glideEdgeOf(s, 111) == GlideEdge::Left && glideEdgeOf(s, 999) == GlideEdge::Off);
     glidePlace(s, GlideEdge::Left, 222);
-    TEST_ASSERT(glidePcAt(s, GlideEdge::Left) == 222 && glideEdgeOf(s, 111) == GlideEdge::None);
+    TEST_ASSERT(glidePcAt(s, GlideEdge::Left) == 222 && glideEdgeOf(s, 111) == GlideEdge::Off);
     glidePlace(s, GlideEdge::Left, 0);
     TEST_ASSERT(glidePcAt(s, GlideEdge::Left) == 0);
     TEST_ASSERT(glideOpposite(GlideEdge::Right) == GlideEdge::Left && glideOpposite(GlideEdge::Left) == GlideEdge::Right);
     TEST_ASSERT(glideOpposite(GlideEdge::Top) == GlideEdge::Bottom && glideOpposite(GlideEdge::Bottom) == GlideEdge::Top);
-    TEST_ASSERT(glideOpposite(GlideEdge::None) == GlideEdge::None);
+    TEST_ASSERT(glideOpposite(GlideEdge::Off) == GlideEdge::Off);
 
     std::string cfg;
     { IdentityManager probe(4253); cfg = probe.configFilePath(); }
@@ -10707,19 +10707,19 @@ void testGlideEdges() {
     const ui::Rect b{0, 0, 1920, 1080};
     TEST_ASSERT(glideEdgeAt(b, {1919, 540}) == GlideEdge::Right && glideEdgeAt(b, {0, 540}) == GlideEdge::Left);
     TEST_ASSERT(glideEdgeAt(b, {960, 0}) == GlideEdge::Top && glideEdgeAt(b, {960, 1079}) == GlideEdge::Bottom);
-    TEST_ASSERT(glideEdgeAt(b, {960, 540}) == GlideEdge::None);
-    TEST_ASSERT(glideEdgeAt(b, {1919, 100}) == GlideEdge::None && glideEdgeAt(b, {1919, 1000}) == GlideEdge::None);
-    TEST_ASSERT(glideEdgeAt(b, {100, 0}) == GlideEdge::None && glideEdgeAt(b, {1919, 110}) == GlideEdge::Right);
+    TEST_ASSERT(glideEdgeAt(b, {960, 540}) == GlideEdge::Off);
+    TEST_ASSERT(glideEdgeAt(b, {1919, 100}) == GlideEdge::Off && glideEdgeAt(b, {1919, 1000}) == GlideEdge::Off);
+    TEST_ASSERT(glideEdgeAt(b, {100, 0}) == GlideEdge::Off && glideEdgeAt(b, {1919, 110}) == GlideEdge::Right);
     TEST_ASSERT(glideEdgeAt(ui::Rect{-1920, 0, 0, 1080}, {-1920, 540}) == GlideEdge::Left);
 
     GlideDwell d;
-    TEST_ASSERT(d.update(GlideEdge::Right, 0) == GlideEdge::None && d.update(GlideEdge::Right, 249) == GlideEdge::None);
-    TEST_ASSERT(d.update(GlideEdge::Right, 250) == GlideEdge::Right && d.update(GlideEdge::Right, 400) == GlideEdge::None);
-    TEST_ASSERT(d.update(GlideEdge::None, 500) == GlideEdge::None && d.update(GlideEdge::Right, 600) == GlideEdge::None);
+    TEST_ASSERT(d.update(GlideEdge::Right, 0) == GlideEdge::Off && d.update(GlideEdge::Right, 249) == GlideEdge::Off);
+    TEST_ASSERT(d.update(GlideEdge::Right, 250) == GlideEdge::Right && d.update(GlideEdge::Right, 400) == GlideEdge::Off);
+    TEST_ASSERT(d.update(GlideEdge::Off, 500) == GlideEdge::Off && d.update(GlideEdge::Right, 600) == GlideEdge::Off);
     TEST_ASSERT(d.update(GlideEdge::Right, 850) == GlideEdge::Right);
     d.reset();
-    TEST_ASSERT(d.update(GlideEdge::Right, 0) == GlideEdge::None && d.update(GlideEdge::None, 100) == GlideEdge::None);
-    TEST_ASSERT(d.update(GlideEdge::Right, 200) == GlideEdge::None && d.update(GlideEdge::Right, 400) == GlideEdge::None);
+    TEST_ASSERT(d.update(GlideEdge::Right, 0) == GlideEdge::Off && d.update(GlideEdge::Off, 100) == GlideEdge::Off);
+    TEST_ASSERT(d.update(GlideEdge::Right, 200) == GlideEdge::Off && d.update(GlideEdge::Right, 400) == GlideEdge::Off);
     TEST_ASSERT(d.update(GlideEdge::Right, 450) == GlideEdge::Right);
 
     GlideHome h;
