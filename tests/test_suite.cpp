@@ -151,7 +151,7 @@ void testDeskIdAndCrypto() {
     TEST_ASSERT(CryptoUtils::parseDeskId("482 910 375") == 482910375ULL);
     TEST_ASSERT(CryptoUtils::parseDeskId("482-910-375") == 482910375ULL);
     TEST_ASSERT(CryptoUtils::parseDeskId("482910375") == 482910375ULL);
-    TEST_ASSERT(CryptoUtils::parseDeskId("127.0.0.1:50990") == 0ULL);
+    TEST_ASSERT(CryptoUtils::parseDeskId("127.0.0.1:50990") == 0ULL);   // fixed-port-ok: parsed only, never dialled
 
     IdentityManager hostId(10);
     hostId.loadOrCreate();
@@ -295,15 +295,11 @@ void testEndToEndSessionAndFileTransfer() {
 
     IdentityManager hostIdentity(11);
     hostIdentity.loadOrCreate();
-    hostIdentity.setListenPort(50994);
     hostIdentity.setUnattendedEnabled(true);
     hostIdentity.setUnattendedPassword("TestPass99");
-    hostIdentity.setRelayServerAddress("127.0.0.1:50999");
 
     IdentityManager viewerIdentity(12);
     viewerIdentity.loadOrCreate();
-    viewerIdentity.setListenPort(50995);
-    viewerIdentity.setRelayServerAddress("127.0.0.1:50999");
 
     NetworkEngine hostNet(hostIdentity);
     NetworkEngine viewerNet(viewerIdentity);
@@ -315,14 +311,17 @@ void testEndToEndSessionAndFileTransfer() {
     std::filesystem::create_directories(tempDir, ec);
     hostNet.fileTransferManager().setReceiveDirectory(tempDir.string());
 
+    // The relay runs first so both engines register with it on their first try; its port is only known once it runs.
+    TEST_ASSERT(hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT));
+    const std::string relayAddr = "127.0.0.1:" + std::to_string(hostNet.localRelayPort());
+    hostIdentity.setRelayServerAddress(relayAddr);
+    viewerIdentity.setRelayServerAddress(relayAddr);
     TEST_ASSERT(hostNet.start());
-    hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
     TEST_ASSERT(viewerNet.start());
 
     // Wait briefly for UDP LAN discovery / Relay registration
-    // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
-    // dial once it is registered, not after a fixed pause.
-    for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Both engines register with the relay in the background; dial once both have, not after a fixed pause.
+    for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 2; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Connect Viewer -> Host using the formatted 9-digit Desk ID ("XXX XXX XXX") and Unattended Password
     std::string targetIdStr = hostIdentity.formattedDeskId();
@@ -563,7 +562,7 @@ void testFileTransferEdgeCasesAndFavorites() {
     // 3. Pinned Favorite Desks & Recent Session removal persistence
     IdentityManager favMgr(18);
     favMgr.loadOrCreate();
-    favMgr.addOrUpdateRecentSession(482910375ULL, "Design-Workstation", "127.0.0.1:50990");
+    favMgr.addOrUpdateRecentSession(482910375ULL, "Design-Workstation", "127.0.0.1:50990");   // fixed-port-ok: stored only, never dialled
     favMgr.toggleFavoriteSession(482910375ULL);
 
     IdentityManager favReload(18);
@@ -2283,15 +2282,15 @@ void testSelfHostedRelayAndStunDiagnostics() {
     // 2. TCP Relay Probe (online vs offline)
     {
         // Probe offline/unreachable port
-        auto probeFail = NetworkEngine::probeRelayServer("127.0.0.1:59998", 200);
+        auto probeFail = NetworkEngine::probeRelayServer("127.0.0.1:1", 200);
         TEST_ASSERT(!probeFail.reachable);
         TEST_ASSERT(probeFail.rttMs == -1);
 
         // Probe active relay server
         RelayServer testRelay;
-        bool started = testRelay.start(50988);
+        bool started = testRelay.start(0);
         TEST_ASSERT(started);
-        auto probeOk = NetworkEngine::probeRelayServer("127.0.0.1:50988", 1000);
+        auto probeOk = NetworkEngine::probeRelayServer("127.0.0.1:" + std::to_string(testRelay.port()), 1000);
         TEST_ASSERT(probeOk.reachable);
         TEST_ASSERT(probeOk.rttMs >= 0);
         testRelay.stop();
@@ -2306,7 +2305,7 @@ void testSelfHostedRelayAndStunDiagnostics() {
             sockaddr_in held{};
             held.sin_family = AF_INET;
             held.sin_addr.s_addr = inet_addr("127.0.0.1");
-            held.sin_port = htons(50989);
+            held.sin_port = htons(50989);   // fixed-port-ok: held on purpose to prove the test doesn't need it
             bind(portHolder, reinterpret_cast<sockaddr*>(&held), sizeof(held));
         }
 
@@ -2388,13 +2387,14 @@ void testSelfHostedRelayAndStunDiagnostics() {
         NetworkEngine engine(idMgr);
         TEST_ASSERT(engine.start());
 
-        engine.setRelayAddressAndReconnect("127.0.0.1:50988");
-        TEST_ASSERT(idMgr.relayServerAddress() == "127.0.0.1:50988");
-
         RelayServer testRelay;
-        TEST_ASSERT(testRelay.start(50988));
+        TEST_ASSERT(testRelay.start(0));
+        const std::string relayAddr = "127.0.0.1:" + std::to_string(testRelay.port());
 
-        engine.startNetworkDiagnostics("127.0.0.1:50988", "127.0.0.1:59999");
+        engine.setRelayAddressAndReconnect(relayAddr);
+        TEST_ASSERT(idMgr.relayServerAddress() == relayAddr);
+
+        engine.startNetworkDiagnostics(relayAddr, "127.0.0.1:1");
         for (int i = 0; i < 40; ++i) {
             if (!engine.isNetworkDiagnosticRunning()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -5095,7 +5095,6 @@ void testTwoFactorAuthTotpAndQrMatrix() {
     {
         IdentityManager hostId(1011);
         hostId.loadOrCreate();
-        hostId.setListenPort(50980);
         hostId.setUnattendedEnabled(true);
         hostId.setUnattendedPassword("SecureTestPass#2026");
 
@@ -5112,7 +5111,6 @@ void testTwoFactorAuthTotpAndQrMatrix() {
 
         IdentityManager viewerId(1012);
         viewerId.loadOrCreate();
-        viewerId.setListenPort(50981);
         NetworkEngine viewerNet(viewerId);
         TEST_ASSERT(viewerNet.start());
 
@@ -5528,13 +5526,11 @@ void testRemoteFileSyncAndFolderMirroring() {
     {
         IdentityManager hostId(1013);
         hostId.loadOrCreate();
-        hostId.setListenPort(50984);
         hostId.setUnattendedEnabled(true);
         hostId.setUnattendedPassword("SyncHostPassword#2026");
 
         IdentityManager viewerId(1014);
         viewerId.loadOrCreate();
-        viewerId.setListenPort(50985);
 
         NetworkEngine hostNet(hostId);
         TEST_ASSERT(hostNet.start());
@@ -7631,9 +7627,9 @@ void testRelayDeskOwnership() {
 
     // Part B: a real RelayServer, spoken to over TCP.
     socket_init_network();
-    const uint16_t port = 50991;
     RelayServer relay;
-    TEST_ASSERT(relay.start(port));
+    TEST_ASSERT(relay.start(0));
+    const uint16_t port = relay.port();
 
     std::mutex sendMu;
     auto dial = [&]() -> uintptr_t {
@@ -9945,13 +9941,11 @@ void testPairedLogin() {
     {
         IdentityManager hostId(4310);
         TEST_ASSERT(hostId.loadOrCreate());
-        hostId.setListenPort(51010);
         hostId.setUnattendedEnabled(true);
         hostId.setUnattendedPassword("HostPw1");
         { AppSettings s = hostId.settings(); s.allowPairing = true; hostId.updateSettings(s); }
         IdentityManager viewerId(4311);
         TEST_ASSERT(viewerId.loadOrCreate());
-        viewerId.setListenPort(51011);
         hostId.addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
         viewerId.addPairedHost({hostId.deskId(), "H", hostId.pairingKey().publicKey(), 1});
 
@@ -10037,12 +10031,13 @@ void testPairedLogin() {
         // the dialled ID (the viewer's) and the answering ID (the host's) differ.
         viewerId.addPairedHost({hostId.deskId(), "H", hostId.pairingKey().publicKey(), 1});
         viewerId.addPairedHost({viewerId.deskId(), "X", otherKey.publicKey(), 1});
+        const uint16_t ownPort = viewerId.listenPort();
         viewerId.setListenPort(hostNet.hostListenPort());
         st = dial(viewerId.formattedDeskId(), "");
         TEST_ASSERT(st.state == ViewerConnectionState::Error && has(st, "doesn't match"));
         TEST_ASSERT(!hostNet.hostSessionStatus().active);
         hangUp();
-        viewerId.setListenPort(51011);
+        viewerId.setListenPort(ownPort);
         TEST_ASSERT(viewerId.removePairedHost(viewerId.deskId()));
 
         // Bad paired logins count toward the per-IP lockout exactly like bad passwords.
@@ -10068,14 +10063,12 @@ void testPairingOffer() {
         IdentityManager hostId, viewerId;
         NetworkEngine hostNet, viewerNet;
         std::string target;
-        Rig(int inst, int port, bool allowPairing)
+        Rig(int inst, bool allowPairing)
             : hostId(inst), viewerId(inst + 1), hostNet(hostId), viewerNet(viewerId) {
             std::error_code e;
             std::filesystem::remove(hostId.configFilePath(), e);
             std::filesystem::remove(viewerId.configFilePath(), e);
             TEST_ASSERT(hostId.loadOrCreate() && viewerId.loadOrCreate());
-            hostId.setListenPort(port);
-            viewerId.setListenPort(port + 1);
             hostId.setUnattendedEnabled(true);
             hostId.setUnattendedPassword("HostPw1");
             setAllowPairing(allowPairing);
@@ -10111,7 +10104,7 @@ void testPairingOffer() {
     };
 
     {
-        Rig rig(4320, 51020, true);
+        Rig rig(4320, true);
         auto st = rig.dial("HostPw1");
         TEST_ASSERT(st.state == ViewerConnectionState::Connected && !st.pairedSession);
         TEST_ASSERT(st.hostAllowsNewPairing && st.offerPairing);
@@ -10132,7 +10125,7 @@ void testPairingOffer() {
         rig.hangUp();
     }
     {
-        Rig rig(4322, 51022, false);
+        Rig rig(4322, false);
         auto st = rig.dial("HostPw1");
         TEST_ASSERT(st.state == ViewerConnectionState::Connected);
         TEST_ASSERT(!st.hostAllowsNewPairing && !st.offerPairing);
@@ -10142,7 +10135,7 @@ void testPairingOffer() {
     }
     {
         // Switched off between login and request: the host decides at the time of the request.
-        Rig rig(4324, 51024, true);
+        Rig rig(4324, true);
         auto st = rig.dial("HostPw1");
         TEST_ASSERT(st.state == ViewerConnectionState::Connected && st.offerPairing);
         rig.setAllowPairing(false);
@@ -10154,7 +10147,7 @@ void testPairingOffer() {
     }
     {
         // A password holder claiming a paired PC's desk ID cannot replace that PC's pinned key.
-        Rig rig(4326, 51026, true);
+        Rig rig(4326, true);
         TEST_ASSERT(rig.dial("HostPw1").offerPairing && rig.viewerNet.requestPairing());
         TEST_ASSERT(rig.waitForAnswer() == PairingRequestState::Paired);
         const auto original = rig.hostId.findPairedViewer(rig.viewerId.deskId());
@@ -10167,7 +10160,6 @@ void testPairingOffer() {
         { std::ofstream f(attackerId.configFilePath()); f << "desk_id=" << rig.viewerId.deskId() << "\n"; }
         TEST_ASSERT(attackerId.loadOrCreate() && attackerId.deskId() == rig.viewerId.deskId());
         TEST_ASSERT(attackerId.pairingKey().publicKey() != rig.viewerId.pairingKey().publicKey());
-        attackerId.setListenPort(51028);
         {
             NetworkEngine attackerNet(attackerId);
             TEST_ASSERT(attackerNet.start());
@@ -10207,9 +10199,6 @@ void testViewerOnlyEngine() {
     {
         IdentityManager hostAId(4330), hostBId(4331), viewerId(4332);
         TEST_ASSERT(hostAId.loadOrCreate() && hostBId.loadOrCreate() && viewerId.loadOrCreate());
-        hostAId.setListenPort(51030);
-        hostBId.setListenPort(51032);
-        viewerId.setListenPort(51034);
         for (IdentityManager* h : {&hostAId, &hostBId}) {
             h->addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
             viewerId.addPairedHost({h->deskId(), "H", h->pairingKey().publicKey(), 1});
@@ -10299,9 +10288,6 @@ void testFleetManager() {
     {
         IdentityManager hostAId(4340), hostBId(4341), viewerId(4342);
         TEST_ASSERT(hostAId.loadOrCreate() && hostBId.loadOrCreate() && viewerId.loadOrCreate());
-        hostAId.setListenPort(51040);
-        hostBId.setListenPort(51042);
-        viewerId.setListenPort(51044);
         for (IdentityManager* h : {&hostAId, &hostBId}) {
             h->addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
             viewerId.addPairedHost({h->deskId(), "H", h->pairingKey().publicKey(), 1});
@@ -10325,7 +10311,7 @@ void testFleetManager() {
 
         // At most 16 at once.
         std::vector<FleetMember> fakes;
-        for (uint64_t i = 0; i < 20; ++i) fakes.push_back({900000000 + i, "Fake" + std::to_string(i), "127.0.0.1:51059"});
+        for (uint64_t i = 0; i < 20; ++i) fakes.push_back({900000000 + i, "Fake" + std::to_string(i), "127.0.0.1:1"});
         TEST_ASSERT(fleet.open(fakes) == 16 && fleet.size() == 16);
         fleet.closeAll();
         TEST_ASSERT(fleet.size() == 0);
@@ -10336,7 +10322,7 @@ void testFleetManager() {
         hostA.setHostKeySinkForTest(logA.sink());
         hostB.setHostKeySinkForTest(logB.sink());
 
-        TEST_ASSERT(fleet.open({{deskA, "A", "127.0.0.1:51040"}, {deskB, "B", "127.0.0.1:51042"}}) == 2);
+        TEST_ASSERT(fleet.open({{deskA, "A", "127.0.0.1:" + std::to_string(hostA.hostListenPort())}, {deskB, "B", "127.0.0.1:" + std::to_string(hostB.hostListenPort())}}) == 2);
         auto stateOf = [&](uint64_t id) {
             for (const auto& t : fleet.status())
                 if (t.deskId == id) return t.state;
@@ -10346,7 +10332,7 @@ void testFleetManager() {
         TEST_ASSERT(waitFor([&] { return stateOf(deskA) == C && stateOf(deskB) == C; }, 10000));
         auto tiles = fleet.status();
         TEST_ASSERT(tiles.size() == 2 && tiles[0].deskId == deskA && tiles[0].name == "A" && tiles[1].deskId == deskB);
-        TEST_ASSERT(fleet.open({{deskA, "A", "127.0.0.1:51040"}}) == 0 && fleet.size() == 2);
+        TEST_ASSERT(fleet.open({{deskA, "A", "127.0.0.1:" + std::to_string(hostA.hostListenPort())}}) == 0 && fleet.size() == 2);
         // Every member settles on LowBandwidth at 15 FPS, even after the engine's own default request on connect.
         auto lowBandwidth = [&] {
             for (const auto& t : fleet.status())
@@ -10406,7 +10392,7 @@ void testFleetManager() {
         {
             NetworkEngine normal(viewerId);
             TEST_ASSERT(normal.start());
-            normal.connectToRemote("127.0.0.1:51042", "");
+            normal.connectToRemote("127.0.0.1:" + std::to_string(hostB.hostListenPort()), "");
             TEST_ASSERT(waitFor([&] { return normal.viewerStats().state == C; }, 4000));
             normal.stop();
         }
@@ -10422,8 +10408,6 @@ void testFleetManager() {
     {
         IdentityManager pId(4346), otherId(4347), rogueId(4348), vId(4349);
         TEST_ASSERT(pId.loadOrCreate() && otherId.loadOrCreate() && rogueId.loadOrCreate() && vId.loadOrCreate());
-        otherId.setListenPort(51052);
-        rogueId.setListenPort(51054);
         for (IdentityManager* h : {&pId, &otherId}) {
             h->addPairedViewer({vId.deskId(), "V", vId.pairingKey().publicKey(), 1});
             vId.addPairedHost({h->deskId(), "H", h->pairingKey().publicKey(), 1});
@@ -10533,9 +10517,6 @@ void testFleetUi() {
     {
         IdentityManager hostId(4343), viewerId(4344), hostBId(4345);
         TEST_ASSERT(hostId.loadOrCreate() && viewerId.loadOrCreate() && hostBId.loadOrCreate());
-        hostId.setListenPort(51046);
-        viewerId.setListenPort(51048);
-        hostBId.setListenPort(51050);
         for (IdentityManager* h : {&hostId, &hostBId}) {
             h->addPairedViewer({viewerId.deskId(), "V", viewerId.pairingKey().publicKey(), 1});
             viewerId.addPairedHost({h->deskId(), "H", h->pairingKey().publicKey(), 1});
@@ -10560,7 +10541,7 @@ void testFleetUi() {
         {
             AppUi app(viewerId, viewerNet, shiftShell, "");
             ui::RecordingCanvas rc;
-            app.openFleetGrid({{hostId.deskId(), "H", "127.0.0.1:51046"}});
+            app.openFleetGrid({{hostId.deskId(), "H", "127.0.0.1:" + std::to_string(host.hostListenPort())}});
             TEST_ASSERT(waitFor([&] {
                 app.render(rc, 1280, 800, 1.0 / 60.0);
                 return rc.serialize().find("|Live") != std::string::npos;
@@ -10609,7 +10590,7 @@ void testFleetUi() {
             AppUi app(viewerId, viewerNet, plainShell, "");
             ui::RecordingCanvas rc;
             auto frame = [&] { app.render(rc, 1280, 800, 1.0 / 60.0); return rc.serialize(); };
-            app.openFleetGrid({{deskA, "Alpha", "127.0.0.1:51046"}, {deskB, "Bravo", "127.0.0.1:51050"}});
+            app.openFleetGrid({{deskA, "Alpha", "127.0.0.1:" + std::to_string(host.hostListenPort())}, {deskB, "Bravo", "127.0.0.1:" + std::to_string(hostB.hostListenPort())}});
             TEST_ASSERT(waitFor([&] { return count(frame(), "Live") == 2; }, 4000));
 
             std::string ops = frame();
@@ -10944,9 +10925,6 @@ void testGlideHome() {
         // P (right) and Q (left) are paired loopback hosts; R (bottom) has forgotten this PC; nothing listens for F (top).
         IdentityManager id(4255), pId(4355), qId(4356), rId(4357);
         TEST_ASSERT(id.loadOrCreate() && pId.loadOrCreate() && qId.loadOrCreate() && rId.loadOrCreate());
-        pId.setListenPort(51090);
-        qId.setListenPort(51092);
-        rId.setListenPort(51094);
         for (IdentityManager* h : {&pId, &qId}) h->addPairedViewer({id.deskId(), "V", id.pairingKey().publicKey(), 1});
         const uint64_t P = pId.deskId(), Q = qId.deskId(), R = rId.deskId(), F = 555000502;
         id.addPairedHost({P, "Reception", pId.pairingKey().publicKey(), 1});
@@ -10963,7 +10941,7 @@ void testGlideHome() {
         NetworkEngine hostP(pId), hostQ(qId), hostR(rId), net(id);
         TEST_ASSERT(hostP.start() && hostQ.start() && hostR.start() && net.startViewerOnly());
         struct Seen { uint64_t desk; const char* name; uint16_t port; };
-        for (const Seen& seen : {Seen{P, "Reception", 51090}, Seen{Q, "Lab", 51092}, Seen{R, "Office", 51094}, Seen{F, "Kiosk", 1}}) {
+        for (const Seen& seen : {Seen{P, "Reception", hostP.hostListenPort()}, Seen{Q, "Lab", hostQ.hostListenPort()}, Seen{R, "Office", hostR.hostListenPort()}, Seen{F, "Kiosk", 1}}) {
             DiscoveredPeer peer;
             peer.deskId = seen.desk;
             peer.hostname = seen.name;
@@ -11125,7 +11103,7 @@ void testGlideHome() {
         {   // Busy: the same paired viewer holds P's one session from elsewhere.
             NetworkEngine other(id);
             TEST_ASSERT(other.startViewerOnly());
-            other.connectToRemote("127.0.0.1:51090", "", P);
+            other.connectToRemote("127.0.0.1:" + std::to_string(hostP.hostListenPort()), "", P);
             TEST_ASSERT(waitFor([&] { return other.viewerStats().state == ViewerConnectionState::Connected; }, 5000));
             auto r = fresh();
             push(*r, right, 0);
@@ -11201,9 +11179,6 @@ void testPairingOfferEveryConnection() {
     {
         IdentityManager hostAId(4350), hostBId(4351), viewerId(4352);
         TEST_ASSERT(hostAId.loadOrCreate() && hostBId.loadOrCreate() && viewerId.loadOrCreate());
-        hostAId.setListenPort(51080);
-        hostBId.setListenPort(51082);
-        viewerId.setListenPort(51084);
         for (IdentityManager* h : {&hostAId, &hostBId}) {   // unpaired, offering pairing, no password to type
             AppSettings s = h->settings();
             s.allowPairing = true;
@@ -11213,7 +11188,7 @@ void testPairingOfferEveryConnection() {
         NetworkEngine hostA(hostAId), hostB(hostBId), viewerNet(viewerId);
         TEST_ASSERT(hostA.start() && hostB.start() && viewerNet.start());
         FakeShell shell;
-        AppUi app(viewerId, viewerNet, shell, "127.0.0.1:51080");
+        AppUi app(viewerId, viewerNet, shell, "127.0.0.1:" + std::to_string(hostA.hostListenPort()));
         ui::RecordingCanvas rc;
         auto frame = [&] {
             for (int i = 0; i < 60; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);   // long enough for a modal to settle
@@ -11248,7 +11223,7 @@ void testPairingOfferEveryConnection() {
         // Back on the dashboard with A still connected, dial B. The UI does not tick until B is up, as when a quick
         // LAN handshake (or a busy message queue) beats the next timer tick: B still gets its own offer.
         TEST_ASSERT(clickText("Dashboard") && connected());
-        app.onText(std::string(40, '\b') + "127.0.0.1:51082");
+        app.onText(std::string(40, '\b') + "127.0.0.1:" + std::to_string(hostB.hostListenPort()));
         TEST_ASSERT(clickText("Connect"));
         TEST_ASSERT(waitFor([&] { return connected() && viewerNet.viewerStats().remoteDeskId == hostBId.deskId(); }, 4000));
         TEST_ASSERT(viewerNet.viewerStats().offerPairing);
@@ -12250,7 +12225,7 @@ void testHostEndsSessionWhenSharingEnds() {
 
     // One viewer connecting to one host whose desktop answers the sharing question as the scenario says.
     auto run = [&](const FakeScenario& sc, bool endAfterFrames, const std::string& expectInStatus, ShareState expectNotice,
-                   int hostPort, int viewerPort, int idSeed) {
+                   int idSeed) {
         PrivateBus bus;
         FakePortal fake(bus.address(), sc);
         WaylandShare::setFactoryForTest([&starts, address = bus.address()](const std::string& token) {
@@ -12263,18 +12238,17 @@ void testHostEndsSessionWhenSharingEnds() {
         });
         IdentityManager hostId(idSeed);
         hostId.loadOrCreate();
-        hostId.setListenPort(static_cast<uint16_t>(hostPort));
         hostId.setUnattendedEnabled(true);
         hostId.setUnattendedPassword("TestPass99");
-        hostId.setRelayServerAddress("127.0.0.1:50999");
         IdentityManager viewerId(idSeed + 1);
         viewerId.loadOrCreate();
-        viewerId.setListenPort(static_cast<uint16_t>(viewerPort));
-        viewerId.setRelayServerAddress("127.0.0.1:50999");
         NetworkEngine hostNet(hostId);
         NetworkEngine viewerNet(viewerId);
+        TEST_ASSERT(hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT));
+        const std::string relayAddr = "127.0.0.1:" + std::to_string(hostNet.localRelayPort());
+        hostId.setRelayServerAddress(relayAddr);
+        viewerId.setRelayServerAddress(relayAddr);
         TEST_ASSERT(hostNet.start());
-        hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
         TEST_ASSERT(viewerNet.start());
 
         // Failure diagnostics. This test fails now and then on Linux CI for a reason not yet found, so keep a timeline of
@@ -12306,7 +12280,7 @@ void testHostEndsSessionWhenSharingEnds() {
 
         // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
         // dial once it is registered, not after a fixed pause.
-        for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 2; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
         mark("dialling");
         TEST_ASSERT(viewerNet.connectToRemote(hostId.formattedDeskId(), "TestPass99"));
         mark("connectToRemote returned");
@@ -12352,9 +12326,9 @@ void testHostEndsSessionWhenSharingEnds() {
 
     FakeScenario refused;
     refused.startResponse = 1;
-    run(refused, false, "did not allow", ShareState::Denied, 50940, 50941, 4260);
+    run(refused, false, "did not allow", ShareState::Denied, 4260);
     FakeScenario allowed;
-    run(allowed, true, "stopped sharing", ShareState::Closed, 50942, 50943, 4262);
+    run(allowed, true, "stopped sharing", ShareState::Closed, 4262);
 }
 
 #endif
@@ -12864,18 +12838,21 @@ void testHostSoundOverTheSession() {
         void stop() override { h->stopped = true; }
     };
 
-    auto makeEngines = [](int seed, int hostPort, int viewerPort, std::unique_ptr<IdentityManager>& hostId,
+    auto makeEngines = [](int seed, std::unique_ptr<IdentityManager>& hostId,
                           std::unique_ptr<IdentityManager>& viewerId) {
         hostId = std::make_unique<IdentityManager>(seed);
         hostId->loadOrCreate();
-        hostId->setListenPort(static_cast<uint16_t>(hostPort));
         hostId->setUnattendedEnabled(true);
         hostId->setUnattendedPassword("TestPass99");
-        hostId->setRelayServerAddress("127.0.0.1:50999");
         viewerId = std::make_unique<IdentityManager>(seed + 1);
         viewerId->loadOrCreate();
-        viewerId->setListenPort(static_cast<uint16_t>(viewerPort));
-        viewerId->setRelayServerAddress("127.0.0.1:50999");
+    };
+    // The relay's port is only known once it runs, so it starts before the engines and both identities learn its address.
+    auto useLocalRelay = [](NetworkEngine& hostNet, IdentityManager& hostId, IdentityManager& viewerId) {
+        TEST_ASSERT(hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT));
+        const std::string relayAddr = "127.0.0.1:" + std::to_string(hostNet.localRelayPort());
+        hostId.setRelayServerAddress(relayAddr);
+        viewerId.setRelayServerAddress(relayAddr);
     };
     auto removeConfigs = [](IdentityManager& a, IdentityManager& b) {
         std::error_code ec;
@@ -12886,17 +12863,16 @@ void testHostSoundOverTheSession() {
     {   // A working source: every frame arrives in order, volume and mute act, and nothing plays after the session ends
         auto heard = std::make_shared<Heard>();
         std::unique_ptr<IdentityManager> hostId, viewerId;
-        makeEngines(4270, 50944, 50945, hostId, viewerId);
+        makeEngines(4270, hostId, viewerId);
         NetworkEngine hostNet(*hostId);
         NetworkEngine viewerNet(*viewerId);
         hostNet.setAudioFactoriesForTest([]() -> std::unique_ptr<SystemAudioSource> { return std::make_unique<RampSource>(); }, {});
         viewerNet.setAudioFactoriesForTest({}, [heard]() -> std::unique_ptr<AudioPlayer> { return std::make_unique<FakePlayer>(heard); });
+        useLocalRelay(hostNet, *hostId, *viewerId);
         TEST_ASSERT(hostNet.start());
-        hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
         TEST_ASSERT(viewerNet.start());
-        // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
-        // dial once it is registered, not after a fixed pause.
-        for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        // Both engines register with the relay in the background; dial once both have, not after a fixed pause.
+        for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 2; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
         TEST_ASSERT(viewerNet.connectToRemote(hostId->formattedDeskId(), "TestPass99"));
 
         auto framesPlayed = [&] {
@@ -12976,17 +12952,16 @@ void testHostSoundOverTheSession() {
     {   // A source that cannot start: the session still shows the screen and carries no sound
         auto heard = std::make_shared<Heard>();
         std::unique_ptr<IdentityManager> hostId, viewerId;
-        makeEngines(4274, 50948, 50949, hostId, viewerId);
+        makeEngines(4274, hostId, viewerId);
         NetworkEngine hostNet(*hostId);
         NetworkEngine viewerNet(*viewerId);
         hostNet.setAudioFactoriesForTest([]() -> std::unique_ptr<SystemAudioSource> { return std::make_unique<NoSource>(); }, {});
         viewerNet.setAudioFactoriesForTest({}, [heard]() -> std::unique_ptr<AudioPlayer> { return std::make_unique<FakePlayer>(heard); });
+        useLocalRelay(hostNet, *hostId, *viewerId);
         TEST_ASSERT(hostNet.start());
-        hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
         TEST_ASSERT(viewerNet.start());
-        // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
-        // dial once it is registered, not after a fixed pause.
-        for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        // Both engines register with the relay in the background; dial once both have, not after a fixed pause.
+        for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 2; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
         TEST_ASSERT(viewerNet.connectToRemote(hostId->formattedDeskId(), "TestPass99"));
         uint64_t seq = 0;
         std::vector<uint8_t> frame;
@@ -13018,22 +12993,20 @@ void testMuteStateAndHostMicSign() {
 
     IdentityManager hostId(4272);
     hostId.loadOrCreate();
-    hostId.setListenPort(50946);
     hostId.setUnattendedEnabled(true);
     hostId.setUnattendedPassword("TestPass99");
-    hostId.setRelayServerAddress("127.0.0.1:50999");
     IdentityManager viewerId(4273);
     viewerId.loadOrCreate();
-    viewerId.setListenPort(50947);
-    viewerId.setRelayServerAddress("127.0.0.1:50999");
     NetworkEngine hostNet(hostId);
     NetworkEngine viewerNet(viewerId);
+    TEST_ASSERT(hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT));
+    const std::string relayAddr = "127.0.0.1:" + std::to_string(hostNet.localRelayPort());
+    hostId.setRelayServerAddress(relayAddr);
+    viewerId.setRelayServerAddress(relayAddr);
     TEST_ASSERT(hostNet.start());
-    hostNet.startLocalRelayServer(DEFAULT_RELAY_PORT);
     TEST_ASSERT(viewerNet.start());
-    // The host registers with the relay in the background, and retries only every 3 s if it started before the relay;
-    // dial once it is registered, not after a fixed pause.
-    for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 1; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Both engines register with the relay in the background; dial once both have, not after a fixed pause.
+    for (int i = 0; i < 200 && hostNet.localRelayPeerCount() < 2; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     auto connected = [&] { return viewerNet.viewerStats().state == ViewerConnectionState::Connected; };
     auto sessionEnded = [&] { return !hostNet.hostSessionStatus().active; };
@@ -13161,7 +13134,7 @@ void testOsAssignedPorts() {
     setOsAssignedPortsForTest(false);
     {
         IdentityManager id(4371);
-        id.setListenPort(0);                            // product path: port 0 must not be advertised as 0
+        id.setListenPort(0);                            // fixed-port-ok: product path, port 0 must not be advertised as 0
         NetworkEngine e(id);
         TEST_ASSERT(e.start());
         TEST_ASSERT(e.hostListenPort() != 0 && e.hostListenPort() == id.listenPort());
@@ -13172,6 +13145,7 @@ void testOsAssignedPorts() {
 
 int main(int argc, char** argv) {
     try {
+        setOsAssignedPortsForTest(true);   // every listener binds an OS-assigned port; tests dial the port that was bound
 #if defined(__linux__)
         if (argc > 1 && std::string(argv[1]) == "--pipewire") {   // CI only, see ci.yml
             testRealPipeWire();
