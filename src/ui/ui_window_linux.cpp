@@ -554,7 +554,7 @@ public:
     ui::WindowPresence windowPresence() const override {
         if (!live() || w_->hiddenInTray) return ui::WindowPresence::Hidden;
         if (w_->iconified()) return ui::WindowPresence::Minimized;
-        return w_->mapped ? ui::WindowPresence::Shown : ui::WindowPresence::Hidden;
+        return ui::WindowPresence::Shown;   // unmapped on another workspace is not "hidden": only the tray hides it
     }
     void setWindowPresence(ui::WindowPresence p) override {
         if (!live()) return;
@@ -568,6 +568,11 @@ public:
                 XFlush(w_->dpy);
                 break;
             case ui::WindowPresence::Hidden:   // in the tray, as hideToTrayIfWanted leaves it
+                if (!w_->trayDocked()) {   // no tray to restore it from: iconify so the window stays reachable
+                    XIconifyWindow(w_->dpy, w_->win, w_->screen);
+                    XFlush(w_->dpy);
+                    break;
+                }
                 XWithdrawWindow(w_->dpy, w_->win, w_->screen);
                 XFlush(w_->dpy);
                 w_->hiddenInTray = true;

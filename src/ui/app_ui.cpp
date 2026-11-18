@@ -9267,7 +9267,7 @@ void AppUi::switchToSessionTab(uint32_t tabId, bool force, bool silent) {
     shell_->invalidate();
 }
 
-void AppUi::closeSessionTab(uint32_t tabId) {
+void AppUi::closeSessionTab(uint32_t tabId, bool quiet) {
     if (tabId == 0) return;
 
     bool wasActive = (tabId == sessionTabs_.activeTabId());
@@ -9293,10 +9293,10 @@ void AppUi::closeSessionTab(uint32_t tabId) {
     sessionTabs_.closeTab(tabId);
 
     if (sessionTabs_.tabCount() > 0) {
-        if (wasActive) {
+        if (wasActive && !quiet) {
             switchToSessionTab(sessionTabs_.activeTabId(), true);
         }
-        showToast("Closed tab: " + tabName);
+        if (!quiet) showToast("Closed tab: " + tabName);
     } else {
         frameBufferBgra_.clear();
         frameBufferW_ = 0;
@@ -9305,8 +9305,10 @@ void AppUi::closeSessionTab(uint32_t tabId) {
         releaseImage(remoteBitmap_);
         bitmapW_ = 0;
         bitmapH_ = 0;
-        switchTab(ActiveTab::Dashboard);
-        showToast("All session tabs closed");
+        if (!quiet) {
+            switchTab(ActiveTab::Dashboard);
+            showToast("All session tabs closed");
+        }
     }
 
     shell_->invalidate();
@@ -9741,14 +9743,20 @@ void AppUi::glideTick(uint64_t nowMs, const ViewerSessionStats& viewer, bool hos
         if (presence != ui::WindowPresence::Shown && glide_->seenShown) {
             glide_->prevPresence = presence;
             glideHomeNow(nowMs);
-        } else if (glideHome_.update(ui::Rect{0.0f, 0.0f, frameWidth_, frameHeight_}, ui::Point{mouseX_, mouseY_}, nowMs)) {
-            glideHomeNow(nowMs);
+        } else if (const std::optional<ui::Point> c = shell_->cursorScreenPos()) {
+            // The window fills one monitor, so its home edge may be a seam the cursor crosses: a point past the edge
+            // counts as on it. Polled, since a warp sends no motion event.
+            const ui::Rect& m = glide_->monitor;
+            const ui::Point p{std::clamp(c->x, m.left, m.right - 1), std::clamp(c->y, m.top, m.bottom - 1)};
+            if (glideHome_.update(m, p, nowMs)) glideHomeNow(nowMs);
         }
         return;
     }
     if (glide_ && !sessionTabs_.getTab(glide_->tabId)) glide_.reset();   // its tab was closed
+    // Looking at the live session from the tab bar is not idle.
+    if (glide_ && activeTab_ == ActiveTab::RemoteSession && sessionTabs_.activeTabId() == glide_->tabId) glide_->homeSinceMs = nowMs;
     if (glide_ && nowMs - glide_->homeSinceMs >= 60000) {   // home and idle for a minute: disconnect
-        closeSessionTab(glide_->tabId);
+        closeSessionTab(glide_->tabId, activeTab_ != ActiveTab::RemoteSession);   // never yank someone out of Settings
         glide_.reset();
     }
     const AppSettings& gs = identity_.settings();
@@ -9810,7 +9818,7 @@ void AppUi::glideOut(GlideEdge edge, ui::Point cursor, uint64_t nowMs) {
     glideHome_.arrive(glideOpposite(edge));
     glideSlideT_ = 0.0f;
     glideSlideVel_ = 0.0f;
-    glide_ = GlideState{ deskId, edge, tabId, true, 0, prevPresence, glideAlong(shell_->desktopBounds(), edge, cursor) };
+    glide_ = GlideState{ deskId, edge, tabId, true, 0, prevPresence, glideAlong(shell_->desktopBounds(), edge, cursor), false, monitor };
     shell_->invalidate();
 }
 
@@ -10019,17 +10027,18 @@ void AppUi::onTick() {
     auto vStats = network_.viewerStats();
     if (vStats.state == ViewerConnectionState::Connected &&
         prevViewerState_ != ViewerConnectionState::Connected) {
-        switchTab(ActiveTab::RemoteSession);
+        const bool glideHome = glide_ && !glide_->inside;   // sent home before it connected: stay where the user is
+        if (!glideHome) switchTab(ActiveTab::RemoteSession);
         // A new connection gets its own pairing offer, even when no tick saw the old one end
         pairOfferShown_ = showPairOfferModal_ = false;
         scaleMode_ = static_cast<ScaleMode>(std::clamp<int>(identity_.settings().defaultScaleMode, 0, 3));
         if (vStats.remoteAddress.find("127.0.0.1") != std::string::npos ||
             vStats.remoteDeskId == identity_.deskId()) {
             remoteInputEnabled_ = false;
-            showToast("Connected on same PC. View-Only enabled (F8 to toggle).");
+            if (!glideHome) showToast("Connected on same PC. View-Only enabled (F8 to toggle).");
         } else {
             remoteInputEnabled_ = true;
-            showToast("Connected to " + vStats.remoteHostname);
+            if (!glideHome) showToast("Connected to " + vStats.remoteHostname);
         }
 
         SessionTab* activeTab = sessionTabs_.activeTab();

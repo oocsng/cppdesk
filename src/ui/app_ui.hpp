@@ -210,6 +210,8 @@ public:
     // Tests.
     const SessionTabManager& sessionTabsForTest() const { return sessionTabs_; }
     bool isGlidingForTest() const { return glide_ && glide_->inside; }
+    ActiveTab activeTabForTest() const { return activeTab_; }
+    void switchTabForTest(ActiveTab t) { switchTab(t); }
 
 private:
     // WinShell implements services that need the UI state (update download, service actions).
@@ -365,7 +367,7 @@ private:
     void openRecordingPlayer(const std::string& filePath = "");
     void closeRecordingPlayer();
     void switchToSessionTab(uint32_t tabId, bool force = false, bool silent = false);
-    void closeSessionTab(uint32_t tabId);
+    void closeSessionTab(uint32_t tabId, bool quiet = false);   // quiet: no view switch or toast
     void hardResetViewerUiState();
     void showToast(const std::string& message, bool isError = false, uint32_t durationMs = 3000);
     bool anyModalActive() const;
@@ -659,7 +661,8 @@ private:
     // Glide: the paired PC whose session tab this window shows full screen after a push off a screen edge.
     struct GlideState { uint64_t deskId = 0; GlideEdge edge = GlideEdge::None; uint32_t tabId = 0;
                         bool inside = false; uint64_t homeSinceMs = 0; ui::WindowPresence prevPresence{}; float along = 0.5f;
-                        bool seenShown = false; };   // the shell has reported the glide window shown at least once
+                        bool seenShown = false;   // the shell has reported the glide window shown at least once
+                        ui::Rect monitor{}; };     // the monitor the glide window fills: its home edge is where the cursor goes home
     std::optional<GlideState> glide_;
     GlideDwell              glideDwell_;
     GlideHome               glideHome_;

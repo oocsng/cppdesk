@@ -9262,7 +9262,12 @@ public:
     ui::WindowPresence presence = ui::WindowPresence::Shown;
     std::optional<ui::Point> cursorScreenPos() const override { return cursor; }
     ui::Rect desktopBounds() const override { return desktop; }
-    ui::Rect monitorBoundsAt(ui::Point) const override { return desktop; }
+    std::vector<ui::Rect> monitors;   // empty: the desktop is one monitor
+    ui::Rect monitorBoundsAt(ui::Point p) const override {
+        for (const ui::Rect& m : monitors)
+            if (p.x >= m.left && p.x < m.right && p.y >= m.top && p.y < m.bottom) return m;
+        return desktop;
+    }
     void warpCursor(ui::Point p) override { warps.push_back(p); cursor = p; }
     void moveWindowToMonitorAt(ui::Point) override {}
     ui::WindowPresence windowPresence() const override { return presence; }
@@ -11029,12 +11034,12 @@ void testGlideHome() {
             TEST_ASSERT(net.viewerStats().state == ViewerConnectionState::Connected);
 
             // Home edge: resting at the entry point does not go home; moving away arms it, 250 ms back at the edge does.
-            r->app->onMouseMove(2, 540);
+            r->shell.cursor = ui::Point{2, 540};
             for (uint64_t ms = 5400; ms <= 6400; ms += 100) tick(*r, ms);
             TEST_ASSERT(r->app->isGlidingForTest());
-            r->app->onMouseMove(60, 540);
+            r->shell.cursor = ui::Point{60, 540};
             tick(*r, 6500);
-            r->app->onMouseMove(0, 540);
+            r->shell.cursor = ui::Point{0, 540};
             for (uint64_t ms = 6600; ms <= 6900; ms += 50) tick(*r, ms);
             TEST_ASSERT(atHome(*r, backRight));
 
@@ -11121,6 +11126,54 @@ void testGlideHome() {
             TEST_ASSERT(tabs(*r) == 0 && !r->shell.fullscreen);
             TEST_ASSERT(toastShown(*r, "Reception is in use by someone else"));
             other.disconnectViewer();
+        }
+        TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active; }, 4000));
+        {   // Two monitors: the glide window fills the right one, so going home means crossing the seam into the left one.
+            auto r = fresh();
+            r->shell.desktop = ui::Rect{0, 0, 3840, 1080};
+            r->shell.monitors = {ui::Rect{0, 0, 1920, 1080}, ui::Rect{1920, 0, 3840, 1080}};
+            r->app->onMouseMove(1000, 500);   // stale window-relative position must not arm the home edge
+            push(*r, ui::Point{3839, 540}, 0);
+            TEST_ASSERT(r->app->isGlidingForTest() && r->shell.warps.back().x == 1922);
+            for (uint64_t ms = 400; ms <= 1400; ms += 100) tick(*r, ms);
+            TEST_ASSERT(r->app->isGlidingForTest());   // resting at the entry point does not bounce back
+            r->shell.cursor = ui::Point{2200, 540};
+            tick(*r, 1500);
+            r->shell.cursor = ui::Point{1900, 540};   // past the seam, nowhere near the window's own edge
+            for (uint64_t ms = 1600; ms <= 1900; ms += 50) tick(*r, ms);
+            TEST_ASSERT(atHome(*r, ui::Point{3837, 540}));
+            net.disconnectViewer();
+        }
+        TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active; }, 4000));
+        {   // Sent home before the connection finished: it must not pull the window back to the live session.
+            auto r = fresh();
+            push(*r, right, 0);
+            f11(*r);
+            TEST_ASSERT(!r->app->isGlidingForTest());
+            TEST_ASSERT(waitFor([&] { return connected(*r); }, 5000));
+            r->app->onTick();
+            r->app->onTick();
+            TEST_ASSERT(r->app->activeTabForTest() == ActiveTab::Dashboard);
+            TEST_ASSERT(!toastShown(*r, "Connected on same PC") && !toastShown(*r, "Connected to"));
+            net.disconnectViewer();
+        }
+        TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active; }, 4000));
+        {   // Idle close: watching the live session counts as use, and closing never throws someone out of Settings.
+            auto r = fresh();
+            push(*r, right, 0);
+            TEST_ASSERT(waitFor([&] { return connected(*r); }, 5000));
+            f11(*r);   // home at 300
+            r->app->switchTabForTest(ActiveTab::RemoteSession);
+            tick(*r, 59000);
+            r->app->switchTabForTest(ActiveTab::Settings);
+            tick(*r, 61000);
+            TEST_ASSERT(tabs(*r) == 1);   // without the refresh it would have closed at 60300
+            tick(*r, 118999);
+            TEST_ASSERT(tabs(*r) == 1);
+            tick(*r, 119000);
+            TEST_ASSERT(tabs(*r) == 0 && r->app->activeTabForTest() == ActiveTab::Settings);
+            TEST_ASSERT(!toastShown(*r, "All session tabs closed"));
+            net.disconnectViewer();
         }
         net.disconnectViewer();
         hostP.setHostKeySinkForTest(nullptr);
