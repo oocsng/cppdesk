@@ -1600,6 +1600,14 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
             std::string peerHost = cardItems[i].hostname;
             std::string peerEp = cardItems[i].endpoint;
 
+            // Pushed before the card's buttons: the last region under the cursor wins, so a card-wide
+            // region added afterwards swallowed the shortcut, edit, star and remove clicks.
+            std::string targetStr = (peerId > 0) ? CryptoUtils::formatDeskId(peerId) : peerEp;
+            clickRegions_.push_back({ cardR, cardItemId, [this, targetStr]() {
+                remoteIdInput_ = targetStr;
+                initiateConnection();
+            }, false });
+
             // Desktop Shortcut (.lnk) Button
             if (peerId > 0 && shell_->has(ui::Capability::DesktopShortcut)) {
                 UiRect lnkBtn = { cardR.right - 120.0f, cardR.top + 7.0f, cardR.right - 96.0f, cardR.top + 27.0f };
@@ -1673,18 +1681,12 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
             drawText(subInfo, { cardR.left + 14.0f, cardR.top + 54.0f, cardR.right - 128.0f, cardR.bottom - 10.0f },
                      ui::FontRole::Small, COL_TEXT_SECONDARY);
 
-            std::string targetStr = (peerId > 0) ? CryptoUtils::formatDeskId(peerId) : peerEp;
             UiRect quickConnBtn = { cardR.right - 98.0f, cardR.top + 38.0f, cardR.right - 12.0f, cardR.bottom - 16.0f };
             drawButton(cardBtnId, quickConnBtn, "Connect",
                        COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this, targetStr]() {
                            remoteIdInput_ = targetStr;
                            initiateConnection();
                        }, ui::FontRole::Small);
-
-            clickRegions_.push_back({ cardR, cardItemId, [this, targetStr]() {
-                remoteIdInput_ = targetStr;
-                initiateConnection();
-            }, false });
         }
     }
 }
@@ -6349,8 +6351,10 @@ void AppUi::drawPairOfferModal(float width, float height, float modalProgress) {
     drawText("Pair with this PC?", { mx, my, mrx, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
     my += 38.0f;
 
-    drawText("Next time you connect to " + pairOfferName_ + ", you'll go straight in, with no password.",
-             { mx, my, mrx, my + 48.0f }, ui::FontRole::Body, COL_TEXT_SECONDARY);
+    // Body text does not wrap, so a long line was cut off at "no passw"; the tooltip format wraps.
+    const std::string offerText = "Next time you connect to " + pairOfferName_ + ", you'll go straight in, with no password.";
+    const float offerH = canvas_->measureTextBlock(offerText, ui::FontRole::Tooltip, mrx - mx).y;
+    drawText(offerText, { mx, my, mrx, my + offerH }, ui::FontRole::Tooltip, COL_TEXT_SECONDARY);
     my += 66.0f;
 
     float btnW = (mrx - mx - 12.0f) * 0.5f;

@@ -151,7 +151,7 @@ fillRoundRect 420.00 305.00 860.00 495.00 r20.00 c1.00,1.00,1.00,1.00
 strokeRoundRect 420.00 305.00 860.00 495.00 r20.00 c0.89,0.87,0.83,1.00 w1.00
 fillRoundRect 434.00 305.80 846.00 306.80 r0.50 c1.00,1.00,1.00,0.75
 drawText 448.00 327.00 832.00 353.00 Heading LC c0.15,0.14,0.13,1.00 |Pair with this PC?
-drawText 448.00 365.00 832.00 413.00 Body LC c0.33,0.31,0.27,1.00 |Next time you connect to Office, you'll go straight in, with no password.
+drawText 448.00 365.00 832.00 397.00 Tooltip LC c0.33,0.31,0.27,1.00 |Next time you connect to Office, you'll go straight in, with no password.
 fillRoundRect 448.00 431.00 634.00 467.00 r8.00 c0.94,0.92,0.88,1.00
 fillRoundRect 451.20 431.80 630.80 432.80 r0.50 c1.00,1.00,1.00,0.16
 strokeRoundRect 448.00 431.00 634.00 467.00 r8.00 c0.89,0.87,0.83,1.00 w1.00
