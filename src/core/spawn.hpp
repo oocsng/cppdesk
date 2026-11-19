@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <optional>
 #include <string>
 #include <thread>
@@ -61,7 +62,10 @@ inline bool detached(const std::vector<std::string>& args) {
     const int rc = spawnp(&pid, argv[0], &actions, argv.data());
     posix_spawn_file_actions_destroy(&actions);
     if (rc != 0) return false;
-    std::thread([pid] { int status = 0; waitpid(pid, &status, 0); }).detach();
+    std::thread([pid] {
+        int status = 0;
+        while (waitpid(pid, &status, 0) == -1 && errno == EINTR) {}
+    }).detach();
     return true;
 }
 
@@ -86,12 +90,23 @@ inline std::optional<std::string> output(const std::vector<std::string>& args) {
     }
     std::string out;
     char buf[4096];
-    ssize_t n;
-    while ((n = read(fds[0], buf, sizeof(buf))) > 0) out.append(buf, static_cast<size_t>(n));
+    for (;;) {
+        const ssize_t n = read(fds[0], buf, sizeof(buf));
+        if (n > 0) {
+            out.append(buf, static_cast<size_t>(n));
+        } else if (n == -1 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
     close(fds[0]);
     int status = 0;
-    waitpid(pid, &status, 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return std::nullopt;
+    pid_t w;
+    do {
+        w = waitpid(pid, &status, 0);
+    } while (w == -1 && errno == EINTR);
+    if (w != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return std::nullopt;
     while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
     return out;
 }

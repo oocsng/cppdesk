@@ -1,5 +1,4 @@
 #include "crypto_identity.hpp"
-#include "../simd/simd_kernels.hpp"
 #include "protocol.hpp"
 
 #if defined(_WIN32)
@@ -10,18 +9,26 @@
 #include <bcrypt.h>
 #include <shlobj.h>
 #else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
-// ECDH and AES-GCM use OpenSSL on Linux and macOS (CommonCrypto exposes no public AES-GCM).
+#if defined(__linux__)
+#include <sys/random.h>
+#endif
+// ECDH, PBKDF2, SHA-256, HMAC and AES-GCM use OpenSSL on Linux and macOS.
 #include <openssl/bn.h>
 #include <openssl/core_names.h>
 #include <openssl/ec.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/param_build.h>
 #endif
 
 #include <cctype>
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -38,12 +45,15 @@ namespace {
 std::string generateRandomSixCharCode() {
     const char* chars = "23456789abcdefghjkmnpqrstuvwxyz";
     uint8_t rnd[6] = {};
-    CryptoUtils::randomBytes(rnd, sizeof(rnd));
+    if (!CryptoUtils::randomBytes(rnd, sizeof(rnd))) {
+        return "";
+    }
     std::string code;
     code.reserve(6);
     for (int i = 0; i < 6; ++i) {
         code.push_back(chars[rnd[i] % 31]);
     }
+    CryptoUtils::secureZero(rnd, sizeof(rnd));
     return code;
 }
 
@@ -59,6 +69,7 @@ bool constantTimeEquals32(const std::array<uint8_t, 32>& a, const std::array<uin
 
 bool CryptoUtils::randomBytes(void* buffer, size_t len) {
     if (len == 0) return true;
+    if (!buffer) return false;
 #if defined(_WIN32)
     NTSTATUS status = BCryptGenRandom(
         nullptr,
@@ -69,6 +80,21 @@ bool CryptoUtils::randomBytes(void* buffer, size_t len) {
     return status >= 0;
 #elif defined(__APPLE__)
     return SecRandomCopyBytes(kSecRandomDefault, len, buffer) == errSecSuccess;
+#elif defined(__linux__)
+    uint8_t* p = static_cast<uint8_t*>(buffer);
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = ::getrandom(p, remaining, 0);
+        if (n > 0) {
+            p += n;
+            remaining -= static_cast<size_t>(n);
+        } else if (n == -1 && errno == EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    return true;
 #else
     FILE* f = std::fopen("/dev/urandom", "rb");
     if (!f) return false;
@@ -80,111 +106,49 @@ bool CryptoUtils::randomBytes(void* buffer, size_t len) {
 
 uint64_t CryptoUtils::generateNineDigitId() {
     uint64_t rnd = 0;
-    randomBytes(&rnd, sizeof(rnd));
+    if (!randomBytes(&rnd, sizeof(rnd))) {
+        return 0;
+    }
     return 100000000ULL + (rnd % 900000000ULL);
 }
-
-#if !defined(_WIN32) && !defined(__APPLE__)
-// Portable fallback SHA-256 implementation for generic Unix
-namespace {
-    inline uint32_t ror(uint32_t val, uint32_t shift) { return (val >> shift) | (val << (32 - shift)); }
-    inline uint32_t ch(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (~x & z); }
-    inline uint32_t maj(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (x & z) ^ (y & z); }
-    inline uint32_t sig0(uint32_t x) { return ror(x, 2) ^ ror(x, 13) ^ ror(x, 22); }
-    inline uint32_t sig1(uint32_t x) { return ror(x, 6) ^ ror(x, 11) ^ ror(x, 25); }
-    inline uint32_t gam0(uint32_t x) { return ror(x, 7) ^ ror(x, 18) ^ (x >> 3); }
-    inline uint32_t gam1(uint32_t x) { return ror(x, 17) ^ ror(x, 19) ^ (x >> 10); }
-
-    const uint32_t K256[64] = {
-        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-    };
-
-    void sha256Transform(uint32_t state[8], const uint8_t block[64]) {
-        uint32_t w[64];
-        for (int i = 0; i < 16; ++i) {
-            w[i] = (static_cast<uint32_t>(block[i * 4]) << 24) |
-                   (static_cast<uint32_t>(block[i * 4 + 1]) << 16) |
-                   (static_cast<uint32_t>(block[i * 4 + 2]) << 8) |
-                   (static_cast<uint32_t>(block[i * 4 + 3]));
-        }
-        for (int i = 16; i < 64; ++i) {
-            w[i] = gam1(w[i - 2]) + w[i - 7] + gam0(w[i - 15]) + w[i - 16];
-        }
-        uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
-        uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
-        for (int i = 0; i < 64; ++i) {
-            uint32_t t1 = h + sig1(e) + ch(e, f, g) + K256[i] + w[i];
-            uint32_t t2 = sig0(a) + maj(a, b, c);
-            h = g; g = f; f = e; e = d + t1;
-            d = c; c = b; b = a; a = t1 + t2;
-        }
-        state[0] += a; state[1] += b; state[2] += c; state[3] += d;
-        state[4] += e; state[5] += f; state[6] += g; state[7] += h;
-    }
-
-    void portableSha256Calc(const uint8_t* msg, size_t len, uint8_t out[32]) {
-        uint32_t state[8] = {
-            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
-        };
-        size_t rem = len % 64;
-        size_t blocks = len / 64;
-        for (size_t i = 0; i < blocks; ++i) {
-            sha256Transform(state, msg + i * 64);
-        }
-        uint8_t tail[128] = {0};
-        if (rem > 0) std::memcpy(tail, msg + blocks * 64, rem);
-        tail[rem] = 0x80;
-        size_t padLen = (rem < 56) ? 64 : 128;
-        uint64_t bitLen = static_cast<uint64_t>(len) * 8ULL;
-        for (int i = 0; i < 8; ++i) {
-            tail[padLen - 1 - i] = static_cast<uint8_t>((bitLen >> (i * 8)) & 0xFF);
-        }
-        for (size_t i = 0; i < padLen; i += 64) {
-            sha256Transform(state, tail + i);
-        }
-        for (int i = 0; i < 8; ++i) {
-            out[i * 4] = static_cast<uint8_t>((state[i] >> 24) & 0xFF);
-            out[i * 4 + 1] = static_cast<uint8_t>((state[i] >> 16) & 0xFF);
-            out[i * 4 + 2] = static_cast<uint8_t>((state[i] >> 8) & 0xFF);
-            out[i * 4 + 3] = static_cast<uint8_t>(state[i] & 0xFF);
-        }
-    }
-}
-#endif
 
 std::array<uint8_t, 32> CryptoUtils::sha256(const void* data, size_t len) {
     std::array<uint8_t, 32> digest{};
 #if defined(_WIN32)
     BCRYPT_ALG_HANDLE hAlg = nullptr;
     BCRYPT_HASH_HANDLE hHash = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (status < 0) std::abort();
 
-    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0) {
-        if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) >= 0) {
-            if (len > 0 && data != nullptr) {
-                BCryptHashData(
-                    hHash,
-                    const_cast<PUCHAR>(static_cast<const uint8_t*>(data)),
-                    static_cast<ULONG>(len),
-                    0
-                );
-            }
-            BCryptFinishHash(hHash, digest.data(), static_cast<ULONG>(digest.size()), 0);
-            BCryptDestroyHash(hHash);
-        }
+    status = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
+    if (status < 0) {
         BCryptCloseAlgorithmProvider(hAlg, 0);
+        std::abort();
     }
+    if (len > 0 && data != nullptr) {
+        status = BCryptHashData(
+            hHash,
+            const_cast<PUCHAR>(static_cast<const uint8_t*>(data)),
+            static_cast<ULONG>(len),
+            0
+        );
+        if (status < 0) {
+            BCryptDestroyHash(hHash);
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            std::abort();
+        }
+    }
+    status = BCryptFinishHash(hHash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (status < 0) std::abort();
 #elif defined(__APPLE__)
     CC_SHA256(data, static_cast<CC_LONG>(len), digest.data());
 #else
-    portableSha256Calc(static_cast<const uint8_t*>(data), len, digest.data());
+    unsigned int outLen = 0;
+    if (EVP_Digest(data, len, digest.data(), &outLen, EVP_sha256(), nullptr) != 1 || outLen != 32) {
+        std::abort();
+    }
 #endif
     return digest;
 }
@@ -225,9 +189,99 @@ std::string CryptoUtils::sha256Hex(const std::string& text) {
     return toHex(d.data(), d.size());
 }
 
-std::string CryptoUtils::hashPassword(const std::string& password, const std::string& salt) {
-    std::string combined = "CppDesk-v1:" + salt + ":" + password;
-    return sha256Hex(combined);
+bool CryptoUtils::pbkdf2Sha256(
+    const std::string& password,
+    const uint8_t* salt,
+    size_t saltLen,
+    uint32_t iterations,
+    std::array<uint8_t, 32>& outDerivedKey)
+{
+    outDerivedKey.fill(0);
+    if (!salt || saltLen == 0 || iterations == 0) return false;
+#if defined(_WIN32)
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    if (status < 0) return false;
+    status = BCryptDeriveKeyPBKDF2(
+        hAlg,
+        reinterpret_cast<PUCHAR>(const_cast<char*>(password.data())),
+        static_cast<ULONG>(password.size()),
+        const_cast<PUCHAR>(salt),
+        static_cast<ULONG>(saltLen),
+        static_cast<ULONGLONG>(iterations),
+        outDerivedKey.data(),
+        static_cast<ULONG>(outDerivedKey.size()),
+        0
+    );
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return status >= 0;
+#else
+    return PKCS5_PBKDF2_HMAC(
+        password.data(),
+        static_cast<int>(password.size()),
+        salt,
+        static_cast<int>(saltLen),
+        static_cast<int>(iterations),
+        EVP_sha256(),
+        static_cast<int>(outDerivedKey.size()),
+        outDerivedKey.data()) == 1;
+#endif
+}
+
+std::string CryptoUtils::hashPassword(const std::string& password, uint32_t iterations) {
+    uint32_t clampedIter = std::clamp(iterations, kMinPbkdf2Iterations, kMaxPbkdf2Iterations);
+    std::array<uint8_t, 16> salt{};
+    if (!randomBytes(salt.data(), salt.size())) return "";
+    std::array<uint8_t, 32> dk{};
+    if (!pbkdf2Sha256(password, salt.data(), salt.size(), clampedIter, dk)) {
+        secureZero(dk.data(), dk.size());
+        return "";
+    }
+    std::string result = "pbkdf2_sha256$" + std::to_string(clampedIter) + "$"
+                       + toHex(salt.data(), salt.size()) + "$"
+                       + toHex(dk.data(), dk.size());
+    secureZero(dk.data(), dk.size());
+    return result;
+}
+
+bool CryptoUtils::parsePasswordVerifier(
+    const std::string& verifier,
+    uint32_t& outIterations,
+    std::array<uint8_t, 16>& outSalt,
+    std::array<uint8_t, 32>& outDerivedKey)
+{
+    static const std::string kPrefix = "pbkdf2_sha256$";
+    if (verifier.rfind(kPrefix, 0) != 0) return false;
+    size_t p1 = kPrefix.size();
+    size_t d1 = verifier.find('$', p1);
+    if (d1 == std::string::npos) return false;
+    size_t d2 = verifier.find('$', d1 + 1);
+    if (d2 == std::string::npos || verifier.find('$', d2 + 1) != std::string::npos) return false;
+
+    uint32_t iter = 0;
+    try {
+        std::string iterStr = verifier.substr(p1, d1 - p1);
+        if (iterStr.empty()) return false;
+        unsigned long long v = std::stoull(iterStr);
+        if (v < kMinPbkdf2Iterations || v > kMaxPbkdf2Iterations) return false;
+        iter = static_cast<uint32_t>(v);
+    } catch (...) {
+        return false;
+    }
+
+    std::string saltHex = verifier.substr(d1 + 1, d2 - (d1 + 1));
+    std::string dkHex = verifier.substr(d2 + 1);
+    if (saltHex.size() != 32 || dkHex.size() != 64) return false;
+
+    auto saltBytes = fromHex(saltHex);
+    auto dkBytes = fromHex(dkHex);
+    if (saltBytes.size() != 16 || dkBytes.size() != 32) return false;
+
+    outIterations = iter;
+    std::copy(saltBytes.begin(), saltBytes.end(), outSalt.begin());
+    std::copy(dkBytes.begin(), dkBytes.end(), outDerivedKey.begin());
+    secureZero(dkBytes.data(), dkBytes.size());
+    return true;
 }
 
 std::array<uint8_t, 32> CryptoUtils::computeChallengeResponseFromToken(
@@ -246,12 +300,21 @@ std::array<uint8_t, 32> CryptoUtils::computeChallengeResponseFromToken(
 
 std::array<uint8_t, 32> CryptoUtils::computeChallengeResponse(
     const std::string& passwordPlain,
+    const std::array<uint8_t, 16>& salt,
+    uint32_t iterations,
     uint64_t hostId,
     uint64_t clientId,
     const std::array<uint8_t, 32>& nonce)
 {
-    std::string passToken = hashPassword(passwordPlain, std::to_string(hostId));
-    return computeChallengeResponseFromToken(passToken, hostId, clientId, nonce);
+    std::array<uint8_t, 32> dk{};
+    if (!pbkdf2Sha256(passwordPlain, salt.data(), salt.size(), iterations, dk)) {
+        return std::array<uint8_t, 32>{};
+    }
+    std::string passToken = toHex(dk.data(), dk.size());
+    auto digest = computeChallengeResponseFromToken(passToken, hostId, clientId, nonce);
+    secureZero(passToken.data(), passToken.size());
+    secureZero(dk.data(), dk.size());
+    return digest;
 }
 
 std::array<uint8_t, 32> CryptoUtils::bindChallengeResponse(
@@ -281,48 +344,41 @@ std::array<uint8_t, 32> CryptoUtils::hmacSha256(const void* key, size_t keyLen, 
 #if defined(_WIN32)
     BCRYPT_ALG_HANDLE hAlg = nullptr;
     NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
-    if (status >= 0) {
-        BCRYPT_HASH_HANDLE hHash = nullptr;
-        status = BCryptCreateHash(hAlg, &hHash, nullptr, 0,
-                                  const_cast<PUCHAR>(static_cast<const uint8_t*>(key)),
-                                  static_cast<ULONG>(keyLen), 0);
-        if (status >= 0) {
-            if (msg && msgLen > 0) {
-                BCryptHashData(hHash,
-                               const_cast<PUCHAR>(static_cast<const uint8_t*>(msg)),
-                               static_cast<ULONG>(msgLen), 0);
-            }
-            BCryptFinishHash(hHash, digest.data(), static_cast<ULONG>(digest.size()), 0);
-            BCryptDestroyHash(hHash);
-        }
+    if (status < 0) std::abort();
+
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    status = BCryptCreateHash(hAlg, &hHash, nullptr, 0,
+                              const_cast<PUCHAR>(static_cast<const uint8_t*>(key)),
+                              static_cast<ULONG>(keyLen), 0);
+    if (status < 0) {
         BCryptCloseAlgorithmProvider(hAlg, 0);
+        std::abort();
     }
+    if (msg && msgLen > 0) {
+        status = BCryptHashData(hHash,
+                                const_cast<PUCHAR>(static_cast<const uint8_t*>(msg)),
+                                static_cast<ULONG>(msgLen), 0);
+        if (status < 0) {
+            BCryptDestroyHash(hHash);
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            std::abort();
+        }
+    }
+    status = BCryptFinishHash(hHash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (status < 0) std::abort();
     return digest;
 #elif defined(__APPLE__)
     CCHmac(kCCHmacAlgSHA256, key, keyLen, msg, msgLen, digest.data());
     return digest;
 #else
-    uint8_t k0[64] = {0};
-    if (keyLen > 64) {
-        portableSha256Calc(static_cast<const uint8_t*>(key), keyLen, k0);
-    } else if (key && keyLen > 0) {
-        std::memcpy(k0, key, keyLen);
+    unsigned int outLen = 0;
+    if (!HMAC(EVP_sha256(), key, static_cast<int>(keyLen),
+              static_cast<const unsigned char*>(msg), msgLen,
+              digest.data(), &outLen) || outLen != 32) {
+        std::abort();
     }
-    uint8_t ipad[64];
-    uint8_t opad[64];
-    for (int i = 0; i < 64; ++i) {
-        ipad[i] = k0[i] ^ 0x36;
-        opad[i] = k0[i] ^ 0x5c;
-    }
-    std::vector<uint8_t> inner(64 + msgLen);
-    std::memcpy(inner.data(), ipad, 64);
-    if (msg && msgLen > 0) std::memcpy(inner.data() + 64, msg, msgLen);
-    uint8_t innerHash[32];
-    portableSha256Calc(inner.data(), inner.size(), innerHash);
-    uint8_t outer[64 + 32];
-    std::memcpy(outer, opad, 64);
-    std::memcpy(outer + 64, innerHash, 32);
-    portableSha256Calc(outer, sizeof(outer), digest.data());
     return digest;
 #endif
 }
@@ -369,61 +425,6 @@ std::string CryptoUtils::sessionFingerprintHex(const std::array<uint8_t, 32>& se
     std::snprintf(buf, sizeof(buf), "%02X%02X-%02X%02X",
                   digest[0], digest[1], digest[2], digest[3]);
     return std::string(buf);
-}
-
-void CryptoUtils::transformPayload(
-    uint8_t* data,
-    size_t len,
-    const std::array<uint8_t, 32>& sessionKey,
-    uint64_t frameSequence)
-{
-    if (!data || len == 0) return;
-
-    // Fast 64-bit SplitMix64 CTR stream cipher seeded from 256-bit sessionKey + frameSequence
-    uint64_t k0 = 0, k1 = 0, k2 = 0, k3 = 0;
-    std::memcpy(&k0, sessionKey.data() + 0, 8);
-    std::memcpy(&k1, sessionKey.data() + 8, 8);
-    std::memcpy(&k2, sessionKey.data() + 16, 8);
-    std::memcpy(&k3, sessionKey.data() + 24, 8);
-
-    uint64_t state = k0 ^ (k1 + 0x9E3779B97F4A7C15ULL) ^ (frameSequence * 0xBF58476D1CE4E5B9ULL);
-    auto nextWord = [&]() -> uint64_t {
-        state += 0x9E3779B97F4A7C15ULL;
-        uint64_t z = (state ^ k2);
-        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-        z = (z ^ (z >> 27) ^ k3) * 0x94D049BB133111EBULL;
-        return z ^ (z >> 31);
-    };
-
-    size_t i = 0;
-    if (SimdKernels::hasAvx2() && len >= 32) {
-        alignas(32) uint64_t ksBatch[32]; // Up to 8 x 32-byte (256-bit) AVX2 blocks per call
-        while (i + 32 <= len) {
-            size_t blocks = std::min<size_t>((len - i) / 32, 8);
-            size_t words = blocks * 4;
-            for (size_t w = 0; w < words; ++w) {
-                ksBatch[w] = nextWord();
-            }
-            cppdesk_avx2_xor_blocks32(data + i, reinterpret_cast<const uint8_t*>(ksBatch), blocks);
-            i += blocks * 32;
-        }
-    }
-
-    while (i + 8 <= len) {
-        uint64_t ks = nextWord();
-        uint64_t chunk = 0;
-        std::memcpy(&chunk, data + i, 8);
-        chunk ^= ks;
-        std::memcpy(data + i, &chunk, 8);
-        i += 8;
-    }
-    if (i < len) {
-        uint64_t ks = nextWord();
-        const uint8_t* ksBytes = reinterpret_cast<const uint8_t*>(&ks);
-        for (size_t j = 0; i < len; ++i, ++j) {
-            data[i] ^= ksBytes[j];
-        }
-    }
 }
 
 std::string CryptoUtils::formatDeskId(uint64_t id) {
@@ -547,10 +548,10 @@ IdentityManager::IdentityManager(int instanceId)
     }
 
 #if defined(_WIN32)
-    char appData[MAX_PATH] = {};
-    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, appData))) {
-        std::filesystem::path dir = std::filesystem::path(appData) / "CppDesk";
-        std::filesystem::path oldDir = std::filesystem::path(appData) / "AeroDesk";
+    wchar_t appData[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appData))) {
+        std::filesystem::path dir = std::filesystem::path(appData) / L"CppDesk";
+        std::filesystem::path oldDir = std::filesystem::path(appData) / L"AeroDesk";
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
 
@@ -563,7 +564,7 @@ IdentityManager::IdentityManager(int instanceId)
             }
         }
 
-        configPath_ = (dir / ("config_" + std::to_string(instanceId_) + ".ini")).string();
+        configPath_ = dir / ("config_" + std::to_string(instanceId_) + ".ini");
     } else {
         std::filesystem::path oldLocal = "aerodesk_" + std::to_string(instanceId_) + ".ini";
         std::filesystem::path newLocal = "cppdesk_" + std::to_string(instanceId_) + ".ini";
@@ -571,42 +572,68 @@ IdentityManager::IdentityManager(int instanceId)
         if (std::filesystem::exists(oldLocal, ec) && !std::filesystem::exists(newLocal, ec)) {
             std::filesystem::copy_file(oldLocal, newLocal, std::filesystem::copy_options::overwrite_existing, ec);
         }
-        configPath_ = newLocal.string();
+        configPath_ = newLocal;
     }
 #else
     const char* home = std::getenv("HOME");
     std::filesystem::path dir = home ? (std::filesystem::path(home) / ".cppdesk") : std::filesystem::path(".cppdesk");
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    configPath_ = (dir / ("config_" + std::to_string(instanceId_) + ".ini")).string();
+    ::chmod(dir.c_str(), 0700);
+    configPath_ = dir / ("config_" + std::to_string(instanceId_) + ".ini");
 #endif
+}
+
+std::string IdentityManager::configFilePath() const {
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    auto u8 = configPath_.u8string();
+    return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
+}
+
+void IdentityManager::setConfigPathForTest(const std::filesystem::path& path) {
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    configPath_ = path;
 }
 
 bool IdentityManager::loadOrCreate() {
     std::string legacyPlainPassword;
-    std::ifstream in(configPath_);
-    if (in.is_open()) {
-        std::string line;
-        recentSessions_.clear();
-        std::lock_guard<std::mutex> pairLock(pairMutex_);
-        pairedViewers_.clear();
-        pairedHosts_.clear();
-        while (std::getline(in, line)) {
-            if (line.empty() || line[0] == '#') continue;
-            auto eq = line.find('=');
-            if (eq == std::string::npos) continue;
-            std::string key = line.substr(0, eq);
-            std::string val = line.substr(eq + 1);
+    bool droppedLegacyVerifier = false;
+    bool modified = false;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        std::ifstream in(configPath_);
+        if (in.is_open()) {
+            std::string line;
+            recentSessions_.clear();
+            std::lock_guard<std::mutex> pairLock(pairMutex_);
+            pairedViewers_.clear();
+            pairedHosts_.clear();
+            while (std::getline(in, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty() || line[0] == '#') continue;
+                auto eq = line.find('=');
+                if (eq == std::string::npos) continue;
+                std::string key = line.substr(0, eq);
+                std::string val = line.substr(eq + 1);
 
-            if (key == "desk_id") {
-                try { deskId_ = std::stoull(val); } catch (...) {}
-            } else if (key == "listen_port") {
-                try { listenPort_ = static_cast<uint16_t>(std::stoi(val)); } catch (...) {}
-            } else if (key == "unattended_enabled") {
-                unattendedEnabled_ = (val == "1" || val == "true");
-            } else if (key == "unattended_verifier") {
-                if (val.size() == 64) unattendedVerifier_ = val;
-            } else if (key == "relay_owner_key") {
+                if (key == "desk_id") {
+                    try { deskId_ = std::stoull(val); } catch (...) {}
+                } else if (key == "listen_port") {
+                    try { listenPort_ = static_cast<uint16_t>(std::stoi(val)); } catch (...) {}
+                } else if (key == "unattended_enabled") {
+                    unattendedEnabled_ = (val == "1" || val == "true");
+                } else if (key == "unattended_verifier") {
+                    uint32_t vIter = 0;
+                    std::array<uint8_t, 16> vSalt{};
+                    std::array<uint8_t, 32> vDk{};
+                    if (CryptoUtils::parsePasswordVerifier(val, vIter, vSalt, vDk)) {
+                        unattendedVerifier_ = val;
+                        CryptoUtils::secureZero(vDk.data(), vDk.size());
+                    } else if (!val.empty()) {
+                        unattendedVerifier_.clear();
+                        droppedLegacyVerifier = true;
+                    }
+                } else if (key == "relay_owner_key") {
                 auto bytes = CryptoUtils::fromHex(val);
                 if (bytes.size() == relayOwnerKey_.size()) std::copy(bytes.begin(), bytes.end(), relayOwnerKey_.begin());
             } else if (key == "unattended_password") {
@@ -760,41 +787,62 @@ bool IdentityManager::loadOrCreate() {
         in.close();
     }
 
-    settings_.targetFps = clampTargetFps(settings_.targetFps);
+        settings_.targetFps = clampTargetFps(settings_.targetFps);
 
-    if (!settings_.totpSecret.empty()) {
-        TotpAlgorithm alg = (settings_.totpAlgorithm == "SHA256") ? TotpAlgorithm::Sha256 : TotpAlgorithm::Sha1;
-        totpManager_.setSecret(settings_.totpSecret, alg);
-    }
+        if (!settings_.totpSecret.empty()) {
+            TotpAlgorithm alg = (settings_.totpAlgorithm == "SHA256") ? TotpAlgorithm::Sha256 : TotpAlgorithm::Sha1;
+            totpManager_.setSecret(settings_.totpSecret, alg);
+        }
 
-    bool modified = false;
-    if (deskId_ < 100000000ULL || deskId_ > 999999999ULL) {
-        deskId_ = CryptoUtils::generateNineDigitId();
-        modified = true;
-    }
+        if (deskId_ < 100000000ULL || deskId_ > 999999999ULL) {
+            deskId_ = CryptoUtils::generateNineDigitId();
+            if (deskId_ < 100000000ULL || deskId_ > 999999999ULL) {
+                return false;
+            }
+            modified = true;
+        }
 
-    if (sessionCode_.empty()) {
-        sessionCode_ = generateRandomSixCharCode();
-    }
+        if (sessionCode_.empty()) {
+            sessionCode_ = generateRandomSixCharCode();
+        }
+        bool hasSessionSalt = false;
+        for (uint8_t b : sessionSalt_) {
+            if (b != 0) { hasSessionSalt = true; break; }
+        }
+        if (!hasSessionSalt) {
+            if (!CryptoUtils::randomBytes(sessionSalt_.data(), sessionSalt_.size())) {
+                return false;
+            }
+        }
 
-    if (!CryptoUtils::isUsableKey(relayOwnerKey_)) {
-        CryptoUtils::randomBytes(relayOwnerKey_.data(), relayOwnerKey_.size());
-        modified = true;
-    }
+        if (!CryptoUtils::isUsableKey(relayOwnerKey_)) {
+            if (!CryptoUtils::randomBytes(relayOwnerKey_.data(), relayOwnerKey_.size())) {
+                CryptoUtils::secureZero(relayOwnerKey_.data(), relayOwnerKey_.size());
+                return false;
+            }
+            modified = true;
+        }
 
-    if (!pairingKey_.isValid()) {
-        pairingKey_.generate();
-        modified = true;
-    }
+        if (!pairingKey_.isValid()) {
+            pairingKey_.generate();
+            modified = true;
+        }
 
-    // Transparently migrate legacy plaintext password to salted SHA-256 verifier
-    if (!legacyPlainPassword.empty() && unattendedVerifier_.empty()) {
-        unattendedVerifier_ = CryptoUtils::hashPassword(legacyPlainPassword, std::to_string(deskId_));
-        modified = true;
-    }
+        if (droppedLegacyVerifier) {
+            std::fprintf(stderr, "[CppDesk] Dropped legacy unattended password verifier; please set your unattended password again.\n");
+            modified = true;
+        }
 
-    if (!unattendedEnabled_) {
-        unattendedVerifier_.clear();
+        // Transparently migrate legacy plaintext password to PBKDF2-HMAC-SHA256 verifier
+        if (!legacyPlainPassword.empty() && unattendedVerifier_.empty()) {
+            unattendedVerifier_ = CryptoUtils::hashPassword(legacyPlainPassword);
+            CryptoUtils::secureZero(legacyPlainPassword.data(), legacyPlainPassword.size());
+            modified = true;
+        }
+
+        if (!unattendedEnabled_) {
+            unattendedVerifier_.clear();
+        }
     }
 
     if (modified) {
@@ -806,106 +854,172 @@ bool IdentityManager::loadOrCreate() {
 bool IdentityManager::save() const {
     // Host, viewer and UI threads all save: one at a time, into a temp file renamed over the config, so it never tears.
     std::lock_guard<std::mutex> saveLock(saveMutex_);
-    const std::string tmpPath = configPath_ + ".tmp";
-    std::ofstream out(tmpPath, std::ios::trunc);
-    if (!out.is_open()) return false;
-    std::error_code ec;
-#ifndef _WIN32
-    // pair_key logs in to every paired host without a password: owner-only before any of it is written.
-    std::filesystem::permissions(tmpPath, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                                 std::filesystem::perm_options::replace, ec);
-#endif
+    std::filesystem::path targetPath;
+    std::ostringstream out;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        targetPath = configPath_;
 
-    out << "# CppDesk Configuration (Salted SHA-256 Verifier Protected)\n";
-    out << "desk_id=" << deskId_ << "\n";
-    out << "listen_port=" << listenPort_ << "\n";
-    out << "unattended_enabled=" << (unattendedEnabled_ ? "1" : "0") << "\n";
-    out << "unattended_verifier=" << unattendedVerifier_ << "\n";
-    out << "relay_owner_key=" << CryptoUtils::toHex(relayOwnerKey_.data(), relayOwnerKey_.size()) << "\n";
-    out << "relay_server=" << (settings_.relayServer.empty() ? relayServerAddr_ : settings_.relayServer) << "\n";
-    out << "relay_auth_key=" << settings_.relayAuthKey << "\n";
-    out << "stun_server=" << settings_.stunServer << "\n";
-    out << "relay_mode=" << static_cast<int>(settings_.relayMode) << "\n";
-    out << "dark_theme=" << (settings_.darkTheme ? "1" : "0") << "\n";
-    out << "target_fps=" << static_cast<int>(clampTargetFps(settings_.targetFps)) << "\n";
-    out << "adaptive_fps=" << (settings_.adaptiveFps ? "1" : "0") << "\n";
-    out << "default_quality=" << static_cast<int>(settings_.defaultQuality) << "\n";
-    out << "connection_profile=" << static_cast<int>(settings_.connectionProfile) << "\n";
-    out << "default_scale=" << static_cast<int>(settings_.defaultScaleMode) << "\n";
-    out << "show_remote_cursor=" << (settings_.showRemoteCursor ? "1" : "0") << "\n";
-    out << "show_session_hud=" << (settings_.showSessionHud ? "1" : "0") << "\n";
-    out << "auto_accept=" << (settings_.autoAcceptIncoming ? "1" : "0") << "\n";
-    out << "default_perms=" << static_cast<int>(settings_.defaultPermissions & PERM_ALL) << "\n";
-    out << "lock_on_disconnect=" << (settings_.lockWorkstationOnDisconnect ? "1" : "0") << "\n";
-    out << "push_notifications=" << (settings_.enablePushNotifications ? "1" : "0") << "\n";
-    out << "taskbar_flash=" << (settings_.enableTaskbarFlash ? "1" : "0") << "\n";
-    out << "notification_sound=" << (settings_.enableNotificationSounds ? "1" : "0") << "\n";
-    out << "minimize_to_tray=" << (settings_.minimizeToTray ? "1" : "0") << "\n";
-    out << "hardware_acceleration=" << (settings_.hardwareAcceleration ? "1" : "0") << "\n";
-    out << "default_audio_volume=" << static_cast<int>(settings_.defaultAudioVolume) << "\n";
-    out << "audio_muted_default=" << (settings_.audioMutedDefault ? "1" : "0") << "\n";
-    out << "audio_input_device_id=" << settings_.audioInputDeviceId << "\n";
-    out << "audio_output_device_id=" << settings_.audioOutputDeviceId << "\n";
-    out << "audio_input_device_name=" << settings_.audioInputDeviceName << "\n";
-    out << "audio_output_device_name=" << settings_.audioOutputDeviceName << "\n";
-    out << "wayland_restore_token=" << settings_.waylandRestoreToken << "\n";
-    out << "auto_virtual_display=" << (settings_.autoVirtualDisplay ? "1" : "0") << "\n";
-    auto sanitizeIniValue = [](const std::string& in) -> std::string {
-        std::string out;
-        out.reserve(in.size());
-        for (char c : in) {
-            if (c == '|' || c == '\r' || c == '\n') {
-                out.push_back(' ');
+        auto sanitizeIniLine = [](const std::string& in) -> std::string {
+            std::string res;
+            res.reserve(in.size());
+            for (char c : in) {
+                if (c == '\r' || c == '\n') {
+                    res.push_back(' ');
+                } else {
+                    res.push_back(c);
+                }
+            }
+            return res;
+        };
+        auto sanitizeIniValue = [](const std::string& in) -> std::string {
+            std::string res;
+            res.reserve(in.size());
+            for (char c : in) {
+                if (c == '|' || c == '\r' || c == '\n') {
+                    res.push_back(' ');
+                } else {
+                    res.push_back(c);
+                }
+            }
+            return res;
+        };
+
+        out << "# CppDesk Configuration (PBKDF2-HMAC-SHA256 Verifier Protected)\n";
+        out << "desk_id=" << deskId_ << "\n";
+        out << "listen_port=" << listenPort_ << "\n";
+        out << "unattended_enabled=" << (unattendedEnabled_ ? "1" : "0") << "\n";
+        out << "unattended_verifier=" << sanitizeIniLine(unattendedVerifier_) << "\n";
+        out << "relay_owner_key=" << CryptoUtils::toHex(relayOwnerKey_.data(), relayOwnerKey_.size()) << "\n";
+        out << "relay_server=" << sanitizeIniLine(settings_.relayServer.empty() ? relayServerAddr_ : settings_.relayServer) << "\n";
+        out << "relay_auth_key=" << sanitizeIniLine(settings_.relayAuthKey) << "\n";
+        out << "stun_server=" << sanitizeIniLine(settings_.stunServer) << "\n";
+        out << "relay_mode=" << static_cast<int>(settings_.relayMode) << "\n";
+        out << "dark_theme=" << (settings_.darkTheme ? "1" : "0") << "\n";
+        out << "target_fps=" << static_cast<int>(clampTargetFps(settings_.targetFps)) << "\n";
+        out << "adaptive_fps=" << (settings_.adaptiveFps ? "1" : "0") << "\n";
+        out << "default_quality=" << static_cast<int>(settings_.defaultQuality) << "\n";
+        out << "connection_profile=" << static_cast<int>(settings_.connectionProfile) << "\n";
+        out << "default_scale=" << static_cast<int>(settings_.defaultScaleMode) << "\n";
+        out << "show_remote_cursor=" << (settings_.showRemoteCursor ? "1" : "0") << "\n";
+        out << "show_session_hud=" << (settings_.showSessionHud ? "1" : "0") << "\n";
+        out << "auto_accept=" << (settings_.autoAcceptIncoming ? "1" : "0") << "\n";
+        out << "default_perms=" << static_cast<int>(settings_.defaultPermissions & PERM_ALL) << "\n";
+        out << "lock_on_disconnect=" << (settings_.lockWorkstationOnDisconnect ? "1" : "0") << "\n";
+        out << "push_notifications=" << (settings_.enablePushNotifications ? "1" : "0") << "\n";
+        out << "taskbar_flash=" << (settings_.enableTaskbarFlash ? "1" : "0") << "\n";
+        out << "notification_sound=" << (settings_.enableNotificationSounds ? "1" : "0") << "\n";
+        out << "minimize_to_tray=" << (settings_.minimizeToTray ? "1" : "0") << "\n";
+        out << "hardware_acceleration=" << (settings_.hardwareAcceleration ? "1" : "0") << "\n";
+        out << "default_audio_volume=" << static_cast<int>(settings_.defaultAudioVolume) << "\n";
+        out << "audio_muted_default=" << (settings_.audioMutedDefault ? "1" : "0") << "\n";
+        out << "audio_input_device_id=" << settings_.audioInputDeviceId << "\n";
+        out << "audio_output_device_id=" << settings_.audioOutputDeviceId << "\n";
+        out << "audio_input_device_name=" << sanitizeIniLine(settings_.audioInputDeviceName) << "\n";
+        out << "audio_output_device_name=" << sanitizeIniLine(settings_.audioOutputDeviceName) << "\n";
+        out << "wayland_restore_token=" << sanitizeIniLine(settings_.waylandRestoreToken) << "\n";
+        out << "auto_virtual_display=" << (settings_.autoVirtualDisplay ? "1" : "0") << "\n";
+        out << "privacy_notice=" << sanitizeIniValue(settings_.privacyCustomNotice) << "\n";
+        out << "privacy_brand=" << sanitizeIniValue(settings_.privacyBrandName) << "\n";
+        out << "privacy_show_id=" << (settings_.privacyShowDeskId ? "1" : "0") << "\n";
+        out << "hardware_dpms_blanking=" << (settings_.hardwareDpmsBlanking ? "1" : "0") << "\n";
+        out << "totp_enabled=" << (settings_.totpEnabled ? "1" : "0") << "\n";
+        out << "totp_secret=" << sanitizeIniLine(settings_.totpSecret) << "\n";
+        out << "totp_algorithm=" << sanitizeIniLine(settings_.totpAlgorithm) << "\n";
+        out << "privacy_cloak_enabled=" << (settings_.privacyCloakEnabled ? "1" : "0") << "\n";
+        out << "privacy_cloak_keywords=" << sanitizeIniValue(settings_.privacyCloakKeywords) << "\n";
+        out << "privacy_cloak_style=" << static_cast<int>(settings_.privacyCloakStyle) << "\n";
+        out << "allow_pairing=" << (settings_.allowPairing ? "1" : "0") << "\n";
+        out << "glide_left=" << settings_.glideLeft << "\n";
+        out << "glide_right=" << settings_.glideRight << "\n";
+        out << "glide_top=" << settings_.glideTop << "\n";
+        out << "glide_bottom=" << settings_.glideBottom << "\n";
+        if (pairingKey_.isValid()) {
+            auto kp = pairingKey_.exportKeyPair();
+            std::string kpHex = CryptoUtils::toHex(kp.data(), kp.size());
+            out << "pair_key=" << kpHex << "\n";
+            CryptoUtils::secureZero(kpHex.data(), kpHex.size());
+            CryptoUtils::secureZero(kp.data(), kp.size());
+        }
+
+        for (const auto& r : recentSessions_) {
+            out << "recent=" << r.deskId << "|" << sanitizeIniValue(r.hostname) << "|" << sanitizeIniValue(r.address) << "|" << (r.isFavorite ? "1" : "0")
+                << "|" << sanitizeIniValue(r.alias) << "|" << sanitizeIniValue(r.tag) << "|" << sanitizeIniValue(r.notes) << "\n";
+        }
+        auto writePeers = [&](const char* name, const std::vector<PairedPeer>& list) {
+            for (const auto& p : list) {
+                out << name << "=" << p.deskId << "|" << CryptoUtils::toHex(p.publicKey.data(), p.publicKey.size())
+                    << "|" << p.pairedAtUnix << "|" << sanitizeIniValue(p.hostname) << "\n";
+            }
+        };
+        {
+            std::lock_guard<std::mutex> pairLock(pairMutex_);
+            writePeers("paired_viewer", pairedViewers_);
+            writePeers("paired_host", pairedHosts_);
+        }
+    }
+
+    std::string content = out.str();
+    std::filesystem::path tmpPath = targetPath;
+    tmpPath += ".tmp";
+    std::error_code ec;
+
+#if defined(_WIN32)
+    {
+        std::ofstream fileOut(tmpPath, std::ios::binary | std::ios::trunc);
+        if (!fileOut.is_open()) {
+            CryptoUtils::secureZero(content.data(), content.size());
+            return false;
+        }
+        fileOut.write(content.data(), static_cast<std::streamsize>(content.size()));
+        fileOut.close();
+        if (!fileOut) {
+            CryptoUtils::secureZero(content.data(), content.size());
+            std::filesystem::remove(tmpPath, ec);
+            return false;
+        }
+    }
+#else
+    {
+        // Create owner-only (0600) before any secret is written; never follow symlinks.
+        int fd = ::open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+        if (fd < 0) {
+            CryptoUtils::secureZero(content.data(), content.size());
+            return false;
+        }
+        if (::fchmod(fd, 0600) != 0) {
+            ::close(fd);
+            ::unlink(tmpPath.c_str());
+            CryptoUtils::secureZero(content.data(), content.size());
+            return false;
+        }
+        const char* p = content.data();
+        size_t rem = content.size();
+        bool writeOk = true;
+        while (rem > 0) {
+            ssize_t n = ::write(fd, p, rem);
+            if (n > 0) {
+                p += n;
+                rem -= static_cast<size_t>(n);
+            } else if (n == -1 && errno == EINTR) {
+                continue;
             } else {
-                out.push_back(c);
+                writeOk = false;
+                break;
             }
         }
-        return out;
-    };
-
-    out << "privacy_notice=" << sanitizeIniValue(settings_.privacyCustomNotice) << "\n";
-    out << "privacy_brand=" << sanitizeIniValue(settings_.privacyBrandName) << "\n";
-    out << "privacy_show_id=" << (settings_.privacyShowDeskId ? "1" : "0") << "\n";
-    out << "hardware_dpms_blanking=" << (settings_.hardwareDpmsBlanking ? "1" : "0") << "\n";
-    out << "totp_enabled=" << (settings_.totpEnabled ? "1" : "0") << "\n";
-    out << "totp_secret=" << settings_.totpSecret << "\n";
-    out << "totp_algorithm=" << settings_.totpAlgorithm << "\n";
-    out << "privacy_cloak_enabled=" << (settings_.privacyCloakEnabled ? "1" : "0") << "\n";
-    out << "privacy_cloak_keywords=" << sanitizeIniValue(settings_.privacyCloakKeywords) << "\n";
-    out << "privacy_cloak_style=" << static_cast<int>(settings_.privacyCloakStyle) << "\n";
-    out << "allow_pairing=" << (settings_.allowPairing ? "1" : "0") << "\n";
-    out << "glide_left=" << settings_.glideLeft << "\n";
-    out << "glide_right=" << settings_.glideRight << "\n";
-    out << "glide_top=" << settings_.glideTop << "\n";
-    out << "glide_bottom=" << settings_.glideBottom << "\n";
-    if (pairingKey_.isValid()) {
-        auto kp = pairingKey_.exportKeyPair();
-        out << "pair_key=" << CryptoUtils::toHex(kp.data(), kp.size()) << "\n";
-        CryptoUtils::secureZero(kp.data(), kp.size());
-    }
-
-    for (const auto& r : recentSessions_) {
-        out << "recent=" << r.deskId << "|" << sanitizeIniValue(r.hostname) << "|" << sanitizeIniValue(r.address) << "|" << (r.isFavorite ? "1" : "0")
-            << "|" << sanitizeIniValue(r.alias) << "|" << sanitizeIniValue(r.tag) << "|" << sanitizeIniValue(r.notes) << "\n";
-    }
-    auto writePeers = [&](const char* name, const std::vector<PairedPeer>& list) {
-        for (const auto& p : list) {
-            out << name << "=" << p.deskId << "|" << CryptoUtils::toHex(p.publicKey.data(), p.publicKey.size())
-                << "|" << p.pairedAtUnix << "|" << sanitizeIniValue(p.hostname) << "\n";
+        if (::close(fd) != 0) writeOk = false;
+        if (!writeOk) {
+            ::unlink(tmpPath.c_str());
+            CryptoUtils::secureZero(content.data(), content.size());
+            return false;
         }
-    };
-    {
-        std::lock_guard<std::mutex> pairLock(pairMutex_);
-        writePeers("paired_viewer", pairedViewers_);
-        writePeers("paired_host", pairedHosts_);
     }
-    out.close();
-    if (!out) {
-        std::filesystem::remove(tmpPath, ec);
-        return false;
-    }
+#endif
+
+    CryptoUtils::secureZero(content.data(), content.size());
     for (int attempt = 0; attempt < 50; ++attempt) {   // a reader holding the config open on Windows blocks the replace briefly
-        std::filesystem::rename(tmpPath, configPath_, ec);
+        std::filesystem::rename(tmpPath, targetPath, ec);
         if (!ec) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -954,62 +1068,123 @@ bool IdentityManager::removePairedHost(uint64_t deskId) {
     bool removed;
     { std::lock_guard<std::mutex> lock(pairMutex_); removed = erasePeer(pairedHosts_, deskId); }
     if (removed) {
-        for (uint64_t* g : {&settings_.glideLeft, &settings_.glideRight, &settings_.glideTop, &settings_.glideBottom})
-            if (*g == deskId) *g = 0;
+        {
+            std::lock_guard<std::mutex> stateLock(stateMutex_);
+            for (uint64_t* g : {&settings_.glideLeft, &settings_.glideRight, &settings_.glideTop, &settings_.glideBottom})
+                if (*g == deskId) *g = 0;
+        }
         save();
     }
     return removed;
 }
 
 void IdentityManager::setUnattendedEnabled(bool enabled) {
-    unattendedEnabled_ = enabled;
-    if (!enabled) {
-        unattendedVerifier_.clear();
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        unattendedEnabled_ = enabled;
+        if (!enabled) {
+            unattendedVerifier_.clear();
+        }
     }
     save();
 }
 
 void IdentityManager::setUnattendedPassword(const std::string& newPassword) {
     if (newPassword.empty()) return;
-    unattendedPassword_ = newPassword;
-    unattendedVerifier_ = CryptoUtils::hashPassword(newPassword, std::to_string(deskId_));
+    std::string verifier = CryptoUtils::hashPassword(newPassword);
+    if (verifier.empty()) return;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        unattendedPassword_ = newPassword;
+        unattendedVerifier_ = std::move(verifier);
+    }
     save();
 }
 
 std::string IdentityManager::regenerateSessionCode() {
-    sessionCode_ = generateRandomSixCharCode();
-    if (unattendedPassword_.empty()) {
-        unattendedVerifier_ = CryptoUtils::hashPassword(sessionCode_, std::to_string(deskId_));
-        save();
+    std::string code = generateRandomSixCharCode();
+    std::array<uint8_t, 16> newSalt{};
+    bool hasNewSalt = CryptoUtils::randomBytes(newSalt.data(), newSalt.size());
+    std::lock_guard<std::mutex> stateLock(stateMutex_);
+    sessionCode_ = code;
+    if (hasNewSalt) {
+        sessionSalt_ = newSalt;
     }
     return sessionCode_;
+}
+
+void IdentityManager::getAuthKdfParams(std::array<uint8_t, 16>& outSalt, uint32_t& outIterations) const {
+    std::lock_guard<std::mutex> stateLock(stateMutex_);
+    if (unattendedEnabled_ && !unattendedVerifier_.empty()) {
+        uint32_t vIter = 0;
+        std::array<uint8_t, 16> vSalt{};
+        std::array<uint8_t, 32> vDk{};
+        if (CryptoUtils::parsePasswordVerifier(unattendedVerifier_, vIter, vSalt, vDk)) {
+            CryptoUtils::secureZero(vDk.data(), vDk.size());
+            outSalt = vSalt;
+            outIterations = vIter;
+            return;
+        }
+    }
+    outSalt = sessionSalt_;
+    outIterations = sessionIterations_;
 }
 
 bool IdentityManager::verifyChallengeResponse(
     uint64_t clientId,
     const std::array<uint8_t, 32>& nonce,
     const std::array<uint8_t, 32>& clientDigest,
-    const std::array<uint8_t, 32>* boundSessionKey) const
+    const std::array<uint8_t, 32>& boundSessionKey,
+    const std::array<uint8_t, 16>& challengeSalt,
+    uint32_t challengeIterations) const
 {
+    if (challengeIterations < CryptoUtils::kMinPbkdf2Iterations ||
+        challengeIterations > CryptoUtils::kMaxPbkdf2Iterations) {
+        return false;
+    }
+
+    uint64_t deskId = 0;
+    std::string sessionCode;
+    bool unattendedEnabled = false;
+    std::string unattendedVerifier;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        deskId = deskId_;
+        sessionCode = sessionCode_;
+        unattendedEnabled = unattendedEnabled_;
+        unattendedVerifier = unattendedVerifier_;
+    }
+
     // 1. Check against active One-Time Session Code
-    if (!sessionCode_.empty()) {
+    if (!sessionCode.empty()) {
         auto expectedCode = CryptoUtils::computeChallengeResponse(
-            sessionCode_, deskId_, clientId, nonce
+            sessionCode, challengeSalt, challengeIterations, deskId, clientId, nonce
         );
-        if (boundSessionKey) expectedCode = CryptoUtils::bindChallengeResponse(*boundSessionKey, expectedCode);
+        expectedCode = CryptoUtils::bindChallengeResponse(boundSessionKey, expectedCode);
         if (constantTimeEquals32(expectedCode, clientDigest)) {
             return true;
         }
     }
 
     // 2. Check against stored unattended password verifier (only when unattended access is enabled)
-    if (unattendedEnabled_ && !unattendedVerifier_.empty()) {
-        auto expected = CryptoUtils::computeChallengeResponseFromToken(
-            unattendedVerifier_, deskId_, clientId, nonce
-        );
-        if (boundSessionKey) expected = CryptoUtils::bindChallengeResponse(*boundSessionKey, expected);
-        if (constantTimeEquals32(expected, clientDigest)) {
-            return true;
+    if (unattendedEnabled && !unattendedVerifier.empty()) {
+        uint32_t vIter = 0;
+        std::array<uint8_t, 16> vSalt{};
+        std::array<uint8_t, 32> vDk{};
+        if (CryptoUtils::parsePasswordVerifier(unattendedVerifier, vIter, vSalt, vDk) &&
+            vIter == challengeIterations && vSalt == challengeSalt) {
+            std::string dkHex = CryptoUtils::toHex(vDk.data(), vDk.size());
+            auto expected = CryptoUtils::computeChallengeResponseFromToken(
+                dkHex, deskId, clientId, nonce
+            );
+            CryptoUtils::secureZero(dkHex.data(), dkHex.size());
+            CryptoUtils::secureZero(vDk.data(), vDk.size());
+            expected = CryptoUtils::bindChallengeResponse(boundSessionKey, expected);
+            if (constantTimeEquals32(expected, clientDigest)) {
+                return true;
+            }
+        } else {
+            CryptoUtils::secureZero(vDk.data(), vDk.size());
         }
     }
 
@@ -1017,113 +1192,149 @@ bool IdentityManager::verifyChallengeResponse(
 }
 
 void IdentityManager::setRelayServerAddress(const std::string& addr) {
-    relayServerAddr_ = addr;
-    settings_.relayServer = addr;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        relayServerAddr_ = addr;
+        settings_.relayServer = addr;
+    }
     save();
 }
 
 void IdentityManager::addOrUpdateRecentSession(uint64_t id, const std::string& host, const std::string& addr,
                                              const std::string& alias, const std::string& tag, const std::string& notes) {
-    bool wasFav = false;
-    std::string existingAlias = alias;
-    std::string existingTag = tag;
-    std::string existingNotes = notes;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        bool wasFav = false;
+        std::string existingAlias = alias;
+        std::string existingTag = tag;
+        std::string existingNotes = notes;
 
-    for (const auto& e : recentSessions_) {
-        bool match = (id > 0 && e.deskId == id) || (!addr.empty() && e.address == addr);
-        if (match) {
-            if (e.isFavorite) wasFav = true;
-            if (existingAlias.empty()) existingAlias = e.alias;
-            if (existingTag.empty()) existingTag = e.tag;
-            if (existingNotes.empty()) existingNotes = e.notes;
-            break;
+        for (const auto& e : recentSessions_) {
+            bool match = (id > 0 && e.deskId == id) || (!addr.empty() && e.address == addr);
+            if (match) {
+                if (e.isFavorite) wasFav = true;
+                if (existingAlias.empty()) existingAlias = e.alias;
+                if (existingTag.empty()) existingTag = e.tag;
+                if (existingNotes.empty()) existingNotes = e.notes;
+                break;
+            }
         }
-    }
 
-    recentSessions_.erase(
-        std::remove_if(recentSessions_.begin(), recentSessions_.end(), [&](const RecentSessionEntry& e) {
-            return (id > 0 && e.deskId == id) || (!addr.empty() && e.address == addr);
-        }),
-        recentSessions_.end()
-    );
-    RecentSessionEntry entry;
-    entry.deskId = id;
-    entry.hostname = host.empty() ? CryptoUtils::formatDeskId(id) : host;
-    entry.address = addr;
-    entry.isFavorite = wasFav;
-    entry.alias = existingAlias;
-    entry.tag = existingTag;
-    entry.notes = existingNotes;
-    recentSessions_.insert(recentSessions_.begin(), entry);
+        recentSessions_.erase(
+            std::remove_if(recentSessions_.begin(), recentSessions_.end(), [&](const RecentSessionEntry& e) {
+                return (id > 0 && e.deskId == id) || (!addr.empty() && e.address == addr);
+            }),
+            recentSessions_.end()
+        );
+        RecentSessionEntry entry;
+        entry.deskId = id;
+        entry.hostname = host.empty() ? CryptoUtils::formatDeskId(id) : host;
+        entry.address = addr;
+        entry.isFavorite = wasFav;
+        entry.alias = existingAlias;
+        entry.tag = existingTag;
+        entry.notes = existingNotes;
+        recentSessions_.insert(recentSessions_.begin(), entry);
 
-    std::stable_sort(recentSessions_.begin(), recentSessions_.end(), [](const RecentSessionEntry& a, const RecentSessionEntry& b) {
-        return a.isFavorite && !b.isFavorite;
-    });
+        std::stable_sort(recentSessions_.begin(), recentSessions_.end(), [](const RecentSessionEntry& a, const RecentSessionEntry& b) {
+            return a.isFavorite && !b.isFavorite;
+        });
 
-    if (recentSessions_.size() > 20) {
-        recentSessions_.resize(20);
+        if (recentSessions_.size() > 20) {
+            recentSessions_.resize(20);
+        }
     }
     save();
 }
 
 void IdentityManager::updateRecentSessionMetadata(uint64_t id, const std::string& alias, const std::string& tag, const std::string& notes) {
-    for (auto& e : recentSessions_) {
-        if (e.deskId == id) {
-            e.alias = alias;
-            e.tag = tag;
-            e.notes = notes;
-            save();
-            break;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        for (auto& e : recentSessions_) {
+            if (e.deskId == id) {
+                e.alias = alias;
+                e.tag = tag;
+                e.notes = notes;
+                found = true;
+                break;
+            }
         }
     }
+    if (found) save();
 }
 
 void IdentityManager::toggleFavoriteSession(uint64_t id) {
-    for (auto& e : recentSessions_) {
-        if (e.deskId == id) {
-            e.isFavorite = !e.isFavorite;
-            break;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        for (auto& e : recentSessions_) {
+            if (e.deskId == id) {
+                e.isFavorite = !e.isFavorite;
+                break;
+            }
         }
+        std::stable_sort(recentSessions_.begin(), recentSessions_.end(), [](const RecentSessionEntry& a, const RecentSessionEntry& b) {
+            return a.isFavorite && !b.isFavorite;
+        });
     }
-    std::stable_sort(recentSessions_.begin(), recentSessions_.end(), [](const RecentSessionEntry& a, const RecentSessionEntry& b) {
-        return a.isFavorite && !b.isFavorite;
-    });
     save();
 }
 
 void IdentityManager::removeRecentSession(uint64_t id) {
-    recentSessions_.erase(
-        std::remove_if(recentSessions_.begin(), recentSessions_.end(), [&](const RecentSessionEntry& e) {
-            return e.deskId == id;
-        }),
-        recentSessions_.end()
-    );
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        recentSessions_.erase(
+            std::remove_if(recentSessions_.begin(), recentSessions_.end(), [&](const RecentSessionEntry& e) {
+                return e.deskId == id;
+            }),
+            recentSessions_.end()
+        );
+    }
     save();
 }
 
 void IdentityManager::clearRecentSessions() {
-    recentSessions_.clear();
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        recentSessions_.clear();
+    }
     save();
 }
 
 void IdentityManager::updateSettings(const AppSettings& newSettings) {
-    settings_ = newSettings;
-    settings_.targetFps = clampTargetFps(settings_.targetFps);
-    settings_.defaultPermissions &= PERM_ALL;
-    relayServerAddr_ = settings_.relayServer;
-    if (!settings_.totpSecret.empty()) {
-        TotpAlgorithm alg = (settings_.totpAlgorithm == "SHA256") ? TotpAlgorithm::Sha256 : TotpAlgorithm::Sha1;
-        totpManager_.setSecret(settings_.totpSecret, alg);
-    } else {
+    std::string totpSecretCopy;
+    TotpAlgorithm totpAlg = TotpAlgorithm::Sha1;
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        settings_ = newSettings;
+        settings_.targetFps = clampTargetFps(settings_.targetFps);
+        settings_.defaultPermissions &= PERM_ALL;
+        relayServerAddr_ = settings_.relayServer;
+        totpSecretCopy = settings_.totpSecret;
+        totpAlg = (settings_.totpAlgorithm == "SHA256") ? TotpAlgorithm::Sha256 : TotpAlgorithm::Sha1;
+    }
+    if (!totpSecretCopy.empty()) {
+        std::vector<uint8_t> decoded;
+        std::string normalized = TotpManager::decodeBase32(totpSecretCopy, decoded)
+            ? TotpManager::encodeBase32(decoded.data(), decoded.size())
+            : "";
+        if (!decoded.empty()) CryptoUtils::secureZero(decoded.data(), decoded.size());
+        if (normalized != totpManager_.getSecretBase32() || totpAlg != totpManager_.getAlgorithm()) {
+            totpManager_.setSecret(totpSecretCopy, totpAlg);
+        }
+    } else if (totpManager_.isConfigured()) {
         totpManager_.clear();
     }
     save();
 }
 
 void IdentityManager::resetSettingsToDefault() {
-    settings_ = AppSettings{};
+    {
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        settings_ = AppSettings{};
+        relayServerAddr_ = settings_.relayServer;
+    }
     totpManager_.clear();
-    relayServerAddr_ = settings_.relayServer;
     save();
 }
 
@@ -1454,7 +1665,11 @@ bool AesGcmSessionCipher::initialize(const std::array<uint8_t, 32>& sessionKey, 
 
     BCRYPT_ALG_HANDLE hAesAlg = nullptr;
     NTSTATUS status = BCryptOpenAlgorithmProvider(&hAesAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
-    if (status < 0) return false;
+    if (status < 0) {
+        reset();
+        return false;
+    }
+    hAesAlg_ = reinterpret_cast<uintptr_t>(hAesAlg);
 
     status = BCryptSetProperty(
         hAesAlg,
@@ -1464,16 +1679,20 @@ bool AesGcmSessionCipher::initialize(const std::array<uint8_t, 32>& sessionKey, 
         0
     );
     if (status < 0) {
-        BCryptCloseAlgorithmProvider(hAesAlg, 0);
+        reset();
         return false;
     }
-    hAesAlg_ = reinterpret_cast<uintptr_t>(hAesAlg);
 
     DWORD keyObjSize = 0;
     DWORD cbData = 0;
-    BCryptGetProperty(hAesAlg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&keyObjSize), sizeof(keyObjSize), &cbData, 0);
+    status = BCryptGetProperty(hAesAlg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&keyObjSize), sizeof(keyObjSize), &cbData, 0);
+    if (status < 0) {
+        reset();
+        return false;
+    }
     if (keyObjSize > 0) {
         keyObjBuf_.resize(keyObjSize);
+        decryptKeyObjBuf_.resize(keyObjSize);
     }
 
     BCRYPT_KEY_HANDLE hAesKey = nullptr;
@@ -1492,12 +1711,32 @@ bool AesGcmSessionCipher::initialize(const std::array<uint8_t, 32>& sessionKey, 
     }
     hAesKey_ = reinterpret_cast<uintptr_t>(hAesKey);
 
+    BCRYPT_KEY_HANDLE hAesDecryptKey = nullptr;
+    status = BCryptGenerateSymmetricKey(
+        hAesAlg,
+        &hAesDecryptKey,
+        decryptKeyObjBuf_.empty() ? nullptr : decryptKeyObjBuf_.data(),
+        static_cast<ULONG>(decryptKeyObjBuf_.size()),
+        const_cast<PUCHAR>(sessionKey_.data()),
+        static_cast<ULONG>(sessionKey_.size()),
+        0
+    );
+    if (status < 0) {
+        reset();
+        return false;
+    }
+    hAesDecryptKey_ = reinterpret_cast<uintptr_t>(hAesDecryptKey);
+
     replayWindow_.reset();
     initialized_ = true;
     return true;
 }
 
 void AesGcmSessionCipher::reset() {
+    if (hAesDecryptKey_) {
+        BCryptDestroyKey(reinterpret_cast<BCRYPT_KEY_HANDLE>(hAesDecryptKey_));
+        hAesDecryptKey_ = 0;
+    }
     if (hAesKey_) {
         BCryptDestroyKey(reinterpret_cast<BCRYPT_KEY_HANDLE>(hAesKey_));
         hAesKey_ = 0;
@@ -1510,6 +1749,8 @@ void AesGcmSessionCipher::reset() {
     CryptoUtils::secureZero(sessionKey_.data(), sessionKey_.size());
     CryptoUtils::secureZero(keyObjBuf_.data(), keyObjBuf_.size());
     keyObjBuf_.clear();
+    CryptoUtils::secureZero(decryptKeyObjBuf_.data(), decryptKeyObjBuf_.size());
+    decryptKeyObjBuf_.clear();
     replayWindow_.reset();
     initialized_ = false;
 }
@@ -1523,6 +1764,9 @@ bool AesGcmSessionCipher::encrypt(
     std::vector<uint8_t>& outEncryptedPayload)
 {
     if (!initialized_ || !hAesKey_) return false;
+    if (plainLen > 0 && !plaintext) return false;
+    if (aadLen > 0 && !aad) return false;
+    if (plainLen > static_cast<size_t>(INT_MAX) || aadLen > static_cast<size_t>(INT_MAX)) return false;
     BCRYPT_KEY_HANDLE hKey = reinterpret_cast<BCRYPT_KEY_HANDLE>(hAesKey_);
 
     uint8_t nonce[12] = {};
@@ -1578,8 +1822,10 @@ bool AesGcmSessionCipher::decrypt(
     std::vector<uint8_t>& outPlaintext,
     uint64_t* outSeq)
 {
-    if (!initialized_ || !hAesKey_ || payloadLen < 28) return false;
-    BCRYPT_KEY_HANDLE hKey = reinterpret_cast<BCRYPT_KEY_HANDLE>(hAesKey_);
+    if (!initialized_ || !hAesDecryptKey_ || !encryptedPayload || payloadLen < 28) return false;
+    if (aadLen > 0 && !aad) return false;
+    if (payloadLen > static_cast<size_t>(INT_MAX) || aadLen > static_cast<size_t>(INT_MAX)) return false;
+    BCRYPT_KEY_HANDLE hKey = reinterpret_cast<BCRYPT_KEY_HANDLE>(hAesDecryptKey_);
 
     const uint8_t* nonce = encryptedPayload;
     const uint8_t* ciphertext = encryptedPayload + 12;
@@ -1950,7 +2196,9 @@ bool AesGcmSessionCipher::encrypt(
     size_t aadLen,
     std::vector<uint8_t>& outEncryptedPayload)
 {
-    if (!initialized_ || plainLen > static_cast<size_t>(INT_MAX)) return false;
+    if (!initialized_ || plainLen > static_cast<size_t>(INT_MAX) || aadLen > static_cast<size_t>(INT_MAX)) return false;
+    if (plainLen > 0 && !plaintext) return false;
+    if (aadLen > 0 && !aad) return false;
 
     uint8_t nonce[12] = {};
     std::memcpy(nonce, isHost_ ? "HST1" : "VIW1", 4);
@@ -1984,7 +2232,8 @@ bool AesGcmSessionCipher::decrypt(
     std::vector<uint8_t>& outPlaintext,
     uint64_t* outSeq)
 {
-    if (!initialized_ || !encryptedPayload || payloadLen < 28 || payloadLen > static_cast<size_t>(INT_MAX)) return false;
+    if (!initialized_ || !encryptedPayload || payloadLen < 28 || payloadLen > static_cast<size_t>(INT_MAX) || aadLen > static_cast<size_t>(INT_MAX)) return false;
+    if (aadLen > 0 && !aad) return false;
 
     const uint8_t* nonce = encryptedPayload;
     const size_t cipherLen = payloadLen - 28;
@@ -2024,15 +2273,5 @@ bool AesGcmSessionCipher::decrypt(
 }
 
 #endif
-
-bool AesGcmSessionCipher::ratchetKey() {
-    if (!initialized_) return false;
-    std::array<uint8_t, 32> nextKey = CryptoUtils::hkdfSha256(
-        sessionKey_.data(), sessionKey_.size(),
-        sessionKey_.data(), sessionKey_.size(),
-        "CppDesk-Ratchet-NextKey"
-    );
-    return initialize(nextKey, isHost_);
-}
 
 } // namespace cppdesk

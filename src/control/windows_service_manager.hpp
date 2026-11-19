@@ -35,12 +35,16 @@ public:
     static bool validateAndConsumeRebootToken(const std::string& tokenHex, uint64_t callerDeskId);
     static bool hasPendingRebootToken(uint64_t* outCallerDeskId = nullptr);
     static void clearRebootToken();
+    // Test-only override: points reboot token storage at a temp dir with current-user+SYSTEM DACL.
+    // Pass empty string to restore production SYSTEM+Administrators storage.
+    static void setRebootTokenDirForTest(const std::wstring& dirPath);
 
     // System reboot execution
     static bool initiateHostReboot(uint32_t countdownSeconds = 5, bool safeMode = false);
+    static bool clearSafeBootIfActive();
 
 private:
-    static std::string getRebootTokenFilePath();
+    static std::wstring getRebootTokenDirPath(bool& outTestOverride);
 };
 
 } // namespace cppdesk
