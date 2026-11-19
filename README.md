@@ -17,7 +17,7 @@
     <img src="https://img.shields.io/github/v/release/oocsng/cppdesk?style=for-the-badge&color=D97757&label=DOWNLOAD%20CPPDESK&sort=semver&labelColor=262320" alt="Download CppDesk">
   </a>
   <a href="https://github.com/oocsng/cppdesk/blob/main/LICENSE">
-    <img src="https://img.shields.io/badge/License-MIT-D97757?style=for-the-badge&labelColor=262320" alt="License: MIT">
+    <img src="https://img.shields.io/badge/License-Apache%202.0-D97757?style=for-the-badge&labelColor=262320" alt="License: Apache 2.0">
   </a>
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-D97757?style=for-the-badge&logo=linux&logoColor=white&labelColor=262320" alt="Platform: Windows | macOS | Linux">
 </p>
@@ -207,4 +207,4 @@ Include the following in your report to help diagnose the issue:
 
 ## License
 
-CppDesk is licensed under the [MIT License](LICENSE). Copyright (c) 2026 CppDesk.
+CppDesk is licensed under the [Apache License 2.0](LICENSE). Copyright (c) 2026 CppDesk.
