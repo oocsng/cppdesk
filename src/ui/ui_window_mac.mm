@@ -8,6 +8,7 @@
 #include "canvas_cg.hpp"
 #include "../control/input_injector.hpp"
 #include "../control/mac_permissions.hpp"
+#include "../control/shortcut_manager.hpp"
 #include "../core/crypto_identity.hpp"
 #include "../net/network_engine.hpp"
 
@@ -460,6 +461,19 @@ struct CppDeskWindowMacImpl {
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
     if (impl_) impl_->requestClose();
     return NSTerminateCancel;
+}
+// A clicked cppdesk:// link arrives here, not in argv, whether the app was running or launched for it.
+- (void)application:(NSApplication*)sender openURLs:(NSArray<NSURL*>*)urls {
+    if (!impl_ || !impl_->app) return;
+    for (NSURL* u in urls) {
+        if (!u.scheme || [u.scheme caseInsensitiveCompare:@"cppdesk"] != NSOrderedSame) continue;
+        const char* rest = u.resourceSpecifier.UTF8String;   // "//123456789"
+        const std::string deskId = cppdesk::ShortcutManager::sanitizeDeskId(rest ? rest : "");
+        if (deskId.size() != 9) continue;
+        [NSApp activateIgnoringOtherApps:YES];
+        impl_->app->connectTo(deskId);
+        return;
+    }
 }
 @end
 

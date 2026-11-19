@@ -193,6 +193,7 @@ public:
     void onCloseRequested();          // the window is about to close (not minimize to tray)
     void onWindowDestroyed();
     void startAutoConnect();          // once the window is up
+    void connectTo(const std::string& deskId);   // a cppdesk:// link opened while the app runs (macOS)
 
     // Tray and notifications.
     void setNotificationManager(std::unique_ptr<NotificationManager> mgr) { notificationMgr_ = std::move(mgr); }

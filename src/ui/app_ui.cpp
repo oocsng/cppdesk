@@ -10641,10 +10641,12 @@ void AppUi::onWindowDestroyed() {
 }
 
 void AppUi::startAutoConnect() {
-    if (!autoConnectTarget_.empty()) {
-        remoteIdInput_ = autoConnectTarget_;
-        initiateConnection();
-    }
+    if (!autoConnectTarget_.empty()) connectTo(autoConnectTarget_);
+}
+
+void AppUi::connectTo(const std::string& deskId) {
+    remoteIdInput_ = deskId;
+    initiateConnection();
 }
 
 void AppUi::restoreFromTray(NotificationType contextType) {
