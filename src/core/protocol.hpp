@@ -15,9 +15,9 @@ namespace cppdesk {
 
 constexpr uint32_t PROTOCOL_MAGIC   = 0x43505044; // "CPPD" (CppDesk packet magic)
 constexpr uint32_t RELAY_MAGIC      = 0x4344534B; // "CDSK" (CppDesk relay magic)
-constexpr uint16_t PROTOCOL_VERSION = 3;
+constexpr uint16_t PROTOCOL_VERSION = 4;
 constexpr const char* CPP_DESK_VERSION = "3.11.2";
-constexpr uint32_t CPP_DESK_VERSION_NUM = 0x030800;
+constexpr uint32_t CPP_DESK_VERSION_NUM = 0x030B02;
 
 struct SemanticVersion {
     int major = 0;
@@ -562,6 +562,8 @@ public:
     ByteWriter() : bufRef_(ownedBuf_) {}
     explicit ByteWriter(std::vector<uint8_t>& externalBuf) : bufRef_(externalBuf) {}
     explicit ByteWriter(std::vector<uint8_t>&& movableBuf) : ownedBuf_(std::move(movableBuf)), bufRef_(ownedBuf_) {}
+    ByteWriter(const ByteWriter&) = delete;
+    ByteWriter& operator=(const ByteWriter&) = delete;
 
     void writeU8(uint8_t v) { bufRef_.push_back(v); }
     void writeU16(uint16_t v) { writeBytes(&v, sizeof(v)); }
@@ -735,6 +737,7 @@ inline bool deserializeSystemDiagnostics(const uint8_t* data, size_t size, Syste
         out.diskUsedBytes = r.readU64();
         out.diskTotalBytes = r.readU64();
         uint16_t count = r.readU16();
+        if (count > r.remaining() / 14) return false;
         out.processes.clear();
         out.processes.reserve(count);
         for (uint16_t i = 0; i < count; ++i) {
@@ -783,7 +786,7 @@ inline void serializePerformanceHud(const PerformanceHudPayload& payload, std::v
 }
 
 inline bool deserializePerformanceHud(const uint8_t* data, size_t size, PerformanceHudPayload& out) {
-    if (!data || size < (sizeof(float) * 4 + sizeof(uint32_t))) return false;
+    if (!data || size < (sizeof(float) * 3 + sizeof(uint32_t))) return false;
     try {
         ByteReader r(data, size);
         out.captureLatencyMs = r.readF32();
@@ -926,7 +929,7 @@ inline bool deserializeClipboardFileList(const uint8_t* data, size_t size, uint3
             entry.fileSize = desc.fileSize;
             entry.fileAttributes = desc.fileAttributes;
             if (desc.nameLengthChars > 0) {
-                std::u16string name(desc.nameLengthChars, u' ');
+                std::u16string name(desc.nameLengthChars, u'\0');
                 std::memcpy(name.data(), r.currentPtr(), nameBytes);
                 entry.fileName = utf16ToWide(name);
                 r.skip(nameBytes);
@@ -1156,33 +1159,40 @@ inline void serializeMonitorList(const std::vector<MonitorDesc>& monitors, std::
 
 inline bool deserializeMonitorList(const uint8_t* data, size_t size, std::vector<MonitorDesc>& out) {
     if (!data || size < 2) return false;
-    try {
-        ByteReader r(data, size);
-        uint16_t mcount = r.readU16();
-        out.clear();
-        out.reserve(mcount);
-        for (uint16_t i = 0; i < mcount; ++i) {
-            MonitorDesc m;
-            m.index = r.readI32();
-            m.x = r.readI32();
-            m.y = r.readI32();
-            m.width = r.readI32();
-            m.height = r.readI32();
-            m.isPrimary = (r.readU8() != 0);
-            m.name = r.readString();
-            if (r.hasRemaining(1 + 4)) {
-                m.isVirtual = (r.readU8() != 0);
-                m.virtualId = r.readU32();
-            } else {
-                m.isVirtual = false;
-                m.virtualId = 0;
+    auto parse = [&](bool withExtended) -> bool {
+        try {
+            ByteReader r(data, size);
+            uint16_t mcount = r.readU16();
+            const size_t minEntrySize = withExtended ? 28 : 23;
+            if (mcount > r.remaining() / minEntrySize) return false;
+            std::vector<MonitorDesc> parsed;
+            parsed.reserve(mcount);
+            for (uint16_t i = 0; i < mcount; ++i) {
+                MonitorDesc m;
+                m.index = r.readI32();
+                m.x = r.readI32();
+                m.y = r.readI32();
+                m.width = r.readI32();
+                m.height = r.readI32();
+                m.isPrimary = (r.readU8() != 0);
+                m.name = r.readString();
+                if (withExtended) {
+                    m.isVirtual = (r.readU8() != 0);
+                    m.virtualId = r.readU32();
+                } else {
+                    m.isVirtual = false;
+                    m.virtualId = 0;
+                }
+                parsed.push_back(std::move(m));
             }
-            out.push_back(std::move(m));
+            if (r.remaining() != 0) return false;
+            out = std::move(parsed);
+            return true;
+        } catch (...) {
+            return false;
         }
-        return true;
-    } catch (...) {
-        return false;
-    }
+    };
+    return parse(true) || parse(false);
 }
 
 struct TotpVerifyPacket {

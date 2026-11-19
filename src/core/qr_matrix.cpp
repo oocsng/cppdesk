@@ -240,24 +240,15 @@ void stampFormatInfo(std::vector<uint8_t>& target, int N, uint16_t formatBits) {
     target[0 * N + 8] = (formatBits >> 0) & 1;
 
     // Split copy around other finders
-    // Bottom-left finder (bits 0 to 6)
-    target[(N - 1) * N + 8] = (formatBits >> 0) & 1;
-    target[(N - 2) * N + 8] = (formatBits >> 1) & 1;
-    target[(N - 3) * N + 8] = (formatBits >> 2) & 1;
-    target[(N - 4) * N + 8] = (formatBits >> 3) & 1;
-    target[(N - 5) * N + 8] = (formatBits >> 4) & 1;
-    target[(N - 6) * N + 8] = (formatBits >> 5) & 1;
-    target[(N - 7) * N + 8] = (formatBits >> 6) & 1;
+    // Bottom-left finder (bits 14 down to 8)
+    for (int k = 0; k < 7; ++k) {
+        target[(N - 1 - k) * N + 8] = (formatBits >> (14 - k)) & 1;
+    }
 
-    // Top-right finder (bits 7 to 14)
-    target[8 * N + (N - 8)] = (formatBits >> 7) & 1;
-    target[8 * N + (N - 7)] = (formatBits >> 8) & 1;
-    target[8 * N + (N - 6)] = (formatBits >> 9) & 1;
-    target[8 * N + (N - 5)] = (formatBits >> 10) & 1;
-    target[8 * N + (N - 4)] = (formatBits >> 11) & 1;
-    target[8 * N + (N - 3)] = (formatBits >> 12) & 1;
-    target[8 * N + (N - 2)] = (formatBits >> 13) & 1;
-    target[8 * N + (N - 1)] = (formatBits >> 14) & 1;
+    // Top-right finder (bits 7 down to 0)
+    for (int k = 0; k < 8; ++k) {
+        target[8 * N + (N - 8 + k)] = (formatBits >> (7 - k)) & 1;
+    }
 }
 
 } // namespace
@@ -284,6 +275,10 @@ void QrMatrix::setModule(int x, int y, bool isDark) {
 QrMatrix QrMatrix::generate(const std::string& text, int minVersion, int maxVersion) {
     minVersion = std::clamp(minVersion, 1, 6);
     maxVersion = std::clamp(maxVersion, minVersion, 6);
+
+    if (text.size() > static_cast<size_t>(kVersionTable[maxVersion].maxDataBytes)) {
+        return QrMatrix{};
+    }
 
     int textLen = static_cast<int>(text.length());
     int chosenVersion = maxVersion;
