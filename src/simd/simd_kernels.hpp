@@ -74,7 +74,11 @@ public:
     static void blitRowBgraOpaque(uint8_t* dstRow, const uint8_t* srcRow, int widthPixels) {
         if (!dstRow || !srcRow || widthPixels <= 0) return;
         int c = 0;
-#if defined(__AVX2__)
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(_M_X64))
+        if (hasAvx2() && widthPixels >= 8) {
+            c = blitRowBgraOpaqueAvx2(dstRow, srcRow, widthPixels);
+        }
+#elif defined(__AVX2__)
         if (hasAvx2() && widthPixels >= 8) {
             const __m256i alphaMask = _mm256_set1_epi32(static_cast<int>(0xFF000000u));
             for (; c + 8 <= widthPixels; c += 8) {
@@ -105,6 +109,20 @@ public:
     }
 
 private:
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(_M_X64))
+    __attribute__((target("avx2")))
+    static int blitRowBgraOpaqueAvx2(uint8_t* dstRow, const uint8_t* srcRow, int widthPixels) {
+        int c = 0;
+        const __m256i alphaMask = _mm256_set1_epi32(static_cast<int>(0xFF000000u));
+        for (; c + 8 <= widthPixels; c += 8) {
+            __m256i px = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(srcRow + static_cast<size_t>(c) * 4));
+            px = _mm256_or_si256(px, alphaMask);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dstRow + static_cast<size_t>(c) * 4), px);
+        }
+        return c;
+    }
+#endif
+
     static bool detectAvx2Cpu() {
 #if defined(__x86_64__) || defined(_M_X64)
         unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;

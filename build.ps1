@@ -47,7 +47,6 @@ $CoreSources = @(
     "src/capture/privacy_cloak_manager.cpp",
     "src/control/scratchpad_manager.cpp",
     "src/control/command_palette.cpp",
-    "src/simd/simd_fallback.cpp",
     "src/ui/ui_platform.cpp",
     "src/ui/recording_canvas.cpp",
     "src/ui/app_ui.cpp",
@@ -68,7 +67,6 @@ $TestSources = $CoreSources + @(
 $CommonFlags = @(
     "-std=c++20",
     "-O2",
-    "-mavx2",
     "-Wall",
     "-Wextra",
     "-DNOMINMAX",
@@ -124,18 +122,18 @@ try {
     if ($sdks) { $hasDotnetSdk = $true }
 } catch {}
 
-if ($BuildRelay -or (($Test -or $Benchmark) -and $hasDotnetSdk)) {
+if ($hasDotnetSdk -and ($BuildRelay -or $Test -or $Benchmark)) {
     Write-Host "[2/3] Building C# (.NET 10) Standalone Relay Server..." -ForegroundColor Cyan
     & dotnet build "relay-dotnet/CppDeskRelay.csproj" -c Release --nologo -v q
     if ($LASTEXITCODE -ne 0) {
-        if ($BuildRelay) {
+        if ($BuildRelay -or $Test) {
             throw "Failed to build C# CppDeskRelay.csproj"
         } else {
             Write-Host "  -> Warning: Failed to build C# CppDeskRelay.csproj" -ForegroundColor Yellow
         }
     } else {
         Write-Host "  -> Verified C# .NET 10 Relay Server (--self-test)..." -ForegroundColor Green
-        & dotnet "relay-dotnet/bin/Release/net10.0/CppDeskRelay.dll" --port 51998 --self-test
+        & dotnet "relay-dotnet/bin/Release/net10.0/CppDeskRelay.dll" --port 0 --self-test
         if ($LASTEXITCODE -ne 0) {
             throw "C# CppDeskRelay self-test failed"
         }
