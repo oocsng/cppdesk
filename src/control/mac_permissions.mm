@@ -15,11 +15,13 @@ ui::HostPermissionStatus macPermissionsNow() {
 }
 
 void macRequestPermission(ui::HostPermission permission) {
-    if (permission == ui::HostPermission::ScreenRecording) {
-        CGRequestScreenCaptureAccess();
-    } else {
-        NSDictionary* options = @{ (__bridge NSString*)kAXTrustedCheckOptionPrompt: @YES };
-        AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
+    @autoreleasepool {
+        if (permission == ui::HostPermission::ScreenRecording) {
+            CGRequestScreenCaptureAccess();
+        } else {
+            NSDictionary* options = @{ (__bridge NSString*)kAXTrustedCheckOptionPrompt: @YES };
+            AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
+        }
     }
 }
 
