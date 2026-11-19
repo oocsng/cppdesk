@@ -137,6 +137,8 @@ struct ViewerSessionStats {
 
 enum class PairingRequestState { Idle, Pending, Paired, Refused };
 
+enum class SessionTarget : uint8_t { Auto = 0, Viewer = 1, Host = 2 };
+
 enum class ViewerPairingDecision { Legacy, UsePaired, RefuseIdentityChanged, RefuseNoPairingSupport };
 
 // A pinned host must prove it holds the pinned key; it is never silently re-paired or downgraded to a password.
@@ -188,39 +190,60 @@ public:
 
 private:
     void acceptLoop();
-    void handleClientSocket(uintptr_t sock, std::string peerIp);
+    void handleClientSocket(uintptr_t sock, std::string peerIp, bool& releaseLimiter);
+    void reapFinishedWorkers();
+
+    struct HostControl {
+        uintptr_t  sock = ~uintptr_t(0);
+        std::mutex writeMutex;
+        bool       closed = false;
+    };
 
     struct RegisteredHost {
-        uint64_t    deskId = 0;
-        std::string hostname;
-        std::string ip;
-        uint16_t    tcpPort = 0;
-        uintptr_t   controlSock = ~uintptr_t(0);
-        uint64_t    lastSeenMs = 0;
+        uint64_t                     deskId = 0;
+        std::string                  hostname;
+        std::string                  ip;
+        uint16_t                     tcpPort = 0;
+        std::shared_ptr<HostControl> ctrl;
+        uint64_t                     lastSeenMs = 0;
     };
 
     struct PendingBridge {
-        uint64_t  token = 0;
+        uint64_t    token = 0;
+        uintptr_t   viewerSock = ~uintptr_t(0);
+        uintptr_t   hostSock = ~uintptr_t(0);
+        std::string hostPeerIp;
+        bool        ready = false;
+    };
+
+    struct ActiveBridge {
         uintptr_t viewerSock = ~uintptr_t(0);
         uintptr_t hostSock = ~uintptr_t(0);
-        bool      ready = false;
+    };
+
+    struct WorkerEntry {
+        std::thread                     thread;
+        std::shared_ptr<std::atomic<bool>> done;
     };
 
     std::atomic<bool>           running_{false};
     uint16_t                    port_ = DEFAULT_RELAY_PORT;
-    uintptr_t                   listenSock_ = ~uintptr_t(0);
+    std::atomic<uintptr_t>      listenSock_{~uintptr_t(0)};
     std::thread                 acceptThread_;
+
+    std::mutex                  workersMutex_;
+    std::vector<WorkerEntry>    workerThreads_;
 
     mutable std::mutex          mutex_;
     std::condition_variable     bridgeCv_;
     std::vector<RegisteredHost> hosts_;
     std::vector<PendingBridge>  bridges_;
+    std::vector<ActiveBridge>   activeBridges_;
     relayowner::OwnerRegistry   owners_;   // desk IDs whose owner key this relay holds
     std::string                 authKey_;
 
     // One thread per connection: cap them so a single address cannot exhaust the host.
     // Each registered host holds one connection and each bridged session two.
-    // Shared with the detached connection threads, which can outlive this object.
     std::shared_ptr<ConnectionLimiter> connLimiter_ = std::make_shared<ConnectionLimiter>(512, 64);
 };
 
@@ -240,7 +263,7 @@ public:
     // Local IP & listening status
     std::string localIpAddress() const { return localIp_; }
     uint16_t hostListenPort() const { return identity_.listenPort(); }
-    bool hostListening() const { return hostListenSock_ != ~uintptr_t(0); }
+    bool hostListening() const { return hostListenSock_.load() != ~uintptr_t(0); }
 
     // Discovery
     std::vector<DiscoveredPeer> discoveredPeers() const;
@@ -342,15 +365,18 @@ public:
     // File transfer, clipboard & live encrypted chat
     uint32_t sendFile(const std::string& filePath,
                       FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads,
-                      float dropNx = 0.0f, float dropNy = 0.0f);
+                      float dropNx = 0.0f, float dropNy = 0.0f,
+                      SessionTarget target = SessionTarget::Auto);
     // Same as sendFile for a path already decoded from UTF-8 (a std::string path is read as the ANSI code page).
     uint32_t sendFilePath(const std::filesystem::path& filePath,
                           FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads,
-                          float dropNx = 0.0f, float dropNy = 0.0f);
+                          float dropNx = 0.0f, float dropNy = 0.0f,
+                          SessionTarget target = SessionTarget::Auto);
     int sendDropPath(const std::string& path,
                      FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads,
-                     float dropNx = 0.0f, float dropNy = 0.0f);
-    bool cancelFileTransfer(uint32_t transferId);
+                     float dropNx = 0.0f, float dropNy = 0.0f,
+                     SessionTarget target = SessionTarget::Auto);
+    bool cancelFileTransfer(uint32_t transferId, SessionTarget target = SessionTarget::Auto);
     void pushLocalClipboardNow();
     bool sendChatMessage(const std::string& text);
     bool sendChatImage(const std::vector<uint8_t>& jpegData, uint32_t w, uint32_t h, const std::string& caption = "");
@@ -371,7 +397,7 @@ public:
     ScratchpadManager& scratchpadManager() { return scratchpadMgr_; }
     const ScratchpadManager& scratchpadManager() const { return scratchpadMgr_; }
     void setOnScratchpadUpdateCallback(std::function<void(const ScratchpadUpdatePayload&)> cb);
-    bool sendScratchpadText(const std::string& text, uint32_t cursorPos = 0);
+    bool sendScratchpadText(const std::string& text, uint32_t cursorPos = 0, SessionTarget target = SessionTarget::Auto);
 
     // Spotlight Omnibar Command Palette
     CommandPaletteManager& commandPaletteManager() { return commandPaletteMgr_; }
@@ -379,10 +405,10 @@ public:
     void setOnCommandPaletteOutputCallback(std::function<void(const CommandPaletteOutputPayload&)> cb);
     bool sendCommandPaletteExec(const std::string& commandLine, uint32_t execId = 0);
 
-    bool requestRemoteScan(const std::string& remotePath);
-    bool requestRemoteBlockHashes(const std::string& relativePath);
+    bool requestRemoteScan(const std::string& remotePath, SessionTarget target = SessionTarget::Auto);
+    bool requestRemoteBlockHashes(const std::string& relativePath, SessionTarget target = SessionTarget::Auto);
     bool startFolderSync(const std::string& localPath, const std::string& remotePath, SyncMode mode, bool purge = false);
-    void cancelFolderSync();
+    void cancelFolderSync(SessionTarget target = SessionTarget::Auto);
 
     // Audio streaming controls (v2.1.0)
     void setAudioVolume(int percent);
@@ -401,6 +427,8 @@ public:
     void setHostMicLiveForTest(bool live) { hostMicLive_.store(live); }
     void injectVoiceChunkForTest(const uint8_t* payload, size_t len) { handleIncomingVoiceChunk(payload, len); }
     bool voiceOpenFailedForTest() const { return voiceOpenFailed_.load(); }
+    // Hands the viewer a received AUDIO_STREAM_CHUNK payload as if the host had sent it (malformed ones included).
+    void injectViewerAudioChunkForTest(const uint8_t* payload, size_t len) { enqueueViewerAudioChunk(payload, len); }
 #if !defined(_WIN32)
     // Tests stand in for the sound hardware: what the host captures and what the viewer plays through. A null factory
     // keeps the real one. Set before a session starts.
@@ -410,8 +438,6 @@ public:
         sourceFactory_ = std::move(source);
         playerFactory_ = std::move(player);
     }
-    // Hands the viewer a received AUDIO_STREAM_CHUNK payload as if the host had sent it (malformed ones included).
-    void injectViewerAudioChunkForTest(const uint8_t* payload, size_t len) { enqueueViewerAudioChunk(payload, len); }
 #endif
 
     // Privacy screen controls (v2.1.0, v3.2.0 & DPMS power management)
@@ -438,9 +464,9 @@ public:
     // Whiteboard & Screen Annotation (v2.1.0)
     WhiteboardManager& whiteboardManager() { return whiteboardMgr_; }
     const WhiteboardManager& whiteboardManager() const { return whiteboardMgr_; }
-    void sendWhiteboardStroke(const AnnotationStroke& stroke);
-    void sendWhiteboardClear();
-    void sendWhiteboardLaser(float normX, float normY);
+    void sendWhiteboardStroke(const AnnotationStroke& stroke, SessionTarget target = SessionTarget::Auto);
+    void sendWhiteboardClear(SessionTarget target = SessionTarget::Auto);
+    void sendWhiteboardLaser(float normX, float normY, SessionTarget target = SessionTarget::Auto);
 
     // Remote Hardware Diagnostics & Live Process Telemetry (Feature 1)
     static SystemDiagnosticsPayload sampleHostDiagnostics();
@@ -466,15 +492,15 @@ public:
     bool hasNewRemoteFileAction();
 
     // Bidirectional Voice Intercom (VoIP Microphone & Playback - Feature 4)
-    bool startVoiceIntercom();
-    void stopVoiceIntercom();
+    bool startVoiceIntercom(SessionTarget target = SessionTarget::Auto);
+    void stopVoiceIntercom(SessionTarget target = SessionTarget::Auto);
     bool isVoiceIntercomActive() const;
     void setVoiceIntercomMicMuted(bool muted);
     bool isVoiceIntercomMicMuted() const;
     float voiceIntercomInputLevel() const;
     void setVoiceInputDevice(int id);
     void setVoiceOutputDevice(int id);
-    void handleIncomingVoiceChunk(const uint8_t* payload, size_t len);
+    void handleIncomingVoiceChunk(const uint8_t* payload, size_t len, SessionTarget source = SessionTarget::Auto);
     bool startVoiceMonitor();
     void stopVoiceMonitor();
     bool isVoiceMonitoring() const;
@@ -533,6 +559,7 @@ private:
     void discoveryLoop();
     void relayRegistrationLoop();
     void hostAcceptLoop();
+    bool tryStartHostSession(uintptr_t clientSock, std::string clientIp);
     void runHostSession(uintptr_t clientSock, std::string clientIp);
     void runViewerSession(std::string targetInput, std::string password, uint64_t requirePairedDeskId);
 
@@ -543,6 +570,8 @@ private:
     // Encrypted send helpers for active sessions
     bool sendHostEncryptedPacket(PacketType type, uint8_t flags, const void* payload, size_t payloadLen);
     bool sendViewerEncryptedPacket(PacketType type, uint8_t flags, const void* payload, size_t payloadLen);
+    bool sendToSessionTarget(SessionTarget target, PacketType type, uint8_t flags, const void* payload, size_t payloadLen);
+    void appendChatMessageLocked(ChatMessageEntry&& entry);
 
     IdentityManager&            identity_;
     std::string                 localIp_ = "127.0.0.1";
@@ -552,7 +581,7 @@ private:
     std::function<void(uint16_t, bool)> hostKeySink_;   // test-only, see setHostKeySinkForTest
 
     // Discovery
-    uintptr_t                   udpSock_ = ~uintptr_t(0);
+    std::atomic<uintptr_t>      udpSock_{~uintptr_t(0)};
     std::thread                 discoveryThread_;
     mutable std::mutex          peersMutex_;
     std::vector<DiscoveredPeer> peers_;
@@ -560,10 +589,11 @@ private:
     // Relay registration & built-in server
     RelayServer                 localRelay_;
     std::thread                 relayRegThread_;
-    uintptr_t                   relayControlSock_ = ~uintptr_t(0);
+    std::atomic<uintptr_t>      relayControlSock_{~uintptr_t(0)};
+    std::atomic<bool>           relayReconnectRequested_{false};
 
     // Host server & session
-    uintptr_t                   hostListenSock_ = ~uintptr_t(0);
+    std::atomic<uintptr_t>      hostListenSock_{~uintptr_t(0)};
     std::thread                 hostAcceptThread_;
     mutable std::mutex          hostSessionThreadMutex_;
     std::thread                 hostSessionThread_;
@@ -571,6 +601,7 @@ private:
     std::mutex                  hostSendMutex_;
     mutable std::mutex          hostCipherMutex_;
     AesGcmSessionCipher         hostCipher_;
+    AesGcmSessionCipher         hostRecvCipher_;
     std::array<uint8_t, 32>     hostSessionKey_{};
     uint64_t                    hostSendSeq_ = 0;
     std::atomic<bool>           hostEncrypted_{false};
@@ -605,6 +636,7 @@ private:
     std::mutex                  viewerSendMutex_;
     mutable std::mutex          viewerCipherMutex_;
     AesGcmSessionCipher         viewerCipher_;
+    AesGcmSessionCipher         viewerRecvCipher_;
     std::array<uint8_t, 32>     viewerSessionKey_{};
     PairingKey::PublicKey       viewerHostPairingKey_{};         // the key the host advertised in this handshake
     bool                        viewerHostKeyVerified_ = false;  // ...and it signed this session's transcript with it
@@ -627,6 +659,7 @@ private:
     int                         viewerCanvasW_ = 0;
     int                         viewerCanvasH_ = 0;
     uint64_t                    viewerFrameSeq_ = 0;
+    mutable uint64_t            viewerLastConsumedSeq_ = 0;
     CursorState                 viewerCursor_;
     mutable RECT                viewerDirtyBounds_{0, 0, 0, 0};
     mutable bool                viewerFullCanvasDirty_ = true;
@@ -654,14 +687,9 @@ private:
     // The host's sound (48 kHz 16-bit stereo) as AUDIO_STREAM_CHUNK; sends nothing while the viewer has muted.
     void sendHostSoundChunk(const int16_t* stereo48k, size_t frames);
 
-    // Host Privacy Curtain Window
-    void createPrivacyCurtainWindow();
-    void destroyPrivacyCurtainWindow();
-
     // Audio Capture & Playback state
     std::thread             hostAudioThread_;
-    std::mutex              hostWorkerThreadMutex_;   // guards hostAudioThread_, hostTerminalThread_, hostTunnelThread_
-    void joinHostWorker(std::thread& worker);
+    std::mutex              hostAudioLifecycleMutex_;
     std::atomic<bool>       hostAudioActive_{false};
 #if defined(_WIN32)
     HWAVEOUT                hWaveOut_ = nullptr;
@@ -689,12 +717,8 @@ private:
 
     // Privacy Mode state
     std::atomic<bool>       hostPrivacyModeActive_{false};
-#if defined(_WIN32)
-    HWND                    hwndPrivacyCurtain_ = nullptr;
-#else
-    void*                   hwndPrivacyCurtain_ = nullptr;
-#endif
     std::atomic<bool>       viewerPrivacyModeActive_{false};
+    mutable std::mutex      privacyCurtainMutex_;
     std::string             privacyCurtainNotice_;
     std::string             privacyCurtainBrand_;
     bool                    privacyCurtainShowId_ = true;
@@ -715,6 +739,7 @@ private:
     int                 childStdoutFd_ = -1;
     int                 childPid_ = -1;
 #endif
+    std::mutex          hostTerminalMutex_;
     std::thread         hostTerminalThread_;
     std::atomic<bool>   hostTerminalActive_{false};
 
@@ -724,11 +749,19 @@ private:
     std::vector<std::string> terminalHistory_;
 
     // TCP Tunneling State
+    static constexpr size_t MAX_ACTIVE_TUNNELS = 64;
+    static constexpr size_t MAX_TUNNEL_WRITE_QUEUE = 4 * 1024 * 1024;
+
     struct ActiveTunnel {
-        uint32_t tunnelId = 0;
-        uint32_t ruleId = 0;
-        socket_t sock = INVALID_SOCKET_VAL;
-        uint16_t targetPort = 0;
+        uint32_t             tunnelId = 0;
+        uint32_t             ruleId = 0;
+        socket_t             sock = INVALID_SOCKET_VAL;
+        uint16_t             targetPort = 0;
+        bool                 connecting = false;
+        uint64_t             connectStartMs = 0;
+        bool                 closeRequested = false;
+        std::vector<uint8_t> writeBuf;
+        size_t               writeOffset = 0;
     };
 
     struct ListenerState {
@@ -736,7 +769,10 @@ private:
         uint16_t localPort = 0;
         uint16_t targetPort = 0;
         socket_t listenSock = INVALID_SOCKET_VAL;
+        bool     closeRequested = false;
     };
+
+    static bool enqueueTunnelWriteLocked(ActiveTunnel& t, const uint8_t* data, size_t len, size_t& outImmediateSent);
 
     void viewerTunnelMultiplexerLoop();
     void hostTunnelProxyLoop();
@@ -753,9 +789,10 @@ private:
     std::unordered_map<uint32_t, ActiveTunnel> viewerTunnels_;
     std::unordered_map<uint32_t, ActiveTunnel> hostTunnels_;
     std::thread                                viewerTunnelThread_;
-    std::mutex                                 viewerTunnelThreadMutex_;
+    std::mutex                                 viewerTunnelLifecycleMutex_;
     std::atomic<bool>                          viewerTunnelActive_{false};
     std::thread                                hostTunnelThread_;
+    std::mutex                                 hostTunnelLifecycleMutex_;
     std::atomic<bool>                          hostTunnelActive_{false};
 
     // Whiteboard Manager (v2.1.0)
@@ -781,6 +818,7 @@ private:
 
     // Voice Intercom State (Feature 4)
     VoiceIntercom                              voiceIntercom_;
+    std::atomic<SessionTarget>                 voiceIntercomTarget_{SessionTarget::Auto};
 
     // Virtual Display & Dynamic Resolution Manager (Feature 5)
     DisplayResolutionManager                   displayManager_;
@@ -820,6 +858,7 @@ private:
     mutable std::mutex                                      commandPaletteCbMutex_;
     std::function<void(const CommandPaletteOutputPayload&)> onCommandPaletteOutput_;
     std::atomic<uint32_t>                                   nextExecId_{1};
+    std::atomic<uint64_t>                                   hostSessionGen_{0};
 };
 
 } // namespace cppdesk

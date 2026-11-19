@@ -173,6 +173,15 @@ struct ThreadZstdContext {
 
 thread_local ThreadZstdContext tl_zstd;
 
+constexpr int      MAX_JPEG_DECODE_DIM      = 8192;
+constexpr uint64_t MAX_JPEG_DECODE_PIXELS   = 8192ULL * 8192ULL;
+constexpr size_t   MAX_TILE_DECODE_PIXELS   = 1024ULL * 1024ULL; // 4 MB BGRA max per tile
+constexpr size_t   MAX_TILE_SCRATCH_RETAIN  = 1024ULL * 1024ULL; // 1 MB retained per worker
+
+inline bool hasJpegSoi(const uint8_t* data, size_t len) {
+    return data && len >= 2 && data[0] == 0xFF && data[1] == 0xD8;
+}
+
 } // namespace
 
 // ---------------- TileCodec ----------------
@@ -262,9 +271,9 @@ std::vector<uint8_t> TileCodec::encodeJpeg(const uint8_t* bgra, int width, int h
 }
 
 bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<uint8_t>& outBgra, int& outW, int& outH) {
+    if (!hasJpegSoi(jpegData, jpegLen)) return false;
     std::lock_guard<std::mutex> gdiLock(g_gdiplusCodecMutex);
     initGdiPlus();
-    if (!jpegData || jpegLen == 0) return false;
 
     IStream* pStream = SHCreateMemStream(jpegData, static_cast<UINT>(jpegLen));
     if (!pStream) return false;
@@ -274,7 +283,8 @@ bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<
     if (bmp && bmp->GetLastStatus() == Gdiplus::Ok) {
         outW = static_cast<int>(bmp->GetWidth());
         outH = static_cast<int>(bmp->GetHeight());
-        if (outW > 0 && outH > 0) {
+        if (outW > 0 && outH > 0 && outW <= MAX_JPEG_DECODE_DIM && outH <= MAX_JPEG_DECODE_DIM &&
+            static_cast<uint64_t>(outW) * static_cast<uint64_t>(outH) <= MAX_JPEG_DECODE_PIXELS) {
             Gdiplus::Rect rect(0, 0, outW, outH);
             Gdiplus::BitmapData bdata{};
             if (bmp->LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bdata) == Gdiplus::Ok) {
@@ -299,10 +309,11 @@ bool TileCodec::decodeJpegIntoCanvas(
     uint8_t* canvasBgra, int canvasW, int canvasH,
     uint16_t x, uint16_t y, uint16_t width, uint16_t height)
 {
+    if (!hasJpegSoi(jpegData, jpegLen) || !canvasBgra || width == 0 || height == 0) return false;
+    if (static_cast<size_t>(width) * height > MAX_TILE_DECODE_PIXELS) return false;
+    if (static_cast<int>(x) + width > canvasW || static_cast<int>(y) + height > canvasH) return false;
     std::lock_guard<std::mutex> gdiLock(g_gdiplusCodecMutex);
     initGdiPlus();
-    if (!jpegData || jpegLen == 0 || !canvasBgra || width == 0 || height == 0) return false;
-    if (static_cast<int>(x) + width > canvasW || static_cast<int>(y) + height > canvasH) return false;
 
     IStream* pStream = SHCreateMemStream(jpegData, static_cast<UINT>(jpegLen));
     if (!pStream) return false;
@@ -376,8 +387,10 @@ std::vector<uint8_t> TileCodec::encodeJpeg(const uint8_t* bgra, int width, int h
 }
 
 bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<uint8_t>& outBgra, int& outW, int& outH) {
-    if (!jpegData || jpegLen == 0) return false;
+    if (!hasJpegSoi(jpegData, jpegLen)) return false;
 
+    // Declare C++ buffers before setjmp so longjmp never skips their destructors.
+    std::vector<uint8_t> rowBuffer;
     struct jpeg_decompress_struct cinfo;
     SafeJpegErrorManager jerr;
     cinfo.err = jpeg_std_error(&jerr.pub);
@@ -394,14 +407,27 @@ bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<
         return false;
     }
 
+    if (cinfo.image_width == 0 || cinfo.image_height == 0 ||
+        cinfo.image_width > static_cast<JDIMENSION>(MAX_JPEG_DECODE_DIM) ||
+        cinfo.image_height > static_cast<JDIMENSION>(MAX_JPEG_DECODE_DIM) ||
+        static_cast<uint64_t>(cinfo.image_width) * static_cast<uint64_t>(cinfo.image_height) > MAX_JPEG_DECODE_PIXELS) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+
     cinfo.out_color_space = JCS_RGB;
     jpeg_start_decompress(&cinfo);
 
     outW = static_cast<int>(cinfo.output_width);
     outH = static_cast<int>(cinfo.output_height);
+    if (outW <= 0 || outH <= 0 || outW > MAX_JPEG_DECODE_DIM || outH > MAX_JPEG_DECODE_DIM ||
+        static_cast<uint64_t>(outW) * static_cast<uint64_t>(outH) > MAX_JPEG_DECODE_PIXELS) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
     outBgra.resize(static_cast<size_t>(outW) * outH * 4);
 
-    std::vector<uint8_t> rowBuffer(outW * 3);
+    rowBuffer.resize(static_cast<size_t>(outW) * 3);
     while (cinfo.output_scanline < cinfo.output_height) {
         int r = static_cast<int>(cinfo.output_scanline);
         JSAMPROW rowPtr = rowBuffer.data();
@@ -426,9 +452,12 @@ bool TileCodec::decodeJpegIntoCanvas(
     uint8_t* canvasBgra, int canvasW, int canvasH,
     uint16_t x, uint16_t y, uint16_t width, uint16_t height)
 {
-    if (!jpegData || jpegLen == 0 || !canvasBgra || width == 0 || height == 0) return false;
+    if (!hasJpegSoi(jpegData, jpegLen) || !canvasBgra || width == 0 || height == 0) return false;
+    if (static_cast<size_t>(width) * height > MAX_TILE_DECODE_PIXELS) return false;
     if (static_cast<int>(x) + width > canvasW || static_cast<int>(y) + height > canvasH) return false;
 
+    std::vector<uint8_t> rowBuffer;
+    std::vector<uint8_t> bgraRow;
     struct jpeg_decompress_struct cinfo;
     SafeJpegErrorManager jerr;
     cinfo.err = jpeg_std_error(&jerr.pub);
@@ -453,8 +482,8 @@ bool TileCodec::decodeJpegIntoCanvas(
     cinfo.out_color_space = JCS_RGB;
     jpeg_start_decompress(&cinfo);
 
-    std::vector<uint8_t> rowBuffer(width * 3);
-    std::vector<uint8_t> bgraRow(width * 4);
+    rowBuffer.resize(static_cast<size_t>(width) * 3);
+    bgraRow.resize(static_cast<size_t>(width) * 4);
 
     while (cinfo.output_scanline < cinfo.output_height) {
         int r = static_cast<int>(cinfo.output_scanline);
@@ -678,6 +707,7 @@ bool TileCodec::decodeTileIntoCanvas(
     int canvasH)
 {
     if (!canvasBgra || width == 0 || height == 0) return false;
+    if (static_cast<size_t>(width) * height > MAX_TILE_DECODE_PIXELS) return false;
     if (static_cast<int>(x) + width > canvasW ||
         static_cast<int>(y) + height > canvasH) {
         return false;
@@ -695,6 +725,9 @@ bool TileCodec::decodeTileIntoCanvas(
             tl_decodeScratch.resize(rectBytes);
         }
         if (!decompressZstd(tileData, dataSize, tl_decodeScratch.data(), rectBytes)) {
+            if (tl_decodeScratch.capacity() > MAX_TILE_SCRATCH_RETAIN) {
+                std::vector<uint8_t>().swap(tl_decodeScratch);
+            }
             return false;
         }
         pixelSrc = tl_decodeScratch.data();
@@ -711,6 +744,9 @@ bool TileCodec::decodeTileIntoCanvas(
         uint8_t* dstRow = canvasBgra + (static_cast<size_t>(y + r) * canvasW + x) * 4;
         const uint8_t* srcRow = pixelSrc + static_cast<size_t>(r) * rowBytes;
         SimdKernels::blitRowBgraOpaque(dstRow, srcRow, width);
+    }
+    if (tl_decodeScratch.capacity() > MAX_TILE_SCRATCH_RETAIN) {
+        std::vector<uint8_t>().swap(tl_decodeScratch);
     }
     return true;
 }
