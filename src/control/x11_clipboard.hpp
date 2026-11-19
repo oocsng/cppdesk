@@ -3,13 +3,15 @@
 // The X11 CLIPBOARD selection for text and files: what CppDesk copies reaches other apps, and what they copy
 // reaches CppDesk (and clipboard sync with a remote peer). A hidden window on its own X connection serves requests.
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
-#include <atomic>
 #include <vector>
 
 typedef struct _XDisplay Display;
@@ -51,6 +53,8 @@ private:
     std::string ours_;
     FetchFiles files_;   // set while CppDesk offers files instead of text
     bool owned_ = false;
+    bool waitingReply_ = false;
+    unsigned long pendingTarget_ = 0;
     bool replied_ = false;
     std::optional<std::string> reply_;
     bool incoming_ = false;      // the owner answered getText with INCR: its text arrives in pieces
@@ -61,10 +65,25 @@ private:
         unsigned long requestor = 0, property = 0, type = 0;
         std::string text;
         size_t sent = 0;
+        std::chrono::steady_clock::time_point lastActivity;
     };
     std::vector<Outgoing> outgoing_;
 
+    struct PendingFetch {
+        unsigned long requestor = 0;
+        unsigned long selection = 0;
+        unsigned long target = 0;
+        unsigned long property = 0;
+        unsigned long time = 0;
+        FetchFiles files;
+    };
+    void runFetchWorker();
+    std::mutex fetchMutex_;
+    std::condition_variable fetchCv_;
+    std::deque<PendingFetch> fetchQueue_;
+
     std::atomic<bool> stop_{false};
+    std::thread fetchWorker_;
     std::thread thread_;
 };
 
