@@ -1318,7 +1318,7 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
             drawText(shareText.body, { hx, hy, hrx, hy + noticeH }, ui::FontRole::Tooltip, COL_TEXT_SECONDARY);
             hy += noticeH + 8.0f;
         }
-        const auto roomForSwitch = [&]() { return (!shareText.visible && !micLive) || hy + 24.0f <= discTop - 4.0f; };
+        const auto roomForSwitch = [&]() { return hy + 24.0f <= discTop - 4.0f; };
 
         uint8_t perms = hStatus.permissions;
         if (roomForSwitch()) drawToggleSwitch("perm_host_input", { hx, hy, hrx, hy + 24.0f }, (perms & PERM_INPUT) != 0,
@@ -1337,7 +1337,7 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
                          });
         hy += 30.0f;
 
-        const float discY = ((shareText.visible || micLive) && hy + 32.0f > hostBox.bottom - 8.0f) ? discTop : hy;
+        const float discY = (hy + 32.0f > hostBox.bottom - 8.0f) ? discTop : hy;
         if (discY + 32.0f <= hostBox.bottom - 8.0f) {
             UiRect discHostBtn = { hx, discY, hrx, discY + 32.0f };
             drawButton("btn_disc_host", discHostBtn, "Disconnect",
@@ -2384,50 +2384,62 @@ void AppUi::drawRemoteSessionView(const UiRect& bounds, float alpha) {
 
         // Multi-Monitor Grid Partition Overlays & Badges
         if (stats.activeMonitorIndex == -1 && stats.monitors.size() > 1) {
-            int minX = 0, minY = 0, maxX = 0, maxY = 0;
+            constexpr size_t kMaxGridMonitors = 16;
+            const size_t monCount = std::min(stats.monitors.size(), kMaxGridMonitors);
+            int64_t minX = 0, minY = 0, maxX = 0, maxY = 0;
             bool hasBounds = false;
-            for (const auto& m : stats.monitors) {
+            for (size_t i = 0; i < monCount; ++i) {
+                const auto& m = stats.monitors[i];
+                if (m.width <= 0 || m.height <= 0) continue;
+                const int64_t mx0 = static_cast<int64_t>(m.x);
+                const int64_t my0 = static_cast<int64_t>(m.y);
+                const int64_t mx1 = mx0 + static_cast<int64_t>(m.width);
+                const int64_t my1 = my0 + static_cast<int64_t>(m.height);
                 if (!hasBounds) {
-                    minX = m.x; minY = m.y;
-                    maxX = m.x + m.width; maxY = m.y + m.height;
+                    minX = mx0; minY = my0;
+                    maxX = mx1; maxY = my1;
                     hasBounds = true;
                 } else {
-                    minX = std::min(minX, m.x);
-                    minY = std::min(minY, m.y);
-                    maxX = std::max(maxX, m.x + m.width);
-                    maxY = std::max(maxY, m.y + m.height);
+                    minX = std::min(minX, mx0);
+                    minY = std::min(minY, my0);
+                    maxX = std::max(maxX, mx1);
+                    maxY = std::max(maxY, my1);
                 }
             }
-            float totalW = static_cast<float>(std::max(1, maxX - minX));
-            float totalH = static_cast<float>(std::max(1, maxY - minY));
+            if (hasBounds) {
+                float totalW = static_cast<float>(std::max<int64_t>(1, maxX - minX));
+                float totalH = static_cast<float>(std::max<int64_t>(1, maxY - minY));
 
-            for (size_t i = 0; i < stats.monitors.size(); ++i) {
-                const auto& m = stats.monitors[i];
-                float relX = (m.x - minX) / totalW;
-                float relY = (m.y - minY) / totalH;
-                float relW = m.width / totalW;
-                float relH = m.height / totalH;
-                UiRect subRect = {
-                    renderedCanvasRect_.left + relX * renderedCanvasRect_.width(),
-                    renderedCanvasRect_.top + relY * renderedCanvasRect_.height(),
-                    renderedCanvasRect_.left + (relX + relW) * renderedCanvasRect_.width(),
-                    renderedCanvasRect_.top + (relY + relH) * renderedCanvasRect_.height()
-                };
+                for (size_t i = 0; i < monCount; ++i) {
+                    const auto& m = stats.monitors[i];
+                    if (m.width <= 0 || m.height <= 0) continue;
+                    float relX = static_cast<float>(static_cast<int64_t>(m.x) - minX) / totalW;
+                    float relY = static_cast<float>(static_cast<int64_t>(m.y) - minY) / totalH;
+                    float relW = static_cast<float>(m.width) / totalW;
+                    float relH = static_cast<float>(m.height) / totalH;
+                    UiRect subRect = {
+                        renderedCanvasRect_.left + relX * renderedCanvasRect_.width(),
+                        renderedCanvasRect_.top + relY * renderedCanvasRect_.height(),
+                        renderedCanvasRect_.left + (relX + relW) * renderedCanvasRect_.width(),
+                        renderedCanvasRect_.top + (relY + relH) * renderedCanvasRect_.height()
+                    };
 
-                // Subtle hairline border around each monitor partition
-                strokeRoundRect(subRect, 0.0f, withAlpha(COL_PRIMARY_ACCENT, 0.40f * alpha), 1.0f);
+                    // Subtle hairline border around each monitor partition
+                    strokeRoundRect(subRect, 0.0f, withAlpha(COL_PRIMARY_ACCENT, 0.40f * alpha), 1.0f);
 
-                // Sleek clickable badge at the top-left of each monitor
-                float badgeW = 126.0f;
-                float badgeH = 22.0f;
-                UiRect badgeRect = { subRect.left + 8.0f, subRect.top + 8.0f, subRect.left + 8.0f + badgeW, subRect.top + 8.0f + badgeH };
-                std::string badgeLabel = "Disp " + std::to_string(m.index + 1) + " (" + std::to_string(m.width) + "x" + std::to_string(m.height) + ")";
-                drawButton("grid_mon_badge_" + std::to_string(i), badgeRect, badgeLabel,
-                           rgba(20, 24, 32, 0.75f), rgba(30, 42, 60, 0.90f),
-                           COL_TEXT_ON_ACCENT, 5.0f, [this, m]() {
-                               network_.selectRemoteMonitor(m.index);
-                               showToast("Focused Display " + std::to_string(m.index + 1));
-                           }, ui::FontRole::Small, true, withAlpha(COL_PRIMARY_ACCENT, 0.6f));
+                    // Sleek clickable badge at the top-left of each monitor
+                    float badgeW = 126.0f;
+                    float badgeH = 22.0f;
+                    UiRect badgeRect = { subRect.left + 8.0f, subRect.top + 8.0f, subRect.left + 8.0f + badgeW, subRect.top + 8.0f + badgeH };
+                    const int64_t dispNum = static_cast<int64_t>(m.index) + 1;
+                    std::string badgeLabel = "Disp " + std::to_string(dispNum) + " (" + std::to_string(m.width) + "x" + std::to_string(m.height) + ")";
+                    drawButton("grid_mon_badge_" + std::to_string(i), badgeRect, badgeLabel,
+                               rgba(20, 24, 32, 0.75f), rgba(30, 42, 60, 0.90f),
+                               COL_TEXT_ON_ACCENT, 5.0f, [this, m, dispNum]() {
+                                   network_.selectRemoteMonitor(m.index);
+                                   showToast("Focused Display " + std::to_string(dispNum));
+                               }, ui::FontRole::Small, true, withAlpha(COL_PRIMARY_ACCENT, 0.6f));
+                }
             }
         }
 
@@ -5515,6 +5527,7 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
                    showDisplayMenu_ = !showDisplayMenu_;
                    showAdminMenu_ = false;
                    showQualityMenu_ = false;
+                   showAudioVolumePopup_ = false;
                }, ui::FontRole::Small, true, COL_BORDER);
     curX = monBtn.right + 6.0f;
 
@@ -5528,6 +5541,7 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
                    showAdminMenu_ = !showAdminMenu_;
                    showDisplayMenu_ = false;
                    showQualityMenu_ = false;
+                   showAudioVolumePopup_ = false;
                }, ui::FontRole::Small, true, COL_BORDER);
     curX = adminBtn.right + 6.0f;
 
@@ -5547,6 +5561,7 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
                    showQualityMenu_ = !showQualityMenu_;
                    showDisplayMenu_ = false;
                    showAdminMenu_ = false;
+                   showAudioVolumePopup_ = false;
                }, ui::FontRole::Small, true, COL_BORDER);
     curX = qualBtn.right + 6.0f;
 
@@ -5646,72 +5661,86 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
                islandDiagOpen ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
     curX = islandTaskMgrBtn.right + 6.0f;
 
+    // Pin Exit (F11) and ? to the right edge so they never invert or collide on narrow/HiDPI screens
+    const float rightReservedLeft = pillRight - 130.0f;
+    const size_t islandMiddleClickStart = clickRegions_.size();
+    canvas_->pushClip(ui::Rect{pillLeft, pillTop, std::max(pillLeft, rightReservedLeft - 4.0f), pillBottom});
     // HUD Toggle Button
     UiRect islandHudBtn = { curX, pillTop + 6.0f, curX + 58.0f, pillBottom - 6.0f };
-    drawButton("island_hud_btn", islandHudBtn, showPerformanceHud_ ? "HUD: ON" : "HUD",
-               showPerformanceHud_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-               showPerformanceHud_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-               showPerformanceHud_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-               8.0f, [this]() {
-                   showPerformanceHud_ = !showPerformanceHud_;
-                   showToast(showPerformanceHud_ ? "Performance HUD: ON" : "Performance HUD: OFF");
-               }, ui::FontRole::Small, !showPerformanceHud_, COL_BORDER);
+    if (islandHudBtn.right <= rightReservedLeft - 4.0f) {
+        drawButton("island_hud_btn", islandHudBtn, showPerformanceHud_ ? "HUD: ON" : "HUD",
+                   showPerformanceHud_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+                   showPerformanceHud_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                   showPerformanceHud_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                   8.0f, [this]() {
+                       showPerformanceHud_ = !showPerformanceHud_;
+                       showToast(showPerformanceHud_ ? "Performance HUD: ON" : "Performance HUD: OFF");
+                   }, ui::FontRole::Small, !showPerformanceHud_, COL_BORDER);
+    }
     curX = islandHudBtn.right + 6.0f;
 
     // Rewind Button
     UiRect islandRewindBtn = { curX, pillTop + 6.0f, curX + 72.0f, pillBottom - 6.0f };
-    drawButton("island_rewind_btn", islandRewindBtn, showRewindScrubber_ ? "Rewind: ON" : "Rewind",
-               showRewindScrubber_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-               showRewindScrubber_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-               showRewindScrubber_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-               8.0f, [this]() {
-                   showRewindScrubber_ = !showRewindScrubber_;
-                   if (!showRewindScrubber_) {
-                       rewindFrozen_ = false;
-                       rewindOffsetMs_ = 0;
-                       displayedFrameSeq_ = 0;
-                       { releaseImage(remoteBitmap_); bitmapW_ = 0; bitmapH_ = 0; }
-                   }
-                   showToast(showRewindScrubber_ ? "Rewind Scrubber Active" : "Snapped to Live");
-                   shell_->invalidate();
-               }, ui::FontRole::Small, !showRewindScrubber_, COL_BORDER);
+    if (islandRewindBtn.right <= rightReservedLeft - 4.0f) {
+        drawButton("island_rewind_btn", islandRewindBtn, showRewindScrubber_ ? "Rewind: ON" : "Rewind",
+                   showRewindScrubber_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+                   showRewindScrubber_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                   showRewindScrubber_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                   8.0f, [this]() {
+                       showRewindScrubber_ = !showRewindScrubber_;
+                       if (!showRewindScrubber_) {
+                           rewindFrozen_ = false;
+                           rewindOffsetMs_ = 0;
+                           displayedFrameSeq_ = 0;
+                           { releaseImage(remoteBitmap_); bitmapW_ = 0; bitmapH_ = 0; }
+                       }
+                       showToast(showRewindScrubber_ ? "Rewind Scrubber Active" : "Snapped to Live");
+                       shell_->invalidate();
+                   }, ui::FontRole::Small, !showRewindScrubber_, COL_BORDER);
+    }
     curX = islandRewindBtn.right + 6.0f;
 
     // Command Palette Button
     UiRect islandPaletteBtn = { curX, pillTop + 6.0f, curX + 68.0f, pillBottom - 6.0f };
-    drawButton("island_palette_btn", islandPaletteBtn, "Palette",
-               showOmnibarModal_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-               showOmnibarModal_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-               showOmnibarModal_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-               8.0f, [this]() {
-                   showOmnibarModal_ = !showOmnibarModal_;
-                   if (showOmnibarModal_) {
-                       focusedField_ = FocusedField::OmnibarInput;
-                       omnibarQuery_.clear();
-                       omnibarSelectedIndex_ = 0;
-                       omnibarFiltered_ = network_.commandPaletteManager().getCatalog();
-                       omnibarHasOutput_ = false;
-                   } else {
-                       focusedField_ = FocusedField::None;
-                   }
-                   shell_->invalidate();
-               }, ui::FontRole::Small, !showOmnibarModal_, COL_BORDER);
+    if (islandPaletteBtn.right <= rightReservedLeft - 4.0f) {
+        drawButton("island_palette_btn", islandPaletteBtn, "Palette",
+                   showOmnibarModal_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+                   showOmnibarModal_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                   showOmnibarModal_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                   8.0f, [this]() {
+                       showOmnibarModal_ = !showOmnibarModal_;
+                       if (showOmnibarModal_) {
+                           focusedField_ = FocusedField::OmnibarInput;
+                           omnibarQuery_.clear();
+                           omnibarSelectedIndex_ = 0;
+                           omnibarFiltered_ = network_.commandPaletteManager().getCatalog();
+                           omnibarHasOutput_ = false;
+                       } else {
+                           focusedField_ = FocusedField::None;
+                       }
+                       shell_->invalidate();
+                   }, ui::FontRole::Small, !showOmnibarModal_, COL_BORDER);
+    }
     curX = islandPaletteBtn.right + 6.0f;
 
     // 6. Pin Button
     UiRect pinBtn = { curX, pillTop + 6.0f, curX + 54.0f, pillBottom - 6.0f };
-    drawButton("island_pin_btn", pinBtn, floatingToolbarPinned_ ? "Pinned" : "Pin",
-               floatingToolbarPinned_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-               floatingToolbarPinned_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-               floatingToolbarPinned_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-               8.0f, [this]() {
-                   floatingToolbarPinned_ = !floatingToolbarPinned_;
-                   showToast(floatingToolbarPinned_ ? "Toolbar Pinned" : "Toolbar Auto-hide");
-               }, ui::FontRole::Small, !floatingToolbarPinned_, COL_BORDER);
-    curX = pinBtn.right + 6.0f;
+    if (pinBtn.right <= rightReservedLeft - 4.0f) {
+        drawButton("island_pin_btn", pinBtn, floatingToolbarPinned_ ? "Pinned" : "Pin",
+                   floatingToolbarPinned_ ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
+                   floatingToolbarPinned_ ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
+                   floatingToolbarPinned_ ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+                   8.0f, [this]() {
+                       floatingToolbarPinned_ = !floatingToolbarPinned_;
+                       showToast(floatingToolbarPinned_ ? "Toolbar Pinned" : "Toolbar Auto-hide");
+                   }, ui::FontRole::Small, !floatingToolbarPinned_, COL_BORDER);
+    }
+    canvas_->popClip();
+    (void)islandMiddleClickStart;
 
-    // Fullscreen Exit Button
-    UiRect fsBtn = { curX, pillTop + 6.0f, pillRight - 46.0f, pillBottom - 6.0f };
+    // Fullscreen Exit Button (pinned left of "?")
+    UiRect helpBtn = { pillRight - 40.0f, pillTop + 6.0f, pillRight - 10.0f, pillBottom - 6.0f };
+    UiRect fsBtn = { std::max(pillLeft + 10.0f, helpBtn.left - 84.0f), pillTop + 6.0f, helpBtn.left - 6.0f, pillBottom - 6.0f };
     drawButton("island_fs_btn", fsBtn, "Exit (F11)",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
                8.0f, [this]() {
@@ -5719,7 +5748,6 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
                }, ui::FontRole::Small, true, COL_BORDER);
 
     // Shortcuts Button "?" (Relocated to far right unobtrusive corner)
-    UiRect helpBtn = { pillRight - 40.0f, pillTop + 6.0f, pillRight - 10.0f, pillBottom - 6.0f };
     drawButton("island_help_btn", helpBtn, "?",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
                8.0f, [this]() {
@@ -5906,6 +5934,7 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
         drawButton("drop_adm_reboot_rec", r4, "Reboot & Reconnect...",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
                        showAdminMenu_ = false;
+                       rebootIsEmergency_ = false;
                        showRebootConfirmModal_ = true;
                    }, ui::FontRole::Small, true, COL_BORDER);
         dy += itemH;
@@ -5913,9 +5942,9 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
         UiRect r5 = { dropRect.left + 8.0f, dy, dropRect.right - 8.0f, dy + 28.0f };
         drawButton("drop_adm_reboot", r5, "Emergency Reboot...",
                    COL_DANGER, COL_DANGER_HV, COL_TEXT_ON_ACCENT, 6.0f, [this]() {
-                       network_.sendSystemAction(SystemActionType::EmergencyReboot);
                        showAdminMenu_ = false;
-                       showToast("Remote Emergency Reboot sent", true);
+                       rebootIsEmergency_ = true;
+                       showRebootConfirmModal_ = true;
                    }, ui::FontRole::Small);
     }
 
@@ -7332,7 +7361,8 @@ void AppUi::drawRebootConfirmModal(float width, float height, float modalProgres
     float mrx = modal.right - 26.0f;
     float my = modal.top + 22.0f;
 
-    drawText("Remote Reboot & Reconnect", { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    drawText(rebootIsEmergency_ ? "Emergency Remote Reboot" : "Remote Reboot & Reconnect",
+             { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
 
     UiRect closeBtn = { mrx - 26.0f, my, mrx, my + 26.0f };
     drawButton("modal_reboot_close", closeBtn, "×",
@@ -7340,16 +7370,20 @@ void AppUi::drawRebootConfirmModal(float width, float height, float modalProgres
                [this]() { showRebootConfirmModal_ = false; }, ui::FontRole::Heading);
     my += 34.0f;
 
-    drawText("The remote machine will restart and automatically reconnect once Windows boots back up. A secure resume token will authenticate the new session without requiring a password.",
+    drawText(rebootIsEmergency_
+                 ? "This will immediately force-reboot the remote machine without saving open work or scheduling automatic reconnect."
+                 : "The remote machine will restart and automatically reconnect once Windows boots back up. A secure resume token will authenticate the new session without requiring a password.",
              { mx, my, mrx, my + 44.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 52.0f;
 
-    // Safe mode toggle
-    UiRect toggleR = { mx, my, mrx, my + 26.0f };
-    drawToggleSwitch("modal_reboot_safemode", toggleR, rebootSafeModeChoice_,
-                     "Boot into Safe Mode with Networking", [this]() {
-                         rebootSafeModeChoice_ = !rebootSafeModeChoice_;
-                     });
+    // Safe mode toggle (only for graceful Reboot & Reconnect)
+    if (!rebootIsEmergency_) {
+        UiRect toggleR = { mx, my, mrx, my + 26.0f };
+        drawToggleSwitch("modal_reboot_safemode", toggleR, rebootSafeModeChoice_,
+                         "Boot into Safe Mode with Networking", [this]() {
+                             rebootSafeModeChoice_ = !rebootSafeModeChoice_;
+                         });
+    }
     my += 40.0f;
 
     // Action buttons
@@ -7362,11 +7396,17 @@ void AppUi::drawRebootConfirmModal(float width, float height, float modalProgres
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f,
                [this]() { showRebootConfirmModal_ = false; }, ui::FontRole::Small, true, COL_BORDER);
 
-    drawButton("modal_reboot_confirm", rebootBtn, "Reboot & Reconnect",
-               COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f,
+    drawButton("modal_reboot_confirm", rebootBtn,
+               rebootIsEmergency_ ? "Emergency Reboot" : "Reboot & Reconnect",
+               rebootIsEmergency_ ? COL_DANGER : COL_PRIMARY_ACCENT,
+               rebootIsEmergency_ ? COL_DANGER_HV : COL_PRIMARY_ACCENT_HV,
+               COL_TEXT_ON_ACCENT, 8.0f,
                [this]() {
                    showRebootConfirmModal_ = false;
-                   if (network_.requestRemoteReboot(rebootSafeModeChoice_, 5)) {
+                   if (rebootIsEmergency_) {
+                       network_.sendSystemAction(SystemActionType::EmergencyReboot);
+                       showToast("Remote Emergency Reboot sent", true);
+                   } else if (network_.requestRemoteReboot(rebootSafeModeChoice_, 5)) {
                        showToast("Reboot requested. Reconnecting once online...");
                    } else {
                        showToast("Failed to request reboot", true);
@@ -8037,6 +8077,7 @@ void AppUi::drawWhiteboardOverlay(const UiRect& canvasRect) {
     drawCardShadow(palRect, 21.0f, 0.95f);
     fillRoundRect(palRect, 21.0f, withAlpha(COL_BG_CARD, 0.96f));
     strokeRoundRect(palRect, 21.0f, withAlpha(COL_BORDER_FOCUS, 0.40f), 1.2f);
+    clickRegions_.push_back({ palRect, "wb_palette_bg", []() {}, false });
 
     float curX = palLeft + 12.0f;
 
@@ -8268,16 +8309,17 @@ void AppUi::drawAudioVolumePopup(float anchorX, float anchorY) {
 
     float pw = 240.0f;
     float ph = 126.0f;
-    float px = std::clamp(anchorX - pw * 0.5f, 20.0f, winW - pw - 20.0f);
+    float px = std::clamp(anchorX - pw * 0.5f, 20.0f, std::max(20.0f, winW - pw - 20.0f));
     float py = std::min(anchorY, winH - ph - 20.0f);
     UiRect basePopRect = { px, py, px + pw, py + ph };
     UiRect popRect = UiPlatform::computeSpringRect(basePopRect, audioPopAnimT_, 0.0f);
 
-    // Scrim/click outside to dismiss
+    // Scrim/click outside to dismiss, plus popup-body absorb region so clicking padding does not dismiss
     if (showAudioVolumePopup_) {
         clickRegions_.push_back(ClickRegion{ UiRect{ 0.0f, 0.0f, winW, winH }, "audio_pop_scrim", [this]() {
             showAudioVolumePopup_ = false;
         }, false });
+        clickRegions_.push_back(ClickRegion{ popRect, "audio_pop_body", []() {}, false });
     }
 
     drawCardShadow(popRect, 14.0f, 0.95f * popAlpha);
@@ -8734,7 +8776,7 @@ void AppUi::onMouseButton(MouseButtonId btn, bool isDown, float x, float y) {
                 }
             }
         }
-    } else if (insideDrawer) {
+    } else if (insideDrawer || drawerAnimT_ > 0.004f) {
         return;
     }
 
@@ -9783,7 +9825,6 @@ void AppUi::drawOmnibarModal(float width, float height, float modalProgress) {
 
     my += 46.0f;
 
-    omnibarFiltered_ = network_.commandPaletteManager().search(omnibarQuery_);
     if (omnibarSelectedIndex_ >= (int)omnibarFiltered_.size()) {
         omnibarSelectedIndex_ = std::max(0, (int)omnibarFiltered_.size() - 1);
     }
@@ -9798,11 +9839,14 @@ void AppUi::drawOmnibarModal(float width, float height, float modalProgress) {
                  ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center, ui::VAlign::Center);
     } else {
         float itemH = 36.0f;
-        int maxItems = std::min((int)omnibarFiltered_.size(), 5);
-        for (int i = 0; i < maxItems; ++i) {
+        const int totalItems = static_cast<int>(omnibarFiltered_.size());
+        const int maxItems = std::min(totalItems, 5);
+        const int startIdx = std::clamp(omnibarSelectedIndex_ - maxItems + 1, 0, std::max(0, totalItems - maxItems));
+        for (int row = 0; row < maxItems; ++row) {
+            const int i = startIdx + row;
             const auto& cmd = omnibarFiltered_[i];
             bool isSel = (i == omnibarSelectedIndex_);
-            UiRect itemR = { listBox.left + 4.0f, listBox.top + 4.0f + i * itemH, listBox.right - 4.0f, listBox.top + 4.0f + (i + 1) * itemH - 2.0f };
+            UiRect itemR = { listBox.left + 4.0f, listBox.top + 4.0f + row * itemH, listBox.right - 4.0f, listBox.top + 4.0f + (row + 1) * itemH - 2.0f };
 
             if (isSel) {
                 fillRoundRect(itemR, 6.0f, withAlpha(COL_PRIMARY_ACCENT, 0.22f));

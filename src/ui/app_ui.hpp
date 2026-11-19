@@ -757,6 +757,7 @@ private:
     // Remote Reboot & Reconnect Modal (v3.2.0)
     bool                    showRebootConfirmModal_ = false;
     bool                    rebootSafeModeChoice_ = false;
+    bool                    rebootIsEmergency_ = false;
     float                   rebootModalAnimT_ = 0.0f;
     float                   rebootModalAnimVel_ = 0.0f;
 
