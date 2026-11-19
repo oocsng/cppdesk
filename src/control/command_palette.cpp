@@ -25,6 +25,7 @@ CommandPaletteManager::CommandPaletteManager() {
 
 void CommandPaletteManager::initDefaultCatalog() {
     std::lock_guard<std::mutex> lock(mutex_);
+#if defined(_WIN32)
     catalog_ = {
         {
             "net.ipconfig",
@@ -111,9 +112,40 @@ void CommandPaletteManager::initDefaultCatalog() {
             true
         }
     };
+#elif defined(__APPLE__)
+    catalog_ = {
+        { "net.ipconfig",     "Display IP Network Configuration",    "Network",     "ifconfig",                false },
+        { "net.flushdns",     "Flush DNS Resolver Cache",            "Network",     "dscacheutil -flushcache", false },
+        { "net.ping",         "Ping Public DNS (8.8.8.8)",           "Network",     "ping -c 4 8.8.8.8",       false },
+        { "net.stat",         "Active Network Connections",          "Network",     "netstat -an",             false },
+        { "net.route",        "Display IP Routing Table",            "Network",     "netstat -rn",             false },
+        { "sys.tasklist",     "List Running Tasks and Processes",    "System",      "ps aux",                  false },
+        { "sys.info",         "Display Host System Information",     "System",      "uname -a",                false },
+        { "sys.whoami",       "Current User and Security Privileges","System",      "id",                      false },
+        { "diag.services",    "Query System Services State",         "Diagnostics", "launchctl list",          false },
+        { "diag.disk",        "Query Disk Free Space and Partitions","Diagnostics", "df -h",                   false },
+        { "act.reboot60",     "Schedule Host Restart in 60s",        "Actions",     "shutdown -r +1",          true  },
+        { "act.abort_reboot", "Abort Pending Host Restart",          "Actions",     "killall shutdown",        true  }
+    };
+#else
+    catalog_ = {
+        { "net.ipconfig",     "Display IP Network Configuration",    "Network",     "ip addr",                                        false },
+        { "net.flushdns",     "Flush DNS Resolver Cache",            "Network",     "resolvectl flush-caches",                        false },
+        { "net.ping",         "Ping Public DNS (8.8.8.8)",           "Network",     "ping -c 4 8.8.8.8",                              false },
+        { "net.stat",         "Active Network Connections",          "Network",     "ss -tunap",                                      false },
+        { "net.route",        "Display IP Routing Table",            "Network",     "ip route",                                       false },
+        { "sys.tasklist",     "List Running Tasks and Processes",    "System",      "ps aux",                                         false },
+        { "sys.info",         "Display Host System Information",     "System",      "uname -a",                                       false },
+        { "sys.whoami",       "Current User and Security Privileges","System",      "id",                                             false },
+        { "diag.services",    "Query System Services State",         "Diagnostics", "systemctl list-units --type=service --no-pager", false },
+        { "diag.disk",        "Query Disk Free Space and Partitions","Diagnostics", "df -h",                                          false },
+        { "act.reboot60",     "Schedule Host Restart in 60s",        "Actions",     "shutdown -r +1",                                 true  },
+        { "act.abort_reboot", "Abort Pending Host Restart",          "Actions",     "shutdown -c",                                    true  }
+    };
+#endif
 }
 
-const std::vector<OmnibarCommand>& CommandPaletteManager::getCatalog() const {
+std::vector<OmnibarCommand> CommandPaletteManager::getCatalog() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return catalog_;
 }
@@ -223,13 +255,23 @@ bool CommandPaletteManager::executeSync(const std::string& cmdLine,
     std::vector<wchar_t> cmdBuf(cmdW.begin(), cmdW.end());
     cmdBuf.push_back(L'\0');
 
+    HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
+    if (hJob) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli{};
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
+            CloseHandle(hJob);
+            hJob = nullptr;
+        }
+    }
+
     BOOL created = CreateProcessW(
         nullptr,
         cmdBuf.data(),
         nullptr,
         nullptr,
         TRUE,
-        CREATE_NO_WINDOW,
+        CREATE_NO_WINDOW | CREATE_SUSPENDED,
         nullptr,
         nullptr,
         &si,
@@ -242,10 +284,17 @@ bool CommandPaletteManager::executeSync(const std::string& cmdLine,
     CloseHandle(hStdinWrite); // Closing write end signals immediate EOF to child process stdin
 
     if (!created) {
+        if (hJob) CloseHandle(hJob);
         CloseHandle(hReadPipe);
         outOutput = "Error: Failed to launch process (Error " + std::to_string(GetLastError()) + ")";
         return false;
     }
+
+    if (hJob && !AssignProcessToJobObject(hJob, pi.hProcess)) {
+        CloseHandle(hJob);
+        hJob = nullptr;
+    }
+    ResumeThread(pi.hThread);
 
     auto startTime = std::chrono::steady_clock::now();
     const size_t maxOutputBytes = 65536;
@@ -285,7 +334,11 @@ bool CommandPaletteManager::executeSync(const std::string& cmdLine,
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - startTime).count();
         if (elapsed > static_cast<int64_t>(timeoutMs)) {
-            TerminateProcess(pi.hProcess, 1);
+            if (hJob) {
+                TerminateJobObject(hJob, 1);
+            } else {
+                TerminateProcess(pi.hProcess, 1);
+            }
             WaitForSingleObject(pi.hProcess, 500);
             outOutput += "\n[Execution timed out after " + std::to_string(timeoutMs) + " ms]";
             break;
@@ -296,6 +349,7 @@ bool CommandPaletteManager::executeSync(const std::string& cmdLine,
     GetExitCodeProcess(pi.hProcess, &rawExitCode);
     outExitCode = static_cast<int32_t>(rawExitCode);
 
+    if (hJob) CloseHandle(hJob);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     CloseHandle(hReadPipe);
