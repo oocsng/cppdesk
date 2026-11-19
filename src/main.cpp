@@ -4,6 +4,9 @@
 #include "ui/ui_window.hpp"
 #include "control/shortcut_manager.hpp"
 #include "net/updater.hpp"
+#if defined(_WIN32)
+#include "control/windows_service_manager.hpp"
+#endif
 
 #include <filesystem>
 #include <fstream>
@@ -163,6 +166,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
         OleUninitialize();
         return 0;
     }
+    // A remote "reboot to Safe Mode" lasts one boot: undo it as soon as we run, even if the viewer never returns.
+    cppdesk::WindowsServiceManager::clearSafeBootIfActive();
 
     cppdesk::IdentityManager identity(instanceId);
     identity.loadOrCreate();
