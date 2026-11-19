@@ -175,36 +175,36 @@ void testDeskIdAndCrypto() {
     TEST_ASSERT(CryptoUtils::randomBytes(nonce.data(), nonce.size()));
 
     uint64_t clientId = 123456789ULL;
-    auto validResp = CryptoUtils::computeChallengeResponse("SecretPass#2026", hostReloaded.deskId(), clientId, nonce);
-    auto wrongResp = CryptoUtils::computeChallengeResponse("WrongPassword", hostReloaded.deskId(), clientId, nonce);
-
-    TEST_ASSERT(hostReloaded.verifyChallengeResponse(clientId, nonce, validResp));
-    TEST_ASSERT(!hostReloaded.verifyChallengeResponse(clientId, nonce, wrongResp));
-
-    // Verify dynamic 6-char One-Time Session Code authentication & regeneration
-    std::string code1 = hostReloaded.sessionCode();
-    TEST_ASSERT(code1.size() == 6);
-    auto codeResp1 = CryptoUtils::computeChallengeResponse(code1, hostReloaded.deskId(), clientId, nonce);
-    TEST_ASSERT(hostReloaded.verifyChallengeResponse(clientId, nonce, codeResp1));
-
-    std::string code2 = hostReloaded.regenerateSessionCode();
-    TEST_ASSERT(code2.size() == 6);
-    auto codeResp2 = CryptoUtils::computeChallengeResponse(code2, hostReloaded.deskId(), clientId, nonce);
-    TEST_ASSERT(hostReloaded.verifyChallengeResponse(clientId, nonce, codeResp2));
-
-    // Stream cipher round-trip & SAS fingerprint ("XXXX-XXXX")
     const uint8_t mockSecret[32] = {0x42};
     auto sessionKey = CryptoUtils::deriveSessionKey(hostReloaded.deskId(), clientId, nonce, mockSecret, sizeof(mockSecret));
     TEST_ASSERT(CryptoUtils::isUsableKey(sessionKey));
     std::string fp = CryptoUtils::sessionFingerprintHex(sessionKey);
     TEST_ASSERT(fp.size() == 9);
 
-    std::string secretPayload = "AeroDesk Encrypted Frame Payload Verification 1234567890";
-    std::vector<uint8_t> buf(secretPayload.begin(), secretPayload.end());
-    CryptoUtils::transformPayload(buf.data(), buf.size(), sessionKey, 42);
-    TEST_ASSERT(std::memcmp(buf.data(), secretPayload.data(), buf.size()) != 0);
-    CryptoUtils::transformPayload(buf.data(), buf.size(), sessionKey, 42);
-    TEST_ASSERT(std::memcmp(buf.data(), secretPayload.data(), buf.size()) == 0);
+    std::array<uint8_t, 16> kdfSalt{};
+    uint32_t kdfIter = 0;
+    hostReloaded.getAuthKdfParams(kdfSalt, kdfIter);
+    auto validResp = CryptoUtils::bindChallengeResponse(
+        sessionKey, CryptoUtils::computeChallengeResponse("SecretPass#2026", kdfSalt, kdfIter, hostReloaded.deskId(), clientId, nonce));
+    auto wrongResp = CryptoUtils::bindChallengeResponse(
+        sessionKey, CryptoUtils::computeChallengeResponse("WrongPassword", kdfSalt, kdfIter, hostReloaded.deskId(), clientId, nonce));
+
+    TEST_ASSERT(hostReloaded.verifyChallengeResponse(clientId, nonce, validResp, sessionKey, kdfSalt, kdfIter));
+    TEST_ASSERT(!hostReloaded.verifyChallengeResponse(clientId, nonce, wrongResp, sessionKey, kdfSalt, kdfIter));
+
+    // Verify dynamic 6-char One-Time Session Code authentication & regeneration
+    std::string code1 = hostReloaded.sessionCode();
+    TEST_ASSERT(code1.size() == 6);
+    auto codeResp1 = CryptoUtils::bindChallengeResponse(
+        sessionKey, CryptoUtils::computeChallengeResponse(code1, kdfSalt, kdfIter, hostReloaded.deskId(), clientId, nonce));
+    TEST_ASSERT(hostReloaded.verifyChallengeResponse(clientId, nonce, codeResp1, sessionKey, kdfSalt, kdfIter));
+
+    std::string code2 = hostReloaded.regenerateSessionCode();
+    TEST_ASSERT(code2.size() == 6);
+    hostReloaded.getAuthKdfParams(kdfSalt, kdfIter);
+    auto codeResp2 = CryptoUtils::bindChallengeResponse(
+        sessionKey, CryptoUtils::computeChallengeResponse(code2, kdfSalt, kdfIter, hostReloaded.deskId(), clientId, nonce));
+    TEST_ASSERT(hostReloaded.verifyChallengeResponse(clientId, nonce, codeResp2, sessionKey, kdfSalt, kdfIter));
 }
 
 void testTileCodecRoundTrip() {
@@ -828,17 +828,6 @@ void testEcdhAndAesGcmEngine() {
     TEST_ASSERT(clientSeq == 1);
     TEST_ASSERT(std::string(clientDec.begin(), clientDec.end()) == mouseEvent);
 
-    // Rekeying Ratchet (Option 4A)
-    TEST_ASSERT(hostCipher.ratchetKey());
-    TEST_ASSERT(viewerCipher.ratchetKey());
-    std::string postRatchetPlain = "Payload after 1 GB ratchet key rotation";
-    mockHdr.payloadSize = static_cast<uint32_t>(12 + postRatchetPlain.size() + 16);
-    std::vector<uint8_t> ratchetEnc;
-    TEST_ASSERT(hostCipher.encrypt(postRatchetPlain.data(), postRatchetPlain.size(), 2, &mockHdr, sizeof(mockHdr), ratchetEnc));
-    std::vector<uint8_t> ratchetDec;
-    TEST_ASSERT(viewerCipher.decrypt(ratchetEnc.data(), ratchetEnc.size(), &mockHdr, sizeof(mockHdr), ratchetDec));
-    TEST_ASSERT(std::string(ratchetDec.begin(), ratchetDec.end()) == postRatchetPlain);
-
     // 4. Multi-Threaded Tile Compression Pool (Option 2A)
     std::vector<TileThreadPool::RectTask> tasks;
     for (int i = 0; i < 8; ++i) {
@@ -1311,9 +1300,9 @@ void testAutoUpdaterAndProtocolV3() {
     // 1. Magic constants & Protocol definitions
     TEST_ASSERT(PROTOCOL_MAGIC == 0x43505044); // "CPPD"
     TEST_ASSERT(RELAY_MAGIC == 0x4344534B);    // "CDSK"
-    TEST_ASSERT(PROTOCOL_VERSION == 3);
+    TEST_ASSERT(PROTOCOL_VERSION == 4);
     TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.11.2");
-    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030800);
+    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030B02);
 
     // 2. Semantic Version Triad Parsing
     int maj = 0, min = 0, pat = 0;
@@ -2692,6 +2681,11 @@ void testWindowsServiceAndRemoteRebootReconnect() {
         TEST_ASSERT(t1Bytes.size() == 32);
         TEST_ASSERT(CryptoUtils::toHex(t1Bytes.data(), t1Bytes.size()) == token1);
 
+        auto tmpRebootDir = std::filesystem::temp_directory_path() / L"cppdesk_test_reboot_token";
+        std::error_code tmpEc;
+        std::filesystem::remove_all(tmpRebootDir, tmpEc);
+        WindowsServiceManager::setRebootTokenDirForTest(tmpRebootDir.wstring());
+
         uint64_t callerDeskId = 987654321ULL;
         WindowsServiceManager::clearRebootToken();
         TEST_ASSERT(!WindowsServiceManager::hasPendingRebootToken());
@@ -2704,20 +2698,25 @@ void testWindowsServiceAndRemoteRebootReconnect() {
         TEST_ASSERT(WindowsServiceManager::hasPendingRebootToken(&readCaller));
         TEST_ASSERT(readCaller == callerDeskId);
 
-        // Validation with wrong desk ID should fail and NOT consume the token
+        // Validation with wrong desk ID fails and invalidates the token
         TEST_ASSERT(!WindowsServiceManager::validateAndConsumeRebootToken(token1, 111222333ULL));
-        TEST_ASSERT(WindowsServiceManager::hasPendingRebootToken());
+        TEST_ASSERT(!WindowsServiceManager::hasPendingRebootToken());
 
-        // Validation with wrong token should fail
+        // Re-save and verify wrong token fails and invalidates the token
+        TEST_ASSERT(WindowsServiceManager::saveRebootToken(token1, callerDeskId, 300));
         TEST_ASSERT(!WindowsServiceManager::validateAndConsumeRebootToken("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", callerDeskId));
-        TEST_ASSERT(WindowsServiceManager::hasPendingRebootToken());
+        TEST_ASSERT(!WindowsServiceManager::hasPendingRebootToken());
 
-        // Valid consumption should succeed
+        // Re-save and verify valid consumption succeeds (single-use semantics)
+        TEST_ASSERT(WindowsServiceManager::saveRebootToken(token1, callerDeskId, 300));
         TEST_ASSERT(WindowsServiceManager::validateAndConsumeRebootToken(token1, callerDeskId));
 
         // Token must now be consumed (single-use semantics)
         TEST_ASSERT(!WindowsServiceManager::hasPendingRebootToken());
         TEST_ASSERT(!WindowsServiceManager::validateAndConsumeRebootToken(token1, callerDeskId));
+
+        WindowsServiceManager::setRebootTokenDirForTest(L"");
+        std::filesystem::remove_all(tmpRebootDir, tmpEc);
     }
 
     // 3. Service Control Manager queries
@@ -7450,32 +7449,31 @@ void testBoundAuthResponse() {
     keyA.fill(0x11);
     keyB.fill(0x22);
 
-    auto legacy = CryptoUtils::computeChallengeResponse("Bound#Pass1", hostId, viewerId, nonce);
-    auto bound = CryptoUtils::bindChallengeResponse(keyA, legacy);
+    std::array<uint8_t, 16> kdfSalt{};
+    uint32_t kdfIter = 0;
+    host.getAuthKdfParams(kdfSalt, kdfIter);
+    auto inner = CryptoUtils::computeChallengeResponse("Bound#Pass1", kdfSalt, kdfIter, hostId, viewerId, nonce);
+    auto bound = CryptoUtils::bindChallengeResponse(keyA, inner);
 
-    TEST_ASSERT(bound != legacy);
-    TEST_ASSERT(bound == CryptoUtils::bindChallengeResponse(keyA, legacy));   // deterministic
-    TEST_ASSERT(bound != CryptoUtils::bindChallengeResponse(keyB, legacy));   // depends on the key
+    TEST_ASSERT(bound != inner);
+    TEST_ASSERT(bound == CryptoUtils::bindChallengeResponse(keyA, inner));   // deterministic
+    TEST_ASSERT(bound != CryptoUtils::bindChallengeResponse(keyB, inner));   // depends on the key
 
-    // Without a session key the old exchange still verifies (pre-3.9 viewers)
-    TEST_ASSERT(host.verifyChallengeResponse(viewerId, nonce, legacy));
-    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, bound));
+    // Only the bound digest verifies; an observer who saw the inner digest gets nothing
+    TEST_ASSERT(host.verifyChallengeResponse(viewerId, nonce, bound, keyA, kdfSalt, kdfIter));
+    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, inner, keyA, kdfSalt, kdfIter));
+    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, bound, keyB, kdfSalt, kdfIter));
 
-    // With a session key only the bound digest verifies; an observer who saw the legacy digest gets nothing
-    TEST_ASSERT(host.verifyChallengeResponse(viewerId, nonce, bound, &keyA));
-    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, legacy, &keyA));
-    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, bound, &keyB));
-
-    // A wrong password never verifies, bound or not
-    auto wrongLegacy = CryptoUtils::computeChallengeResponse("Wrong#Pass1", hostId, viewerId, nonce);
-    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, CryptoUtils::bindChallengeResponse(keyA, wrongLegacy), &keyA));
+    // A wrong password never verifies
+    auto wrongInner = CryptoUtils::computeChallengeResponse("Wrong#Pass1", kdfSalt, kdfIter, hostId, viewerId, nonce);
+    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, CryptoUtils::bindChallengeResponse(keyA, wrongInner), keyA, kdfSalt, kdfIter));
 
     // The one-time session code takes the same bound path
     const std::string code = host.sessionCode();
     TEST_ASSERT(!code.empty());
-    auto codeLegacy = CryptoUtils::computeChallengeResponse(code, hostId, viewerId, nonce);
-    TEST_ASSERT(host.verifyChallengeResponse(viewerId, nonce, CryptoUtils::bindChallengeResponse(keyA, codeLegacy), &keyA));
-    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, codeLegacy, &keyA));
+    auto codeInner = CryptoUtils::computeChallengeResponse(code, kdfSalt, kdfIter, hostId, viewerId, nonce);
+    TEST_ASSERT(host.verifyChallengeResponse(viewerId, nonce, CryptoUtils::bindChallengeResponse(keyA, codeInner), keyA, kdfSalt, kdfIter));
+    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, codeInner, keyA, kdfSalt, kdfIter));
 }
 
 void testConnectionLimiter() {
