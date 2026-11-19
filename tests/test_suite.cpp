@@ -6632,196 +6632,6 @@ void testCrossPlatformUiWindowingAndMacOsViewer() {
         TEST_ASSERT(std::abs(roundViewY - geo2.contentRect.bottom) < 0.001f);
     }
 
-    // Sub-test 2: Keycode Translation & Modifier Bitmask Transitions
-    {
-        // 2.1: macOS to Windows VK translation for navigation & control
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x24) == 0x0D); // Return -> VK_RETURN
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x30) == 0x09); // Tab -> VK_TAB
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x31) == 0x20); // Space -> VK_SPACE
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x33) == 0x08); // Backspace -> VK_BACK
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x35) == 0x1B); // Escape -> VK_ESCAPE
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x75) == 0x2E); // Forward Delete -> VK_DELETE
-
-        // Arrows
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7B) == 0x25); // Left -> VK_LEFT
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7C) == 0x27); // Right -> VK_RIGHT
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7E) == 0x26); // Up -> VK_UP
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7D) == 0x28); // Down -> VK_DOWN
-
-        // Paging & Home/End
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x73) == 0x24); // Home -> VK_HOME
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x77) == 0x23); // End -> VK_END
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x74) == 0x21); // Page Up -> VK_PRIOR
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x79) == 0x22); // Page Down -> VK_NEXT
-
-        // Alphanumerics A-Z
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x00) == 0x41); // 'A'
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x06) == 0x5A); // 'Z'
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x0B) == 0x42); // 'B'
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x0C) == 0x51); // 'Q'
-
-        // Digits 0-9
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x1D) == 0x30); // '0'
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x12) == 0x31); // '1'
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x19) == 0x39); // '9'
-
-        // Function keys F1-F12
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7A) == 0x70); // F1
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x6F) == 0x7B); // F12
-
-        // Modifiers
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x38) == 0x10); // Shift
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x3B) == 0x11); // Control
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x3A) == 0x12); // Option
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x37) == 0x5B); // Command (Win)
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x39) == 0x14); // CapsLock
-
-        // 2.2: Bidirectional inverse mapping roundtrip: windowsVkToMacKeyCode(macKeyCodeToWindowsVk(k)) == k
-        std::vector<uint16_t> sampleKeys = {
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x19, 0x1A, 0x1C, 0x1D, 0x1F,
-            0x20, 0x22, 0x23, 0x24, 0x25, 0x26, 0x28, 0x2D, 0x2E,
-            0x30, 0x31, 0x33, 0x35, 0x37, 0x38, 0x39, 0x3A, 0x3B,
-            0x73, 0x74, 0x75, 0x77, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x6F
-        };
-        for (uint16_t mk : sampleKeys) {
-            uint32_t vk = UiPlatform::macKeyCodeToWindowsVk(mk);
-            TEST_ASSERT(vk != 0);
-            uint16_t roundTrip = UiPlatform::windowsVkToMacKeyCode(vk);
-            TEST_ASSERT(roundTrip == mk);
-        }
-
-        // Unmapped key checks
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0xFFFF) == 0);
-        TEST_ASSERT(UiPlatform::windowsVkToMacKeyCode(0xFFFF) == 0xFFFF);
-
-        // 2.3: Modifier Bitmask Transition Decoding
-        // Shift key pressed: 0 -> (1 << 17)
-        uint64_t mask0 = 0;
-        uint64_t maskShift = (1ULL << 17);
-        auto trans1 = UiPlatform::decodeModifierTransitions(mask0, maskShift);
-        TEST_ASSERT(trans1.size() == 1);
-        TEST_ASSERT(trans1[0].vkCode == 0x10); // VK_SHIFT
-        TEST_ASSERT(trans1[0].isDown == true);
-
-        // Shift released: (1 << 17) -> 0
-        auto trans2 = UiPlatform::decodeModifierTransitions(maskShift, mask0);
-        TEST_ASSERT(trans2.size() == 1);
-        TEST_ASSERT(trans2[0].vkCode == 0x10);
-        TEST_ASSERT(trans2[0].isDown == false);
-
-        // Command released: (1 << 20) -> 0
-        uint64_t maskCmd = (1ULL << 20);
-        auto trans3 = UiPlatform::decodeModifierTransitions(maskCmd, mask0);
-        TEST_ASSERT(trans3.size() == 1);
-        TEST_ASSERT(trans3[0].vkCode == 0x5B); // VK_LWIN
-        TEST_ASSERT(trans3[0].isDown == false);
-
-        // Multi-modifier combo: Shift pressed, Control and Option simultaneously engaged
-        uint64_t maskComboOld = (1ULL << 17); // Shift down
-        uint64_t maskComboNew = (1ULL << 18) | (1ULL << 19); // Shift up, Ctrl down, Opt down
-        auto trans4 = UiPlatform::decodeModifierTransitions(maskComboOld, maskComboNew);
-        TEST_ASSERT(trans4.size() == 3);
-        bool shiftUpSeen = false;
-        bool ctrlDownSeen = false;
-        bool optDownSeen = false;
-        for (const auto& t : trans4) {
-            if (t.vkCode == 0x10 && !t.isDown) shiftUpSeen = true;
-            if (t.vkCode == 0x11 && t.isDown) ctrlDownSeen = true;
-            if (t.vkCode == 0x12 && t.isDown) optDownSeen = true;
-        }
-        TEST_ASSERT(shiftUpSeen);
-        TEST_ASSERT(ctrlDownSeen);
-        TEST_ASSERT(optDownSeen);
-
-        // Test 32-bit overload
-        uint32_t mask32Old = 0;
-        uint32_t mask32New = static_cast<uint32_t>(1U << 17);
-        auto trans32 = UiPlatform::decodeModifierTransitions(mask32Old, mask32New);
-        TEST_ASSERT(trans32.size() == 1);
-        TEST_ASSERT(trans32[0].vkCode == 0x10);
-        TEST_ASSERT(trans32[0].isDown == true);
-    }
-
-    // Sub-test 3: Canvas Tile Blitting & Pitch Math
-    {
-        const int canvasW = 128;
-        const int canvasH = 128;
-        const int canvasPitch = canvasW * 4;
-        std::vector<uint8_t> canvas(canvasH * canvasPitch, 0x10); // Background color 0x10
-
-        const int tileW = 32;
-        const int tileH = 32;
-        const int tilePitch = tileW * 4;
-        std::vector<uint8_t> tile(tileH * tilePitch, 0xFF); // White tile 0xFF
-
-        // 3.1: Blit 32x32 colored tile into offset (16, 16)
-        bool blitOk = UiPlatform::blitTileToCanvas(
-            canvas.data(), canvasW, canvasH, canvasPitch,
-            tile.data(), 16, 16, tileW, tileH, tilePitch);
-        TEST_ASSERT(blitOk);
-
-        // Verify interior pixels match expected color (0xFF)
-        for (int y = 16; y < 16 + tileH; ++y) {
-            for (int x = 16; x < 16 + tileW; ++x) {
-                for (int c = 0; c < 4; ++c) {
-                    TEST_ASSERT(canvas[y * canvasPitch + x * 4 + c] == 0xFF);
-                }
-            }
-        }
-
-        // Verify exterior pixels remain untouched (0x10)
-        TEST_ASSERT(canvas[15 * canvasPitch + 15 * 4] == 0x10);
-        TEST_ASSERT(canvas[49 * canvasPitch + 49 * 4] == 0x10);
-        TEST_ASSERT(canvas[0] == 0x10);
-        TEST_ASSERT(canvas[100 * canvasPitch + 100 * 4] == 0x10);
-
-        // 3.2: Boundary clipping: tile partially outside right/bottom canvas boundaries
-        // Canvas is 128x128, tile placed at (110, 110) with size 32x32 -> [110, 128) x [110, 128)
-        std::vector<uint8_t> tileClip(tileH * tilePitch, 0xAA);
-        bool clipOk = UiPlatform::blitTileToCanvas(
-            canvas.data(), canvasW, canvasH, canvasPitch,
-            tileClip.data(), 110, 110, tileW, tileH, tilePitch);
-        TEST_ASSERT(clipOk);
-
-        for (int y = 110; y < 128; ++y) {
-            for (int x = 110; x < 128; ++x) {
-                TEST_ASSERT(canvas[y * canvasPitch + x * 4] == 0xAA);
-            }
-        }
-
-        // 3.3: Boundary clipping: tile partially outside left/top boundaries (negative coords)
-        std::vector<uint8_t> tileNeg(tileH * tilePitch, 0xBB);
-        bool negOk = UiPlatform::blitTileToCanvas(
-            canvas.data(), canvasW, canvasH, canvasPitch,
-            tileNeg.data(), -10, -10, tileW, tileH, tilePitch);
-        TEST_ASSERT(negOk);
-        TEST_ASSERT(canvas[0 * canvasPitch + 0 * 4] == 0xBB);
-        TEST_ASSERT(canvas[21 * canvasPitch + 21 * 4] == 0xBB);
-
-        // 3.4: Complete out-of-bounds rejection
-        bool oobRight = UiPlatform::blitTileToCanvas(
-            canvas.data(), canvasW, canvasH, canvasPitch,
-            tile.data(), 200, 200, tileW, tileH, tilePitch);
-        TEST_ASSERT(!oobRight);
-
-        bool oobLeft = UiPlatform::blitTileToCanvas(
-            canvas.data(), canvasW, canvasH, canvasPitch,
-            tile.data(), -100, -100, tileW, tileH, tilePitch);
-        TEST_ASSERT(!oobLeft);
-
-        // 3.5: Null buffer validation
-        bool nullDst = UiPlatform::blitTileToCanvas(
-            nullptr, canvasW, canvasH, canvasPitch,
-            tile.data(), 0, 0, tileW, tileH, tilePitch);
-        TEST_ASSERT(!nullDst);
-
-        bool nullSrc = UiPlatform::blitTileToCanvas(
-            canvas.data(), canvasW, canvasH, canvasPitch,
-            nullptr, 0, 0, tileW, tileH, tilePitch);
-        TEST_ASSERT(!nullSrc);
-    }
-
     // Sub-test 4: MacBook-Style Fluid Spring Physics & Tactile Transform Math
     {
         // 4.1: Spring physics integration (UiPlatform::stepSpring)
@@ -9216,7 +9026,7 @@ void testLinuxNotifications() {
 // A PlatformShell for headless screen tests: no window, a fixed clock, and switchable capabilities.
 class FakeShell : public ui::PlatformShell {
 public:
-    bool service = true, elevation = true, shortcut = true, actionCenter = true, tray = true, notifications = true;
+    bool service = true, elevation = true, shortcut = true, actionCenter = true, tray = true;
     bool hostPermsCap = false;
     ui::HostPermissionStatus hostPerms;
     std::vector<ui::HostPermission> requestedPerms, openedPerms;
@@ -9233,11 +9043,8 @@ public:
     void chooseOpenFile(const std::string&, const std::string&, const std::string&, ChosenPath chosen) override { chosen(std::nullopt); }
     void chooseFolder(const std::string&, ChosenPath chosen) override { chosen(std::nullopt); }
     void openUrl(const std::string&) override {}
-    void revealPath(const std::string&) override {}
     int relaunches = 0;
     void relaunchApp() override { ++relaunches; }
-    void showNotification(const std::string&, const std::string&) override {}
-    void setTrayStatus(const std::string&) override {}
     void setFrameIntervalMs(unsigned) override {}
     bool fullscreen = false;
     bool setFullscreen(bool on) override { fullscreen = on; return true; }
@@ -9280,7 +9087,6 @@ public:
             case ui::Capability::DesktopShortcut: return shortcut;
             case ui::Capability::ActionCenterToasts: return actionCenter;
             case ui::Capability::TrayIcon: return tray;
-            case ui::Capability::NativeNotifications: return notifications;
             case ui::Capability::HostPermissions: return hostPermsCap;
         }
         return false;

@@ -148,15 +148,6 @@ public:
         ShellExecuteW(nullptr, L"open", utf8ToWide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
 
-    void revealPath(const std::string& path) override {
-        const std::wstring wPath = utf8ToWide(path);
-        if (wPath.empty()) return;
-        PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(wPath.c_str());
-        if (!pidl) return;
-        SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
-        ILFree(pidl);
-    }
-
     // Starting a second copy now would hit the single-instance mutex; WinMain launches it after CloseHandle.
     void relaunchApp() override {
         w_.relaunchRequested_ = true;

@@ -48,11 +48,6 @@ struct ViewportGeometry {
     operator UiPlatformRect&() { return contentRect; }
 };
 
-struct ModifierTransition {
-    uint32_t vkCode = 0;
-    bool isDown = false;
-};
-
 class UiPlatform {
 public:
     static ViewportGeometry calculateViewportGeometry(float viewWidth, float viewHeight, uint32_t frameWidth, uint32_t frameHeight, ScaleMode scaleMode);
@@ -60,15 +55,6 @@ public:
     static bool mapPointToNormalized(float x, float y, const UiPlatformRect& canvasRect, float& outNormX, float& outNormY);
     static void mapNormalizedToPoint(float normX, float normY, const ViewportGeometry& geo, float& outViewX, float& outViewY);
     static void mapNormalizedToPoint(float normX, float normY, const UiPlatformRect& canvasRect, float& outViewX, float& outViewY);
-
-    static uint32_t macKeyCodeToWindowsVk(uint16_t macKeyCode);
-    static uint16_t windowsVkToMacKeyCode(uint32_t vkCode);
-
-    static std::vector<ModifierTransition> decodeModifierTransitions(uint64_t oldMask, uint64_t newMask);
-    static std::vector<ModifierTransition> decodeModifierTransitions(uint32_t oldMask, uint32_t newMask);
-
-    static bool blitTileToCanvas(uint8_t* dstCanvas, int canvasWidth, int canvasHeight, int canvasPitch,
-                                const uint8_t* srcTile, int tileX, int tileY, int tileWidth, int tileHeight, int tilePitch);
 
     // Second-order damped harmonic oscillator (macOS CoreAnimation CASpringAnimation physics)
     static bool stepSpring(float& pos, float& vel, float target, float omega, float zeta, float dt, float eps = 0.0012f);
@@ -102,27 +88,6 @@ inline void mapNormalizedToPoint(float normX, float normY, const ViewportGeometr
 
 inline void mapNormalizedToPoint(float normX, float normY, const UiPlatformRect& canvasRect, float& outViewX, float& outViewY) {
     UiPlatform::mapNormalizedToPoint(normX, normY, canvasRect, outViewX, outViewY);
-}
-
-inline uint32_t macKeyCodeToWindowsVk(uint16_t macKeyCode) {
-    return UiPlatform::macKeyCodeToWindowsVk(macKeyCode);
-}
-
-inline uint16_t windowsVkToMacKeyCode(uint32_t vkCode) {
-    return UiPlatform::windowsVkToMacKeyCode(vkCode);
-}
-
-inline std::vector<ModifierTransition> decodeModifierTransitions(uint64_t oldMask, uint64_t newMask) {
-    return UiPlatform::decodeModifierTransitions(oldMask, newMask);
-}
-
-inline std::vector<ModifierTransition> decodeModifierTransitions(uint32_t oldMask, uint32_t newMask) {
-    return UiPlatform::decodeModifierTransitions(oldMask, newMask);
-}
-
-inline bool blitTileToCanvas(uint8_t* dstCanvas, int canvasWidth, int canvasHeight, int canvasPitch,
-                            const uint8_t* srcTile, int tileX, int tileY, int tileWidth, int tileHeight, int tilePitch) {
-    return UiPlatform::blitTileToCanvas(dstCanvas, canvasWidth, canvasHeight, canvasPitch, srcTile, tileX, tileY, tileWidth, tileHeight, tilePitch);
 }
 
 } // namespace cppdesk

@@ -561,14 +561,6 @@ public:
             if (u) [[NSWorkspace sharedWorkspace] openURL:u];
         }
     }
-    void revealPath(const std::string& path) override {
-        @autoreleasepool {
-            NSURL* u = [NSURL fileURLWithPath:toNs(path)];
-            std::error_code ec;
-            if (std::filesystem::is_directory(std::filesystem::path(path), ec)) [[NSWorkspace sharedWorkspace] openURL:u];
-            else [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[ u ]];
-        }
-    }
     // Starting a second copy now would hit the single-instance lock; main re-executes after the loop instead.
     void relaunchApp() override {
         if (!w_) return;
@@ -690,7 +682,6 @@ public:
 
     bool has(ui::Capability c) const override {
         if (c == ui::Capability::TrayIcon) return w_ && w_->statusItem != nil;
-        if (c == ui::Capability::NativeNotifications) return true;
         if (c == ui::Capability::HostPermissions) return w_ != nullptr;   // not in snapshots: every screen looks alike
         return false;   // the Windows-only controls stay hidden
     }

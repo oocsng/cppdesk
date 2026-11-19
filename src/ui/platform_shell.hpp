@@ -20,7 +20,6 @@ enum class Capability {
     DesktopShortcut,     // create a desktop shortcut for a desk
     ActionCenterToasts,  // Windows Action Center notifications toggle
     TrayIcon,            // minimize to the tray / menu bar
-    NativeNotifications, // OS notifications for incoming requests
     HostPermissions,     // the OS asks the user to allow screen sharing and control (macOS)
 };
 
@@ -59,7 +58,6 @@ public:
                                 const std::string& filterPattern, ChosenPath chosen) = 0;
     virtual void chooseFolder(const std::string& title, ChosenPath chosen) = 0;
     virtual void openUrl(const std::string& url) = 0;
-    virtual void revealPath(const std::string& path) = 0;
     // Start a fresh copy of the app and close this one.
     virtual void relaunchApp() = 0;
 
@@ -107,9 +105,6 @@ public:
 
     virtual ServiceState serviceState() const = 0;
     virtual bool runServiceAction(ServiceAction action) = 0;
-
-    virtual void showNotification(const std::string&, const std::string&) {}
-    virtual void setTrayStatus(const std::string&) {}
 
     virtual bool has(Capability c) const = 0;
 

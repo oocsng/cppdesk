@@ -517,13 +517,6 @@ public:
         if (!UiPlatform::isSafeExternalUrl(url)) return;
         spawn::detached({ "xdg-open", url });
     }
-    void revealPath(const std::string& path) override {
-        std::error_code ec;
-        const std::filesystem::path p(path);
-        std::string dir = std::filesystem::is_directory(p, ec) ? p.string() : p.parent_path().string();
-        if (dir.empty()) dir = ".";
-        spawn::detached({ "xdg-open", dir });
-    }
     // Starting a second copy now would hit the single-instance lock; main re-executes after the loop instead.
     void relaunchApp() override {
         if (!w_) return;
@@ -660,7 +653,6 @@ public:
 
     bool has(ui::Capability c) const override {
         if (c == ui::Capability::TrayIcon) return w_ && w_->trayDocked();
-        if (c == ui::Capability::NativeNotifications) return hasNotifySend_;
         return false;   // the Windows-only controls stay hidden
     }
 
@@ -694,7 +686,6 @@ private:
 
     CppDeskWindowLinuxImpl* w_ = nullptr;
     bool snapshotMode_ = false;
-    bool hasNotifySend_ = spawn::onPath("notify-send");
 };
 
 void CppDeskWindowLinuxImpl::handleEvent(XEvent& ev) {
