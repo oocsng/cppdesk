@@ -108,8 +108,8 @@ public:
     virtual ServiceState serviceState() const = 0;
     virtual bool runServiceAction(ServiceAction action) = 0;
 
-    virtual void showNotification(const std::string& title, const std::string& body) = 0;
-    virtual void setTrayStatus(const std::string& tooltip) = 0;
+    virtual void showNotification(const std::string&, const std::string&) {}
+    virtual void setTrayStatus(const std::string&) {}
 
     virtual bool has(Capability c) const = 0;
 
