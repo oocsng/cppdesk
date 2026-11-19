@@ -20,11 +20,17 @@ APPIMAGE_PLUGIN="$TOOLS/plugin-$APPIMAGE_PLUGIN_TAG/linuxdeploy-plugin-appimage-
 fetch() {   # <file> <url> <sha256>
     if [ ! -x "$1" ]; then
         mkdir -p "$(dirname "$1")"
-        curl -fsSL -o "$1.part" "$2"
-        chmod +x "$1.part"
-        mv "$1.part" "$1"
+        local tmp
+        tmp=$(mktemp "$(dirname "$1")/.fetch.XXXXXX")
+        if ! curl -fsSL -o "$tmp" "$2" || ! echo "$3  $tmp" | sha256sum -c --quiet -; then
+            rm -f "$tmp"
+            return 1
+        fi
+        chmod +x "$tmp"
+        mv -f "$tmp" "$1"
+    else
+        echo "$3  $1" | sha256sum -c --quiet -
     fi
-    echo "$3  $1" | sha256sum -c --quiet -
 }
 fetch "$LINUXDEPLOY" \
     "https://github.com/linuxdeploy/linuxdeploy/releases/download/$LINUXDEPLOY_TAG/linuxdeploy-x86_64.AppImage" \
@@ -41,7 +47,11 @@ APPDIR="$WORK/AppDir"
 DESTDIR="$APPDIR" cmake --install "$BUILD" --prefix /usr
 # linuxdeploy leaves out libraries it assumes every desktop has. Pango needs FriBidi, which a minimal system
 # lacks, so carry it too.
-FRIBIDI=$(ldconfig -p | awk '/libfribidi\.so\.0 /{print $NF; exit}')
+FRIBIDI=$(PATH="$PATH:/sbin:/usr/sbin" ldconfig -p | awk '/libfribidi\.so\.0 \(.*x86-64\)/{print $NF; exit}')
+EXTRA_ARGS=()
+if [ -n "$FRIBIDI" ]; then
+    EXTRA_ARGS+=(--library "$FRIBIDI")
+fi
 (
     cd "$WORK"
     # linuxdeploy finds its output plugin by name on PATH.
@@ -49,7 +59,7 @@ FRIBIDI=$(ldconfig -p | awk '/libfribidi\.so\.0 /{print $NF; exit}')
         --appdir "$APPDIR" \
         --desktop-file "$APPDIR/usr/share/applications/cppdesk.desktop" \
         --icon-file "$APPDIR/usr/share/icons/hicolor/256x256/apps/cppdesk.png" \
-        ${FRIBIDI:+--library "$FRIBIDI"} \
+        "${EXTRA_ARGS[@]}" \
         --output appimage
     mv CppDesk-x86_64.AppImage "$OUT/"
 )
