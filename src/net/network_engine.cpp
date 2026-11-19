@@ -79,8 +79,6 @@ static const IID IID_IAudioCaptureClient_val = { 0xc8adbd64, 0xe71e, 0x48a0, { 0
 static const GUID KSDATAFORMAT_SUBTYPE_IEEE_FLOAT_val = { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 #endif
 
-std::once_flag g_wsaInitFlag;
-
 void ensureWinsockInitialized() {
     socket_init_network();
 }
@@ -780,6 +778,16 @@ size_t RelayServer::registeredPeerCount() const {
     return hosts_.size();
 }
 
+void RelayServer::setAuthKey(const std::string& authKey) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    authKey_ = authKey;
+}
+
+std::string RelayServer::authKey() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return authKey_;
+}
+
 void RelayServer::acceptLoop() {
     while (running_.load()) {
         SOCKET ls = toWinSock(listenSock_);
@@ -828,6 +836,33 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
     }
 
     PacketType pt = static_cast<PacketType>(hdr.type);
+    const std::string configuredAuthKey = authKey();
+    if (!relayowner::stripAndVerifyAuthTag(configuredAuthKey, hdr.type, hdr.flags, payload)) {
+        if (pt == PacketType::RELAY_REGISTER) {
+            ByteWriter aw;
+            aw.writeU8(0);
+            FrameHeader ackHdr{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::RELAY_REGISTER_ACK), 0, static_cast<uint32_t>(aw.buffer().size()) };
+            sendAllBytes(toWinSock(sock), &ackHdr, sizeof(ackHdr));
+            sendAllBytes(toWinSock(sock), aw.buffer().data(), aw.buffer().size());
+        } else if (pt == PacketType::RELAY_LOOKUP) {
+            ByteWriter w;
+            w.writeU8(0);
+            w.writeString("");
+            w.writeU16(0);
+            w.writeString("");
+            FrameHeader respHdr{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::RELAY_LOOKUP_RESP), 0, static_cast<uint32_t>(w.buffer().size()) };
+            sendAllBytes(toWinSock(sock), &respHdr, sizeof(respHdr));
+            sendAllBytes(toWinSock(sock), w.buffer().data(), w.buffer().size());
+        } else if (pt == PacketType::RELAY_CONNECT_REQ) {
+            ByteWriter w;
+            w.writeU8(0);
+            FrameHeader rh{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::RELAY_BRIDGE_READY), 0, static_cast<uint32_t>(w.buffer().size()) };
+            sendAllBytes(toWinSock(sock), &rh, sizeof(rh));
+            sendAllBytes(toWinSock(sock), w.buffer().data(), w.buffer().size());
+        }
+        closeWinSock(sock);
+        return;
+    }
 
     if (pt == PacketType::RELAY_REGISTER) {
         try {
@@ -1391,13 +1426,26 @@ void NetworkEngine::relayRegistrationLoop() {
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         relayName += ":" + std::to_string(rPort);
         const relayowner::Key relayKey = relayowner::deriveRelayKey(identity_.relayOwnerKey(), relayName);
+        const std::string relayAuthKey = identity_.settings().relayAuthKey;
+
+        auto sendRelayFrame = [&](uintptr_t targetSock, PacketType type, const std::vector<uint8_t>& body, std::mutex& mu) {
+            if (relayAuthKey.empty()) {
+                return sendFrame(targetSock, type, 0, body.data(), body.size(), mu);
+            }
+            std::vector<uint8_t> tagged = body;
+            relayowner::Key tag = relayowner::computeAuthTag(relayAuthKey, static_cast<uint8_t>(type), body.data(), body.size());
+            tagged.insert(tagged.end(), tag.begin(), tag.end());
+            return sendFrame(targetSock, type, relayowner::FLAG_RELAY_AUTH, tagged.data(), tagged.size(), mu);
+        };
 
         std::mutex regMutex;
-        if (!sendFrame(relayControlSock_, PacketType::RELAY_REGISTER, 0, w.buffer().data(), w.buffer().size(), regMutex)) {
+        if (!sendRelayFrame(relayControlSock_, PacketType::RELAY_REGISTER, w.buffer(), regMutex)) {
             closeWinSock(relayControlSock_);
             continue;
         }
 
+        bool awaitingRegisterAck = true;
+        bool challengeAnswered = false;
         while (running_.load()) {
             SOCKET s = toWinSock(relayControlSock_);
             if (s == INVALID_SOCKET) break;
@@ -1423,7 +1471,8 @@ void NetworkEngine::relayRegistrationLoop() {
 
             PacketType pt = static_cast<PacketType>(hdr.type);
             if (pt == PacketType::RELAY_REGISTER_CHALLENGE) {
-                if (pay.size() != 1 + relayowner::NONCE_LEN) break;
+                if (!awaitingRegisterAck || challengeAnswered || pay.size() != 1 + relayowner::NONCE_LEN) break;
+                challengeAnswered = true;
                 relayowner::Nonce nonce{};
                 std::copy(pay.begin() + 1, pay.end(), nonce.begin());
                 relayowner::Key reply = (pay[0] == relayowner::MODE_ENROLL)
@@ -1432,7 +1481,13 @@ void NetworkEngine::relayRegistrationLoop() {
                 if (!sendFrame(relayControlSock_, PacketType::RELAY_REGISTER_PROOF, 0, reply.data(), reply.size(), regMutex)) break;
                 continue;
             }
+            if (pt == PacketType::RELAY_REGISTER_ACK) {
+                if (!awaitingRegisterAck || pay.empty() || pay[0] != 1) break;
+                awaitingRegisterAck = false;
+                continue;
+            }
             if (pt == PacketType::RELAY_INCOMING_REQ) {
+                if (awaitingRegisterAck) continue;
                 try {
                     ByteReader r(pay);
                     uint64_t bridgeToken = r.readU64();
@@ -1443,7 +1498,7 @@ void NetworkEngine::relayRegistrationLoop() {
                         bw.writeU64(bridgeToken);
                         std::mutex bm;
                         uintptr_t bSock = fromWinSock(bs);
-                        if (sendFrame(bSock, PacketType::RELAY_BRIDGE_ACCEPT, 0, bw.buffer().data(), bw.buffer().size(), bm)) {
+                        if (sendRelayFrame(bSock, PacketType::RELAY_BRIDGE_ACCEPT, bw.buffer(), bm)) {
                             if (activeHostClientSock_.load() == ~uintptr_t(0)) {
                                 std::lock_guard<std::mutex> slk(hostSessionThreadMutex_);
                                 try {
@@ -1469,6 +1524,7 @@ void NetworkEngine::relayRegistrationLoop() {
 }
 
 bool NetworkEngine::startLocalRelayServer(uint16_t port) {
+    localRelay_.setAuthKey(identity_.settings().relayAuthKey);
     return localRelay_.start(port);
 }
 
@@ -3438,6 +3494,17 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                 std::string rHost;
                 uint16_t rPort = DEFAULT_RELAY_PORT;
                 if (parseHostPort(identity_.relayServerAddress(), rHost, rPort, DEFAULT_RELAY_PORT)) {
+                    const std::string relayAuthKey = identity_.settings().relayAuthKey;
+                    auto sendRelayFrame = [&](uintptr_t targetSock, PacketType type, const std::vector<uint8_t>& body, std::mutex& mu) {
+                        if (relayAuthKey.empty()) {
+                            return sendFrame(targetSock, type, 0, body.data(), body.size(), mu);
+                        }
+                        std::vector<uint8_t> tagged = body;
+                        relayowner::Key tag = relayowner::computeAuthTag(relayAuthKey, static_cast<uint8_t>(type), body.data(), body.size());
+                        tagged.insert(tagged.end(), tag.begin(), tag.end());
+                        return sendFrame(targetSock, type, relayowner::FLAG_RELAY_AUTH, tagged.data(), tagged.size(), mu);
+                    };
+
                     if (!isReconnecting) {
                         setStatus(ViewerConnectionState::ResolvingId, "Querying Relay Server (" + rHost + ":" + std::to_string(rPort) + ")...");
                     }
@@ -3447,7 +3514,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         ByteWriter lw;
                         lw.writeU64(targetDeskId);
                         std::mutex lm;
-                        if (sendFrame(lSock, PacketType::RELAY_LOOKUP, 0, lw.buffer().data(), lw.buffer().size(), lm)) {
+                        if (sendRelayFrame(lSock, PacketType::RELAY_LOOKUP, lw.buffer(), lm)) {
                             FrameHeader lhdr{};
                             std::vector<uint8_t> lpay;
                             if (recvFrame(lSock, lhdr, lpay) && static_cast<PacketType>(lhdr.type) == PacketType::RELAY_LOOKUP_RESP) {
@@ -3483,7 +3550,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             ByteWriter bw;
                             bw.writeU64(targetDeskId);
                             std::mutex bm;
-                            if (sendFrame(bSock, PacketType::RELAY_CONNECT_REQ, 0, bw.buffer().data(), bw.buffer().size(), bm)) {
+                            if (sendRelayFrame(bSock, PacketType::RELAY_CONNECT_REQ, bw.buffer(), bm)) {
                                 FrameHeader bhdr{};
                                 std::vector<uint8_t> bpay;
                                 if (recvFrame(bSock, bhdr, bpay) && static_cast<PacketType>(bhdr.type) == PacketType::RELAY_BRIDGE_READY) {
@@ -6114,7 +6181,6 @@ uint32_t NetworkEngine::addPortForwardRule(uint16_t localPort, uint16_t targetPo
     if (startActive && viewerActive_.load()) {
         SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (ls != INVALID_SOCKET) {
-            u_long nonblock = 1;
             socket_set_nonblocking(ls, true);
             sockaddr_in addr{};
             addr.sin_family = AF_INET;
@@ -6164,7 +6230,6 @@ void NetworkEngine::setPortForwardRuleActive(uint32_t ruleId, bool active) {
             } else if (viewerActive_.load()) {
                 SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                 if (ls != INVALID_SOCKET) {
-                    u_long nonblock = 1;
                     socket_set_nonblocking(ls, true);
                     sockaddr_in addr{};
                     addr.sin_family = AF_INET;
@@ -6236,7 +6301,6 @@ void NetworkEngine::viewerTunnelMultiplexerLoop() {
             if (r.active) {
                 SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                 if (ls != INVALID_SOCKET) {
-                    u_long nonblock = 1;
                     socket_set_nonblocking(ls, true);
                     sockaddr_in addr{};
                     addr.sin_family = AF_INET;
