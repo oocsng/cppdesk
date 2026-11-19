@@ -210,22 +210,12 @@ socket_t connectTcpWithTimeout(const std::string& host, uint16_t port, int timeo
             return INVALID_SOCKET_VAL;
         }
 
-        fd_set wfds{}, efds{};
-        FD_ZERO(&wfds);
-        FD_ZERO(&efds);
-        FD_SET(s, &wfds);
-        FD_SET(s, &efds);
+        pollfd_t pfd{};
+        pfd.fd = s;
+        pfd.events = POLLOUT;
 
-        timeval tv{};
-        tv.tv_sec = timeoutMs / 1000;
-        tv.tv_usec = (timeoutMs % 1000) * 1000;
-
-#if defined(_WIN32)
-        int sel = select(socket_select_nfds(s), nullptr, &wfds, &efds, &tv);
-#else
-        int sel = select(s + 1, nullptr, &wfds, &efds, &tv);
-#endif
-        if (sel <= 0 || FD_ISSET(s, &efds) || !FD_ISSET(s, &wfds)) {
+        int sel = socketPoll(&pfd, 1, timeoutMs);
+        if (sel <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) || !(pfd.revents & POLLOUT)) {
             socket_close(s);
             return INVALID_SOCKET_VAL;
         }
@@ -1561,6 +1551,26 @@ void NetworkEngine::updateHostSessionPermissions(uint8_t newPermissions) {
     ByteWriter w;
     w.writeU8(newPermissions);
     sendHostEncryptedPacket(PacketType::PERMISSION_UPDATE, 0, w.buffer().data(), w.buffer().size());
+
+    if ((newPermissions & PERM_INPUT) == 0) {
+        std::vector<uint32_t> revokedTunnels;
+        {
+            std::lock_guard<std::mutex> lk(tunnelMutex_);
+            for (const auto& kv : hostTunnels_) {
+                revokedTunnels.push_back(kv.first);
+            }
+        }
+        stopHostTerminal();
+        stopHostTunnelProxy();
+        for (uint32_t tid : revokedTunnels) {
+            TunnelCloseHeader tch{};
+            tch.tunnelId = tid;
+            tch.reasonCode = 2; // Forbidden
+            ByteWriter cw;
+            cw.writeBytes(&tch, sizeof(tch));
+            sendHostEncryptedPacket(PacketType::TUNNEL_CLOSE, 0, cw.buffer().data(), cw.buffer().size());
+        }
+    }
 }
 
 void NetworkEngine::disconnectHostClient() {
@@ -2660,27 +2670,59 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                 r.readBytes(&toh, sizeof(toh));
 
                                 bool permitted = (perms & PERM_INPUT) != 0;
-                                SOCKET ts = INVALID_SOCKET;
+                                bool duplicateId = false;
                                 bool ok = false;
                                 if (permitted) {
-                                    ts = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-                                    if (ts != INVALID_SOCKET) {
-                                        sockaddr_in targetAddr{};
-                                        targetAddr.sin_family = AF_INET;
-                                        targetAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-                                        targetAddr.sin_port = htons(toh.targetPort);
-                                        if (connect(ts, reinterpret_cast<sockaddr*>(&targetAddr), sizeof(targetAddr)) == 0) {
-                                            u_long nonblock = 1;
-                                            ioctlsocket(ts, FIONBIO, &nonblock);
-                                            ok = true;
-                                            std::lock_guard<std::mutex> lk(tunnelMutex_);
-                                            hostTunnels_[toh.tunnelId] = { toh.tunnelId, 0, ts, toh.targetPort };
-                                        } else {
-                                            closesocket(ts);
+                                    bool atLimit = false;
+                                    {
+                                        std::lock_guard<std::mutex> lk(tunnelMutex_);
+                                        auto it = hostTunnels_.find(toh.tunnelId);
+                                        if (it != hostTunnels_.end() && !it->second.closeRequested) {
+                                            duplicateId = true;
+                                        } else if (hostTunnels_.size() >= MAX_ACTIVE_TUNNELS) {
+                                            atLimit = true;
+                                        }
+                                    }
+                                    if (!duplicateId && !atLimit) {
+                                        if (!hostTunnelActive_.load()) {
+                                            startHostTunnelProxy();
+                                        }
+                                        SOCKET ts = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                                        if (ts != INVALID_SOCKET) {
+                                            socket_set_nonblocking(ts, true);
+                                            socket_set_nosigpipe(ts);
+                                            sockaddr_in targetAddr{};
+                                            targetAddr.sin_family = AF_INET;
+                                            targetAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                                            targetAddr.sin_port = htons(toh.targetPort);
+                                            int rc = connect(ts, reinterpret_cast<sockaddr*>(&targetAddr), sizeof(targetAddr));
+                                            const bool inProgress = (rc == SOCKET_ERROR && socket_is_wouldblock(socket_errno()));
+                                            if (rc == 0 || inProgress) {
+                                                std::lock_guard<std::mutex> lk(tunnelMutex_);
+                                                auto it = hostTunnels_.find(toh.tunnelId);
+                                                if (it != hostTunnels_.end()) {
+                                                    duplicateId = true;
+                                                    socket_close(ts);
+                                                } else if (hostTunnels_.size() >= MAX_ACTIVE_TUNNELS) {
+                                                    socket_close(ts);
+                                                } else {
+                                                    ActiveTunnel at;
+                                                    at.tunnelId = toh.tunnelId;
+                                                    at.ruleId = 0;
+                                                    at.sock = ts;
+                                                    at.targetPort = toh.targetPort;
+                                                    at.connecting = inProgress;
+                                                    at.connectStartMs = nowTickMs();
+                                                    hostTunnels_.emplace(toh.tunnelId, std::move(at));
+                                                    ok = true;
+                                                }
+                                            } else {
+                                                socket_close(ts);
+                                            }
                                         }
                                     }
                                 }
-                                if (!ok) {
+                                if (!ok && !duplicateId) {
                                     TunnelCloseHeader tch{};
                                     tch.tunnelId = toh.tunnelId;
                                     tch.reasonCode = permitted ? 1 : 2; // Refused / Forbidden
@@ -2697,16 +2739,11 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                     TunnelDataHeader tdh{};
                                     r.readBytes(&tdh, sizeof(tdh));
                                     if (r.hasRemaining(tdh.dataLen)) {
-                                        SOCKET ts = INVALID_SOCKET;
-                                        {
-                                            std::lock_guard<std::mutex> lk(tunnelMutex_);
-                                            auto it = hostTunnels_.find(tdh.tunnelId);
-                                            if (it != hostTunnels_.end()) {
-                                                ts = it->second.sock;
-                                            }
-                                        }
-                                        if (ts != INVALID_SOCKET) {
-                                            sendAllBytes(ts, r.currentPtr(), tdh.dataLen);
+                                        size_t sentNow = 0;
+                                        std::lock_guard<std::mutex> lk(tunnelMutex_);
+                                        auto it = hostTunnels_.find(tdh.tunnelId);
+                                        if (it != hostTunnels_.end()) {
+                                            enqueueTunnelWriteLocked(it->second, r.currentPtr(), tdh.dataLen, sentNow);
                                         }
                                     }
                                 }
@@ -2720,8 +2757,8 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                 std::lock_guard<std::mutex> lk(tunnelMutex_);
                                 auto it = hostTunnels_.find(tch.tunnelId);
                                 if (it != hostTunnels_.end()) {
-                                    closesocket(it->second.sock);
-                                    hostTunnels_.erase(it);
+                                    it->second.closeRequested = true;
+                                    socket_shutdown(it->second.sock);
                                 }
                             }
                             break;
@@ -2733,6 +2770,9 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                     r.readBytes(&tdh, sizeof(tdh));
                                     if (tdh.streamKind == static_cast<uint8_t>(TerminalStreamKind::StdinInput)) {
                                         if (r.hasRemaining(tdh.textLen)) {
+                                            if (!hostTerminalActive_.load()) {
+                                                startHostTerminal(false);
+                                            }
                                             std::string input(reinterpret_cast<const char*>(r.currentPtr()), tdh.textLen);
                                             injectHostTerminalStdin(input);
                                         }
@@ -4619,23 +4659,18 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                 const uint8_t* tdata = payload.data() + sizeof(tdh);
                                 size_t tlen = payload.size() - sizeof(tdh);
                                 if (tlen > 0) {
-                                    SOCKET cs = INVALID_SOCKET;
-                                    uint32_t rId = 0;
-                                    {
-                                        std::lock_guard<std::mutex> lk(tunnelMutex_);
-                                        auto it = viewerTunnels_.find(tdh.tunnelId);
-                                        if (it != viewerTunnels_.end()) {
-                                            cs = it->second.sock;
-                                            rId = it->second.ruleId;
-                                        }
-                                    }
-                                    if (cs != INVALID_SOCKET) {
-                                        sendAllBytes(cs, tdata, tlen);
-                                        std::lock_guard<std::mutex> lk(tunnelMutex_);
-                                        for (auto& r : tunnelRules_) {
-                                            if (r.ruleId == rId) {
-                                                r.bytesTransferredIn += tlen;
-                                                break;
+                                    std::lock_guard<std::mutex> lk(tunnelMutex_);
+                                    auto it = viewerTunnels_.find(tdh.tunnelId);
+                                    if (it != viewerTunnels_.end()) {
+                                        size_t sentNow = 0;
+                                        enqueueTunnelWriteLocked(it->second, tdata, tlen, sentNow);
+                                        if (sentNow > 0) {
+                                            uint32_t rId = it->second.ruleId;
+                                            for (auto& r : tunnelRules_) {
+                                                if (r.ruleId == rId) {
+                                                    r.bytesTransferredIn += sentNow;
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -4650,8 +4685,8 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                 std::lock_guard<std::mutex> lk(tunnelMutex_);
                                 auto it = viewerTunnels_.find(tch.tunnelId);
                                 if (it != viewerTunnels_.end()) {
-                                    closesocket(it->second.sock);
-                                    viewerTunnels_.erase(it);
+                                    it->second.closeRequested = true;
+                                    socket_shutdown(it->second.sock);
                                 }
                             }
                             break;
@@ -6073,7 +6108,9 @@ void NetworkEngine::injectHostTerminalStdin(const std::string& input) {
 
 void NetworkEngine::hostTerminalReaderLoop() {
     char buf[4096];
-    while (hostTerminalActive_.load() && running_.load() && activeHostClientSock_.load() != ~uintptr_t(0)) {
+    while (hostTerminalActive_.load() && running_.load() &&
+           activeHostClientSock_.load() != ~uintptr_t(0) &&
+           (hostLivePermissions_.load() & PERM_INPUT) != 0) {
         if (!hChildStdoutRead_) break;
         DWORD avail = 0;
         if (PeekNamedPipe(hChildStdoutRead_, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
@@ -6183,7 +6220,9 @@ void NetworkEngine::injectHostTerminalStdin(const std::string& input) {
 
 void NetworkEngine::hostTerminalReaderLoop() {
     char buf[4096];
-    while (hostTerminalActive_.load() && running_.load() && activeHostClientSock_.load() != ~uintptr_t(0)) {
+    while (hostTerminalActive_.load() && running_.load() &&
+           activeHostClientSock_.load() != ~uintptr_t(0) &&
+           (hostLivePermissions_.load() & PERM_INPUT) != 0) {
         pollfd pfd{ childStdoutFd_, POLLIN, 0 };
         int pr = poll(&pfd, 1, 20);
         if (pr < 0 && errno == EINTR) continue;
@@ -6200,6 +6239,40 @@ void NetworkEngine::hostTerminalReaderLoop() {
 }
 #endif
 
+bool NetworkEngine::enqueueTunnelWriteLocked(ActiveTunnel& t, const uint8_t* data, size_t len, size_t& outImmediateSent) {
+    outImmediateSent = 0;
+    if (t.closeRequested || t.sock == INVALID_SOCKET_VAL) return false;
+    if (len == 0) return true;
+
+    const size_t pending = t.writeBuf.size() - t.writeOffset;
+    if (!t.connecting && pending == 0) {
+        int n = send(t.sock, reinterpret_cast<const char*>(data), static_cast<int>(std::min<size_t>(len, 65536)), 0);
+        if (n > 0) {
+            outImmediateSent = static_cast<size_t>(n);
+            data += n;
+            len -= static_cast<size_t>(n);
+            if (len == 0) return true;
+        } else if (n == 0 || !socket_is_wouldblock(socket_errno())) {
+            t.closeRequested = true;
+            return false;
+        }
+    }
+
+    if (pending + len > MAX_TUNNEL_WRITE_QUEUE) {
+        t.closeRequested = true;
+        return false;
+    }
+    if (t.writeOffset > 0 && t.writeOffset == t.writeBuf.size()) {
+        t.writeBuf.clear();
+        t.writeOffset = 0;
+    } else if (t.writeOffset > 65536) {
+        t.writeBuf.erase(t.writeBuf.begin(), t.writeBuf.begin() + static_cast<std::ptrdiff_t>(t.writeOffset));
+        t.writeOffset = 0;
+    }
+    t.writeBuf.insert(t.writeBuf.end(), data, data + len);
+    return true;
+}
+
 uint32_t NetworkEngine::addPortForwardRule(uint16_t localPort, uint16_t targetPort, const std::string& desc, bool startActive) {
     std::lock_guard<std::mutex> lk(tunnelMutex_);
     PortForwardRule r;
@@ -6213,15 +6286,15 @@ uint32_t NetworkEngine::addPortForwardRule(uint16_t localPort, uint16_t targetPo
     if (startActive && viewerActive_.load()) {
         SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (ls != INVALID_SOCKET) {
-            u_long nonblock = 1;
             socket_set_nonblocking(ls, true);
+            socket_set_nosigpipe(ls);
             sockaddr_in addr{};
             addr.sin_family = AF_INET;
             addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             addr.sin_port = htons(localPort);
             if (bind(ls, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
                 listen(ls, 5) == 0) {
-                tunnelListeners_.push_back({ r.ruleId, localPort, targetPort, ls });
+                tunnelListeners_.push_back({ r.ruleId, localPort, targetPort, ls, false });
             } else {
                 socket_close(ls);
             }
@@ -6232,11 +6305,19 @@ uint32_t NetworkEngine::addPortForwardRule(uint16_t localPort, uint16_t targetPo
 
 void NetworkEngine::removePortForwardRule(uint32_t ruleId) {
     std::lock_guard<std::mutex> lk(tunnelMutex_);
-    for (auto it = tunnelListeners_.begin(); it != tunnelListeners_.end(); ++it) {
+    const bool muxRunning = viewerTunnelActive_.load();
+    for (auto it = tunnelListeners_.begin(); it != tunnelListeners_.end(); ) {
         if (it->ruleId == ruleId) {
-            socket_close(it->listenSock);
-            tunnelListeners_.erase(it);
-            break;
+            if (muxRunning) {
+                it->closeRequested = true;
+                socket_shutdown(it->listenSock);
+                ++it;
+            } else {
+                socket_close(it->listenSock);
+                it = tunnelListeners_.erase(it);
+            }
+        } else {
+            ++it;
         }
     }
     for (auto it = tunnelRules_.begin(); it != tunnelRules_.end(); ++it) {
@@ -6249,31 +6330,48 @@ void NetworkEngine::removePortForwardRule(uint32_t ruleId) {
 
 void NetworkEngine::setPortForwardRuleActive(uint32_t ruleId, bool active) {
     std::lock_guard<std::mutex> lk(tunnelMutex_);
+    const bool muxRunning = viewerTunnelActive_.load();
     for (auto& r : tunnelRules_) {
         if (r.ruleId == ruleId) {
             r.active = active;
             if (!active) {
-                for (auto it = tunnelListeners_.begin(); it != tunnelListeners_.end(); ++it) {
+                for (auto it = tunnelListeners_.begin(); it != tunnelListeners_.end(); ) {
                     if (it->ruleId == ruleId) {
-                        socket_close(it->listenSock);
-                        tunnelListeners_.erase(it);
-                        break;
+                        if (muxRunning) {
+                            it->closeRequested = true;
+                            socket_shutdown(it->listenSock);
+                            ++it;
+                        } else {
+                            socket_close(it->listenSock);
+                            it = tunnelListeners_.erase(it);
+                        }
+                    } else {
+                        ++it;
                     }
                 }
             } else if (viewerActive_.load()) {
-                SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-                if (ls != INVALID_SOCKET) {
-                    u_long nonblock = 1;
-                    socket_set_nonblocking(ls, true);
-                    sockaddr_in addr{};
-                    addr.sin_family = AF_INET;
-                    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-                    addr.sin_port = htons(r.localPort);
-                    if (bind(ls, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
-                        listen(ls, 5) == 0) {
-                        tunnelListeners_.push_back({ r.ruleId, r.localPort, r.targetPort, ls });
-                    } else {
-                        socket_close(ls);
+                bool alreadyListening = false;
+                for (const auto& l : tunnelListeners_) {
+                    if (l.ruleId == ruleId && !l.closeRequested) {
+                        alreadyListening = true;
+                        break;
+                    }
+                }
+                if (!alreadyListening) {
+                    SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                    if (ls != INVALID_SOCKET) {
+                        socket_set_nonblocking(ls, true);
+                        socket_set_nosigpipe(ls);
+                        sockaddr_in addr{};
+                        addr.sin_family = AF_INET;
+                        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                        addr.sin_port = htons(r.localPort);
+                        if (bind(ls, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+                            listen(ls, 5) == 0) {
+                            tunnelListeners_.push_back({ r.ruleId, r.localPort, r.targetPort, ls, false });
+                        } else {
+                            socket_close(ls);
+                        }
                     }
                 }
             }
@@ -6341,17 +6439,25 @@ void NetworkEngine::viewerTunnelMultiplexerLoop() {
         std::lock_guard<std::mutex> lk(tunnelMutex_);
         for (const auto& r : tunnelRules_) {
             if (r.active) {
+                bool alreadyListening = false;
+                for (const auto& l : tunnelListeners_) {
+                    if (l.ruleId == r.ruleId && !l.closeRequested) {
+                        alreadyListening = true;
+                        break;
+                    }
+                }
+                if (alreadyListening) continue;
                 SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                 if (ls != INVALID_SOCKET) {
-                    u_long nonblock = 1;
                     socket_set_nonblocking(ls, true);
+                    socket_set_nosigpipe(ls);
                     sockaddr_in addr{};
                     addr.sin_family = AF_INET;
                     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
                     addr.sin_port = htons(r.localPort);
                     if (bind(ls, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
                         listen(ls, 5) == 0) {
-                        tunnelListeners_.push_back({ r.ruleId, r.localPort, r.targetPort, ls });
+                        tunnelListeners_.push_back({ r.ruleId, r.localPort, r.targetPort, ls, false });
                     } else {
                         socket_close(ls);
                     }
@@ -6363,67 +6469,142 @@ void NetworkEngine::viewerTunnelMultiplexerLoop() {
     std::vector<uint8_t> readBuf(16384);
 
     while (viewerTunnelActive_.load() && running_.load() && viewerActive_.load()) {
-        fd_set readSet;
-        FD_ZERO(&readSet);
-        SOCKET maxSock = 0;
+        struct PollItem {
+            bool     isListener = false;
+            uint32_t id = 0;       // ruleId or tunnelId
+            uint32_t ruleId = 0;
+            uint16_t targetPort = 0;
+            socket_t sock = INVALID_SOCKET_VAL;
+        };
+        std::vector<PollItem> items;
+        std::vector<pollfd_t> pollFds;
 
-        std::vector<ListenerState> currentListeners;
-        std::vector<ActiveTunnel> currentTunnels;
         {
             std::lock_guard<std::mutex> lk(tunnelMutex_);
-            currentListeners = tunnelListeners_;
-            for (const auto& kv : viewerTunnels_) {
-                currentTunnels.push_back(kv.second);
+            // Sweep listeners and tunnels marked for close exclusively on this owning thread.
+            for (auto it = tunnelListeners_.begin(); it != tunnelListeners_.end(); ) {
+                if (it->closeRequested) {
+                    socket_close(it->listenSock);
+                    it = tunnelListeners_.erase(it);
+                } else {
+                    pollfd_t pfd{};
+                    pfd.fd = it->listenSock;
+                    pfd.events = POLLIN;
+                    pollFds.push_back(pfd);
+                    items.push_back({ true, it->ruleId, it->ruleId, it->targetPort, it->listenSock });
+                    ++it;
+                }
             }
-        }
-
-        for (const auto& l : currentListeners) {
-            FD_SET(l.listenSock, &readSet);
-            if (l.listenSock > maxSock) maxSock = l.listenSock;
-        }
-        for (const auto& t : currentTunnels) {
-            FD_SET(t.sock, &readSet);
-            if (t.sock > maxSock) maxSock = t.sock;
-        }
-
-        timeval tv{ 0, 20000 };
-        int res = select(static_cast<int>(maxSock + 1), &readSet, nullptr, nullptr, &tv);
-        if (res <= 0) continue;
-
-        for (const auto& l : currentListeners) {
-            if (FD_ISSET(l.listenSock, &readSet)) {
-                sockaddr_in clientAddr{};
-                socklen_t addrLen = sizeof(clientAddr);
-                SOCKET cs = accept(l.listenSock, reinterpret_cast<sockaddr*>(&clientAddr), &addrLen);
-                if (cs != INVALID_SOCKET) {
-                    u_long nonblock = 1;
-                    ioctlsocket(cs, FIONBIO, &nonblock);
-
-                    uint32_t tid = 0;
-                    {
-                        std::lock_guard<std::mutex> lk(tunnelMutex_);
-                        tid = nextTunnelId_++;
-                        viewerTunnels_[tid] = { tid, l.ruleId, cs, l.targetPort };
+            for (auto it = viewerTunnels_.begin(); it != viewerTunnels_.end(); ) {
+                if (it->second.closeRequested) {
+                    socket_close(it->second.sock);
+                    it = viewerTunnels_.erase(it);
+                } else {
+                    pollfd_t pfd{};
+                    pfd.fd = it->second.sock;
+                    pfd.events = POLLIN;
+                    if (it->second.writeOffset < it->second.writeBuf.size()) {
+                        pfd.events |= POLLOUT;
                     }
-
-                    TunnelOpenHeader toh{};
-                    toh.tunnelId = tid;
-                    toh.targetPort = l.targetPort;
-                    toh.flags = 0;
-                    ByteWriter w;
-                    w.writeBytes(&toh, sizeof(toh));
-                    sendViewerEncryptedPacket(PacketType::TUNNEL_OPEN, 0, w.buffer().data(), w.buffer().size());
+                    pollFds.push_back(pfd);
+                    items.push_back({ false, it->second.tunnelId, it->second.ruleId, it->second.targetPort, it->second.sock });
+                    ++it;
                 }
             }
         }
 
+        if (pollFds.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
+
+        int res = socketPoll(pollFds.data(), pollFds.size(), 20);
+        if (res <= 0) continue;
+
         std::vector<uint32_t> closedTunnels;
-        for (const auto& t : currentTunnels) {
-            if (FD_ISSET(t.sock, &readSet)) {
-                int n = recv(t.sock, reinterpret_cast<char*>(readBuf.data()), static_cast<int>(readBuf.size()), 0);
+        for (size_t i = 0; i < items.size(); ++i) {
+            const auto revents = pollFds[i].revents;
+            if (revents == 0) continue;
+
+            if (items[i].isListener) {
+                if (revents & POLLIN) {
+                    sockaddr_in clientAddr{};
+                    socklen_t addrLen = sizeof(clientAddr);
+                    SOCKET cs = accept(items[i].sock, reinterpret_cast<sockaddr*>(&clientAddr), &addrLen);
+                    if (cs != INVALID_SOCKET) {
+                        socket_set_nonblocking(cs, true);
+                        socket_set_nosigpipe(cs);
+
+                        uint32_t tid = 0;
+                        bool accepted = false;
+                        {
+                            std::lock_guard<std::mutex> lk(tunnelMutex_);
+                            if (viewerTunnels_.size() < MAX_ACTIVE_TUNNELS) {
+                                tid = nextTunnelId_++;
+                                ActiveTunnel at;
+                                at.tunnelId = tid;
+                                at.ruleId = items[i].ruleId;
+                                at.sock = cs;
+                                at.targetPort = items[i].targetPort;
+                                viewerTunnels_.emplace(tid, std::move(at));
+                                accepted = true;
+                            }
+                        }
+                        if (!accepted) {
+                            socket_close(cs);
+                            continue;
+                        }
+
+                        TunnelOpenHeader toh{};
+                        toh.tunnelId = tid;
+                        toh.targetPort = items[i].targetPort;
+                        toh.flags = 0;
+                        ByteWriter w;
+                        w.writeBytes(&toh, sizeof(toh));
+                        sendViewerEncryptedPacket(PacketType::TUNNEL_OPEN, 0, w.buffer().data(), w.buffer().size());
+                    }
+                }
+                continue;
+            }
+
+            // Active viewer tunnel socket
+            bool tunnelFailed = false;
+            if (revents & POLLOUT) {
+                std::lock_guard<std::mutex> lk(tunnelMutex_);
+                auto it = viewerTunnels_.find(items[i].id);
+                if (it != viewerTunnels_.end() && !it->second.closeRequested) {
+                    auto& t = it->second;
+                    while (t.writeOffset < t.writeBuf.size()) {
+                        const size_t rem = t.writeBuf.size() - t.writeOffset;
+                        int n = send(t.sock, reinterpret_cast<const char*>(t.writeBuf.data() + t.writeOffset),
+                                     static_cast<int>(std::min<size_t>(rem, 65536)), 0);
+                        if (n > 0) {
+                            t.writeOffset += static_cast<size_t>(n);
+                            for (auto& r : tunnelRules_) {
+                                if (r.ruleId == t.ruleId) {
+                                    r.bytesTransferredIn += static_cast<size_t>(n);
+                                    break;
+                                }
+                            }
+                        } else if (n < 0 && socket_is_wouldblock(socket_errno())) {
+                            break;
+                        } else {
+                            tunnelFailed = true;
+                            break;
+                        }
+                    }
+                    if (t.writeOffset == t.writeBuf.size()) {
+                        t.writeBuf.clear();
+                        t.writeOffset = 0;
+                    }
+                }
+            }
+
+            if (!tunnelFailed && (revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+                int n = recv(items[i].sock, reinterpret_cast<char*>(readBuf.data()), static_cast<int>(readBuf.size()), 0);
                 if (n > 0) {
                     TunnelDataHeader tdh{};
-                    tdh.tunnelId = t.tunnelId;
+                    tdh.tunnelId = items[i].id;
                     tdh.dataLen = static_cast<uint32_t>(n);
                     ByteWriter w;
                     w.writeBytes(&tdh, sizeof(tdh));
@@ -6432,14 +6613,20 @@ void NetworkEngine::viewerTunnelMultiplexerLoop() {
 
                     std::lock_guard<std::mutex> lk(tunnelMutex_);
                     for (auto& r : tunnelRules_) {
-                        if (r.ruleId == t.ruleId) {
-                            r.bytesTransferredOut += n;
+                        if (r.ruleId == items[i].ruleId) {
+                            r.bytesTransferredOut += static_cast<size_t>(n);
                             break;
                         }
                     }
+                } else if (n < 0 && socket_is_wouldblock(socket_errno())) {
+                    // Spurious wakeup on non-blocking socket; keep tunnel alive.
                 } else {
-                    closedTunnels.push_back(t.tunnelId);
+                    tunnelFailed = true;
                 }
+            }
+
+            if (tunnelFailed) {
+                closedTunnels.push_back(items[i].id);
             }
         }
 
@@ -6454,7 +6641,7 @@ void NetworkEngine::viewerTunnelMultiplexerLoop() {
             std::lock_guard<std::mutex> lk(tunnelMutex_);
             auto it = viewerTunnels_.find(tid);
             if (it != viewerTunnels_.end()) {
-                closesocket(it->second.sock);
+                socket_close(it->second.sock);
                 viewerTunnels_.erase(it);
             }
         }
@@ -6494,63 +6681,152 @@ void NetworkEngine::stopHostTunnelProxy() {
 void NetworkEngine::hostTunnelProxyLoop() {
     std::vector<uint8_t> readBuf(16384);
 
-    while (hostTunnelActive_.load() && running_.load() && activeHostClientSock_.load() != ~uintptr_t(0)) {
-        fd_set readSet;
-        FD_ZERO(&readSet);
-        SOCKET maxSock = 0;
+    while (hostTunnelActive_.load() && running_.load() &&
+           activeHostClientSock_.load() != ~uintptr_t(0) &&
+           (hostLivePermissions_.load() & PERM_INPUT) != 0) {
+        struct PollItem {
+            uint32_t tunnelId = 0;
+            socket_t sock = INVALID_SOCKET_VAL;
+            bool     connecting = false;
+        };
+        std::vector<PollItem> items;
+        std::vector<pollfd_t> pollFds;
+        std::vector<std::pair<uint32_t, uint8_t>> timedOutTunnels;
+        const uint64_t now = nowTickMs();
 
-        std::vector<ActiveTunnel> currentTunnels;
         {
             std::lock_guard<std::mutex> lk(tunnelMutex_);
-            for (const auto& kv : hostTunnels_) {
-                currentTunnels.push_back(kv.second);
+            for (auto it = hostTunnels_.begin(); it != hostTunnels_.end(); ) {
+                auto& t = it->second;
+                if (t.closeRequested) {
+                    socket_close(t.sock);
+                    it = hostTunnels_.erase(it);
+                    continue;
+                }
+                if (t.connecting && now - t.connectStartMs > 5000) {
+                    timedOutTunnels.push_back({ t.tunnelId, 1 });
+                    socket_close(t.sock);
+                    it = hostTunnels_.erase(it);
+                    continue;
+                }
+                pollfd_t pfd{};
+                pfd.fd = t.sock;
+                if (t.connecting) {
+                    pfd.events = POLLOUT;
+                } else {
+                    pfd.events = POLLIN;
+                    if (t.writeOffset < t.writeBuf.size()) {
+                        pfd.events |= POLLOUT;
+                    }
+                }
+                pollFds.push_back(pfd);
+                items.push_back({ t.tunnelId, t.sock, t.connecting });
+                ++it;
             }
         }
 
-        if (currentTunnels.empty()) {
+        for (const auto& tc : timedOutTunnels) {
+            TunnelCloseHeader tch{};
+            tch.tunnelId = tc.first;
+            tch.reasonCode = tc.second;
+            ByteWriter w;
+            w.writeBytes(&tch, sizeof(tch));
+            sendHostEncryptedPacket(PacketType::TUNNEL_CLOSE, 0, w.buffer().data(), w.buffer().size());
+        }
+
+        if (pollFds.empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             continue;
         }
 
-        for (const auto& t : currentTunnels) {
-            FD_SET(t.sock, &readSet);
-            if (t.sock > maxSock) maxSock = t.sock;
-        }
-
-        timeval tv{ 0, 20000 };
-        int res = select(static_cast<int>(maxSock + 1), &readSet, nullptr, nullptr, &tv);
+        int res = socketPoll(pollFds.data(), pollFds.size(), 20);
         if (res <= 0) continue;
 
-        std::vector<uint32_t> closedTunnels;
-        for (const auto& t : currentTunnels) {
-            if (FD_ISSET(t.sock, &readSet)) {
-                int n = recv(t.sock, reinterpret_cast<char*>(readBuf.data()), static_cast<int>(readBuf.size()), 0);
+        std::vector<std::pair<uint32_t, uint8_t>> closedTunnels;
+        for (size_t i = 0; i < items.size(); ++i) {
+            const auto revents = pollFds[i].revents;
+            if (revents == 0) continue;
+
+            if (items[i].connecting) {
+                int soErr = 0;
+#if defined(_WIN32)
+                int soLen = sizeof(soErr);
+#else
+                socklen_t soLen = sizeof(soErr);
+#endif
+                getsockopt(items[i].sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &soLen);
+                if (soErr != 0 || (revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                    closedTunnels.push_back({ items[i].tunnelId, 1 });
+                } else if (revents & POLLOUT) {
+                    std::lock_guard<std::mutex> lk(tunnelMutex_);
+                    auto it = hostTunnels_.find(items[i].tunnelId);
+                    if (it != hostTunnels_.end()) {
+                        it->second.connecting = false;
+                    }
+                }
+                continue;
+            }
+
+            bool tunnelFailed = false;
+            if (revents & POLLOUT) {
+                std::lock_guard<std::mutex> lk(tunnelMutex_);
+                auto it = hostTunnels_.find(items[i].tunnelId);
+                if (it != hostTunnels_.end() && !it->second.closeRequested) {
+                    auto& t = it->second;
+                    while (t.writeOffset < t.writeBuf.size()) {
+                        const size_t rem = t.writeBuf.size() - t.writeOffset;
+                        int n = send(t.sock, reinterpret_cast<const char*>(t.writeBuf.data() + t.writeOffset),
+                                     static_cast<int>(std::min<size_t>(rem, 65536)), 0);
+                        if (n > 0) {
+                            t.writeOffset += static_cast<size_t>(n);
+                        } else if (n < 0 && socket_is_wouldblock(socket_errno())) {
+                            break;
+                        } else {
+                            tunnelFailed = true;
+                            break;
+                        }
+                    }
+                    if (t.writeOffset == t.writeBuf.size()) {
+                        t.writeBuf.clear();
+                        t.writeOffset = 0;
+                    }
+                }
+            }
+
+            if (!tunnelFailed && (revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+                int n = recv(items[i].sock, reinterpret_cast<char*>(readBuf.data()), static_cast<int>(readBuf.size()), 0);
                 if (n > 0) {
                     TunnelDataHeader tdh{};
-                    tdh.tunnelId = t.tunnelId;
+                    tdh.tunnelId = items[i].tunnelId;
                     tdh.dataLen = static_cast<uint32_t>(n);
                     ByteWriter w;
                     w.writeBytes(&tdh, sizeof(tdh));
                     w.writeBytes(readBuf.data(), n);
                     sendHostEncryptedPacket(PacketType::TUNNEL_DATA, 0, w.buffer().data(), w.buffer().size());
+                } else if (n < 0 && socket_is_wouldblock(socket_errno())) {
+                    // Spurious wakeup on non-blocking socket; keep tunnel alive.
                 } else {
-                    closedTunnels.push_back(t.tunnelId);
+                    tunnelFailed = true;
                 }
+            }
+
+            if (tunnelFailed) {
+                closedTunnels.push_back({ items[i].tunnelId, 0 });
             }
         }
 
-        for (uint32_t tid : closedTunnels) {
+        for (const auto& tc : closedTunnels) {
             TunnelCloseHeader tch{};
-            tch.tunnelId = tid;
-            tch.reasonCode = 0;
+            tch.tunnelId = tc.first;
+            tch.reasonCode = tc.second;
             ByteWriter w;
             w.writeBytes(&tch, sizeof(tch));
             sendHostEncryptedPacket(PacketType::TUNNEL_CLOSE, 0, w.buffer().data(), w.buffer().size());
 
             std::lock_guard<std::mutex> lk(tunnelMutex_);
-            auto it = hostTunnels_.find(tid);
+            auto it = hostTunnels_.find(tc.first);
             if (it != hostTunnels_.end()) {
-                closesocket(it->second.sock);
+                socket_close(it->second.sock);
                 hostTunnels_.erase(it);
             }
         }
@@ -7311,16 +7587,12 @@ StunNatResult NetworkEngine::queryStunServer(const std::string& hostPort, uint32
         return result;
     }
 
-    fd_set rfds{};
-    FD_ZERO(&rfds);
-    FD_SET(s, &rfds);
+    pollfd_t pfd{};
+    pfd.fd = s;
+    pfd.events = POLLIN;
 
-    timeval tv{};
-    tv.tv_sec = timeoutMs / 1000;
-    tv.tv_usec = (timeoutMs % 1000) * 1000;
-
-    int sel = select(socket_select_nfds(s), &rfds, nullptr, nullptr, &tv);
-    if (sel <= 0 || !FD_ISSET(s, &rfds)) {
+    int sel = socketPoll(&pfd, 1, static_cast<int>(timeoutMs));
+    if (sel <= 0 || !(pfd.revents & POLLIN)) {
         closesocket(s);
         result.natTypeDescription = "STUN query timed out";
         return result;

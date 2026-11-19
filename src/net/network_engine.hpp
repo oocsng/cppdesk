@@ -738,11 +738,19 @@ private:
     std::vector<std::string> terminalHistory_;
 
     // TCP Tunneling State
+    static constexpr size_t MAX_ACTIVE_TUNNELS = 64;
+    static constexpr size_t MAX_TUNNEL_WRITE_QUEUE = 4 * 1024 * 1024;
+
     struct ActiveTunnel {
-        uint32_t tunnelId = 0;
-        uint32_t ruleId = 0;
-        socket_t sock = INVALID_SOCKET_VAL;
-        uint16_t targetPort = 0;
+        uint32_t             tunnelId = 0;
+        uint32_t             ruleId = 0;
+        socket_t             sock = INVALID_SOCKET_VAL;
+        uint16_t             targetPort = 0;
+        bool                 connecting = false;
+        uint64_t             connectStartMs = 0;
+        bool                 closeRequested = false;
+        std::vector<uint8_t> writeBuf;
+        size_t               writeOffset = 0;
     };
 
     struct ListenerState {
@@ -750,7 +758,10 @@ private:
         uint16_t localPort = 0;
         uint16_t targetPort = 0;
         socket_t listenSock = INVALID_SOCKET_VAL;
+        bool     closeRequested = false;
     };
+
+    static bool enqueueTunnelWriteLocked(ActiveTunnel& t, const uint8_t* data, size_t len, size_t& outImmediateSent);
 
     void viewerTunnelMultiplexerLoop();
     void hostTunnelProxyLoop();
