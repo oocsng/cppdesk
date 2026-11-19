@@ -80,6 +80,8 @@ public:
     static float dpiScaleFromXftDpi(const char* value);
     // Local paths from a text/uri-list (file drops): file:// entries only, percent-decoded.
     static std::vector<std::string> parseFileUriList(const std::string& uriList);
+    // True only for http:// or https:// URLs with a non-empty remainder and no whitespace or control characters.
+    static bool isSafeExternalUrl(const std::string& url);
 };
 
 inline ViewportGeometry calculateViewportGeometry(float viewWidth, float viewHeight, uint32_t frameWidth, uint32_t frameHeight, ScaleMode scaleMode) {
