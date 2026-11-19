@@ -31,6 +31,7 @@ public:
     }
 
     void push(const uint8_t* bgra, int w, int h) {
+        if (!bgra) return;
         write(w, h, [&](uint8_t* dst) { std::memcpy(dst, bgra, static_cast<size_t>(w) * h * 4); });
     }
 
