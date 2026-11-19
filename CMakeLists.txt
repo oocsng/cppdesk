@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 # ScreenCaptureKit (macOS host capture) needs 12.3; must be set before project().
 set(CMAKE_OSX_DEPLOYMENT_TARGET "12.3" CACHE STRING "")
-project(CppDesk VERSION 3.11.2 LANGUAGES C CXX ASM)
+project(CppDesk VERSION 3.11.2 LANGUAGES C CXX)
+if(NOT MSVC)
+    enable_language(ASM)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -51,11 +54,17 @@ set(CORE_SOURCES
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 if(WIN32)
+    if((CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang") AND (CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|x64"))
+        list(APPEND CORE_SOURCES src/simd/simd_kernels.S)
+    else()
+        message(FATAL_ERROR "Windows CMake builds require MinGW/Clang x86-64 (GNU assembler) for src/simd/simd_kernels.S")
+    endif()
     list(APPEND CORE_SOURCES
-        src/simd/simd_kernels.S
         src/control/windows_service_manager.cpp
         src/ui/canvas_d2d.cpp
     )
+
+    find_library(LIB_ZSTD zstd REQUIRED)
 
     add_compile_definitions(
         NOMINMAX
@@ -84,7 +93,7 @@ if(WIN32)
         winmm
         winhttp
         psapi
-        zstd
+        ${LIB_ZSTD}
     )
 elseif(APPLE)
     enable_language(OBJCXX)
@@ -99,7 +108,8 @@ elseif(APPLE)
         src/control/mac_permissions.mm
     )
 
-    find_library(LIB_ZSTD zstd REQUIRED)
+    # Prefer static zstd so the macOS app bundle has no Homebrew runtime dependency.
+    find_library(LIB_ZSTD NAMES libzstd.a zstd REQUIRED)
     find_path(ZSTD_INCLUDE_DIR zstd.h REQUIRED)   # Homebrew keeps headers outside the default search path
     include_directories(${ZSTD_INCLUDE_DIR})
     # Static, so the app has no Homebrew runtime dependency (macOS has no public AES-GCM, see crypto_identity.cpp).
@@ -107,7 +117,6 @@ elseif(APPLE)
     find_package(OpenSSL REQUIRED)
     find_library(COCOA_FRAMEWORK Cocoa REQUIRED)
     find_library(APPKIT_FRAMEWORK AppKit REQUIRED)
-    find_library(METAL_FRAMEWORK Metal REQUIRED)
     find_library(QUARTZ_CORE QuartzCore REQUIRED)
     find_library(CORE_GRAPHICS CoreGraphics REQUIRED)
     find_library(CORE_TEXT CoreText REQUIRED)
@@ -270,7 +279,7 @@ endif()
 # Application executable
 if(WIN32)
     enable_language(RC)
-    add_executable(CppDesk
+    add_executable(CppDesk WIN32
         ${CORE_SOURCES}
         src/ui/ui_window.cpp
         src/main.cpp
@@ -289,13 +298,13 @@ elseif(APPLE)
         MACOSX_BUNDLE_BUNDLE_IDENTIFIER "com.oocsng.cppdesk"
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/Info.plist"
         MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
         MACOSX_BUNDLE_LONG_VERSION_STRING "${PROJECT_VERSION}"
     )
     target_link_libraries(CppDesk PRIVATE
         ${PLATFORM_LIBS}
         ${COCOA_FRAMEWORK}
         ${APPKIT_FRAMEWORK}
-        ${METAL_FRAMEWORK}
         ${QUARTZ_CORE}
     )
 elseif(UNIX AND NOT APPLE)

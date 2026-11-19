@@ -183,6 +183,8 @@ public:
     bool isRunning() const { return running_.load(); }
     uint16_t port() const { return port_; }
     size_t registeredPeerCount() const;
+    void setAuthKey(const std::string& authKey);
+    std::string authKey() const;
 
 private:
     void acceptLoop();
@@ -214,6 +216,7 @@ private:
     std::vector<RegisteredHost> hosts_;
     std::vector<PendingBridge>  bridges_;
     relayowner::OwnerRegistry   owners_;   // desk IDs whose owner key this relay holds
+    std::string                 authKey_;
 
     // One thread per connection: cap them so a single address cannot exhaust the host.
     // Each registered host holds one connection and each bridged session two.

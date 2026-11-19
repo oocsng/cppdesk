@@ -9,10 +9,11 @@ namespace CppDeskRelay;
 
 internal static class Program
 {
-    private const uint ProtocolMagic = 0x4344534B; // "CDSK"
+    private const uint ProtocolMagic = 0x43505044; // "CPPD"
     private const int DefaultRelayPort = 50999;
-    private const int MaxPayloadSize = 32 * 1024 * 1024;
     private const int MaxControlFrame = 64 * 1024;
+    private const int MaxPingPayload = 64;
+    private const int ReadChunkSize = 4096;
 
     private const byte PacketPing              = 0x07;
     private const byte PacketPong              = 0x08;
@@ -27,14 +28,20 @@ internal static class Program
     private const byte PacketRelayRegisterChallenge = 0x5A;
     private const byte PacketRelayRegisterProof     = 0x5B;
 
+    private const byte FlagRelayAuth = 0x04;
+    private const int AuthTagLength = 32;
+    private static readonly byte[] AuthLabel = Encoding.ASCII.GetBytes("CppDesk-relay-auth-v1");
+    private static string _authKey = string.Empty;
+
     private const byte OwnerCap = 1;        // trailing byte on RELAY_REGISTER: "I can prove ownership"
     private const byte ModeProve = 0;       // challenge: answer with HMAC(key, label || deskId || nonce)
     private const byte ModeEnroll = 1;      // challenge: answer with the key itself
     private const int OwnerNonceLength = 16;
     private const int OwnerKeyLength = 32;
-    private const int OwnerMaxRecords = 100_000;
+    private static int _ownerMaxRecords = 100_000;
     private static readonly TimeSpan OwnerTtl = TimeSpan.FromDays(7);   // an ID nobody has used for this long is free again
     private static readonly byte[] OwnerLabel = Encoding.ASCII.GetBytes("CppDesk-relay-owner-v1");
+    private static readonly TimeSpan ControlWriteTimeout = TimeSpan.FromSeconds(5);
 
     // Desk IDs whose owner key this relay holds. A host's first registration enrolls its key (trust on first
     // use); later ones must answer a fresh challenge, so knowing an ID is not enough to take it over.
@@ -54,8 +61,11 @@ internal static class Program
         public DateTime LastSeenUtc { get; set; } = RegisteredAtUtc;
     }
 
+    private sealed record BridgeHandover(TcpClient Client, Action ReleaseResources);
+
+    private static readonly object HostSwapLock = new();
     private static readonly ConcurrentDictionary<ulong, RegisteredHost> Hosts = new();
-    private static readonly ConcurrentDictionary<ulong, TaskCompletionSource<TcpClient>> PendingBridges = new();
+    private static readonly ConcurrentDictionary<ulong, TaskCompletionSource<BridgeHandover>> PendingBridges = new();
     private static readonly SemaphoreSlim ClientSlots = new(256, 256);
 
     // A client must send its first frame within this time, or the connection is dropped (slowloris guard).
@@ -65,19 +75,24 @@ internal static class Program
     // so this is generous for an office behind one NAT while stopping a single address from taking every slot.
     private static int _maxConnectionsPerIp = 64;
     private static readonly Dictionary<IPAddress, int> ConnectionsPerIp = new();
-    private static long _totalLookups;
     private static long _activeBridges;
 
     public static async Task<int> Main(string[] args)
     {
         int port = DefaultRelayPort;
         bool selfTest = false;
+        _authKey = Environment.GetEnvironmentVariable("CPPDESK_RELAY_AUTH_KEY") ?? string.Empty;
 
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--port" && i + 1 < args.Length && int.TryParse(args[i + 1], out int p))
             {
                 port = p;
+                i++;
+            }
+            else if (args[i] == "--auth-key" && i + 1 < args.Length)
+            {
+                _authKey = args[i + 1];
                 i++;
             }
             else if (args[i] == "--self-test")
@@ -94,7 +109,14 @@ internal static class Program
         };
 
         var listener = new TcpListener(IPAddress.Any, port);
-        listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        if (OperatingSystem.IsWindows())
+        {
+            listener.Server.ExclusiveAddressUse = true;
+        }
+        else
+        {
+            listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        }
         listener.Start();
 
         int boundPort = ((IPEndPoint)listener.LocalEndpoint).Port;
@@ -103,7 +125,10 @@ internal static class Program
         if (selfTest)
         {
             _ = Task.Run(() => AcceptLoopAsync(listener, cts.Token));
-            bool ok = await RunSelfTestAsync(boundPort) && await RunHardeningSelfTestAsync(boundPort) && await RunOwnershipSelfTestAsync(boundPort);
+            bool ok = await RunSelfTestAsync(boundPort)
+                   && await RunHardeningSelfTestAsync(boundPort)
+                   && await RunOwnershipSelfTestAsync(boundPort)
+                   && await RunAuthKeySelfTestAsync(boundPort);
             cts.Cancel();
             listener.Stop();
             return ok ? 0 : 1;
@@ -133,6 +158,16 @@ internal static class Program
 
                 _ = Task.Run(async () =>
                 {
+                    bool slotAcquired = false;
+                    int released = 0;
+                    void ReleaseAll()
+                    {
+                        if (Interlocked.Exchange(ref released, 1) != 0) return;
+                        if (slotAcquired) ClientSlots.Release();
+                        if (remoteIp is not null) ReleaseIp(remoteIp);
+                    }
+
+                    bool transferred = false;
                     try
                     {
                         if (!await ClientSlots.WaitAsync(100, ct))
@@ -140,18 +175,12 @@ internal static class Program
                             client.Dispose();
                             return;
                         }
-                        try
-                        {
-                            await HandleClientAsync(client, ct);
-                        }
-                        finally
-                        {
-                            ClientSlots.Release();
-                        }
+                        slotAcquired = true;
+                        transferred = await HandleClientAsync(client, ReleaseAll, ct);
                     }
                     finally
                     {
-                        if (remoteIp is not null) ReleaseIp(remoteIp);
+                        if (!transferred) ReleaseAll();
                     }
                 }, ct);
             }
@@ -204,16 +233,39 @@ internal static class Program
         }
     }
 
-    private static async Task HandleClientAsync(TcpClient client, CancellationToken ct)
+    private static async Task<bool> HandleClientAsync(TcpClient client, Action releaseResources, CancellationToken ct)
     {
         bool keepAlive = false;
+        bool transferred = false;
         try
         {
             NetworkStream stream = client.GetStream();
             using var firstFrameCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             firstFrameCts.CancelAfter(_firstFrameTimeout);
-            var (ok, type, _, payload) = await ReadFrameAsync(stream, firstFrameCts.Token);
-            if (!ok) return;
+            var (ok, type, flags, payload) = await ReadFrameAsync(stream, firstFrameCts.Token);
+            if (!ok) return false;
+
+            if (!VerifyAndStripAuthTag(type, flags, ref payload))
+            {
+                if (type == PacketRelayRegister)
+                {
+                    await WriteFrameAsync(stream, PacketRelayRegisterAck, 0, new byte[] { 0 }, firstFrameCts.Token);
+                }
+                else if (type == PacketRelayLookup)
+                {
+                    using var errMs = new MemoryStream();
+                    errMs.WriteByte(0);
+                    WriteString(errMs, string.Empty);
+                    WriteU16(errMs, 0);
+                    WriteString(errMs, string.Empty);
+                    await WriteFrameAsync(stream, PacketRelayLookupResp, 0, errMs.ToArray(), firstFrameCts.Token);
+                }
+                else if (type == PacketRelayConnectReq)
+                {
+                    await WriteFrameAsync(stream, PacketRelayBridgeReady, 0, new byte[] { 0 }, firstFrameCts.Token);
+                }
+                return false;
+            }
 
             switch (type)
             {
@@ -222,12 +274,13 @@ internal static class Program
                     int pos = 0;
                     ulong deskId = ReadU64(payload, ref pos);
                     string hostname = ReadString(payload, ref pos);
-                    string ip = ReadString(payload, ref pos);
+                    _ = ReadString(payload, ref pos); // ignore claimed IP; use observed RemoteEndPoint
                     ushort tcpPort = ReadU16(payload, ref pos);
 
-                    if (string.IsNullOrWhiteSpace(ip) && client.Client.RemoteEndPoint is IPEndPoint ep)
+                    string ip = string.Empty;
+                    if (client.Client.RemoteEndPoint is IPEndPoint ep)
                     {
-                        ip = ep.Address.ToString();
+                        ip = ep.Address.IsIPv4MappedToIPv6 ? ep.Address.MapToIPv4().ToString() : ep.Address.ToString();
                     }
 
                     // Hosts from before ownership proofs end the frame here.
@@ -239,36 +292,48 @@ internal static class Program
                         byte[] challenge = new byte[1 + OwnerNonceLength];
                         challenge[0] = enrolling ? ModeEnroll : ModeProve;
                         nonce.CopyTo(challenge, 1);
-                        await WriteFrameAsync(stream, PacketRelayRegisterChallenge, 0, challenge, ct);
+                        await WriteFrameAsync(stream, PacketRelayRegisterChallenge, 0, challenge, firstFrameCts.Token);
 
                         var (pOk, pType, _, proof) = await ReadFrameAsync(stream, firstFrameCts.Token);
                         bool proven = pOk && pType == PacketRelayRegisterProof && proof.Length == OwnerKeyLength &&
                                       (enrolling ? EnrollOwner(deskId, proof) : VerifyOwner(deskId, nonce, proof));
                         if (!proven)
                         {
-                            await WriteFrameAsync(stream, PacketRelayRegisterAck, 0, new byte[] { 0 }, ct);
-                            return;
+                            await WriteFrameAsync(stream, PacketRelayRegisterAck, 0, new byte[] { 0 }, firstFrameCts.Token);
+                            return false;
                         }
-
-                        // The owner takes its registration over from its own stale connection.
-                        if (Hosts.TryGetValue(deskId, out var stale))
-                        {
-                            try { stale.ControlStream.Dispose(); } catch { }
-                        }
-                    }
-                    else if (HasLiveOwner(deskId) ||
-                             (Hosts.TryGetValue(deskId, out var existing) &&
-                              (DateTime.UtcNow - existing.LastSeenUtc) < TimeSpan.FromSeconds(45)))
-                    {
-                        await WriteFrameAsync(stream, PacketRelayRegisterAck, 0, new byte[] { 0 }, ct);
-                        return;
                     }
 
                     var host = new RegisteredHost(deskId, hostname, ip, tcpPort, stream, new SemaphoreSlim(1, 1), DateTime.UtcNow);
-                    Hosts[deskId] = host;
+                    RegisteredHost? replaced = null;
+                    bool rejected = false;
+                    lock (HostSwapLock)
+                    {
+                        if (!ownerCapable &&
+                            (HasLiveOwner(deskId) ||
+                             (Hosts.TryGetValue(deskId, out var existing) &&
+                              (DateTime.UtcNow - existing.LastSeenUtc) < TimeSpan.FromSeconds(45))))
+                        {
+                            rejected = true;
+                        }
+                        else
+                        {
+                            Hosts.TryGetValue(deskId, out replaced);
+                            Hosts[deskId] = host;
+                        }
+                    }
+                    if (rejected)
+                    {
+                        await WriteFrameAsync(stream, PacketRelayRegisterAck, 0, new byte[] { 0 }, firstFrameCts.Token);
+                        return false;
+                    }
+                    if (replaced is not null)
+                    {
+                        try { replaced.ControlStream.Dispose(); } catch { }
+                    }
 
-                    await WriteFrameAsync(stream, PacketRelayRegisterAck, 0, new byte[] { 1 }, ct);
-                    Log($"Registered Host {FormatDeskId(deskId)} ({hostname} @ {ip}:{tcpPort}) | Active Hosts: {Hosts.Count}");
+                    await WriteFrameWithTimeoutAsync(stream, PacketRelayRegisterAck, 0, new byte[] { 1 }, ct);
+                    Log($"Registered Host {FormatDeskId(deskId)} ({SanitizeForLog(hostname)} @ {SanitizeForLog(ip)}:{tcpPort}) | Active Hosts: {Hosts.Count}");
 
                     keepAlive = true;
                     using var pingCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -284,10 +349,12 @@ internal static class Program
                             pingCts.CancelAfter(TimeSpan.FromSeconds(90));
                             if (pType == PacketPing)
                             {
-                                await host.WriteLock.WaitAsync(ct);
+                                using var pongCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                                pongCts.CancelAfter(ControlWriteTimeout);
+                                await host.WriteLock.WaitAsync(pongCts.Token);
                                 try
                                 {
-                                    await WriteFrameAsync(stream, PacketPong, 0, Array.Empty<byte>(), ct);
+                                    await WriteFrameAsync(stream, PacketPong, 0, Array.Empty<byte>(), pongCts.Token);
                                 }
                                 finally
                                 {
@@ -299,11 +366,8 @@ internal static class Program
                     finally
                     {
                         if (ownerCapable) TouchOwner(deskId);
-                        if (((ICollection<KeyValuePair<ulong, RegisteredHost>>)Hosts)
-                                .Remove(new KeyValuePair<ulong, RegisteredHost>(deskId, host)))
-                        {
-                            host.WriteLock.Dispose();
-                        }
+                        ((ICollection<KeyValuePair<ulong, RegisteredHost>>)Hosts)
+                            .Remove(new KeyValuePair<ulong, RegisteredHost>(deskId, host));
                         client.Dispose();
                         Log($"Unregistered Host {FormatDeskId(deskId)} | Active Hosts: {Hosts.Count}");
                     }
@@ -312,7 +376,6 @@ internal static class Program
 
                 case PacketRelayLookup:
                 {
-                    Interlocked.Increment(ref _totalLookups);
                     int pos = 0;
                     ulong targetId = ReadU64(payload, ref pos);
 
@@ -324,7 +387,6 @@ internal static class Program
                             if (((ICollection<KeyValuePair<ulong, RegisteredHost>>)Hosts)
                                     .Remove(new KeyValuePair<ulong, RegisteredHost>(targetId, foundHost)))
                             {
-                                foundHost.WriteLock.Dispose();
                                 try { foundHost.ControlStream.Dispose(); } catch { }
                             }
                             foundHost = null;
@@ -346,7 +408,7 @@ internal static class Program
                         WriteString(ms, string.Empty);
                     }
 
-                    await WriteFrameAsync(stream, PacketRelayLookupResp, 0, ms.ToArray(), ct);
+                    await WriteFrameWithTimeoutAsync(stream, PacketRelayLookupResp, 0, ms.ToArray(), ct);
                     break;
                 }
 
@@ -357,66 +419,91 @@ internal static class Program
 
                     if (!Hosts.TryGetValue(targetId, out RegisteredHost? host))
                     {
-                        await WriteFrameAsync(stream, PacketRelayBridgeReady, 0, new byte[] { 0 }, ct);
+                        await WriteFrameWithTimeoutAsync(stream, PacketRelayBridgeReady, 0, new byte[] { 0 }, ct);
                         break;
                     }
 
                     ulong token = BinaryPrimitives.ReadUInt64LittleEndian(RandomNumberGenerator.GetBytes(8));
-                    var tcs = new TaskCompletionSource<TcpClient>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    var tcs = new TaskCompletionSource<BridgeHandover>(TaskCreationOptions.RunContinuationsAsynchronously);
                     PendingBridges[token] = tcs;
 
                     byte[] reqPayload = new byte[8];
                     BinaryPrimitives.WriteUInt64LittleEndian(reqPayload, token);
-                    await host.WriteLock.WaitAsync(ct);
+                    BridgeHandover? hostBridge = null;
+                    bool reqSent = false;
                     try
                     {
-                        await WriteFrameAsync(host.ControlStream, PacketRelayIncomingReq, 0, reqPayload, ct);
-                    }
-                    finally
-                    {
-                        host.WriteLock.Release();
-                    }
-
-                    using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(3500));
-
-                    TcpClient? hostBridgeClient = null;
-                    try
-                    {
-                        hostBridgeClient = await tcs.Task.WaitAsync(timeoutCts.Token);
+                        using var writeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        writeCts.CancelAfter(ControlWriteTimeout);
+                        await host.WriteLock.WaitAsync(writeCts.Token);
+                        try
+                        {
+                            await WriteFrameAsync(host.ControlStream, PacketRelayIncomingReq, 0, reqPayload, writeCts.Token);
+                            reqSent = true;
+                        }
+                        finally
+                        {
+                            host.WriteLock.Release();
+                        }
                     }
                     catch
+                    {
+                        if (((ICollection<KeyValuePair<ulong, RegisteredHost>>)Hosts)
+                                .Remove(new KeyValuePair<ulong, RegisteredHost>(targetId, host)))
+                        {
+                            try { host.ControlStream.Dispose(); } catch { }
+                        }
+                    }
+
+                    if (reqSent)
+                    {
+                        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(3500));
+                        try
+                        {
+                            hostBridge = await tcs.Task.WaitAsync(timeoutCts.Token);
+                        }
+                        catch { }
+                    }
+
+                    if (hostBridge is null)
                     {
                         if (PendingBridges.TryRemove(token, out _))
                         {
                             tcs.TrySetCanceled();
                         }
+                        else if (tcs.Task.IsCompletedSuccessfully)
+                        {
+                            var orphan = tcs.Task.Result;
+                            orphan.Client.Dispose();
+                            orphan.ReleaseResources();
+                        }
                         else
                         {
-                            try
+                            _ = tcs.Task.ContinueWith(static t =>
                             {
-                                var orphan = await tcs.Task;
-                                orphan?.Dispose();
-                            }
-                            catch { }
+                                if (t.IsCompletedSuccessfully)
+                                {
+                                    t.Result.Client.Dispose();
+                                    t.Result.ReleaseResources();
+                                }
+                            }, TaskScheduler.Default);
                         }
-                    }
 
-                    if (hostBridgeClient is null)
-                    {
-                        await WriteFrameAsync(stream, PacketRelayBridgeReady, 0, new byte[] { 0 }, ct);
+                        await WriteFrameWithTimeoutAsync(stream, PacketRelayBridgeReady, 0, new byte[] { 0 }, ct);
                         break;
                     }
 
-                    await WriteFrameAsync(stream, PacketRelayBridgeReady, 0, new byte[] { 1 }, ct);
-
                     keepAlive = true;
-                    Interlocked.Increment(ref _activeBridges);
-                    Log($"Bridged Relay Session for {FormatDeskId(targetId)} (Active Bridges: {Interlocked.Read(ref _activeBridges)})");
-
+                    bool bridgeCounted = false;
                     try
                     {
-                        NetworkStream hostBridgeStream = hostBridgeClient.GetStream();
+                        await WriteFrameWithTimeoutAsync(stream, PacketRelayBridgeReady, 0, new byte[] { 1 }, ct);
+                        Interlocked.Increment(ref _activeBridges);
+                        bridgeCounted = true;
+                        Log($"Bridged Relay Session for {FormatDeskId(targetId)} (Active Bridges: {Interlocked.Read(ref _activeBridges)})");
+
+                        NetworkStream hostBridgeStream = hostBridge.Client.GetStream();
                         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
                         Task t1 = stream.CopyToAsync(hostBridgeStream, linked.Token);
                         Task t2 = hostBridgeStream.CopyToAsync(stream, linked.Token);
@@ -426,8 +513,9 @@ internal static class Program
                     }
                     finally
                     {
-                        Interlocked.Decrement(ref _activeBridges);
-                        hostBridgeClient.Dispose();
+                        if (bridgeCounted) Interlocked.Decrement(ref _activeBridges);
+                        hostBridge.Client.Dispose();
+                        hostBridge.ReleaseResources();
                         client.Dispose();
                     }
                     break;
@@ -439,8 +527,11 @@ internal static class Program
                     ulong token = ReadU64(payload, ref pos);
                     if (PendingBridges.TryRemove(token, out var tcs))
                     {
-                        keepAlive = true;
-                        tcs.TrySetResult(client);
+                        if (tcs.TrySetResult(new BridgeHandover(client, releaseResources)))
+                        {
+                            keepAlive = true;
+                            transferred = true;
+                        }
                     }
                     break;
                 }
@@ -457,6 +548,51 @@ internal static class Program
                 client.Dispose();
             }
         }
+        return transferred;
+    }
+
+    private static byte[] ComputeAuthTag(string authKey, byte type, ReadOnlySpan<byte> body)
+    {
+        byte[] keyBytes = Encoding.UTF8.GetBytes(authKey);
+        byte[] msg = new byte[AuthLabel.Length + 1 + body.Length];
+        AuthLabel.CopyTo(msg, 0);
+        msg[AuthLabel.Length] = type;
+        body.CopyTo(msg.AsSpan(AuthLabel.Length + 1));
+        return HMACSHA256.HashData(keyBytes, msg);
+    }
+
+    private static bool VerifyAndStripAuthTag(byte type, byte flags, ref byte[] payload)
+    {
+        bool hasTag = (flags & FlagRelayAuth) != 0;
+        if (hasTag)
+        {
+            if (payload.Length < AuthTagLength) return false;
+            int bodyLen = payload.Length - AuthTagLength;
+            if (!string.IsNullOrEmpty(_authKey))
+            {
+                byte[] expected = ComputeAuthTag(_authKey, type, payload.AsSpan(0, bodyLen));
+                if (!CryptographicOperations.FixedTimeEquals(expected, payload.AsSpan(bodyLen, AuthTagLength)))
+                {
+                    return false;
+                }
+            }
+            payload = bodyLen > 0 ? payload[..bodyLen] : Array.Empty<byte>();
+            return true;
+        }
+        return string.IsNullOrEmpty(_authKey);
+    }
+
+    private static string SanitizeForLog(string value, int maxLen = 128)
+    {
+        if (string.IsNullOrEmpty(value)) return string.Empty;
+        int len = Math.Min(value.Length, maxLen);
+        var sb = new StringBuilder(len);
+        for (int i = 0; i < len; i++)
+        {
+            char c = value[i];
+            sb.Append(char.IsControl(c) || c < 0x20 || c == 0x7F ? '?' : c);
+        }
+        return sb.ToString();
     }
 
     private static async Task<(bool Ok, byte Type, byte Flags, byte[] Payload)> ReadFrameAsync(NetworkStream stream, CancellationToken ct)
@@ -470,19 +606,36 @@ internal static class Program
         byte type = hdr[4];
         byte flags = hdr[5];
         uint size = BinaryPrimitives.ReadUInt32LittleEndian(hdr.AsSpan(6, 4));
-        uint cap = type switch
+        int cap = type switch
         {
-            PacketRelayRegister or PacketRelayLookup or PacketRelayConnectReq or PacketRelayBridgeAccept or PacketRelayRegisterProof => MaxControlFrame,
-            _ => MaxPayloadSize
+            PacketPing or PacketPong => MaxPingPayload,
+            PacketRelayRegister or PacketRelayRegisterAck or PacketRelayLookup or PacketRelayLookupResp
+                or PacketRelayConnectReq or PacketRelayIncomingReq or PacketRelayBridgeAccept
+                or PacketRelayBridgeReady or PacketRelayRegisterChallenge or PacketRelayRegisterProof => MaxControlFrame,
+            _ => -1
         };
-        if (size > cap) return (false, 0, 0, Array.Empty<byte>());
+        if (cap < 0 || size > (uint)cap) return (false, 0, 0, Array.Empty<byte>());
 
-        byte[] payload = size > 0 ? new byte[size] : Array.Empty<byte>();
-        if (size > 0 && !await ReadExactAsync(stream, payload, ct))
-        {
-            return (false, 0, 0, Array.Empty<byte>());
-        }
+        if (size == 0) return (true, type, flags, Array.Empty<byte>());
+        byte[]? payload = await ReadBoundedPayloadAsync(stream, (int)size, ct);
+        if (payload is null) return (false, 0, 0, Array.Empty<byte>());
         return (true, type, flags, payload);
+    }
+
+    private static async Task<byte[]?> ReadBoundedPayloadAsync(NetworkStream stream, int totalSize, CancellationToken ct)
+    {
+        using var ms = new MemoryStream(Math.Min(totalSize, ReadChunkSize));
+        byte[] chunk = new byte[Math.Min(totalSize, ReadChunkSize)];
+        int remaining = totalSize;
+        while (remaining > 0)
+        {
+            int toRead = Math.Min(remaining, chunk.Length);
+            int n = await stream.ReadAsync(chunk.AsMemory(0, toRead), ct);
+            if (n <= 0) return null;
+            ms.Write(chunk, 0, n);
+            remaining -= n;
+        }
+        return ms.ToArray();
     }
 
     private static async Task<bool> ReadExactAsync(NetworkStream stream, byte[] buffer, CancellationToken ct)
@@ -495,6 +648,13 @@ internal static class Program
             offset += n;
         }
         return true;
+    }
+
+    private static async Task WriteFrameWithTimeoutAsync(NetworkStream stream, byte type, byte flags, byte[] payload, CancellationToken ct)
+    {
+        using var writeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        writeCts.CancelAfter(ControlWriteTimeout);
+        await WriteFrameAsync(stream, type, flags, payload, writeCts.Token);
     }
 
     private static async Task WriteFrameAsync(NetworkStream stream, byte type, byte flags, byte[] payload, CancellationToken ct)
@@ -679,16 +839,24 @@ internal static class Program
         return rec;
     }
 
-    // False when the ID already has a live owner. A full table accepts the ID unprotected rather than lock real hosts out.
+    // False when the ID already has a live owner or the table is full after pruning expired records.
     private static bool EnrollOwner(ulong deskId, byte[] key)
     {
         lock (Owners)
         {
             if (LiveOwnerLocked(deskId) is not null) return false;
-            if (Owners.Count < OwnerMaxRecords || Owners.ContainsKey(deskId))
+            if (Owners.Count >= _ownerMaxRecords && !Owners.ContainsKey(deskId))
             {
-                Owners[deskId] = new OwnerRecord(key, DateTime.UtcNow);
+                DateTime now = DateTime.UtcNow;
+                var expired = new List<ulong>();
+                foreach (var kv in Owners)
+                {
+                    if (now - kv.Value.LastSeenUtc > OwnerTtl) expired.Add(kv.Key);
+                }
+                foreach (ulong id in expired) Owners.Remove(id);
+                if (Owners.Count >= _ownerMaxRecords) return false;
             }
+            Owners[deskId] = new OwnerRecord(key, DateTime.UtcNow);
             return true;
         }
     }
@@ -893,5 +1061,115 @@ internal static class Program
 
         Log($"Self-test verified: Found={found}, Host={hostName}, Endpoint={ip}:{hostPort}");
         return found == 1 && ip == "127.0.0.1" && hostPort == 50990 && hostName == "DotNet-TestHost";
+    }
+
+    private static async Task<bool> RunAuthKeySelfTestAsync(int port)
+    {
+        string savedKey = _authKey;
+        try
+        {
+            _authKey = "test-relay-secret-key";
+
+            static byte[] Tagged(byte type, byte[] body, string key)
+            {
+                byte[] tag = ComputeAuthTag(key, type, body);
+                byte[] combined = new byte[body.Length + tag.Length];
+                Buffer.BlockCopy(body, 0, combined, 0, body.Length);
+                Buffer.BlockCopy(tag, 0, combined, body.Length, tag.Length);
+                return combined;
+            }
+
+            using var regMs = new MemoryStream();
+            WriteU64(regMs, 912345678UL);
+            WriteString(regMs, "Auth-Host");
+            WriteString(regMs, "169.254.169.254"); // spoofed IP must be ignored
+            WriteU16(regMs, 50992);
+            byte[] regBody = regMs.ToArray();
+
+            // 1. Missing auth tag is refused.
+            using (var c1 = new TcpClient())
+            {
+                await c1.ConnectAsync(IPAddress.Loopback, port);
+                await WriteFrameAsync(c1.GetStream(), PacketRelayRegister, 0, regBody, CancellationToken.None);
+                var (ok, type, _, pay) = await ReadFrameAsync(c1.GetStream(), CancellationToken.None);
+                if (!ok || type != PacketRelayRegisterAck || pay.Length < 1 || pay[0] != 0)
+                {
+                    Log("Self-test FAILED: unauthenticated register was not rejected");
+                    return false;
+                }
+            }
+
+            // 2. Wrong auth key is refused.
+            using (var c2 = new TcpClient())
+            {
+                await c2.ConnectAsync(IPAddress.Loopback, port);
+                await WriteFrameAsync(c2.GetStream(), PacketRelayRegister, FlagRelayAuth, Tagged(PacketRelayRegister, regBody, "wrong-key"), CancellationToken.None);
+                var (ok, type, _, pay) = await ReadFrameAsync(c2.GetStream(), CancellationToken.None);
+                if (!ok || type != PacketRelayRegisterAck || pay.Length < 1 || pay[0] != 0)
+                {
+                    Log("Self-test FAILED: wrong auth key was not rejected");
+                    return false;
+                }
+            }
+
+            // 3. Correct auth key succeeds and lookup returns observed loopback IP, not spoofed IP.
+            using var hostClient = new TcpClient();
+            await hostClient.ConnectAsync(IPAddress.Loopback, port);
+            await WriteFrameAsync(hostClient.GetStream(), PacketRelayRegister, FlagRelayAuth, Tagged(PacketRelayRegister, regBody, _authKey), CancellationToken.None);
+            var (ackOk, ackType, _, ackPay) = await ReadFrameAsync(hostClient.GetStream(), CancellationToken.None);
+            if (!ackOk || ackType != PacketRelayRegisterAck || ackPay.Length < 1 || ackPay[0] != 1)
+            {
+                Log("Self-test FAILED: valid auth key register failed");
+                return false;
+            }
+
+            using var lookMs = new MemoryStream();
+            WriteU64(lookMs, 912345678UL);
+            byte[] lookBody = lookMs.ToArray();
+
+            using (var lClient = new TcpClient())
+            {
+                await lClient.ConnectAsync(IPAddress.Loopback, port);
+                await WriteFrameAsync(lClient.GetStream(), PacketRelayLookup, FlagRelayAuth, Tagged(PacketRelayLookup, lookBody, _authKey), CancellationToken.None);
+                var (respOk, respType, _, respPay) = await ReadFrameAsync(lClient.GetStream(), CancellationToken.None);
+                if (!respOk || respType != PacketRelayLookupResp)
+                {
+                    Log("Self-test FAILED: authenticated lookup failed");
+                    return false;
+                }
+                int pos = 0;
+                byte found = respPay[pos++];
+                string ip = ReadString(respPay, ref pos);
+                if (found != 1 || ip != "127.0.0.1")
+                {
+                    Log($"Self-test FAILED: expected observed IP 127.0.0.1, got '{ip}'");
+                    return false;
+                }
+            }
+
+            // 4. Oversized ping header is dropped without allocating.
+            using (var dosClient = new TcpClient())
+            {
+                await dosClient.ConnectAsync(IPAddress.Loopback, port);
+                byte[] badHdr = new byte[10];
+                BinaryPrimitives.WriteUInt32LittleEndian(badHdr.AsSpan(0, 4), ProtocolMagic);
+                badHdr[4] = PacketPing;
+                badHdr[5] = 0;
+                BinaryPrimitives.WriteUInt32LittleEndian(badHdr.AsSpan(6, 4), 16 * 1024 * 1024);
+                await dosClient.GetStream().WriteAsync(badHdr);
+                if (!await IsClosedByServerAsync(dosClient, TimeSpan.FromSeconds(2)))
+                {
+                    Log("Self-test FAILED: oversized ping frame was not dropped");
+                    return false;
+                }
+            }
+
+            Log("Self-test verified: relayAuthKey enforcement, observed IP, and ping size cap");
+            return true;
+        }
+        finally
+        {
+            _authKey = savedKey;
+        }
     }
 }

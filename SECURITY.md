@@ -11,6 +11,8 @@ We provide security updates and patches for the following versions:
 
 We strongly recommend always running the latest stable release to receive security enhancements, crypto hardening, and critical protocol updates.
 
+Release binaries and auto-updates are verified over HTTPS with SHA-256 digests from GitHub Releases metadata; binaries are not code-signed.
+
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in CppDesk, please report it privately. Do not open public GitHub issues or post publicly on social channels.

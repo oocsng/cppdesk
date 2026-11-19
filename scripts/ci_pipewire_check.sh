@@ -5,7 +5,7 @@ set -u
 export XDG_RUNTIME_DIR="$(mktemp -d)"
 chmod 700 "$XDG_RUNTIME_DIR"
 LOGS="$(mktemp -d)"
-trap 'for f in "$LOGS"/*.log; do echo "--- $f"; tail -n 40 "$f"; done; kill $(jobs -p) 2>/dev/null' EXIT
+trap 'for f in "$LOGS"/*.log; do [ -f "$f" ] && echo "--- $f" && tail -n 40 "$f"; done; kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; rm -rf "$XDG_RUNTIME_DIR" "$LOGS"' EXIT
 
 pipewire > "$LOGS/pipewire.log" 2>&1 &
 sleep 2
