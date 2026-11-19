@@ -280,21 +280,27 @@ public:
                     delete pInfo;
                 }
             }
-        });
+        }, updateGate_);
     }
     void startUpdateDownload(const std::string& url, uint64_t, const std::string& sha256,
                              std::function<void(bool, const std::string&)> done) override {
-        wchar_t tempDir[MAX_PATH]{};
-        GetTempPathW(MAX_PATH, tempDir);
-        std::wstring targetPath = std::wstring(tempDir) + L"CppDesk_update.exe";
+        std::wstring targetPath = AutoUpdater::createStagingExePath();
+        if (targetPath.empty()) {
+            done(false, "Failed to prepare secure update staging directory");
+            return;
+        }
         wchar_t currentExe[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, currentExe, MAX_PATH);
-        std::wstring currExePath(currentExe);
+        DWORD exeLen = GetModuleFileNameW(nullptr, currentExe, MAX_PATH);
+        if (exeLen == 0 || exeLen >= MAX_PATH) {
+            done(false, "Failed to resolve current executable path");
+            return;
+        }
+        std::wstring currExePath(currentExe, exeLen);
         HWND h = w_.hwnd_;
         AutoUpdater::downloadUpdateAssetAsync(
             url, targetPath,
             [h](uint64_t downloaded, uint64_t total, double speed) {
-                if (!h) return;
+                if (!h || !IsWindow(h)) return;
                 auto* p = new UpdateProgressData{ downloaded, total, speed };
                 if (!PostMessageW(h, WM_APP_UPDATE_PROGRESS, reinterpret_cast<WPARAM>(p), 0)) {
                     delete p;
@@ -306,6 +312,7 @@ public:
                     return;
                 }
                 if (!AutoUpdater::validatePeBinary(targetPath)) {
+                    DeleteFileW(targetPath.c_str());
                     done(false, "Validation error: Corrupt PE binary");
                     return;
                 }
@@ -318,7 +325,12 @@ public:
                     done(false, "Failed to launch updater helper");
                 }
             },
-            sha256);
+            sha256,
+            updateGate_);
+    }
+    void cancelUpdates() {
+        updateGate_->invalidate();
+        AutoUpdater::cancelPendingOperations();
     }
     ui::ServiceState serviceState() const override {
         switch (WindowsServiceManager::getServiceState()) {
@@ -344,6 +356,7 @@ public:
 
 private:
     CppDeskWindow& w_;
+    std::shared_ptr<AutoUpdater::CallbackGate> updateGate_ = std::make_shared<AutoUpdater::CallbackGate>();
 };
 
 CppDeskWindow::CppDeskWindow(IdentityManager& identity, NetworkEngine& network, const std::string& autoConnectTarget)
@@ -378,6 +391,7 @@ CppDeskWindow::CppDeskWindow(IdentityManager& identity, NetworkEngine& network, 
 }
 
 CppDeskWindow::~CppDeskWindow() {
+    if (shell_) static_cast<WinShell*>(shell_.get())->cancelUpdates();
     app_.reset();
     releaseGraphics();
 }
@@ -859,6 +873,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_DESTROY:
             KillTimer(hwnd_, 1);
+            if (shell_) static_cast<WinShell*>(shell_.get())->cancelUpdates();
             app_->onWindowDestroyed();
             PostQuitMessage(0);
             return 0;
