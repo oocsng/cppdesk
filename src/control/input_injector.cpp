@@ -113,6 +113,36 @@ uint16_t InputInjector::mapVkToMacKeyCode(uint16_t vk) {
         case 0x7A: return 0x67; // F11
         case 0x7B: return 0x6F; // F12
 
+        // Punctuation & symbols (ANSI layout)
+        case 0xBA: return 0x29; // VK_OEM_1 -> kVK_ANSI_Semicolon
+        case 0xBB: return 0x18; // VK_OEM_PLUS -> kVK_ANSI_Equal
+        case 0xBC: return 0x2B; // VK_OEM_COMMA -> kVK_ANSI_Comma
+        case 0xBD: return 0x1B; // VK_OEM_MINUS -> kVK_ANSI_Minus
+        case 0xBE: return 0x2F; // VK_OEM_PERIOD -> kVK_ANSI_Period
+        case 0xBF: return 0x2C; // VK_OEM_2 -> kVK_ANSI_Slash
+        case 0xC0: return 0x32; // VK_OEM_3 -> kVK_ANSI_Grave
+        case 0xDB: return 0x21; // VK_OEM_4 -> kVK_ANSI_LeftBracket
+        case 0xDC: return 0x2A; // VK_OEM_5 -> kVK_ANSI_Backslash
+        case 0xDD: return 0x1E; // VK_OEM_6 -> kVK_ANSI_RightBracket
+        case 0xDE: return 0x27; // VK_OEM_7 -> kVK_ANSI_Quote
+
+        // Numpad
+        case 0x60: return 0x52; // VK_NUMPAD0 -> kVK_ANSI_Keypad0
+        case 0x61: return 0x53; // VK_NUMPAD1 -> kVK_ANSI_Keypad1
+        case 0x62: return 0x54; // VK_NUMPAD2 -> kVK_ANSI_Keypad2
+        case 0x63: return 0x55; // VK_NUMPAD3 -> kVK_ANSI_Keypad3
+        case 0x64: return 0x56; // VK_NUMPAD4 -> kVK_ANSI_Keypad4
+        case 0x65: return 0x57; // VK_NUMPAD5 -> kVK_ANSI_Keypad5
+        case 0x66: return 0x58; // VK_NUMPAD6 -> kVK_ANSI_Keypad6
+        case 0x67: return 0x59; // VK_NUMPAD7 -> kVK_ANSI_Keypad7
+        case 0x68: return 0x5B; // VK_NUMPAD8 -> kVK_ANSI_Keypad8
+        case 0x69: return 0x5C; // VK_NUMPAD9 -> kVK_ANSI_Keypad9
+        case 0x6A: return 0x43; // VK_MULTIPLY -> kVK_ANSI_KeypadMultiply
+        case 0x6B: return 0x45; // VK_ADD -> kVK_ANSI_KeypadPlus
+        case 0x6D: return 0x4E; // VK_SUBTRACT -> kVK_ANSI_KeypadMinus
+        case 0x6E: return 0x41; // VK_DECIMAL -> kVK_ANSI_KeypadDecimal
+        case 0x6F: return 0x4B; // VK_DIVIDE -> kVK_ANSI_KeypadDivide
+
         default: return 0xFFFF;
     }
 }
@@ -269,7 +299,7 @@ namespace {
 
 #if defined(_WIN32)
 void ensureDesktopSynced() {
-    static uint64_t lastSyncTick = 0;
+    thread_local uint64_t lastSyncTick = 0;
     uint64_t now = GetTickCount64();
     if (now - lastSyncTick > 1000) {
         lastSyncTick = now;
@@ -309,8 +339,8 @@ inline void getCachedVirtualDesktopMetrics(int& outLeft, int& outTop, int& outWi
 }
 
 void mapNormalizedToVirtualDesktop(float normX, float normY, const MonitorDesc& mon, LONG& outDx, LONG& outDy) {
-    normX = std::clamp(normX, 0.0f, 1.0f);
-    normY = std::clamp(normY, 0.0f, 1.0f);
+    normX = std::isfinite(normX) ? std::clamp(normX, 0.0f, 1.0f) : 0.0f;
+    normY = std::isfinite(normY) ? std::clamp(normY, 0.0f, 1.0f) : 0.0f;
 
     double targetX = mon.x + normX * std::max(1, mon.width - 1);
     double targetY = mon.y + normY * std::max(1, mon.height - 1);
@@ -327,6 +357,7 @@ void mapNormalizedToVirtualDesktop(float normX, float normY, const MonitorDesc& 
 
 #if defined(_WIN32)
 void InputInjector::injectMouseMove(float normX, float normY, const MonitorDesc& monitor) {
+    if (!std::isfinite(normX) || !std::isfinite(normY)) return;
     ensureDesktopSynced();
     normX = std::clamp(normX, 0.0f, 1.0f);
     normY = std::clamp(normY, 0.0f, 1.0f);
@@ -354,6 +385,7 @@ void InputInjector::injectMouseMove(float normX, float normY, const MonitorDesc&
 }
 
 void InputInjector::injectMouseButton(MouseButtonId button, bool isDown, float normX, float normY, const MonitorDesc& monitor) {
+    if (!std::isfinite(normX) || !std::isfinite(normY)) return;
     ensureDesktopSynced();
     normX = std::clamp(normX, 0.0f, 1.0f);
     normY = std::clamp(normY, 0.0f, 1.0f);
@@ -490,14 +522,18 @@ bool InputInjector::syncToInputDesktop() {
         return true;
     }
 
-    static std::mutex s_deskMtx;
-    std::lock_guard<std::mutex> lk(s_deskMtx);
-    static HDESK s_prevSwitchedDesk = nullptr;
-    if (SetThreadDesktop(hInputDesk)) {
-        if (s_prevSwitchedDesk) {
-            CloseDesktop(s_prevSwitchedDesk);
+    struct ThreadDeskGuard {
+        HDESK desk = nullptr;
+        ~ThreadDeskGuard() {
+            if (desk) CloseDesktop(desk);
         }
-        s_prevSwitchedDesk = hInputDesk;
+    };
+    thread_local ThreadDeskGuard t_prevSwitchedDesk;
+    if (SetThreadDesktop(hInputDesk)) {
+        if (t_prevSwitchedDesk.desk) {
+            CloseDesktop(t_prevSwitchedDesk.desk);
+        }
+        t_prevSwitchedDesk.desk = hInputDesk;
         return true;
     }
 
@@ -542,10 +578,10 @@ bool InputInjector::executeSystemAction(SystemActionType action) {
             return true;
 
         case SystemActionType::ShowDesktop:
-            injectKeyEvent(VK_LWIN, 0, true, false);
+            injectKeyEvent(VK_LWIN, 0, true, true);
             injectKeyEvent('D', 0, true, false);
             injectKeyEvent('D', 0, false, false);
-            injectKeyEvent(VK_LWIN, 0, false, false);
+            injectKeyEvent(VK_LWIN, 0, false, true);
             return true;
 
         case SystemActionType::LockWorkstation:
@@ -553,7 +589,7 @@ bool InputInjector::executeSystemAction(SystemActionType action) {
 
         case SystemActionType::SendCtrlAltDel: {
             typedef VOID(WINAPI* SendSASFunc)(BOOL AsUser);
-            HMODULE hSas = LoadLibraryA("sas.dll");
+            HMODULE hSas = LoadLibraryExW(L"sas.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
             bool sasSucceeded = false;
             if (hSas) {
                 auto pFunc = GetProcAddress(hSas, "SendSAS");
@@ -596,6 +632,7 @@ namespace {
 // All injection state: events arrive from the session thread, the modifiers a peer holds, and the pointer.
 std::mutex g_macInputMutex;
 MacMouseTracker g_macMouse;
+uint8_t g_macHeldModKeys = 0;
 CGEventFlags g_macHeldFlags = 0;
 
 uint64_t macNowMs() {
@@ -624,14 +661,27 @@ CGPoint macTargetPoint(float nx, float ny, const MonitorDesc& monitor) {
     return CGPointMake(p.x, p.y);
 }
 
-CGEventFlags macFlagForKeyCode(uint16_t macKey) {
+uint8_t macModBitForKeyCode(uint16_t macKey) {
     switch (macKey) {
-        case 0x37: case 0x36: return kCGEventFlagMaskCommand;
-        case 0x38: case 0x3C: return kCGEventFlagMaskShift;
-        case 0x3A: case 0x3D: return kCGEventFlagMaskAlternate;
-        case 0x3B: case 0x3E: return kCGEventFlagMaskControl;
+        case 0x37: return 1u << 0; // Left Command
+        case 0x36: return 1u << 1; // Right Command
+        case 0x38: return 1u << 2; // Left Shift
+        case 0x3C: return 1u << 3; // Right Shift
+        case 0x3A: return 1u << 4; // Left Option
+        case 0x3D: return 1u << 5; // Right Option
+        case 0x3B: return 1u << 6; // Left Control
+        case 0x3E: return 1u << 7; // Right Control
         default: return 0;
     }
+}
+
+CGEventFlags macFlagsFromModKeys(uint8_t bits) {
+    CGEventFlags flags = 0;
+    if (bits & ((1u << 0) | (1u << 1))) flags |= kCGEventFlagMaskCommand;
+    if (bits & ((1u << 2) | (1u << 3))) flags |= kCGEventFlagMaskShift;
+    if (bits & ((1u << 4) | (1u << 5))) flags |= kCGEventFlagMaskAlternate;
+    if (bits & ((1u << 6) | (1u << 7))) flags |= kCGEventFlagMaskControl;
+    return flags;
 }
 
 CGEventType macMouseType(const MacMouseEvent& ev) {
@@ -660,12 +710,14 @@ void macPostMouse(const MacMouseEvent& ev, CGPoint pt) {
 } // namespace
 
 void InputInjector::injectMouseMove(float normX, float normY, const MonitorDesc& monitor) {
+    if (!std::isfinite(normX) || !std::isfinite(normY)) return;
     const CGPoint pt = macTargetPoint(normX, normY, monitor);
     std::lock_guard<std::mutex> lock(g_macInputMutex);
     macPostMouse(g_macMouse.onMove(), pt);
 }
 
 void InputInjector::injectMouseButton(MouseButtonId button, bool isDown, float normX, float normY, const MonitorDesc& monitor) {
+    if (!std::isfinite(normX) || !std::isfinite(normY)) return;
     const CGPoint pt = macTargetPoint(normX, normY, monitor);
     std::lock_guard<std::mutex> lock(g_macInputMutex);
     macPostMouse(g_macMouse.onButton(button, isDown, static_cast<float>(pt.x), static_cast<float>(pt.y), macNowMs()), pt);
@@ -693,8 +745,12 @@ void InputInjector::injectKeyEvent(uint16_t vkCode, uint16_t scanCode, bool isDo
     const uint16_t macKey = macHostKeyCodeForVk(vkCode);
     if (macKey == 0xFFFF) return;
     std::lock_guard<std::mutex> lock(g_macInputMutex);
-    const CGEventFlags flag = macFlagForKeyCode(macKey);
-    if (flag) g_macHeldFlags = isDown ? (g_macHeldFlags | flag) : (g_macHeldFlags & ~flag);
+    const uint8_t bit = macModBitForKeyCode(macKey);
+    if (bit) {
+        g_macHeldModKeys = isDown ? static_cast<uint8_t>(g_macHeldModKeys | bit)
+                                  : static_cast<uint8_t>(g_macHeldModKeys & ~bit);
+        g_macHeldFlags = macFlagsFromModKeys(g_macHeldModKeys);
+    }
     CGEventRef ev = CGEventCreateKeyboardEvent(nullptr, static_cast<CGKeyCode>(macKey), isDown);
     if (ev) {
         CGEventSetFlags(ev, g_macHeldFlags);
@@ -717,6 +773,7 @@ void InputInjector::releaseAllModifiers() {
         if (g_macMouse.isDown(b.button)) macPostMouse(g_macMouse.onButton(b.id, false, 0.0f, 0.0f, macNowMs()), pt);
     }
     g_macMouse.reset();
+    g_macHeldModKeys = 0;
     g_macHeldFlags = 0;
     const CGKeyCode mods[] = { 0x38, 0x3C, 0x3B, 0x3E, 0x3A, 0x3D, 0x37, 0x36 };   // Shift, Control, Option, Command
     for (CGKeyCode m : mods) {
@@ -758,10 +815,10 @@ bool InputInjector::executeSystemAction(SystemActionType) {
 namespace {
 #if __has_include(<X11/Xlib.h>)
 static std::mutex s_x11InputMutex;
-Display* getCachedX11Display() {
+// Caller must hold s_x11InputMutex.
+Display* getCachedX11DisplayLocked() {
     static Display* s_dpy = nullptr;
     static bool s_inited = false;
-    std::lock_guard<std::mutex> lk(s_x11InputMutex);
     if (!s_inited) {
         ensureXlibThreads();
         s_inited = true;
@@ -788,10 +845,12 @@ bool viaWayland(Send&& send) {
 } // namespace
 
 void InputInjector::injectMouseMove(float normX, float normY, const MonitorDesc& monitor) {
+    if (!std::isfinite(normX) || !std::isfinite(normY)) return;
     if (viaWayland([&](wayland::WaylandShare& s) { s.pointerMove(normX, normY); })) return;
     ++s_x11InputCalls;
 #if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
-    Display* dpy = getCachedX11Display();
+    std::lock_guard<std::mutex> lk(s_x11InputMutex);
+    Display* dpy = getCachedX11DisplayLocked();
     if (!dpy) return;
 
     normX = std::clamp(normX, 0.0f, 1.0f);
@@ -807,10 +866,12 @@ void InputInjector::injectMouseMove(float normX, float normY, const MonitorDesc&
 }
 
 void InputInjector::injectMouseButton(MouseButtonId button, bool isDown, float normX, float normY, const MonitorDesc& monitor) {
+    if (!std::isfinite(normX) || !std::isfinite(normY)) return;
     if (viaWayland([&](wayland::WaylandShare& s) { s.pointerButton(button, isDown, normX, normY); })) return;
     ++s_x11InputCalls;
 #if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
-    Display* dpy = getCachedX11Display();
+    std::lock_guard<std::mutex> lk(s_x11InputMutex);
+    Display* dpy = getCachedX11DisplayLocked();
     if (!dpy) return;
 
     normX = std::clamp(normX, 0.0f, 1.0f);
@@ -835,7 +896,8 @@ void InputInjector::injectMouseWheel(int32_t verticalDelta, int32_t horizontalDe
     if (viaWayland([&](wayland::WaylandShare& s) { s.wheel(verticalDelta, horizontalDelta); })) return;
     ++s_x11InputCalls;
 #if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
-    Display* dpy = getCachedX11Display();
+    std::lock_guard<std::mutex> lk(s_x11InputMutex);
+    Display* dpy = getCachedX11DisplayLocked();
     if (!dpy) return;
 
     if (verticalDelta > 0) {
@@ -865,7 +927,8 @@ void InputInjector::injectKeyEvent(uint16_t vkCode, uint16_t scanCode, bool isDo
     if (viaWayland([&](wayland::WaylandShare& s) { s.key(vkCode, isDown); })) return;
     ++s_x11InputCalls;
 #if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
-    Display* dpy = getCachedX11Display();
+    std::lock_guard<std::mutex> lk(s_x11InputMutex);
+    Display* dpy = getCachedX11DisplayLocked();
     if (!dpy) return;
 
     uint32_t sym = mapVkToX11KeySym(vkCode);
@@ -885,7 +948,8 @@ void InputInjector::releaseAllModifiers() {
     if (viaWayland([](wayland::WaylandShare& s) { s.releaseAll(); })) return;
     ++s_x11InputCalls;
 #if __has_include(<X11/Xlib.h>) && __has_include(<X11/extensions/XTest.h>)
-    Display* dpy = getCachedX11Display();
+    std::lock_guard<std::mutex> lk(s_x11InputMutex);
+    Display* dpy = getCachedX11DisplayLocked();
     if (!dpy) return;
 
     uint32_t mods[] = { 0xFFE1, 0xFFE2, 0xFFE3, 0xFFE4, 0xFFE9, 0xFFEA, 0xFFEB, 0xFFEC };
