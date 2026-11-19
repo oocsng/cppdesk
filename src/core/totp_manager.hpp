@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -22,12 +23,12 @@ public:
     void setSecretRaw(const uint8_t* key, size_t keyLen, TotpAlgorithm alg = TotpAlgorithm::Sha1);
     void clear();
 
-    std::string getSecretBase32() const { return secretBase32_; }
-    TotpAlgorithm getAlgorithm() const { return algorithm_; }
-    void setAlgorithm(TotpAlgorithm alg) { algorithm_ = alg; }
+    std::string getSecretBase32() const { std::lock_guard<std::mutex> lk(mutex_); return secretBase32_; }
+    TotpAlgorithm getAlgorithm() const { std::lock_guard<std::mutex> lk(mutex_); return algorithm_; }
+    void setAlgorithm(TotpAlgorithm alg) { std::lock_guard<std::mutex> lk(mutex_); algorithm_ = alg; }
 
     // Generates a new cryptographically random 20-byte (160-bit) secret
-    void generateNewSecret(TotpAlgorithm alg = TotpAlgorithm::Sha1);
+    bool generateNewSecret(TotpAlgorithm alg = TotpAlgorithm::Sha1);
 
     // Code generation
     // If unixTime == 0, current system time std::time(nullptr) is used.
@@ -63,10 +64,13 @@ public:
         size_t dataLen,
         std::vector<uint8_t>& digestOut);
 
-    uint64_t lastConsumedStep() const { return lastConsumedStep_; }
-    void resetLastConsumedStep() { lastConsumedStep_ = 0; }
+    uint64_t lastConsumedStep() const { std::lock_guard<std::mutex> lk(mutex_); return lastConsumedStep_; }
+    void resetLastConsumedStep() { std::lock_guard<std::mutex> lk(mutex_); lastConsumedStep_ = 0; }
 
 private:
+    void clearLocked();
+
+    mutable std::mutex   mutex_;
     std::vector<uint8_t> secretBytes_;
     std::string          secretBase32_;
     TotpAlgorithm        algorithm_ = TotpAlgorithm::Sha1;
