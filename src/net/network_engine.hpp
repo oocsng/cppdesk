@@ -186,38 +186,59 @@ public:
 
 private:
     void acceptLoop();
-    void handleClientSocket(uintptr_t sock, std::string peerIp);
+    void handleClientSocket(uintptr_t sock, std::string peerIp, bool& releaseLimiter);
+    void reapFinishedWorkers();
+
+    struct HostControl {
+        uintptr_t  sock = ~uintptr_t(0);
+        std::mutex writeMutex;
+        bool       closed = false;
+    };
 
     struct RegisteredHost {
-        uint64_t    deskId = 0;
-        std::string hostname;
-        std::string ip;
-        uint16_t    tcpPort = 0;
-        uintptr_t   controlSock = ~uintptr_t(0);
-        uint64_t    lastSeenMs = 0;
+        uint64_t                     deskId = 0;
+        std::string                  hostname;
+        std::string                  ip;
+        uint16_t                     tcpPort = 0;
+        std::shared_ptr<HostControl> ctrl;
+        uint64_t                     lastSeenMs = 0;
     };
 
     struct PendingBridge {
-        uint64_t  token = 0;
+        uint64_t    token = 0;
+        uintptr_t   viewerSock = ~uintptr_t(0);
+        uintptr_t   hostSock = ~uintptr_t(0);
+        std::string hostPeerIp;
+        bool        ready = false;
+    };
+
+    struct ActiveBridge {
         uintptr_t viewerSock = ~uintptr_t(0);
         uintptr_t hostSock = ~uintptr_t(0);
-        bool      ready = false;
+    };
+
+    struct WorkerEntry {
+        std::thread                     thread;
+        std::shared_ptr<std::atomic<bool>> done;
     };
 
     std::atomic<bool>           running_{false};
     uint16_t                    port_ = DEFAULT_RELAY_PORT;
-    uintptr_t                   listenSock_ = ~uintptr_t(0);
+    std::atomic<uintptr_t>      listenSock_{~uintptr_t(0)};
     std::thread                 acceptThread_;
+
+    std::mutex                  workersMutex_;
+    std::vector<WorkerEntry>    workerThreads_;
 
     mutable std::mutex          mutex_;
     std::condition_variable     bridgeCv_;
     std::vector<RegisteredHost> hosts_;
     std::vector<PendingBridge>  bridges_;
+    std::vector<ActiveBridge>   activeBridges_;
     relayowner::OwnerRegistry   owners_;   // desk IDs whose owner key this relay holds
 
     // One thread per connection: cap them so a single address cannot exhaust the host.
     // Each registered host holds one connection and each bridged session two.
-    // Shared with the detached connection threads, which can outlive this object.
     std::shared_ptr<ConnectionLimiter> connLimiter_ = std::make_shared<ConnectionLimiter>(512, 64);
 };
 

@@ -98,6 +98,36 @@ void setTcpNoDelay(socket_t s) {
     NetworkEngine::setTcpNoDelay(s);
 }
 
+#if defined(_WIN32)
+using pollfd_t = WSAPOLLFD;
+inline int socketPoll(pollfd_t* fds, size_t count, int timeoutMs) {
+    if (!fds || count == 0) return 0;
+    return WSAPoll(fds, static_cast<ULONG>(count), timeoutMs);
+}
+#else
+using pollfd_t = struct pollfd;
+inline int socketPoll(pollfd_t* fds, size_t count, int timeoutMs) {
+    if (!fds || count == 0) return 0;
+    int rc;
+    do {
+        rc = poll(fds, static_cast<nfds_t>(count), timeoutMs);
+    } while (rc < 0 && errno == EINTR);
+    return rc;
+}
+#endif
+
+void setSocketSendTimeoutMs(socket_t s, int timeoutMs) {
+#if defined(_WIN32)
+    DWORD dwTimeout = static_cast<DWORD>(timeoutMs);
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&dwTimeout), sizeof(dwTimeout));
+#else
+    struct timeval tv;
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
 void setSocketTimeoutMs(socket_t s, int timeoutMs) {
 #if defined(_WIN32)
     DWORD dwTimeout = static_cast<DWORD>(timeoutMs);
@@ -275,8 +305,8 @@ void spliceSockets(socket_t a, socket_t b) {
         if (n <= 0) break;
         if (!sendAllBytes(b, buf, static_cast<size_t>(n))) break;
     }
-    socket_close(a);
-    socket_close(b);
+    socket_shutdown(a);
+    socket_shutdown(b);
 }
 
 void executeRemoteSystemAction(SystemActionType action) {
@@ -587,35 +617,75 @@ bool RelayServer::start(uint16_t port) {
     }
 
     port_ = boundPortOf(ls, port);
-    listenSock_ = fromWinSock(ls);
+    listenSock_.store(fromWinSock(ls));
     running_.store(true);
     acceptThread_ = std::thread(&RelayServer::acceptLoop, this);
     return true;
 }
 
+void RelayServer::reapFinishedWorkers() {
+    std::vector<std::thread> finished;
+    {
+        std::lock_guard<std::mutex> lk(workersMutex_);
+        for (auto it = workerThreads_.begin(); it != workerThreads_.end(); ) {
+            if (it->done && it->done->load()) {
+                finished.push_back(std::move(it->thread));
+                it = workerThreads_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto& t : finished) {
+        if (t.joinable()) {
+            try { t.join(); } catch (...) {}
+        }
+    }
+}
+
 void RelayServer::stop() {
     if (!running_.exchange(false)) return;
-    closeWinSock(listenSock_);
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        // Only wake each host thread: it closes its own socket when it leaves, and a second close here could land on a
-        // handle another connection has been given since.
-        for (auto& h : hosts_) {
-            socket_shutdown(toWinSock(h.controlSock));
-        }
-        hosts_.clear();
-        for (auto& b : bridges_) {
-            closeWinSock(b.viewerSock);
-            closeWinSock(b.hostSock);
-        }
-        bridges_.clear();
-    }
-    bridgeCv_.notify_all();
+    socket_shutdown(toWinSock(listenSock_.load()));
     try {
         if (acceptThread_.joinable()) {
             acceptThread_.join();
         }
     } catch (...) {}
+    {
+        uintptr_t ls = listenSock_.exchange(~uintptr_t(0));
+        closeWinSock(ls);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Only wake each worker thread: it closes its own socket when it leaves, avoiding double-close races.
+        for (auto& h : hosts_) {
+            if (h.ctrl) socket_shutdown(toWinSock(h.ctrl->sock));
+        }
+        hosts_.clear();
+        for (auto& b : bridges_) {
+            socket_shutdown(toWinSock(b.viewerSock));
+            socket_shutdown(toWinSock(b.hostSock));
+        }
+        for (auto& ab : activeBridges_) {
+            socket_shutdown(toWinSock(ab.viewerSock));
+            socket_shutdown(toWinSock(ab.hostSock));
+        }
+    }
+    bridgeCv_.notify_all();
+
+    std::vector<std::thread> remaining;
+    {
+        std::lock_guard<std::mutex> lk(workersMutex_);
+        for (auto& w : workerThreads_) {
+            remaining.push_back(std::move(w.thread));
+        }
+        workerThreads_.clear();
+    }
+    for (auto& t : remaining) {
+        if (t.joinable()) {
+            try { t.join(); } catch (...) {}
+        }
+    }
 }
 
 size_t RelayServer::registeredPeerCount() const {
@@ -625,8 +695,16 @@ size_t RelayServer::registeredPeerCount() const {
 
 void RelayServer::acceptLoop() {
     while (running_.load()) {
-        SOCKET ls = toWinSock(listenSock_);
+        reapFinishedWorkers();
+        SOCKET ls = toWinSock(listenSock_.load());
         if (ls == INVALID_SOCKET) break;
+
+        pollfd_t pfd{};
+        pfd.fd = ls;
+        pfd.events = POLLIN;
+        int pr = socketPoll(&pfd, 1, 150);
+        if (pr <= 0) continue;
+        if (!running_.load()) break;
 
         sockaddr_in clientAddr{};
         socklen_t addrLen = sizeof(clientAddr);
@@ -646,14 +724,29 @@ void RelayServer::acceptLoop() {
             closeWinSock(rejected);
             continue;
         }
-        std::thread([this, limiter = connLimiter_, sock = fromWinSock(cs), peerIp]() {
-            handleClientSocket(sock, peerIp);
-            limiter->release(peerIp);
-        }).detach();
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        std::lock_guard<std::mutex> lk(workersMutex_);
+        if (!running_.load()) {
+            connLimiter_->release(peerIp);
+            uintptr_t rejected = fromWinSock(cs);
+            closeWinSock(rejected);
+            break;
+        }
+        workerThreads_.push_back({
+            std::thread([this, limiter = connLimiter_, sock = fromWinSock(cs), peerIp, done]() {
+                bool releaseLimiter = true;
+                handleClientSocket(sock, peerIp, releaseLimiter);
+                if (releaseLimiter) {
+                    limiter->release(peerIp);
+                }
+                done->store(true);
+            }),
+            done
+        });
     }
 }
 
-void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
+void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp, bool& releaseLimiter) {
     FrameHeader hdr{};
     std::vector<uint8_t> payload;
 
@@ -673,6 +766,9 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
     PacketType pt = static_cast<PacketType>(hdr.type);
 
     if (pt == PacketType::RELAY_REGISTER) {
+        auto ctrl = std::make_shared<HostControl>();
+        ctrl->sock = sock;
+        bool registered = false;
         try {
             ByteReader r(payload);
             uint64_t deskId = r.readU64();
@@ -688,8 +784,11 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
                 ByteWriter aw;
                 aw.writeU8(accepted);
                 FrameHeader ackHdr{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::RELAY_REGISTER_ACK), 0, static_cast<uint32_t>(aw.buffer().size()) };
-                sendAllBytes(toWinSock(sock), &ackHdr, sizeof(ackHdr));
-                sendAllBytes(toWinSock(sock), aw.buffer().data(), aw.buffer().size());
+                std::lock_guard<std::mutex> wlk(ctrl->writeMutex);
+                if (!ctrl->closed) {
+                    sendAllBytes(toWinSock(ctrl->sock), &ackHdr, sizeof(ackHdr));
+                    sendAllBytes(toWinSock(ctrl->sock), aw.buffer().data(), aw.buffer().size());
+                }
             };
 
             // An ID that has an owner is only ever taken over by a host that proves it.
@@ -733,7 +832,7 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
                         if (h.deskId == deskId) {
                             // Wake the old registration's thread but leave the close to it: closing here too would hit
                             // whatever connection has reused that handle number by the time the thread wakes.
-                            socket_shutdown(toWinSock(h.controlSock));
+                            if (h.ctrl) socket_shutdown(toWinSock(h.ctrl->sock));
                             return true;
                         }
                         return false;
@@ -745,9 +844,10 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
                 rh.hostname = hostname;
                 rh.ip = effectiveIp;
                 rh.tcpPort = tcpPort;
-                rh.controlSock = sock;
+                rh.ctrl = ctrl;
                 rh.lastSeenMs = nowTickMs();
-                hosts_.push_back(rh);
+                hosts_.push_back(std::move(rh));
+                registered = true;
             }
 
             sendAck(1);
@@ -755,7 +855,9 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
             setSocketTimeoutMs(toWinSock(sock), 30000);
             while (running_.load()) {
                 FrameHeader chdr{};
-                if (!recvAllBytes(toWinSock(sock), &chdr, sizeof(chdr)) || chdr.magic != PROTOCOL_MAGIC) {
+                if (!recvAllBytes(toWinSock(sock), &chdr, sizeof(chdr)) ||
+                    chdr.magic != PROTOCOL_MAGIC ||
+                    chdr.payloadSize > 65536) {
                     break;
                 }
                 std::vector<uint8_t> cpay(chdr.payloadSize);
@@ -765,20 +867,31 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
                 if (ownerCapable) owners_.touch(deskId, nowTickMs());
                 if (static_cast<PacketType>(chdr.type) == PacketType::PING) {
                     FrameHeader pong{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::PONG), 0, 0 };
-                    sendAllBytes(toWinSock(sock), &pong, sizeof(pong));
+                    std::lock_guard<std::mutex> wlk(ctrl->writeMutex);
+                    if (!ctrl->closed) {
+                        sendAllBytes(toWinSock(ctrl->sock), &pong, sizeof(pong));
+                    }
                 }
             }
 
             if (ownerCapable) owners_.touch(deskId, nowTickMs());
+        } catch (...) {}
+
+        if (registered) {
             std::lock_guard<std::mutex> lock(mutex_);
             hosts_.erase(
                 std::remove_if(hosts_.begin(), hosts_.end(), [&](const RegisteredHost& h) {
-                    return h.controlSock == sock;
+                    return h.ctrl == ctrl;
                 }),
                 hosts_.end()
             );
-        } catch (...) {}
-        closeWinSock(sock);
+        }
+        socket_shutdown(toWinSock(ctrl->sock));
+        {
+            std::lock_guard<std::mutex> wlk(ctrl->writeMutex);
+            ctrl->closed = true;
+            closeWinSock(ctrl->sock);
+        }
         return;
     }
 
@@ -819,32 +932,45 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
     }
 
     if (pt == PacketType::RELAY_CONNECT_REQ) {
+        uintptr_t matchedHostSock = ~uintptr_t(0);
+        std::string matchedHostPeerIp;
+        uint64_t token = 0;
+        bool bridgeInserted = false;
+        auto releaseMatchedHost = [&]() {
+            if (matchedHostSock != ~uintptr_t(0)) {
+                closeWinSock(matchedHostSock);
+            }
+            if (!matchedHostPeerIp.empty()) {
+                connLimiter_->release(matchedHostPeerIp);
+                matchedHostPeerIp.clear();
+            }
+        };
         try {
             ByteReader r(payload);
             uint64_t targetId = r.readU64();
 
-            uintptr_t hostCtrl = ~uintptr_t(0);
-            uint64_t token = 0;
+            std::shared_ptr<HostControl> hostCtrl;
             CryptoUtils::randomBytes(&token, sizeof(token));
 
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 for (const auto& h : hosts_) {
-                    if (h.deskId == targetId) {
-                        hostCtrl = h.controlSock;
+                    if (h.deskId == targetId && h.ctrl) {
+                        hostCtrl = h.ctrl;
                         break;
                     }
                 }
-                if (hostCtrl != ~uintptr_t(0)) {
+                if (hostCtrl) {
                     PendingBridge pb;
                     pb.token = token;
                     pb.viewerSock = sock;
                     pb.ready = false;
-                    bridges_.push_back(pb);
+                    bridges_.push_back(std::move(pb));
+                    bridgeInserted = true;
                 }
             }
 
-            if (hostCtrl == ~uintptr_t(0)) {
+            if (!hostCtrl) {
                 ByteWriter w;
                 w.writeU8(0);
                 FrameHeader rh{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::RELAY_BRIDGE_READY), 0, static_cast<uint32_t>(w.buffer().size()) };
@@ -854,13 +980,17 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
                 return;
             }
 
-            ByteWriter reqW;
-            reqW.writeU64(token);
-            FrameHeader reqH{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::RELAY_INCOMING_REQ), 0, static_cast<uint32_t>(reqW.buffer().size()) };
-            sendAllBytes(toWinSock(hostCtrl), &reqH, sizeof(reqH));
-            sendAllBytes(toWinSock(hostCtrl), reqW.buffer().data(), reqW.buffer().size());
+            {
+                ByteWriter reqW;
+                reqW.writeU64(token);
+                FrameHeader reqH{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::RELAY_INCOMING_REQ), 0, static_cast<uint32_t>(reqW.buffer().size()) };
+                std::lock_guard<std::mutex> wlk(hostCtrl->writeMutex);
+                if (!hostCtrl->closed) {
+                    sendAllBytes(toWinSock(hostCtrl->sock), &reqH, sizeof(reqH));
+                    sendAllBytes(toWinSock(hostCtrl->sock), reqW.buffer().data(), reqW.buffer().size());
+                }
+            }
 
-            uintptr_t matchedHostSock = ~uintptr_t(0);
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 bridgeCv_.wait_for(lock, std::chrono::milliseconds(3500), [&]() {
@@ -871,19 +1001,26 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
                 });
                 for (auto it = bridges_.begin(); it != bridges_.end(); ++it) {
                     if (it->token == token) {
-                        if (it->ready) matchedHostSock = it->hostSock;
+                        if (it->ready) {
+                            matchedHostSock = it->hostSock;
+                            matchedHostPeerIp = std::move(it->hostPeerIp);
+                        }
                         bridges_.erase(it);
+                        bridgeInserted = false;
                         break;
                     }
                 }
             }
 
-            if (matchedHostSock == ~uintptr_t(0)) {
-                ByteWriter w;
-                w.writeU8(0);
-                FrameHeader rh{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::RELAY_BRIDGE_READY), 0, static_cast<uint32_t>(w.buffer().size()) };
-                sendAllBytes(toWinSock(sock), &rh, sizeof(rh));
-                sendAllBytes(toWinSock(sock), w.buffer().data(), w.buffer().size());
+            if (matchedHostSock == ~uintptr_t(0) || !running_.load()) {
+                if (running_.load()) {
+                    ByteWriter w;
+                    w.writeU8(0);
+                    FrameHeader rh{ PROTOCOL_MAGIC, static_cast<uint8_t>(PacketType::RELAY_BRIDGE_READY), 0, static_cast<uint32_t>(w.buffer().size()) };
+                    sendAllBytes(toWinSock(sock), &rh, sizeof(rh));
+                    sendAllBytes(toWinSock(sock), w.buffer().data(), w.buffer().size());
+                }
+                releaseMatchedHost();
                 closeWinSock(sock);
                 return;
             }
@@ -897,14 +1034,43 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
             sendAllBytes(toWinSock(sock), &rh, sizeof(rh));
             sendAllBytes(toWinSock(sock), w.buffer().data(), w.buffer().size());
 
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                activeBridges_.push_back({ sock, matchedHostSock });
+            }
+
             std::thread t(spliceSockets, toWinSock(sock), toWinSock(matchedHostSock));
             spliceSockets(toWinSock(matchedHostSock), toWinSock(sock));
             if (t.joinable()) t.join();
 
-            closeWinSock(matchedHostSock);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                activeBridges_.erase(
+                    std::remove_if(activeBridges_.begin(), activeBridges_.end(), [&](const ActiveBridge& ab) {
+                        return ab.viewerSock == sock && ab.hostSock == matchedHostSock;
+                    }),
+                    activeBridges_.end()
+                );
+            }
+
+            releaseMatchedHost();
             closeWinSock(sock);
             return;
         } catch (...) {
+            if (bridgeInserted) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (auto it = bridges_.begin(); it != bridges_.end(); ++it) {
+                    if (it->token == token) {
+                        if (it->ready) {
+                            matchedHostSock = it->hostSock;
+                            matchedHostPeerIp = std::move(it->hostPeerIp);
+                        }
+                        bridges_.erase(it);
+                        break;
+                    }
+                }
+            }
+            releaseMatchedHost();
             closeWinSock(sock);
             return;
         }
@@ -920,6 +1086,7 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
                 for (auto& b : bridges_) {
                     if (b.token == token && !b.ready) {
                         b.hostSock = sock;
+                        b.hostPeerIp = peerIp;
                         b.ready = true;
                         matched = true;
                         break;
@@ -927,6 +1094,8 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp) {
                 }
             }
             if (matched) {
+                // Lease now belongs to the RELAY_CONNECT_REQ thread for the bridged socket's lifetime.
+                releaseLimiter = false;
                 bridgeCv_.notify_all();
                 return;
             }
