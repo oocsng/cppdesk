@@ -4648,39 +4648,48 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             break;
                         }
                         case PacketType::FILE_OFFER: {
-                            uint32_t tid = r.readU32();
-                            uint64_t fsz = r.readU64();
-                            std::string fname = r.readString();
-                            FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads;
-                            float dropNx = 0.0f, dropNy = 0.0f;
-                            if (r.hasRemaining(1)) {
-                                targetHint = static_cast<FileOfferTarget>(r.readU8());
+                            // Viewer-only (Fleet) engines never accept unsolicited host file drops, and
+                            // interactive viewers always save into the sandboxed downloads directory (never Desktop).
+                            if (!viewerOnly_.load()) {
+                                uint32_t tid = r.readU32();
+                                uint64_t fsz = r.readU64();
+                                std::string fname = r.readString();
+                                float dropNx = 0.0f, dropNy = 0.0f;
+                                if (r.hasRemaining(1)) {
+                                    (void)r.readU8(); // ignore remote targetHint; never write to viewer Desktop
+                                }
+                                if (r.hasRemaining(8)) {
+                                    dropNx = r.readF32();
+                                    dropNy = r.readF32();
+                                }
+                                fileManager_.handleFileOffer(tid, fsz, fname, FileOfferTarget::DefaultDownloads, dropNx, dropNy);
                             }
-                            if (r.hasRemaining(8)) {
-                                dropNx = r.readF32();
-                                dropNy = r.readF32();
-                            }
-                            fileManager_.handleFileOffer(tid, fsz, fname, targetHint, dropNx, dropNy);
                             break;
                         }
                         case PacketType::FILE_CHUNK: {
-                            uint32_t tid = r.readU32();
-                            uint64_t off = r.readU64();
-                            uint32_t clen = r.readU32();
-                            if (r.hasRemaining(clen)) {
-                                fileManager_.handleFileChunk(tid, off, r.currentPtr(), clen);
+                            if (!viewerOnly_.load()) {
+                                uint32_t tid = r.readU32();
+                                uint64_t off = r.readU64();
+                                uint32_t clen = r.readU32();
+                                if (r.hasRemaining(clen)) {
+                                    fileManager_.handleFileChunk(tid, off, r.currentPtr(), clen);
+                                }
                             }
                             break;
                         }
                         case PacketType::FILE_COMPLETE: {
-                            uint32_t tid = r.readU32();
-                            std::string sha = r.readString();
-                            fileManager_.handleFileComplete(tid, sha);
+                            if (!viewerOnly_.load()) {
+                                uint32_t tid = r.readU32();
+                                std::string sha = r.readString();
+                                fileManager_.handleFileComplete(tid, sha);
+                            }
                             break;
                         }
                         case PacketType::FILE_CANCEL: {
-                            uint32_t tid = r.readU32();
-                            fileManager_.handleFileCancel(tid);
+                            if (!viewerOnly_.load()) {
+                                uint32_t tid = r.readU32();
+                                fileManager_.handleFileCancel(tid);
+                            }
                             break;
                         }
                         case PacketType::CHAT_MESSAGE: {

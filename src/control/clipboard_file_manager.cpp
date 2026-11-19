@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include "mac_clipboard.hpp"
 #else
+#include <openssl/evp.h>
 #include <unistd.h>
 #include <cstdlib>
 #include "x11_clipboard.hpp"
@@ -23,6 +24,8 @@
 
 #include <filesystem>
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstring>
 #include <chrono>
 #include <cmath>
@@ -48,6 +51,26 @@ std::string sanitizeFilename(const std::string& rawName) {
             c == '/' || c == '\\' || c == '|' || c == '?' || c == '*' ||
             static_cast<unsigned char>(c) < 32) {
             c = '_';
+        }
+    }
+    while (!base.empty() && (base.back() == ' ' || base.back() == '.')) {
+        base.pop_back();
+    }
+    if (base.empty() || base == "." || base == "..") base = "received_file.bin";
+
+    std::string stemUpper = base.substr(0, base.find('.'));
+    for (char& c : stemUpper) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    static const char* kReserved[] = {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+    };
+    for (const char* r : kReserved) {
+        if (stemUpper == r) {
+            base = "_" + base;
+            break;
         }
     }
     return base;
@@ -162,21 +185,40 @@ struct FileTransferManager::IncrementalSha256 {
 };
 #else
 struct FileTransferManager::IncrementalSha256 {
-    std::vector<uint8_t> buffer_;
+    EVP_MD_CTX* ctx_ = nullptr;
+    bool        valid = false;
 
-    IncrementalSha256() = default;
-    ~IncrementalSha256() = default;
+    IncrementalSha256() {
+        ctx_ = EVP_MD_CTX_new();
+        if (ctx_ && EVP_DigestInit_ex(ctx_, EVP_sha256(), nullptr) == 1) {
+            valid = true;
+        }
+    }
+
+    ~IncrementalSha256() {
+        if (ctx_) {
+            EVP_MD_CTX_free(ctx_);
+            ctx_ = nullptr;
+        }
+    }
 
     void update(const void* data, size_t len) {
-        if (data && len > 0) {
-            const auto* p = static_cast<const uint8_t*>(data);
-            buffer_.insert(buffer_.end(), p, p + len);
+        if (valid && data && len > 0) {
+            if (EVP_DigestUpdate(ctx_, data, len) != 1) {
+                valid = false;
+            }
         }
     }
 
     std::string finishHex() {
-        auto digest = CryptoUtils::sha256(buffer_.data(), buffer_.size());
-        buffer_.clear();
+        std::array<uint8_t, 32> digest{};
+        unsigned int outLen = 0;
+        if (valid && ctx_) {
+            if (EVP_DigestFinal_ex(ctx_, digest.data(), &outLen) != 1 || outLen != digest.size()) {
+                digest.fill(0);
+            }
+            valid = false;
+        }
         return CryptoUtils::toHex(digest.data(), digest.size());
     }
 };
@@ -955,6 +997,12 @@ void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalByt
         return;
     }
 
+    for (const auto& existing : incomingStreams_) {
+        if (existing->transferId == transferId) {
+            return;
+        }
+    }
+
     if (incomingStreams_.size() >= 10) {
         FileTransferItem item;
         item.transferId = transferId;
@@ -971,12 +1019,25 @@ void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalByt
     if (std::filesystem::exists(targetPath, ec)) {
         std::string stem = targetPath.stem().string();
         std::string ext = targetPath.extension().string();
+        bool foundSlot = false;
         for (int n = 1; n < 1000; ++n) {
             auto candidate = std::filesystem::path(baseDir) / (stem + " (" + std::to_string(n) + ")" + ext);
             if (!std::filesystem::exists(candidate, ec)) {
                 targetPath = candidate;
+                foundSlot = true;
                 break;
             }
+        }
+        if (!foundSlot) {
+            FileTransferItem item;
+            item.transferId = transferId;
+            item.fileName = cleanName;
+            item.totalBytes = totalBytes;
+            item.isOutgoing = false;
+            item.status = TransferStatus::Failed;
+            item.statusText = "Rejected (Filename Collisions)";
+            items_.insert(items_.begin(), item);
+            return;
         }
     }
 
@@ -1102,6 +1163,7 @@ void FileTransferManager::handleFileComplete(uint32_t transferId, const std::str
     std::string partPath;
     std::string finalPath;
     bool foundStream = false;
+    bool sizeMatch = false;
 
     for (auto it = incomingStreams_.begin(); it != incomingStreams_.end(); ++it) {
         if ((*it)->transferId == transferId) {
@@ -1110,6 +1172,7 @@ void FileTransferManager::handleFileComplete(uint32_t transferId, const std::str
             if ((*it)->hasher) {
                 computedSha = (*it)->hasher->finishHex();
             }
+            sizeMatch = ((*it)->receivedBytes == (*it)->totalBytes);
             partPath = (*it)->partPath;
             finalPath = (*it)->savePath;
             foundStream = true;
@@ -1118,7 +1181,7 @@ void FileTransferManager::handleFileComplete(uint32_t transferId, const std::str
         }
     }
 
-    bool hashValid = !sha256Hex.empty() && (computedSha == sha256Hex);
+    bool hashValid = foundStream && sizeMatch && !sha256Hex.empty() && (computedSha == sha256Hex);
     std::error_code ec;
     if (foundStream) {
         if (hashValid) {
@@ -1145,7 +1208,7 @@ void FileTransferManager::handleFileComplete(uint32_t transferId, const std::str
                 item.statusText = "Verified (" + formatBytesSize(item.totalBytes) + ") • " + FileTransferItem::formatSpeed(item.avgSpeedBps);
             } else {
                 item.status = TransferStatus::Failed;
-                item.statusText = "Failed (SHA-256 Mismatch)";
+                item.statusText = !sizeMatch ? "Failed (Incomplete Transfer)" : "Failed (SHA-256 Mismatch)";
             }
             break;
         }
