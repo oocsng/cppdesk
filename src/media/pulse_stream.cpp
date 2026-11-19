@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -130,8 +131,15 @@ bool PulseStream::open(Dir dir, const char* device, uint32_t rate, uint8_t chann
     Api api;
     if (!loadApi(api)) return false;
 
-    const uint32_t bytesPerMs = rate * channels * 2 / 1000;
-    const uint32_t lat = static_cast<uint32_t>(std::max(1, latencyMs)) * std::max<uint32_t>(1, bytesPerMs);
+    const size_t frameBytes = static_cast<size_t>(channels) * sizeof(int16_t);
+    auto alignFrame = [frameBytes](uint64_t n) -> size_t {
+        size_t aligned = static_cast<size_t>((n / frameBytes) * frameBytes);
+        return aligned >= frameBytes ? aligned : frameBytes;
+    };
+    const uint64_t bytesPerSec = static_cast<uint64_t>(rate) * frameBytes;
+    const uint64_t lat64 = (bytesPerSec * static_cast<uint64_t>(std::max(1, latencyMs))) / 1000ULL;
+    const uint64_t maxLat32 = ((std::numeric_limits<uint32_t>::max)() / frameBytes) * frameBytes;
+    const uint32_t lat = static_cast<uint32_t>(std::min<uint64_t>(alignFrame(std::max<uint64_t>(lat64, frameBytes)), maxLat32));
     pa_sample_spec ss{};
     ss.format = PA_SAMPLE_S16LE;
     ss.rate = rate;
@@ -146,12 +154,13 @@ bool PulseStream::open(Dir dir, const char* device, uint32_t rate, uint8_t chann
                               device, dir == Dir::Record ? "record" : "playback", &ss, nullptr, &attr, &err);
     if (!h) return false;
 
-    const size_t maxBytes = static_cast<size_t>(bytesPerMs) * (dir == Dir::Record ? 1000 : 250);
-    auto st = std::make_shared<State>(std::max<size_t>(maxBytes, 4096));
+    const uint64_t keepMs = (dir == Dir::Record) ? 1000ULL : 250ULL;
+    const size_t maxBytes = alignFrame(std::max<uint64_t>((bytesPerSec * keepMs) / 1000ULL, 4096ULL));
+    auto st = std::make_shared<State>(maxBytes);
     st->api = api;
     st->h = h;
     st->dir = dir;
-    st->chunk = std::max<size_t>(static_cast<size_t>(bytesPerMs) * 20, 64);
+    st->chunk = alignFrame(std::max<uint64_t>((bytesPerSec * 20ULL) / 1000ULL, 64ULL));
     {
         std::lock_guard<std::mutex> lk(stMu_);
         st_ = st;
@@ -218,7 +227,10 @@ void PulseStream::close() {
         st_.reset();
     }
     if (!st) return;
-    st->stop = true;
+    {
+        std::lock_guard<std::mutex> lk(st->mu);
+        st->stop = true;
+    }
     st->cv.notify_all();
     if (worker_.joinable()) {
         bool finished;

@@ -310,18 +310,43 @@ bool VoiceIntercom::startCapture(AudioChunkCallback onChunk, uint32_t sampleRate
     DWORD bufBytes = (hwSampleRate_ / 50) * wfx.nBlockAlign;
     if (bufBytes == 0) bufBytes = 1920;
 
+    auto cleanupCaptureFail = [&]() {
+        if (hWaveIn_) {
+            waveInReset(hWaveIn_);
+            for (size_t j = 0; j < NUM_CAPTURE_BUFFERS; ++j) {
+                if (captureHeaders_[j].dwFlags & WHDR_PREPARED) {
+                    waveInUnprepareHeader(hWaveIn_, &captureHeaders_[j], sizeof(WAVEHDR));
+                }
+                captureHeaders_[j].dwFlags = 0;
+            }
+            waveInClose(hWaveIn_);
+            hWaveIn_ = nullptr;
+        }
+        if (hCaptureEvent_) {
+            CloseHandle(hCaptureEvent_);
+            hCaptureEvent_ = nullptr;
+        }
+        capturing_.store(false);
+    };
+
     for (size_t i = 0; i < NUM_CAPTURE_BUFFERS; ++i) {
         captureBuffers_[i].assign(bufBytes, 0);
         std::memset(&captureHeaders_[i], 0, sizeof(WAVEHDR));
         captureHeaders_[i].lpData = reinterpret_cast<LPSTR>(captureBuffers_[i].data());
         captureHeaders_[i].dwBufferLength = bufBytes;
-        waveInPrepareHeader(hWaveIn_, &captureHeaders_[i], sizeof(WAVEHDR));
-        waveInAddBuffer(hWaveIn_, &captureHeaders_[i], sizeof(WAVEHDR));
+        if (waveInPrepareHeader(hWaveIn_, &captureHeaders_[i], sizeof(WAVEHDR)) != MMSYSERR_NOERROR ||
+            waveInAddBuffer(hWaveIn_, &captureHeaders_[i], sizeof(WAVEHDR)) != MMSYSERR_NOERROR) {
+            cleanupCaptureFail();
+            return false;
+        }
     }
 
-    capturing_.store(true);
     captureStopping_.store(false);
-    waveInStart(hWaveIn_);
+    if (waveInStart(hWaveIn_) != MMSYSERR_NOERROR) {
+        cleanupCaptureFail();
+        return false;
+    }
+    capturing_.store(true);
 
     captureThread_ = std::thread(&VoiceIntercom::captureWorker, this);
     return true;
@@ -411,7 +436,21 @@ void VoiceIntercom::stopCapture() {
 
 bool VoiceIntercom::startPlayback(uint32_t sampleRate, uint8_t channels) {
     std::lock_guard<std::mutex> lk(playbackMutex_);
-    if (hWaveOut_) return true;
+    if (hWaveOut_) {
+        if (playbackSampleRate_ == sampleRate && playbackChannels_ == channels) {
+            return true;
+        }
+        waveOutReset(hWaveOut_);
+        for (size_t i = 0; i < NUM_PLAYBACK_BUFFERS; ++i) {
+            if (playbackHeaders_[i].dwFlags & WHDR_PREPARED) {
+                waveOutUnprepareHeader(hWaveOut_, &playbackHeaders_[i], sizeof(WAVEHDR));
+            }
+            playbackHeaders_[i].dwFlags = 0;
+        }
+        waveOutClose(hWaveOut_);
+        hWaveOut_ = nullptr;
+        playing_.store(false);
+    }
 
     UINT devId = WAVE_MAPPER;
     if (selectedOutputDeviceId_ >= 0) {
@@ -491,10 +530,14 @@ bool VoiceIntercom::startPlayback(uint32_t sampleRate, uint8_t channels) {
 }
 
 void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes, uint8_t sourceChannels) {
-    bytes = (bytes / sizeof(int16_t)) * sizeof(int16_t);
     if (!pcm || bytes < sizeof(int16_t) || bytes > 192000) return;
     std::lock_guard<std::mutex> lk(playbackMutex_);
-    if (!hWaveOut_) return;
+    if (!hWaveOut_ || playbackChannels_ == 0) return;
+
+    const size_t srcCh = (sourceChannels >= 1 && sourceChannels <= 2) ? sourceChannels : playbackChannels_;
+    const size_t srcFrameBytes = srcCh * sizeof(int16_t);
+    bytes = (bytes / srcFrameBytes) * srcFrameBytes;
+    if (bytes == 0) return;
 
     size_t chosenIdx = size_t(-1);
     for (size_t step = 0; step < NUM_PLAYBACK_BUFFERS; ++step) {
@@ -547,6 +590,10 @@ void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes, uint8
         sendBytes = convertedBuf.size();
     }
 
+    const size_t dstFrameBytes = static_cast<size_t>(playbackChannels_) * sizeof(int16_t);
+    sendBytes = (sendBytes / dstFrameBytes) * dstFrameBytes;
+    if (sendBytes == 0 || !sendPcm) return;
+
     WAVEHDR& hdr = playbackHeaders_[currentPlayIdx_];
     if (playbackBuffers_[currentPlayIdx_].size() < sendBytes) {
         playbackBuffers_[currentPlayIdx_].resize(sendBytes);
@@ -563,8 +610,12 @@ void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes, uint8
     hdr.dwFlags = 0;
 
     if (waveOutPrepareHeader(hWaveOut_, &hdr, sizeof(WAVEHDR)) == MMSYSERR_NOERROR) {
-        waveOutWrite(hWaveOut_, &hdr, sizeof(WAVEHDR));
-        currentPlayIdx_ = (currentPlayIdx_ + 1) % NUM_PLAYBACK_BUFFERS;
+        if (waveOutWrite(hWaveOut_, &hdr, sizeof(WAVEHDR)) == MMSYSERR_NOERROR) {
+            currentPlayIdx_ = (currentPlayIdx_ + 1) % NUM_PLAYBACK_BUFFERS;
+        } else {
+            waveOutUnprepareHeader(hWaveOut_, &hdr, sizeof(WAVEHDR));
+            hdr.dwFlags = 0;
+        }
     }
 }
 
@@ -598,7 +649,7 @@ void VoiceIntercom::MacAudioInputCallback(
     (void)packet_desc;
     auto* self = static_cast<VoiceIntercom*>(custom_data);
     if (!self || !buffer || buffer->mAudioDataByteSize == 0) {
-        if (queue && buffer) {
+        if (self && self->capturing_.load() && queue && buffer) {
             AudioQueueEnqueueBuffer(queue, buffer, 0, nullptr);
         }
         return;
@@ -647,16 +698,32 @@ bool VoiceIntercom::startCapture(AudioChunkCallback onChunk, uint32_t sampleRate
     UInt32 bufferByteSize = (sampleRate_ / 50) * format.mBytesPerFrame;
     if (bufferByteSize == 0) bufferByteSize = 1920;
 
+    auto cleanupMacCaptureFail = [&]() {
+        capturing_.store(false);
+        if (inQueue_) {
+            AudioQueueDispose(inQueue_, true);
+            inQueue_ = nullptr;
+        }
+        for (size_t j = 0; j < NUM_CAPTURE_BUFFERS; ++j) {
+            inBuffers_[j] = nullptr;
+        }
+    };
+
     for (size_t i = 0; i < NUM_CAPTURE_BUFFERS; ++i) {
         status = AudioQueueAllocateBuffer(inQueue_, bufferByteSize, &inBuffers_[i]);
-        if (status == noErr && inBuffers_[i]) {
-            AudioQueueEnqueueBuffer(inQueue_, inBuffers_[i], 0, nullptr);
+        if (status != noErr || !inBuffers_[i] ||
+            AudioQueueEnqueueBuffer(inQueue_, inBuffers_[i], 0, nullptr) != noErr) {
+            cleanupMacCaptureFail();
+            return false;
         }
     }
 
-    capturing_.store(true);
     captureStopping_.store(false);
-    AudioQueueStart(inQueue_, nullptr);
+    capturing_.store(true);
+    if (AudioQueueStart(inQueue_, nullptr) != noErr) {
+        cleanupMacCaptureFail();
+        return false;
+    }
     return true;
 }
 
@@ -694,7 +761,17 @@ void VoiceIntercom::MacAudioOutputCallback(void* custom_data, AudioQueueRef queu
 
 bool VoiceIntercom::startPlayback(uint32_t sampleRate, uint8_t channels) {
     std::lock_guard<std::mutex> lk(playbackMutex_);
-    if (outQueue_) return true;
+    if (outQueue_) {
+        if (playbackSampleRate_ == sampleRate && playbackChannels_ == channels) {
+            return true;
+        }
+        playing_.store(false);
+        AudioQueueStop(outQueue_, true);
+        AudioQueueDispose(outQueue_, true);
+        outQueue_ = nullptr;
+        for (size_t i = 0; i < NUM_PLAYBACK_BUFFERS; ++i) outBuffers_[i] = nullptr;
+        playQueue_.reset();
+    }
 
     AudioStreamBasicDescription format{};
     format.mSampleRate = static_cast<Float64>(sampleRate);
@@ -753,6 +830,7 @@ void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes, uint8
         samples.swap(adapted);
     }
     samples.resize(samples.size() / playbackChannels_ * playbackChannels_);   // whole frames only
+    if (samples.empty()) return;
     const int vol = outputVolume_.load();
     if (vol != 100) applyGain(samples.data(), samples.size(), static_cast<float>(vol) / 100.0f);
     playQueue_->push(reinterpret_cast<const uint8_t*>(samples.data()), samples.size() * sizeof(int16_t));
@@ -812,7 +890,13 @@ void VoiceIntercom::stopCapture() {
 
 bool VoiceIntercom::startPlayback(uint32_t sampleRate, uint8_t channels) {
     std::lock_guard<std::mutex> lk(playbackMutex_);
-    if (playStream_.isOpen()) return true;
+    if (playStream_.isOpen()) {
+        if (playbackSampleRate_ == sampleRate && playbackChannels_ == channels) {
+            return true;
+        }
+        playStream_.close();
+        playing_.store(false);
+    }
     if (!playStream_.open(PulseStream::Dir::Playback, nullptr, sampleRate, channels, "CppDesk voice", 60)) {
         playing_.store(false);
         return false;
@@ -827,7 +911,7 @@ void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes, uint8
     bytes = (bytes / sizeof(int16_t)) * sizeof(int16_t);
     if (!pcm || bytes < sizeof(int16_t) || bytes > 192000) return;
     std::lock_guard<std::mutex> lk(playbackMutex_);
-    if (!playing_.load()) return;
+    if (!playing_.load() || playbackChannels_ == 0) return;
 
     std::vector<int16_t> samples(bytes / sizeof(int16_t));
     std::memcpy(samples.data(), pcm, bytes);
@@ -837,6 +921,7 @@ void VoiceIntercom::enqueuePlaybackChunk(const uint8_t* pcm, size_t bytes, uint8
         samples.swap(adapted);
     }
     samples.resize(samples.size() / playbackChannels_ * playbackChannels_);   // whole frames only
+    if (samples.empty()) return;
     const int vol = outputVolume_.load();
     if (vol != 100) applyGain(samples.data(), samples.size(), static_cast<float>(vol) / 100.0f);
     playStream_.write(reinterpret_cast<const uint8_t*>(samples.data()), samples.size() * sizeof(int16_t));
