@@ -446,6 +446,8 @@ public:
     bool isHostPrivacyModeActive() const;
     void setHostPrivacyMode(bool enable, const std::string& notice = "", const std::string& brand = "", bool showId = true, ScreenBlankMode blankMode = ScreenBlankMode::Unified);
     void configurePrivacyCurtain(const std::string& notice, const std::string& brand, bool showId);
+    void configurePrivacyCloak(bool enabled, uint8_t style, const std::string& keywords);
+    void applyPrivacyCloakConfig(PrivacyCloakManager& cloak) const;
 
     // TCP Port Forwarding & Tunneling Manager (v2.1.0)
     uint32_t addPortForwardRule(uint16_t localPort, uint16_t targetPort, const std::string& desc, bool startActive = true);
@@ -722,6 +724,11 @@ private:
     std::string             privacyCurtainNotice_;
     std::string             privacyCurtainBrand_;
     bool                    privacyCurtainShowId_ = true;
+    mutable std::mutex      privacyCloakMutex_;
+    bool                    privacyCloakEnabled_ = false;
+    uint8_t                 privacyCloakStyle_ = 0;
+    std::string             privacyCloakKeywords_;
+    std::atomic<uint64_t>   privacyCloakGen_{0};
 
     // Host Terminal Process & Anonymous Pipes
     void startHostTerminal(bool usePowerShell = false);

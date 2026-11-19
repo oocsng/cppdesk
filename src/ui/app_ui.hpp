@@ -27,9 +27,12 @@
 #include <array>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 #include <optional>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 #include "canvas.hpp"
 #include "platform_shell.hpp"
@@ -178,7 +181,7 @@ public:
     void onFocusChanged(bool focused);
     void onMouseLeave();
     void onCaptureLost();
-    bool isTextInputFocused() const { return hoveredIsTextInput_; }
+    bool isTextInputFocused() const { return focusedField_ != FocusedField::None && focusedField_ != FocusedField::RemoteCanvas; }
     ui::CursorShape cursorShape() const;
 
     // Window events.
@@ -358,7 +361,9 @@ private:
     void initiateConnection();
     void openSendFileDialog();
     void openPickFolderDialog(std::string& outPath);
+    bool saveBgraSnapshotToBmp(const uint8_t* bgra, size_t bgraSize, int w, int h, const std::string& prefix, std::string& outFileName);
     void saveRemoteScreenshot();
+    void refreshSystemServiceCache();
     void toggleScreenRecording();
     void sendChatFromInput();
     void sendTerminalFromInput();
@@ -397,7 +402,6 @@ private:
     bool                    showFileDrawer_ = false;
     bool                    remoteInputEnabled_ = true;
     bool                    showLocalPassword_ = false;
-    bool                    showRemotePassword_ = false;
     bool                    isFullscreen_ = false;
 
     std::string             autoConnectTarget_;
@@ -410,10 +414,6 @@ private:
     uint8_t                 relayModeEdit_ = 0;
     std::string             privacyBrandEdit_;
     std::string             privacyNoticeEdit_;
-    bool                    relayDiagnosticRunning_ = false;
-    std::string             relayDiagnosticStatus_;
-    int                     relayDiagnosticLatency_ = -1;
-    bool                    relayDiagnosticSuccess_ = false;
     std::string             chatInput_;
     int32_t                 chatScrollOffset_ = 0;
     std::string             clipSearchQuery_;
@@ -453,12 +453,7 @@ private:
 
     // Pending incoming request local permission checkboxes
     uint8_t                 modalPermissions_ = PERM_ALL;
-    bool                    modalWasActive_ = false;
     uint32_t                lastSeenUnreadChat_ = 0;
-    bool                    prevIncomingPending_ = false;
-    size_t                  lastNotifiedChatCount_ = 0;
-    size_t                  prevActiveTransfers_ = 0;
-    ViewerConnectionState   prevNotifiedViewerState_ = ViewerConnectionState::Disconnected;
 
     // Remote video canvas cache
     uint64_t                displayedFrameSeq_ = 0;
@@ -468,12 +463,6 @@ private:
     CursorState             remoteCursor_{};
     UiRect                  renderedCanvasRect_{};
     UiRect                  stageRect_{};
-
-    // Rolling network telemetry history
-    static constexpr size_t SPARKLINE_SAMPLES = 36;
-    std::array<float, SPARKLINE_SAMPLES> rttHistory_{};
-    std::array<float, SPARKLINE_SAMPLES> fpsHistory_{};
-    uint64_t                lastTelemetrySampleTick_ = 0;
 
     // Hit-test regions & macOS Spring Physics Animation Engine state
     std::vector<ClickRegion>                        clickRegions_;
@@ -486,6 +475,8 @@ private:
     bool                    mouseInsideClient_ = false;
     bool                    trackingMouseLeave_ = false;
     bool                    mouseLeftDown_ = false;
+    uint8_t                 remoteCanvasPressedMask_ = 0;
+    bool                    whiteboardStrokeActive_ = false;
     uint64_t                lastMouseSendTick_ = 0;
 
     // High-precision timing & second-order spring states (pos + velocity)
@@ -559,7 +550,6 @@ private:
 
     // Remote Terminal UI state (v2.1.0)
     std::string             terminalInputText_;
-    int                     terminalHistoryIndex_ = -1;
     float                   terminalScrollOffset_ = 0.0f;
 
     // Remote Hardware Diagnostics & Process Telemetry UI state (Feature 1)
@@ -568,7 +558,6 @@ private:
     // Settings Tab vertical scroll & section state
     SettingsSection              settingsSection_ = SettingsSection::Appearance;
     bool                         voiceMonitorAttempted_ = false;
-    std::string                  voiceMonitorError_;
     std::vector<AudioDeviceDesc> cachedInputDevices_;
     std::vector<AudioDeviceDesc> cachedOutputDevices_;
     bool                         showAudioInputMenu_ = false;
@@ -703,7 +692,7 @@ private:
     bool                    prevHostActive_ = false;
     std::string             prevViewerHostname_;
     std::string             prevHostClientName_;
-    size_t                  prevCompletedTransfersCount_ = 0;
+    std::unordered_set<uint32_t> notifiedCompletedTransferIds_;
     bool                    prevHasPendingIncoming_ = false;
 
     // Mandatory Auto-Updater state (v3.0.0)
@@ -711,7 +700,7 @@ private:
     float                   updateModalAnimT_ = 0.0f;
     float                   updateModalAnimVel_ = 0.0f;
     bool                    isCheckingUpdates_ = false;
-    std::string             updateStatusText_ = "Version v3.11.2 (Up to date)";
+    std::string             updateStatusText_ = std::string("Version v") + CPP_DESK_VERSION + " (Up to date)";
     UpdateInfo              latestUpdateInfo_{};
     float                   startupUpdateCheckTimer_ = 2.0f;
     bool                    startupCheckTriggered_ = false;
@@ -727,9 +716,32 @@ private:
     std::string             peerMismatchViewerVer_;
     bool                    showPeerMismatchModal_ = false;
 
+    // Cross-thread callback delivery (drained on the UI thread in onTick)
+    struct DownloadDoneBox {
+        std::mutex mtx;
+        bool alive = true;
+        bool ready = false;
+        bool ok = false;
+        std::string message;
+    };
+    std::shared_ptr<DownloadDoneBox> downloadDoneBox_ = std::make_shared<DownloadDoneBox>();
+
+    struct PendingPeerMismatch {
+        bool pending = false;
+        std::string hostVer;
+        std::string viewerVer;
+    };
+    std::mutex               pendingNetEventsMutex_;
+    PendingPeerMismatch      pendingPeerMismatch_;
+    std::vector<std::string> pendingUpgradeNotices_;
+
+    std::atomic<bool>        localSyncScanRunning_{false};
+    std::thread              localSyncScanThread_;
+
     // Remote Reboot & Reconnect Modal (v3.2.0)
     bool                    showRebootConfirmModal_ = false;
     bool                    rebootSafeModeChoice_ = false;
+    bool                    rebootIsEmergency_ = false;
     float                   rebootModalAnimT_ = 0.0f;
     float                   rebootModalAnimVel_ = 0.0f;
 
@@ -757,7 +769,6 @@ private:
     bool                    totpEnrollSuccess_ = false;
     std::vector<uint8_t>    totpQrMatrix_;
     int                     totpQrMatrixSize_ = 0;
-    bool                    showTotpRegenConfirm_ = false;
 
     // Viewer TOTP Challenge Modal state
     bool                    showTotpModal_ = false;
@@ -789,8 +800,6 @@ private:
 
     // Dual-Peer Collaborative Scratchpad UI
     std::string             scratchpadTextEdit_;
-    uint64_t                lastSeenScratchpadRev_ = 0;
-    float                   scratchpadScrollOffset_ = 0.0f;
 
     // Spotlight Omnibar Command Palette UI
     bool                    showOmnibarModal_ = false;
@@ -813,6 +822,12 @@ private:
     UiRect                  activeTooltipTargetRect_{};
     float                   tooltipAnimT_ = 0.0f;
     float                   tooltipAnimVel_ = 0.0f;
+
+    // Cached SystemService section state (avoid per-frame SCM RPC / Registry queries)
+    bool                    systemServiceCacheValid_ = false;
+    ui::ServiceState        cachedServiceState_ = ui::ServiceState::NotInstalled;
+    bool                    cachedUriProtocolReg_ = false;
+    uint64_t                lastSystemServicePollMs_ = 0;
 };
 
 } // namespace cppdesk
