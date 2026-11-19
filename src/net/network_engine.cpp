@@ -1073,6 +1073,7 @@ void NetworkEngine::stop() {
         }
         try { if (diagThread.joinable()) diagThread.join(); } catch (...) {}
     }
+    commandPaletteMgr_.shutdown();
 }
 
 std::vector<DiscoveredPeer> NetworkEngine::discoveredPeers() const {
@@ -1462,6 +1463,7 @@ void NetworkEngine::hostAcceptLoop() {
 }
 
 void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
+    hostSessionGen_.fetch_add(1);
     activeHostClientSock_.store(clientSock);
     hostEncrypted_.store(false);
 
@@ -2741,8 +2743,12 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                 CommandPaletteExecPayload execReq{};
                                 if (deserializeCommandPaletteExec(rpay.data(), rpay.size(), execReq)) {
                                     uint32_t cmdId = execReq.commandId;
+                                    uint64_t sessionGen = hostSessionGen_.load();
                                     std::string runCmd = execReq.customCommand.empty() ? execReq.commandKey : execReq.customCommand;
-                                    commandPaletteMgr_.executeAsync(runCmd, [this, cmdId](int32_t exitCode, const std::string& output) {
+                                    commandPaletteMgr_.executeAsync(runCmd, [this, cmdId, sessionGen](int32_t exitCode, const std::string& output) {
+                                        if (!running_.load() || hostSessionGen_.load() != sessionGen) {
+                                            return;
+                                        }
                                         CommandPaletteOutputPayload outPayload{};
                                         outPayload.commandId = cmdId;
                                         outPayload.exitCode = exitCode;

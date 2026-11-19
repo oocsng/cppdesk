@@ -809,6 +809,7 @@ private:
     mutable std::mutex                                      commandPaletteCbMutex_;
     std::function<void(const CommandPaletteOutputPayload&)> onCommandPaletteOutput_;
     std::atomic<uint32_t>                                   nextExecId_{1};
+    std::atomic<uint64_t>                                   hostSessionGen_{0};
 };
 
 } // namespace cppdesk
