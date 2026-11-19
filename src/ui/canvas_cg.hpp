@@ -78,6 +78,7 @@ private:
 
     CGContextRef ctx_ = nullptr;   // borrowed
     bool inFrame_ = false;
+    bool singularTransform_ = false;
     float scale_ = 1.0f;
     std::array<CTFontRef, 8> fonts_{};
     std::unordered_map<uint32_t, ImageEntry> images_;

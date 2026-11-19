@@ -161,6 +161,7 @@ void CGCanvas::attach(CGContextRef bitmap, float dpiScale) {
     detach();
     ctx_ = bitmap;
     scale_ = dpiScale > 0.0f ? dpiScale : 1.0f;
+    if (!ctx_) return;
     // Text drawn at fractional positions, without per-glyph rounding, so a width measured is the width drawn.
     CGContextSetAllowsFontSubpixelPositioning(ctx_, true);
     CGContextSetShouldSubpixelPositionFonts(ctx_, true);
@@ -172,16 +173,24 @@ void CGCanvas::detach() {
     images_.clear();
     ctx_ = nullptr;
     transform_ = Transform2D::identity();
+    singularTransform_ = false;
     stack_.clear();
 }
 
 void CGCanvas::applyTransform() {
     // CoreGraphics has no public "set CTM": undo the current one, then build base (DIP to y-down device pixels)
-    // and the caller's transform. concat(X) means X first, then the CTM, like Transform2D's "a*b applies a first".
+    // and the caller's transform. Never concat a singular matrix into the CTM, or CGAffineTransformInvert
+    // would be unable to recover on subsequent setTransform calls.
     CGContextConcatCTM(ctx_, CGAffineTransformInvert(CGContextGetCTM(ctx_)));
     const float pixelH = static_cast<float>(CGBitmapContextGetHeight(ctx_));
     CGContextConcatCTM(ctx_, CGAffineTransformMake(scale_, 0, 0, -scale_, 0, pixelH));
     const Transform2D& t = transform_;
+    const float det = t.m11 * t.m22 - t.m12 * t.m21;
+    if (!std::isfinite(det) || std::fabs(det) < 1e-7f) {
+        singularTransform_ = true;
+        return;
+    }
+    singularTransform_ = false;
     CGContextConcatCTM(ctx_, CGAffineTransformMake(t.m11, t.m12, t.m21, t.m22, t.dx, t.dy));
 }
 
@@ -189,6 +198,7 @@ void CGCanvas::beginFrame(float, float, Color clear) {
     if (!ctx_) return;
     if (inFrame_) endFrame();
     inFrame_ = true;
+    singularTransform_ = false;
     CGContextSaveGState(ctx_);   // the frame's own state level; endFrame restores it
     transform_ = Transform2D::identity();
     stack_.clear();
@@ -216,7 +226,7 @@ void CGCanvas::setStroke(Color c, float width) {
 }
 
 void CGCanvas::fillRect(Rect r, Color c) {
-    if (!inFrame_) return;
+    if (!inFrame_ || singularTransform_) return;
     setFill(c);
     CGContextFillRect(ctx_, CGRectMake(r.left, r.top, r.right - r.left, r.bottom - r.top));
 }
@@ -231,35 +241,35 @@ void CGCanvas::roundRectPath(Rect r, float radius) {
 }
 
 void CGCanvas::fillRoundRect(Rect r, float radius, Color c) {
-    if (!inFrame_) return;
+    if (!inFrame_ || singularTransform_) return;
     roundRectPath(r, radius);
     setFill(c);
     CGContextFillPath(ctx_);
 }
 
 void CGCanvas::strokeRoundRect(Rect r, float radius, Color c, float width) {
-    if (!inFrame_) return;
+    if (!inFrame_ || singularTransform_) return;
     roundRectPath(r, radius);
     setStroke(c, width);
     CGContextStrokePath(ctx_);
 }
 
 void CGCanvas::fillEllipse(float cx, float cy, float rx, float ry, Color c) {
-    if (!inFrame_ || rx <= 0.0f || ry <= 0.0f) return;
+    if (!inFrame_ || singularTransform_ || rx <= 0.0f || ry <= 0.0f) return;
     CGContextAddEllipseInRect(ctx_, CGRectMake(cx - rx, cy - ry, 2 * rx, 2 * ry));
     setFill(c);
     CGContextFillPath(ctx_);
 }
 
 void CGCanvas::strokeEllipse(float cx, float cy, float rx, float ry, Color c, float width) {
-    if (!inFrame_ || rx <= 0.0f || ry <= 0.0f) return;
+    if (!inFrame_ || singularTransform_ || rx <= 0.0f || ry <= 0.0f) return;
     CGContextAddEllipseInRect(ctx_, CGRectMake(cx - rx, cy - ry, 2 * rx, 2 * ry));
     setStroke(c, width);
     CGContextStrokePath(ctx_);
 }
 
 void CGCanvas::drawLine(float x0, float y0, float x1, float y1, Color c, float width) {
-    if (!inFrame_) return;
+    if (!inFrame_ || singularTransform_) return;
     CGContextMoveToPoint(ctx_, x0, y0);
     CGContextAddLineToPoint(ctx_, x1, y1);
     setStroke(c, width);
@@ -315,14 +325,14 @@ void CGCanvas::buildPath(const Path& p) {
 }
 
 void CGCanvas::fillPath(const Path& p, Color c) {
-    if (!inFrame_ || p.segments().empty()) return;
+    if (!inFrame_ || singularTransform_ || p.segments().empty()) return;
     buildPath(p);
     setFill(c);
     CGContextFillPath(ctx_);
 }
 
 void CGCanvas::strokePath(const Path& p, Color c, float width) {
-    if (!inFrame_ || p.segments().empty()) return;
+    if (!inFrame_ || singularTransform_ || p.segments().empty()) return;
     buildPath(p);
     setStroke(c, width);
     CGContextStrokePath(ctx_);
@@ -347,8 +357,9 @@ CGCanvas::Laid CGCanvas::layoutText(std::string_view utf8, FontRole font, float 
         CTLineRef line = CTTypesetterCreateLine(ts, CFRangeMake(start, count));
         start += count;
         CGFloat asc = 0, desc = 0, lead = 0;
-        // Trailing whitespace at a wrap point is not part of the line's visible width.
-        const double w = CTLineGetTypographicBounds(line, &asc, &desc, &lead) - CTLineGetTrailingWhitespaceWidth(line);
+        // Trailing whitespace at a wrap point is not part of the line's visible width; single-line measurement keeps it.
+        const double trailing = wrapWidth > 0.0f ? CTLineGetTrailingWhitespaceWidth(line) : 0.0;
+        const double w = CTLineGetTypographicBounds(line, &asc, &desc, &lead) - trailing;
         out.lines.push_back(line);
         out.widths.push_back(static_cast<float>(std::max(0.0, w)));
         out.ascent = static_cast<float>(asc);
@@ -363,7 +374,7 @@ CGCanvas::Laid CGCanvas::layoutText(std::string_view utf8, FontRole font, float 
 }
 
 void CGCanvas::drawText(std::string_view utf8, Rect r, FontRole font, Color c, HAlign h, VAlign v) {
-    if (!inFrame_ || utf8.empty()) return;
+    if (!inFrame_ || singularTransform_ || utf8.empty()) return;
     const float w = r.right - r.left, hgt = r.bottom - r.top;
     const bool wraps = font == FontRole::Tooltip;   // only the tooltip format wraps, as on Windows
     Laid laid = layoutText(utf8, font, wraps ? w : 0.0f);
@@ -426,7 +437,7 @@ void CGCanvas::updateImage(ImageId id, const uint8_t* bgra, int pitch, Rect dirt
 
 void CGCanvas::drawImage(ImageId id, Rect dst, float opacity) {
     auto it = images_.find(id.value);
-    if (!inFrame_ || it == images_.end()) return;
+    if (!inFrame_ || singularTransform_ || it == images_.end()) return;
     const ImageEntry& e = it->second;
     const float w = dst.right - dst.left, h = dst.bottom - dst.top;
     if (w <= 0.0f || h <= 0.0f) return;
@@ -457,7 +468,7 @@ void CGCanvas::destroyImage(ImageId id) { images_.erase(id.value); }
 void CGCanvas::pushClip(Rect r) {
     if (!inFrame_) return;
     CGContextSaveGState(ctx_);
-    CGContextClipToRect(ctx_, CGRectMake(r.left, r.top, r.right - r.left, r.bottom - r.top));
+    CGContextClipToRect(ctx_, singularTransform_ ? CGRectZero : CGRectMake(r.left, r.top, r.right - r.left, r.bottom - r.top));
     stack_.push_back(Pushed::Clip);
 }
 

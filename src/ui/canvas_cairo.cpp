@@ -105,6 +105,7 @@ void CairoCanvas::fillRect(Rect r, Color c) {
 
 void CairoCanvas::roundRectPath(Rect r, float radius) {
     const float w = r.right - r.left, h = r.bottom - r.top;
+    if (w <= 0.0f || h <= 0.0f) return;
     radius = std::clamp(radius, 0.0f, std::min(w, h) / 2.0f);
     cairo_new_sub_path(cr_);
     cairo_arc(cr_, r.right - radius, r.top + radius, radius, -kPi / 2, 0);
