@@ -32,7 +32,7 @@ public:
 private:
     mutable std::mutex mutex_;
     std::string        text_;
-    uint64_t           revision_ = 0;
+    uint32_t           revision_ = 0;
     uint32_t           lastEditorDeskId_ = 0;
     uint32_t           cursorPos_ = 0;
 };

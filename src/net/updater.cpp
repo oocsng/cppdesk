@@ -7,8 +7,11 @@
 #endif
 #include <windows.h>
 #include <winhttp.h>
+#include <sddl.h>
 #endif
 
+#include <algorithm>
+#include <chrono>
 #include <sstream>
 #include <vector>
 #include <thread>
@@ -17,6 +20,9 @@
 namespace cppdesk {
 
 namespace {
+
+constexpr size_t kMaxReleaseApiBytes = 2 * 1024 * 1024;       // 2 MB GitHub API JSON cap
+constexpr uint64_t kMaxUpdateAssetBytes = 256ULL * 1024 * 1024; // 256 MB executable cap
 
 std::wstring toWide(const std::string& str) {
     if (str.empty()) return L"";
@@ -29,6 +35,14 @@ std::wstring toWide(const std::string& str) {
 #else
     return std::wstring(str.begin(), str.end());
 #endif
+}
+
+bool isValidSha256Hex(const std::string& hex) {
+    if (hex.size() != 64) return false;
+    for (char c : hex) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
+    }
+    return true;
 }
 
 // "sha256:<64 hex>" -> lower-case hex; anything else -> "".
@@ -44,7 +58,228 @@ std::string parseSha256Digest(const std::string& digest) {
     return hex;
 }
 
+void skipJsonWs(const std::string& s, size_t& i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+}
+
+// Parses a JSON string starting at s[i] == '"', advancing i past the closing '"'.
+bool parseJsonStringAt(const std::string& s, size_t& i, std::string& out) {
+    if (i >= s.size() || s[i] != '"') return false;
+    ++i;
+    out.clear();
+    bool escape = false;
+    while (i < s.size()) {
+        char c = s[i++];
+        if (escape) {
+            if (c == 'n') out += '\n';
+            else if (c == 'r') out += '\r';
+            else if (c == 't') out += '\t';
+            else if (c == '\\') out += '\\';
+            else if (c == '"') out += '"';
+            else if (c == '/') out += '/';
+            else out += c;
+            escape = false;
+        } else if (c == '\\') {
+            escape = true;
+        } else if (c == '"') {
+            return true;
+        } else {
+            out += c;
+        }
+    }
+    return false;
+}
+
+// Advances i past a JSON value (string, object, array, or primitive).
+void skipJsonValue(const std::string& s, size_t& i) {
+    skipJsonWs(s, i);
+    if (i >= s.size()) return;
+    if (s[i] == '"') {
+        std::string dummy;
+        parseJsonStringAt(s, i, dummy);
+        return;
+    }
+    if (s[i] == '{' || s[i] == '[') {
+        int depth = 0;
+        bool inStr = false;
+        bool esc = false;
+        while (i < s.size()) {
+            char c = s[i++];
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+            } else {
+                if (c == '"') inStr = true;
+                else if (c == '{' || c == '[') ++depth;
+                else if (c == '}' || c == ']') {
+                    if (--depth == 0) return;
+                }
+            }
+        }
+        return;
+    }
+    while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']' &&
+           s[i] != ' ' && s[i] != '\t' && s[i] != '\r' && s[i] != '\n') {
+        ++i;
+    }
+}
+
+#if defined(_WIN32)
+struct TrackedWinHttpSession {
+    std::mutex mutex;
+    HINTERNET handle = nullptr;
+    bool closed = false;
+
+    void close() {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (!closed && handle) {
+            closed = true;
+            WinHttpCloseHandle(handle);
+            handle = nullptr;
+        }
+    }
+};
+
+std::mutex g_activeSessionsMutex;
+std::vector<std::weak_ptr<TrackedWinHttpSession>> g_activeSessions;
+
+std::shared_ptr<TrackedWinHttpSession> registerWinHttpSession(HINTERNET hSession) {
+    auto s = std::make_shared<TrackedWinHttpSession>();
+    s->handle = hSession;
+    std::lock_guard<std::mutex> lk(g_activeSessionsMutex);
+    g_activeSessions.erase(
+        std::remove_if(g_activeSessions.begin(), g_activeSessions.end(),
+                       [](const std::weak_ptr<TrackedWinHttpSession>& w) { return w.expired(); }),
+        g_activeSessions.end());
+    g_activeSessions.push_back(s);
+    return s;
+}
+
+bool validatePeFromHandle(HANDLE hFile) {
+    LARGE_INTEGER liSize{};
+    if (!GetFileSizeEx(hFile, &liSize) || liSize.QuadPart < static_cast<LONGLONG>(sizeof(IMAGE_DOS_HEADER) + sizeof(DWORD))) {
+        return false;
+    }
+    LARGE_INTEGER zero{};
+    if (!SetFilePointerEx(hFile, zero, nullptr, FILE_BEGIN)) return false;
+
+    IMAGE_DOS_HEADER dos{};
+    DWORD bytesRead = 0;
+    if (!ReadFile(hFile, &dos, sizeof(dos), &bytesRead, nullptr) || bytesRead != sizeof(dos)) return false;
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) return false;
+    if (dos.e_lfanew <= 0 || static_cast<uint64_t>(dos.e_lfanew) + sizeof(DWORD) > static_cast<uint64_t>(liSize.QuadPart)) {
+        return false;
+    }
+
+    LARGE_INTEGER liSeek{};
+    liSeek.QuadPart = dos.e_lfanew;
+    if (!SetFilePointerEx(hFile, liSeek, nullptr, FILE_BEGIN)) return false;
+
+    DWORD ntSig = 0;
+    if (!ReadFile(hFile, &ntSig, sizeof(ntSig), &bytesRead, nullptr) || bytesRead != sizeof(ntSig)) return false;
+    return (ntSig == IMAGE_NT_SIGNATURE);
+}
+
+bool handleMatchesSha256(HANDLE hFile, const std::string& expectedHex) {
+    if (!isValidSha256Hex(expectedHex)) return false;
+    LARGE_INTEGER zero{};
+    if (!SetFilePointerEx(hFile, zero, nullptr, FILE_BEGIN)) return false;
+
+    std::vector<uint8_t> data;
+    constexpr DWORD kChunk = 1 << 20;
+    std::vector<uint8_t> chunk(kChunk);
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(hFile, chunk.data(), kChunk, &got, nullptr)) return false;
+        if (got == 0) break;
+        if (data.size() + got > kMaxUpdateAssetBytes) return false;
+        data.insert(data.end(), chunk.begin(), chunk.begin() + got);
+    }
+
+    std::string actual = CryptoUtils::toHex(CryptoUtils::sha256(data.data(), data.size()).data(), 32);
+    std::string expected = expectedHex;
+    for (char& c : expected) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return actual == expected;
+}
+
+bool createOwnerOnlyDirectory(const std::wstring& dirPath) {
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = FALSE;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    // Owner-only full access, inherited by files created inside the staging directory.
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;OICI;FA;;;OW)", SDDL_REVISION_1, &sd, nullptr)) {
+        sa.lpSecurityDescriptor = sd;
+    }
+    BOOL ok = CreateDirectoryW(dirPath.c_str(), sd ? &sa : nullptr);
+    DWORD err = GetLastError();
+    if (sd) LocalFree(sd);
+    return ok || err == ERROR_ALREADY_EXISTS;
+}
+#endif
+
+template <typename Fn>
+void invokeWithGate(const std::shared_ptr<AutoUpdater::CallbackGate>& gate, Fn&& fn) {
+    if (gate) {
+        gate->runIfAlive(std::forward<Fn>(fn));
+    } else {
+        fn();
+    }
+}
+
 } // namespace
+
+void AutoUpdater::cancelPendingOperations() {
+#if defined(_WIN32)
+    std::vector<std::shared_ptr<TrackedWinHttpSession>> sessions;
+    {
+        std::lock_guard<std::mutex> lk(g_activeSessionsMutex);
+        for (const auto& w : g_activeSessions) {
+            if (auto s = w.lock()) sessions.push_back(std::move(s));
+        }
+        g_activeSessions.clear();
+    }
+    for (const auto& s : sessions) {
+        s->close();
+    }
+#endif
+}
+
+std::wstring AutoUpdater::createStagingExePath() {
+#if defined(_WIN32)
+    std::wstring baseDir;
+    DWORD need = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+    if (need > 1) {
+        std::wstring localAppData(need, L'\0');
+        DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData.data(), need);
+        if (got > 0 && got < need) {
+            localAppData.resize(got);
+            std::wstring appDir = localAppData + L"\\CppDesk";
+            CreateDirectoryW(appDir.c_str(), nullptr);
+            std::wstring updatesDir = appDir + L"\\updates";
+            if (createOwnerOnlyDirectory(updatesDir)) {
+                baseDir = updatesDir;
+            }
+        }
+    }
+    if (baseDir.empty()) {
+        wchar_t tempDir[MAX_PATH]{};
+        DWORD len = GetTempPathW(MAX_PATH, tempDir);
+        if (len == 0 || len >= MAX_PATH) return L"";
+        std::wstring fallbackDir = std::wstring(tempDir) + L"CppDesk_updates";
+        if (!createOwnerOnlyDirectory(fallbackDir)) return L"";
+        baseDir = fallbackDir;
+    }
+
+    uint8_t rnd[8]{};
+    CryptoUtils::randomBytes(rnd, sizeof(rnd));
+    std::string hex = CryptoUtils::toHex(rnd, sizeof(rnd));
+    return baseDir + L"\\CppDesk_update_" + toWide(hex) + L".exe";
+#else
+    return L"";
+#endif
+}
 
 bool AutoUpdater::parseVersionTriad(const std::string& verStr, int& major, int& minor, int& patch) {
     major = 0;
@@ -103,38 +338,31 @@ bool AutoUpdater::isNewerVersion(const std::string& candidateVer, const std::str
 }
 
 std::string AutoUpdater::extractJsonString(const std::string& json, const std::string& key) {
-    std::string needle = "\"" + key + "\"";
-    size_t keyPos = json.find(needle);
-    if (keyPos == std::string::npos) return "";
+    if (json.empty() || key.empty()) return "";
 
-    size_t colonPos = json.find(':', keyPos + needle.size());
-    if (colonPos == std::string::npos) return "";
-
-    size_t quoteStart = json.find('"', colonPos + 1);
-    if (quoteStart == std::string::npos) return "";
-
-    std::string result;
-    bool escape = false;
-    for (size_t i = quoteStart + 1; i < json.size(); ++i) {
-        char c = json[i];
-        if (escape) {
-            if (c == 'n') result += '\n';
-            else if (c == 'r') result += '\r';
-            else if (c == 't') result += '\t';
-            else if (c == '\\') result += '\\';
-            else if (c == '"') result += '"';
-            else if (c == '/') result += '/';
-            else result += c;
-            escape = false;
-        } else if (c == '\\') {
-            escape = true;
-        } else if (c == '"') {
-            break;
+    size_t i = 0;
+    while (i < json.size()) {
+        if (json[i] == '"') {
+            std::string str;
+            if (!parseJsonStringAt(json, i, str)) return "";
+            size_t afterKey = i;
+            skipJsonWs(json, afterKey);
+            if (afterKey < json.size() && json[afterKey] == ':') {
+                size_t valPos = afterKey + 1;
+                skipJsonWs(json, valPos);
+                if (str == key) {
+                    if (valPos >= json.size() || json[valPos] != '"') return "";
+                    std::string val;
+                    return parseJsonStringAt(json, valPos, val) ? val : "";
+                }
+                i = valPos;
+                continue;
+            }
         } else {
-            result += c;
+            ++i;
         }
     }
-    return result;
+    return "";
 }
 
 UpdateInfo AutoUpdater::queryLatestReleaseSync(
@@ -160,6 +388,9 @@ UpdateInfo AutoUpdater::queryLatestReleaseSync(
         return info;
     }
 
+    WinHttpSetTimeouts(hSession, 10000, 10000, 15000, 30000);
+    auto trackedSession = registerWinHttpSession(hSession);
+
     HINTERNET hConnect = WinHttpConnect(
         hSession,
         L"api.github.com",
@@ -168,7 +399,7 @@ UpdateInfo AutoUpdater::queryLatestReleaseSync(
     );
 
     if (!hConnect) {
-        WinHttpCloseHandle(hSession);
+        trackedSession->close();
         info.errorMessage = "Failed to connect to GitHub API";
         return info;
     }
@@ -187,10 +418,13 @@ UpdateInfo AutoUpdater::queryLatestReleaseSync(
 
     if (!hRequest) {
         WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+        trackedSession->close();
         info.errorMessage = "Failed to open WinHTTP request";
         return info;
     }
+
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
     // Set standard GitHub API request headers
     LPCWSTR headers = L"User-Agent: CppDesk-Updater\r\nAccept: application/vnd.github.v3+json\r\n";
@@ -207,7 +441,7 @@ UpdateInfo AutoUpdater::queryLatestReleaseSync(
     if (!bSend || !WinHttpReceiveResponse(hRequest, nullptr)) {
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+        trackedSession->close();
         info.errorMessage = "Failed to query GitHub release response";
         return info;
     }
@@ -226,17 +460,23 @@ UpdateInfo AutoUpdater::queryLatestReleaseSync(
     if (statusCode != 200) {
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+        trackedSession->close();
         info.errorMessage = "GitHub API returned HTTP " + std::to_string(statusCode);
         return info;
     }
 
     std::string responseBody;
     DWORD bytesAvailable = 0;
+    bool responseTooLarge = false;
     while (WinHttpQueryDataAvailable(hRequest, &bytesAvailable) && bytesAvailable > 0) {
-        std::vector<char> buffer(bytesAvailable + 1, 0);
+        DWORD toRead = std::min<DWORD>(bytesAvailable, 64 * 1024);
+        if (responseBody.size() + toRead > kMaxReleaseApiBytes) {
+            responseTooLarge = true;
+            break;
+        }
+        std::vector<char> buffer(toRead);
         DWORD bytesRead = 0;
-        if (WinHttpReadData(hRequest, buffer.data(), bytesAvailable, &bytesRead) && bytesRead > 0) {
+        if (WinHttpReadData(hRequest, buffer.data(), toRead, &bytesRead) && bytesRead > 0) {
             responseBody.append(buffer.data(), bytesRead);
         } else {
             break;
@@ -245,7 +485,12 @@ UpdateInfo AutoUpdater::queryLatestReleaseSync(
 
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
+    trackedSession->close();
+
+    if (responseTooLarge) {
+        info.errorMessage = "GitHub API response exceeded safety size limit";
+        return info;
+    }
 
     info.latestVersion = extractJsonString(responseBody, "tag_name");
     if (!info.latestVersion.empty() && (info.latestVersion[0] == 'v' || info.latestVersion[0] == 'V')) {
@@ -278,12 +523,14 @@ void AutoUpdater::checkForUpdatesAsync(
     std::function<void(const UpdateInfo&)> onComplete,
     const std::string& repoOwner,
     const std::string& repoName,
-    const std::string& currentVersion)
+    const std::string& currentVersion,
+    std::shared_ptr<CallbackGate> gate)
 {
-    std::thread([onComplete, repoOwner, repoName, currentVersion]() {
+    std::thread([onComplete = std::move(onComplete), repoOwner, repoName, currentVersion, gate = std::move(gate)]() {
+        if (gate && !gate->isAlive()) return;
         UpdateInfo info = queryLatestReleaseSync(repoOwner, repoName, currentVersion);
         if (onComplete) {
-            onComplete(info);
+            invokeWithGate(gate, [&]() { onComplete(info); });
         }
     }).detach();
 }
@@ -293,39 +540,109 @@ std::string AutoUpdater::extractAssetDownloadUrl(const std::string& json, const 
     if (outSha256) outSha256->clear();
     if (json.empty() || assetName.empty()) return "";
 
-    size_t pos = 0;
-    while ((pos = json.find(assetName, pos)) != std::string::npos) {
-        size_t objStart = json.rfind('{', pos);
-        size_t objEnd = json.find('}', pos);
-        if (objStart != std::string::npos && objEnd != std::string::npos && objEnd > objStart) {
-            std::string assetObj = json.substr(objStart, objEnd - objStart + 1);
-            std::string dlUrl = extractJsonString(assetObj, "browser_download_url");
-            if (!dlUrl.empty()) {
-                if (outSha256) *outSha256 = parseSha256Digest(extractJsonString(assetObj, "digest"));
-                if (outSize) {
-                    size_t sizeKey = assetObj.find("\"size\"");
-                    if (sizeKey != std::string::npos) {
-                        size_t col = assetObj.find(':', sizeKey);
-                        if (col != std::string::npos) {
-                            size_t dStart = col + 1;
-                            while (dStart < assetObj.size() && (assetObj[dStart] == ' ' || assetObj[dStart] == '\t')) dStart++;
-                            size_t dEnd = dStart;
-                            while (dEnd < assetObj.size() && std::isdigit(static_cast<unsigned char>(assetObj[dEnd]))) dEnd++;
-                            if (dEnd > dStart) {
-                                try {
-                                    *outSize = std::stoull(assetObj.substr(dStart, dEnd - dStart));
-                                } catch (...) {
-                                    *outSize = 0;
-                                }
-                            }
-                        }
-                    }
+    // Locate the "assets": [ ... ] array at top level (ignoring string literals such as "body").
+    size_t i = 0;
+    size_t assetsArrStart = std::string::npos;
+    int braceDepth = 0;
+    while (i < json.size()) {
+        char c = json[i];
+        if (c == '{') {
+            ++braceDepth;
+            ++i;
+        } else if (c == '}') {
+            if (braceDepth > 0) --braceDepth;
+            ++i;
+        } else if (c == '"') {
+            std::string key;
+            if (!parseJsonStringAt(json, i, key)) return "";
+            size_t p = i;
+            skipJsonWs(json, p);
+            if (p < json.size() && json[p] == ':') {
+                ++p;
+                skipJsonWs(json, p);
+                if (braceDepth <= 1 && key == "assets" && p < json.size() && json[p] == '[') {
+                    assetsArrStart = p;
+                    break;
                 }
-                return dlUrl;
+                i = p;
+            }
+        } else {
+            ++i;
+        }
+    }
+
+    if (assetsArrStart == std::string::npos) return "";
+
+    // Walk each object inside the "assets" array.
+    i = assetsArrStart + 1;
+    while (i < json.size()) {
+        skipJsonWs(json, i);
+        if (i >= json.size() || json[i] == ']') break;
+        if (json[i] == ',') {
+            ++i;
+            continue;
+        }
+        if (json[i] != '{') {
+            skipJsonValue(json, i);
+            continue;
+        }
+
+        // Parse top-level fields of this asset object only (nested objects like "uploader" are skipped cleanly).
+        ++i; // consume '{'
+        std::string curName;
+        std::string curUrl;
+        std::string curDigest;
+        uint64_t curSize = 0;
+
+        while (i < json.size()) {
+            skipJsonWs(json, i);
+            if (i >= json.size()) break;
+            if (json[i] == '}') {
+                ++i;
+                break;
+            }
+            if (json[i] == ',') {
+                ++i;
+                continue;
+            }
+            if (json[i] != '"') {
+                skipJsonValue(json, i);
+                continue;
+            }
+            std::string field;
+            if (!parseJsonStringAt(json, i, field)) return "";
+            skipJsonWs(json, i);
+            if (i >= json.size() || json[i] != ':') break;
+            ++i;
+            skipJsonWs(json, i);
+
+            if ((field == "name" || field == "browser_download_url" || field == "digest") &&
+                i < json.size() && json[i] == '"') {
+                std::string val;
+                if (!parseJsonStringAt(json, i, val)) return "";
+                if (field == "name") curName = std::move(val);
+                else if (field == "browser_download_url") curUrl = std::move(val);
+                else if (field == "digest") curDigest = std::move(val);
+            } else if (field == "size" && i < json.size() && std::isdigit(static_cast<unsigned char>(json[i]))) {
+                size_t dStart = i;
+                while (i < json.size() && std::isdigit(static_cast<unsigned char>(json[i]))) ++i;
+                try {
+                    curSize = std::stoull(json.substr(dStart, i - dStart));
+                } catch (...) {
+                    curSize = 0;
+                }
+            } else {
+                skipJsonValue(json, i);
             }
         }
-        pos += assetName.size();
+
+        if (curName == assetName && !curUrl.empty()) {
+            if (outSize) *outSize = curSize;
+            if (outSha256) *outSha256 = parseSha256Digest(curDigest);
+            return curUrl;
+        }
     }
+
     return "";
 }
 
@@ -334,14 +651,35 @@ void AutoUpdater::downloadUpdateAssetAsync(
     const std::wstring& targetPath,
     UpdateProgressCallback onProgress,
     std::function<void(bool success, const std::string& error)> onComplete,
-    const std::string& expectedSha256)
+    const std::string& expectedSha256,
+    std::shared_ptr<CallbackGate> gate)
 {
 #if !defined(_WIN32)
-    if (onComplete) onComplete(false, "Auto-updater not supported on this platform");
+    if (onComplete) {
+        invokeWithGate(gate, [&]() { onComplete(false, "Auto-updater not supported on this platform"); });
+    }
 #else
-    std::thread([downloadUrl, targetPath, onProgress, onComplete, expectedSha256]() {
+    std::thread([downloadUrl, targetPath, onProgress = std::move(onProgress), onComplete = std::move(onComplete), expectedSha256, gate = std::move(gate)]() {
+        auto reportDone = [&](bool ok, const std::string& err) {
+            if (onComplete) {
+                invokeWithGate(gate, [&]() { onComplete(ok, err); });
+            }
+        };
+        auto reportProgress = [&](uint64_t downloaded, uint64_t total, double speed) {
+            if (onProgress) {
+                invokeWithGate(gate, [&]() { onProgress(downloaded, total, speed); });
+            }
+        };
+
+        if (gate && !gate->isAlive()) return;
+
         if (downloadUrl.empty() || targetPath.empty()) {
-            if (onComplete) onComplete(false, "Invalid URL or target path");
+            reportDone(false, "Invalid URL or target path");
+            return;
+        }
+
+        if (!isValidSha256Hex(expectedSha256)) {
+            reportDone(false, "Refusing update without a valid SHA-256 digest");
             return;
         }
 
@@ -353,7 +691,12 @@ void AutoUpdater::downloadUpdateAssetAsync(
         urlComp.dwExtraInfoLength = static_cast<DWORD>(-1);
 
         if (!WinHttpCrackUrl(wUrl.c_str(), static_cast<DWORD>(wUrl.size()), 0, &urlComp)) {
-            if (onComplete) onComplete(false, "Failed to parse download URL");
+            reportDone(false, "Failed to parse download URL");
+            return;
+        }
+
+        if (urlComp.nScheme != INTERNET_SCHEME_HTTPS) {
+            reportDone(false, "Refusing non-HTTPS update URL");
             return;
         }
 
@@ -369,9 +712,12 @@ void AutoUpdater::downloadUpdateAssetAsync(
         );
 
         if (!hSession) {
-            if (onComplete) onComplete(false, "Failed to initialize WinHTTP session");
+            reportDone(false, "Failed to initialize WinHTTP session");
             return;
         }
+
+        WinHttpSetTimeouts(hSession, 10000, 10000, 15000, 30000);
+        auto trackedSession = registerWinHttpSession(hSession);
 
         HINTERNET hConnect = WinHttpConnect(
             hSession,
@@ -381,12 +727,11 @@ void AutoUpdater::downloadUpdateAssetAsync(
         );
 
         if (!hConnect) {
-            WinHttpCloseHandle(hSession);
-            if (onComplete) onComplete(false, "Failed to connect to host: " + downloadUrl);
+            trackedSession->close();
+            reportDone(false, "Failed to connect to host: " + downloadUrl);
             return;
         }
 
-        DWORD reqFlags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
         HINTERNET hRequest = WinHttpOpenRequest(
             hConnect,
             L"GET",
@@ -394,18 +739,18 @@ void AutoUpdater::downloadUpdateAssetAsync(
             nullptr,
             WINHTTP_NO_REFERER,
             WINHTTP_DEFAULT_ACCEPT_TYPES,
-            reqFlags
+            WINHTTP_FLAG_SECURE
         );
 
         if (!hRequest) {
             WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
-            if (onComplete) onComplete(false, "Failed to create WinHTTP request");
+            trackedSession->close();
+            reportDone(false, "Failed to create WinHTTP request");
             return;
         }
 
-        // Configure WinHTTP to automatically follow HTTP 302 redirects
-        DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+        // Follow HTTPS redirects only; refuse HTTPS-to-HTTP downgrades.
+        DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
         WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
         LPCWSTR reqHeaders = L"User-Agent: CppDesk-Updater\r\nAccept: application/octet-stream\r\n";
@@ -422,8 +767,8 @@ void AutoUpdater::downloadUpdateAssetAsync(
         if (!bSend || !WinHttpReceiveResponse(hRequest, nullptr)) {
             WinHttpCloseHandle(hRequest);
             WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
-            if (onComplete) onComplete(false, "Failed to receive HTTP response header");
+            trackedSession->close();
+            reportDone(false, "Failed to receive HTTP response header");
             return;
         }
 
@@ -435,8 +780,8 @@ void AutoUpdater::downloadUpdateAssetAsync(
         if (statusCode != 200) {
             WinHttpCloseHandle(hRequest);
             WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
-            if (onComplete) onComplete(false, "Server returned HTTP " + std::to_string(statusCode));
+            trackedSession->close();
+            reportDone(false, "Server returned HTTP " + std::to_string(statusCode));
             return;
         }
 
@@ -450,10 +795,18 @@ void AutoUpdater::downloadUpdateAssetAsync(
                 totalBytes = 0;
             }
         }
+        if (totalBytes > kMaxUpdateAssetBytes) {
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            trackedSession->close();
+            reportDone(false, "Update asset exceeds maximum allowed size");
+            return;
+        }
 
+        // Exclusive handle: verify SHA-256 and PE headers before closing so no other process can swap the file mid-check.
         HANDLE hFile = CreateFileW(
             targetPath.c_str(),
-            GENERIC_WRITE,
+            GENERIC_READ | GENERIC_WRITE,
             0,
             nullptr,
             CREATE_ALWAYS,
@@ -464,8 +817,8 @@ void AutoUpdater::downloadUpdateAssetAsync(
         if (hFile == INVALID_HANDLE_VALUE) {
             WinHttpCloseHandle(hRequest);
             WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
-            if (onComplete) onComplete(false, "Failed to create target file on disk");
+            trackedSession->close();
+            reportDone(false, "Failed to create target file on disk");
             return;
         }
 
@@ -478,8 +831,13 @@ void AutoUpdater::downloadUpdateAssetAsync(
         constexpr DWORD BUF_SIZE = 64 * 1024;
         std::vector<uint8_t> buffer(BUF_SIZE);
         bool readSuccess = true;
+        bool exceededCap = false;
 
         while (true) {
+            if (gate && !gate->isAlive()) {
+                readSuccess = false;
+                break;
+            }
             DWORD bytesAvailable = 0;
             if (!WinHttpQueryDataAvailable(hRequest, &bytesAvailable)) {
                 readSuccess = false;
@@ -500,6 +858,12 @@ void AutoUpdater::downloadUpdateAssetAsync(
                 break;
             }
 
+            if (downloadedBytes + bytesRead > kMaxUpdateAssetBytes) {
+                readSuccess = false;
+                exceededCap = true;
+                break;
+            }
+
             DWORD written = 0;
             if (!WriteFile(hFile, buffer.data(), bytesRead, &written, nullptr) || written != bytesRead) {
                 readSuccess = false;
@@ -516,35 +880,39 @@ void AutoUpdater::downloadUpdateAssetAsync(
                 lastSpeedBytes = downloadedBytes;
             }
 
-            if (onProgress) {
-                onProgress(downloadedBytes, totalBytes, currentSpeedBps);
-            }
+            reportProgress(downloadedBytes, totalBytes, currentSpeedBps);
         }
 
-        CloseHandle(hFile);
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+        trackedSession->close();
 
         if (!readSuccess || (totalBytes > 0 && downloadedBytes != totalBytes)) {
+            CloseHandle(hFile);
             DeleteFileW(targetPath.c_str());
-            if (onComplete) onComplete(false, "Download stream truncated or failed");
+            reportDone(false, exceededCap ? "Update asset exceeds maximum allowed size" : "Download stream truncated or failed");
             return;
         }
 
-        if (!expectedSha256.empty() && !fileMatchesSha256(targetPath, expectedSha256)) {
+        FlushFileBuffers(hFile);
+        const bool shaOk = handleMatchesSha256(hFile, expectedSha256);
+        const bool peOk = shaOk && validatePeFromHandle(hFile);
+        CloseHandle(hFile);
+
+        if (!shaOk) {
             DeleteFileW(targetPath.c_str());
-            if (onComplete) onComplete(false, "Update checksum mismatch (SHA-256)");
+            reportDone(false, "Update checksum mismatch (SHA-256)");
             return;
         }
 
-        if (onProgress) {
-            onProgress(downloadedBytes, totalBytes, currentSpeedBps);
+        if (!peOk) {
+            DeleteFileW(targetPath.c_str());
+            reportDone(false, "Validation error: Corrupt PE binary");
+            return;
         }
 
-        if (onComplete) {
-            onComplete(true, "");
-        }
+        reportProgress(downloadedBytes, totalBytes, currentSpeedBps);
+        reportDone(true, "");
     }).detach();
 #endif
 }
@@ -554,7 +922,6 @@ bool AutoUpdater::validatePeBinary(const std::wstring&) { return false; }
 bool AutoUpdater::fileMatchesSha256(const std::wstring&, const std::string&) { return false; }
 int AutoUpdater::applySelfUpdateAndRestart(const std::wstring&, const std::wstring&, uint32_t, bool) { return 1; }
 int AutoUpdater::applySelfUpdateAndRestart(const std::wstring&, uint32_t) { return 1; }
-std::wstring AutoUpdater::buildSelfUpdateCommand(const std::wstring&, const std::wstring&) { return L""; }
 bool AutoUpdater::launchSelfUpdate(const std::wstring&, const std::wstring&) { return false; }
 #else
 bool AutoUpdater::fileMatchesSha256(const std::wstring& filePath, const std::string& expectedHex) {
@@ -655,15 +1022,27 @@ int AutoUpdater::applySelfUpdateAndRestart(
     Sleep(200);
 
     bool copied = false;
+    bool usedCopyFallback = false;
     for (int attempt = 0; attempt < 30; ++attempt) {
-        if (MoveFileExW(sourceExePath.c_str(), targetExePath.c_str(), MOVEFILE_REPLACE_EXISTING) ||
-            CopyFileW(sourceExePath.c_str(), targetExePath.c_str(), FALSE)) {
+        if (MoveFileExW(sourceExePath.c_str(), targetExePath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
             copied = true;
+            break;
+        }
+        if (CopyFileW(sourceExePath.c_str(), targetExePath.c_str(), FALSE)) {
+            copied = true;
+            usedCopyFallback = true;
             break;
         }
         Sleep(250);
     }
 
+    if (copied && usedCopyFallback) {
+        if (!DeleteFileW(sourceExePath.c_str())) {
+            MoveFileExW(sourceExePath.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+        }
+    }
+
+    bool launched = !launchAfter;
     if (copied && launchAfter) {
         STARTUPINFOW si{};
         si.cb = sizeof(si);
@@ -676,6 +1055,7 @@ int AutoUpdater::applySelfUpdateAndRestart(
         if (CreateProcessW(targetExePath.c_str(), cmdBuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
+            launched = true;
         } else {
             ZeroMemory(&si, sizeof(si));
             si.cb = sizeof(si);
@@ -686,21 +1066,26 @@ int AutoUpdater::applySelfUpdateAndRestart(
             if (CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
+                launched = true;
             }
         }
     }
-    return copied ? 0 : 1;
+    return (copied && launched) ? 0 : 1;
 }
 
 int AutoUpdater::applySelfUpdateAndRestart(const std::wstring& targetExePath, uint32_t waitPid) {
-    wchar_t myPath[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, myPath, MAX_PATH);
+    std::wstring myPath(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD len = GetModuleFileNameW(nullptr, myPath.data(), static_cast<DWORD>(myPath.size()));
+        if (len == 0) return 1;
+        if (len < myPath.size()) {
+            myPath.resize(len);
+            break;
+        }
+        if (myPath.size() >= 32768) return 1;
+        myPath.resize(myPath.size() * 2);
+    }
     return applySelfUpdateAndRestart(myPath, targetExePath, waitPid, true);
-}
-
-std::wstring AutoUpdater::buildSelfUpdateCommand(const std::wstring& newExePath, const std::wstring& currentExePath) {
-    std::wstring cmd = L"cmd.exe /c \"timeout /t 1 /nobreak >nul & move /y \"" + newExePath + L"\" \"" + currentExePath + L"\" & start \"\" \"" + currentExePath + L"\"\"";
-    return cmd;
 }
 
 bool AutoUpdater::launchSelfUpdate(const std::wstring& newExePath, const std::wstring& currentExePath) {

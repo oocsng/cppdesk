@@ -13,27 +13,40 @@ SessionRewindBuffer::SessionRewindBuffer() {
 void SessionRewindBuffer::pushFrame(uint64_t timestampMs, const uint8_t* bgra, int width, int height) {
     if (!bgra || width <= 0 || height <= 0) return;
 
-    // Throttle to approximately INTERVAL_MS intervals
+    // Throttle to approximately INTERVAL_MS intervals and preserve strict monotonic timestamp order
     uint64_t prevTs = 0;
+    bool prevHasLast = false;
+    uint64_t gen = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (count_ > 0 && timestampMs > lastPushedTs_ && (timestampMs - lastPushedTs_) < (INTERVAL_MS - 50)) {
-            return;
+        if (hasLastPushed_) {
+            if (timestampMs <= lastPushedTs_ || (timestampMs - lastPushedTs_) < (INTERVAL_MS - 50)) {
+                return;
+            }
         }
         prevTs = lastPushedTs_;
+        prevHasLast = hasLastPushed_;
         lastPushedTs_ = timestampMs;
+        hasLastPushed_ = true;
+        gen = generation_;
     }
 
     std::vector<uint8_t> jpeg = TileCodec::encodeJpeg(bgra, width, height, 70);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (gen != generation_) {
+        return;
+    }
     if (jpeg.empty()) {
-        std::lock_guard<std::mutex> lock(mutex_);
         if (lastPushedTs_ == timestampMs) {
             lastPushedTs_ = prevTs;
+            hasLastPushed_ = prevHasLast;
         }
         return;
     }
-
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (count_ > 0 && timestampMs <= buffer_[(start_ + count_ - 1) % MAX_SNAPSHOTS].timestampMs) {
+        return;
+    }
 
     size_t slot = 0;
     if (count_ < MAX_SNAPSHOTS) {
@@ -154,9 +167,11 @@ size_t SessionRewindBuffer::totalMemoryBytes() const {
 
 void SessionRewindBuffer::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
+    ++generation_;
     start_ = 0;
     count_ = 0;
     lastPushedTs_ = 0;
+    hasLastPushed_ = false;
     for (auto& f : buffer_) {
         f.jpegData.clear();
         f.timestampMs = 0;

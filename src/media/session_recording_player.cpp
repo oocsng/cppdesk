@@ -14,12 +14,18 @@
 #include <filesystem>
 #include <iostream>
 #include <cstring>
+#include <cctype>
 #include <cmath>
+#include <limits>
 #include <algorithm>
 
 namespace cppdesk {
 
 namespace {
+
+constexpr size_t kMaxAviIndexEntries = 4u * 1024u * 1024u;
+constexpr uint64_t kMaxAviFramePayloadBytes = 128ULL * 1024ULL * 1024ULL;
+constexpr uint64_t kMaxAviOutputFileBytes = 0xFFFFFFF0ULL;
 
 #if defined(_WIN32)
 int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
@@ -72,6 +78,10 @@ void SessionRecordingPlayer::close() {
         moviListHeaderOffset_ = 0;
         moviDataOffset_ = 0;
         moviDataSize_ = 0;
+        fileLength_ = 0;
+        mainHeader_ = {};
+        streamHeader_ = {};
+        bmpInfoHeader_ = {};
     }
 }
 
@@ -104,6 +114,7 @@ bool SessionRecordingPlayer::open(const std::string& filePath) {
         return false;
     }
     uint64_t fileLen = static_cast<uint64_t>(endPos);
+    fileLength_ = fileLen;
     fileStream_.seekg(12);
 
     std::vector<AviIndexEntry> rawIndexEntries;
@@ -178,14 +189,20 @@ bool SessionRecordingPlayer::open(const std::string& filePath) {
                 moviDataSize_ = ckSize >= 4 ? (ckSize - 4) : 0;
             }
         } else if (ckid == FOURCC_idx1) {
-            size_t entryCount = ckSize / sizeof(AviIndexEntry);
+            uint64_t avail = (chunkDataPos <= fileLen) ? (fileLen - chunkDataPos) : 0;
+            uint64_t readableBytes = (std::min<uint64_t>)(ckSize, avail);
+            size_t entryCount = static_cast<size_t>((std::min<uint64_t>)(readableBytes / sizeof(AviIndexEntry), kMaxAviIndexEntries));
             rawIndexEntries.resize(entryCount);
             if (entryCount > 0) {
                 fileStream_.read(reinterpret_cast<char*>(rawIndexEntries.data()),
-                                 entryCount * sizeof(AviIndexEntry));
+                                 static_cast<std::streamsize>(entryCount * sizeof(AviIndexEntry)));
+                std::streamsize got = fileStream_.gcount();
+                size_t actualEntries = (got > 0) ? (static_cast<size_t>(got) / sizeof(AviIndexEntry)) : 0;
+                rawIndexEntries.resize(actualEntries);
             }
         }
 
+        if (nextChunkPos <= chunkPos || nextChunkPos > fileLen) break;
         fileStream_.seekg(nextChunkPos);
     }
 
@@ -199,6 +216,10 @@ bool SessionRecordingPlayer::open(const std::string& filePath) {
     }
 
     if (bmpInfoHeader_.biHeight != 0) {
+        if (bmpInfoHeader_.biHeight == (std::numeric_limits<int32_t>::min)()) {
+            fileStream_.close();
+            return false;
+        }
         frameHeight_ = std::abs(bmpInfoHeader_.biHeight);
     } else if (mainHeader_.dwHeight > 0) {
         frameHeight_ = static_cast<int>(mainHeader_.dwHeight);
@@ -270,9 +291,16 @@ bool SessionRecordingPlayer::open(const std::string& filePath) {
                         break;
                 }
 
+                uint64_t payloadPos = chunkStart + 8ULL;
+                if (payloadPos > fileLen || entry.size == 0 ||
+                    static_cast<uint64_t>(entry.size) > fileLen - payloadPos ||
+                    static_cast<uint64_t>(entry.size) > kMaxAviFramePayloadBytes) {
+                    continue;
+                }
+
                 AviFrameIndex fi;
                 fi.frameIndex = static_cast<uint32_t>(frames_.size());
-                fi.filePayloadPos = chunkStart + 8;
+                fi.filePayloadPos = payloadPos;
                 fi.payloadSize = entry.size;
                 fi.isKeyframe = (entry.flags & 0x00000010) != 0;
                 fi.timestampUs = static_cast<uint64_t>(fi.frameIndex) * frameDurationUs;
@@ -356,8 +384,9 @@ bool SessionRecordingPlayer::recoverIndexByScanningMovi() {
         }
 
         if (ckid == FOURCC_00dc || ckid == FOURCC_00db) {
-            if (scanPos + 8 + ckSize > fileLen + 1) {
-                break; // Truncated final frame
+            if (ckSize == 0 || static_cast<uint64_t>(ckSize) > kMaxAviFramePayloadBytes ||
+                static_cast<uint64_t>(ckSize) > fileLen - (scanPos + 8ULL)) {
+                break; // Truncated or invalid frame
             }
 
             AviFrameIndex fi;
@@ -395,29 +424,51 @@ bool SessionRecordingPlayer::decodeFramePayload(
 {
     if (!payload || size == 0) return false;
 
-    // 1. MJPEG branch
-    bool isMjpeg = (bmpInfoHeader_.biCompression == FOURCC_MJPG ||
-                    bmpInfoHeader_.biCompression == FOURCC_mjpg ||
-                    (size >= 2 && payload[0] == 0xFF && payload[1] == 0xD8));
-    if (isMjpeg) {
+    const int w = bmpInfoHeader_.biWidth > 0 ? bmpInfoHeader_.biWidth : frameWidth_;
+    const int32_t rawH = bmpInfoHeader_.biHeight != 0 ? bmpInfoHeader_.biHeight : static_cast<int32_t>(frameHeight_);
+    const bool explicitMjpeg = (bmpInfoHeader_.biCompression == FOURCC_MJPG ||
+                                bmpInfoHeader_.biCompression == FOURCC_mjpg);
+
+    // 1. MJPEG branch: never misclassify valid BI_RGB uncompressed frames whose bottom-left pixel starts with 0xFF 0xD8.
+    bool looksLikeUncompressed = false;
+    if (!explicitMjpeg && bmpInfoHeader_.biCompression == 0 &&
+        w > 0 && w <= 16384 && rawH != 0 && rawH != (std::numeric_limits<int32_t>::min)()) {
+        int absH = std::abs(rawH);
+        if (absH <= 16384) {
+            uint64_t minBytes = 0;
+            if (bmpInfoHeader_.biBitCount == 32) {
+                minBytes = static_cast<uint64_t>(w) * static_cast<uint64_t>(absH) * 4ULL;
+            } else if (bmpInfoHeader_.biBitCount == 24) {
+                uint64_t srcStride = ((static_cast<uint64_t>(w) * 3ULL + 3ULL) / 4ULL) * 4ULL;
+                minBytes = srcStride * static_cast<uint64_t>(absH);
+            }
+            if (minBytes > 0 && size >= minBytes) {
+                looksLikeUncompressed = true;
+            }
+        }
+    }
+
+    if (explicitMjpeg || (!looksLikeUncompressed && size >= 2 && payload[0] == 0xFF && payload[1] == 0xD8)) {
         return TileCodec::decodeJpeg(payload, size, outBgra, outW, outH);
     }
 
     // 2. Uncompressed DIB branch
-    int w = bmpInfoHeader_.biWidth > 0 ? bmpInfoHeader_.biWidth : frameWidth_;
-    int rawH = bmpInfoHeader_.biHeight != 0 ? bmpInfoHeader_.biHeight : frameHeight_;
-    if (w <= 0 || w > 16384 || rawH == 0 || std::abs(rawH) > 16384) return false;
+    if (w <= 0 || w > 16384 || rawH == 0 || rawH == (std::numeric_limits<int32_t>::min)()) return false;
+    int h = std::abs(rawH);
+    if (h > 16384) return false;
 
     bool isBottomUp = (rawH > 0);
-    int h = std::abs(rawH);
+    uint64_t expectedSize64 = static_cast<uint64_t>(w) * static_cast<uint64_t>(h) * 4ULL;
+    if (expectedSize64 == 0 || expectedSize64 > kMaxAviFramePayloadBytes) return false;
+
+    size_t expectedSize = static_cast<size_t>(expectedSize64);
     outW = w;
     outH = h;
-    size_t expectedSize = static_cast<size_t>(w) * static_cast<size_t>(h) * 4;
     outBgra.resize(expectedSize);
 
     if (bmpInfoHeader_.biBitCount == 32) {
         if (size < expectedSize) return false;
-        size_t rowBytes = static_cast<size_t>(w * 4);
+        size_t rowBytes = static_cast<size_t>(w) * 4;
         uint8_t* dst = outBgra.data();
         if (isBottomUp) {
             for (int y = 0; y < h; ++y) {
@@ -429,18 +480,18 @@ bool SessionRecordingPlayer::decodeFramePayload(
             std::memcpy(dst, payload, expectedSize);
         }
         // Ensure opaque alpha for rendering
-        for (int i = 3; i < static_cast<int>(expectedSize); i += 4) {
+        for (size_t i = 3; i < expectedSize; i += 4) {
             if (dst[i] == 0) dst[i] = 0xFF;
         }
         return true;
     } else if (bmpInfoHeader_.biBitCount == 24) {
         size_t srcStride = ((static_cast<size_t>(w) * 3 + 3) / 4) * 4;
-        if (size < srcStride * h) return false;
+        if (size < srcStride * static_cast<size_t>(h)) return false;
         uint8_t* dst = outBgra.data();
         for (int y = 0; y < h; ++y) {
             size_t srcRowIdx = isBottomUp ? static_cast<size_t>(h - 1 - y) : static_cast<size_t>(y);
             const uint8_t* srcRow = payload + srcRowIdx * srcStride;
-            uint8_t* dstRow = dst + static_cast<size_t>(y) * (w * 4);
+            uint8_t* dstRow = dst + static_cast<size_t>(y) * static_cast<size_t>(w) * 4;
             for (int x = 0; x < w; ++x) {
                 dstRow[x * 4 + 0] = srcRow[x * 3 + 0]; // B
                 dstRow[x * 4 + 1] = srcRow[x * 3 + 1]; // G
@@ -461,14 +512,24 @@ bool SessionRecordingPlayer::seekToFrame(uint32_t frameIndex) {
     }
 
     const auto& fi = frames_[frameIndex];
+    if (fi.payloadSize == 0 ||
+        static_cast<uint64_t>(fi.payloadSize) > kMaxAviFramePayloadBytes ||
+        fi.filePayloadPos > fileLength_ ||
+        static_cast<uint64_t>(fi.payloadSize) > fileLength_ - fi.filePayloadPos) {
+        return false;
+    }
+
     std::vector<uint8_t> payload(fi.payloadSize);
+    std::function<void()> cb;
     {
         std::lock_guard<std::mutex> lock(frameMutex_);
         if (!fileStream_.is_open()) return false;
         fileStream_.clear();
         fileStream_.seekg(fi.filePayloadPos);
         fileStream_.read(reinterpret_cast<char*>(payload.data()), fi.payloadSize);
-        if (!fileStream_.good()) return false;
+        if (!fileStream_.good() || fileStream_.gcount() != static_cast<std::streamsize>(fi.payloadSize)) {
+            return false;
+        }
 
         int w = 0, h = 0;
         if (!decodeFramePayload(payload.data(), fi.payloadSize, currentFrameBgra_, w, h)) {
@@ -478,10 +539,11 @@ bool SessionRecordingPlayer::seekToFrame(uint32_t frameIndex) {
         frameHeight_ = h;
         currentFrameIndex_.store(frameIndex);
         hasNewFrame_.store(true);
+        cb = onFrameReadyCallback_;
     }
 
-    if (onFrameReadyCallback_) {
-        onFrameReadyCallback_();
+    if (cb) {
+        cb();
     }
     return true;
 }
@@ -529,6 +591,7 @@ void SessionRecordingPlayer::copyCurrentFrameBgra(std::vector<uint8_t>& outBuf, 
 }
 
 void SessionRecordingPlayer::setOnFrameReady(std::function<void()> cb) {
+    std::lock_guard<std::mutex> lock(frameMutex_);
     onFrameReadyCallback_ = std::move(cb);
 }
 
@@ -590,11 +653,11 @@ void SessionRecordingPlayer::playbackWorkerLoop() {
             isPlaying_.store(false);
         } else {
             lock.unlock();
-            if (!seekToFrame(next)) {
-                isPlaying_.store(false);
-                break;
-            }
+            bool ok = seekToFrame(next);
             lock.lock();
+            if (!ok) {
+                isPlaying_.store(false);
+            }
         }
 
         playbackCv_.wait_until(lock, nextTick, [this]() {
@@ -698,7 +761,8 @@ bool SessionRecordingPlayer::exportSnapshotPng(const std::string& outputPath) {
 bool SessionRecordingPlayer::exportSnapshot(const std::string& outputPath) {
     std::filesystem::path p(outputPath);
     std::string ext = p.extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (ext == ".png") {
         return exportSnapshotPng(outputPath);
     }
@@ -795,6 +859,7 @@ bool SessionRecordingPlayer::trimClip(const std::string& outputPath, uint32_t st
 
         for (uint32_t i = startFrame; i <= endFrame; ++i) {
             const auto& fi = frames_[i];
+            if (fi.filePayloadPos < 8 || fi.filePayloadPos > fileLength_) return false;
             uint64_t chunkHeaderPos = fi.filePayloadPos - 8;
             fileStream_.clear();
             fileStream_.seekg(chunkHeaderPos);
@@ -802,15 +867,30 @@ bool SessionRecordingPlayer::trimClip(const std::string& outputPath, uint32_t st
             uint32_t ckSize = 0;
             fileStream_.read(reinterpret_cast<char*>(&ckid), 4);
             fileStream_.read(reinterpret_cast<char*>(&ckSize), 4);
-            if (!fileStream_.good()) return false;
+            if (!fileStream_.good() ||
+                static_cast<uint64_t>(ckSize) > kMaxAviFramePayloadBytes ||
+                static_cast<uint64_t>(ckSize) > fileLength_ - fi.filePayloadPos) {
+                return false;
+            }
 
             if (payloadBuf.size() < ckSize) {
                 payloadBuf.resize(ckSize);
             }
             fileStream_.read(reinterpret_cast<char*>(payloadBuf.data()), ckSize);
-            if (!fileStream_.good()) return false;
+            if (!fileStream_.good() || fileStream_.gcount() != static_cast<std::streamsize>(ckSize)) {
+                return false;
+            }
 
-            uint32_t newChunkStart = static_cast<uint32_t>(out.tellp());
+            std::streampos outPos = out.tellp();
+            if (outPos < 0) return false;
+            uint64_t outPos64 = static_cast<uint64_t>(outPos);
+            uint64_t paddedChunk = 8ULL + static_cast<uint64_t>(ckSize) + (ckSize & 1U);
+            uint64_t projectedIdx = 8ULL + static_cast<uint64_t>(newIndexEntries.size() + 1) * sizeof(AviIndexEntry);
+            if (outPos64 + paddedChunk + projectedIdx > kMaxAviOutputFileBytes) {
+                return false;
+            }
+
+            uint32_t newChunkStart = static_cast<uint32_t>(outPos64);
             out.write(reinterpret_cast<const char*>(&ckid), 4);
             out.write(reinterpret_cast<const char*>(&ckSize), 4);
             out.write(reinterpret_cast<const char*>(payloadBuf.data()), ckSize);
@@ -818,6 +898,7 @@ bool SessionRecordingPlayer::trimClip(const std::string& outputPath, uint32_t st
                 char pad = 0;
                 out.write(&pad, 1);
             }
+            if (!out.good()) return false;
 
             AviIndexEntry entry{};
             entry.ckid = ckid;
@@ -829,7 +910,9 @@ bool SessionRecordingPlayer::trimClip(const std::string& outputPath, uint32_t st
     }
 
     // 4. Write idx1 chunk
-    uint32_t idxStart = static_cast<uint32_t>(out.tellp());
+    std::streampos idxPos = out.tellp();
+    if (idxPos < 0 || static_cast<uint64_t>(idxPos) > kMaxAviOutputFileBytes) return false;
+    uint32_t idxStart = static_cast<uint32_t>(idxPos);
     out.write("idx1", 4);
     uint32_t idxSize = static_cast<uint32_t>(newIndexEntries.size() * sizeof(AviIndexEntry));
     out.write(reinterpret_cast<const char*>(&idxSize), 4);
@@ -837,7 +920,11 @@ bool SessionRecordingPlayer::trimClip(const std::string& outputPath, uint32_t st
         out.write(reinterpret_cast<const char*>(newIndexEntries.data()), idxSize);
     }
 
-    uint32_t totalFileSize = static_cast<uint32_t>(out.tellp());
+    std::streampos endOutPos = out.tellp();
+    if (endOutPos < 8 || static_cast<uint64_t>(endOutPos) > (std::numeric_limits<uint32_t>::max)()) {
+        return false;
+    }
+    uint32_t totalFileSize = static_cast<uint32_t>(endOutPos);
     uint32_t riffSize = totalFileSize - 8;
     uint32_t moviSize = (idxStart - newMoviDataOffset) + 4;
 
@@ -850,8 +937,9 @@ bool SessionRecordingPlayer::trimClip(const std::string& outputPath, uint32_t st
     out.write(reinterpret_cast<const char*>(&moviSize), 4);
 
     out.flush();
+    bool ok = out.good();
     out.close();
-    return true;
+    return ok;
 }
 
 } // namespace cppdesk

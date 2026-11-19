@@ -188,7 +188,7 @@ static LRESULT CALLBACK BlankLowLevelMouseProc(int nCode, WPARAM wParam, LPARAM 
     if (nCode >= 0 && lParam != 0) {
         const MSLLHOOKSTRUCT* hs = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
         if (ScreenBlankManager::isPhysicalMouseInput(*hs)) {
-            ScreenBlankManager::instance().triggerEmergencyWake();
+            ScreenBlankManager::instance().requestAsyncEmergencyWake();
         }
     }
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
@@ -198,7 +198,7 @@ static LRESULT CALLBACK BlankLowLevelKeyboardProc(int nCode, WPARAM wParam, LPAR
     if (nCode >= 0 && lParam != 0) {
         const KBDLLHOOKSTRUCT* hs = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
         if (ScreenBlankManager::isPhysicalKeyboardInput(*hs)) {
-            ScreenBlankManager::instance().triggerEmergencyWake();
+            ScreenBlankManager::instance().requestAsyncEmergencyWake();
         }
     }
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
@@ -208,6 +208,16 @@ ScreenBlankManager::ScreenBlankManager() = default;
 
 ScreenBlankManager::~ScreenBlankManager() {
     disengageBlanking();
+    {
+        std::lock_guard<std::mutex> lk(wakeMutex_);
+        wakeStop_ = true;
+    }
+    wakeCv_.notify_all();
+    if (wakeThread_.joinable()) {
+        try {
+            wakeThread_.join();
+        } catch (...) {}
+    }
 }
 
 ScreenBlankManager& ScreenBlankManager::instance() {
@@ -246,7 +256,8 @@ bool ScreenBlankManager::engageBlanking(
     bool showDeskId,
     uint64_t deskId)
 {
-    disengageBlanking();
+    std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex_);
+    disengageBlankingLocked();
 
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
@@ -255,7 +266,18 @@ bool ScreenBlankManager::engageBlanking(
         brandName_ = brand;
         showDeskId_ = showDeskId;
         deskId_ = deskId;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(initMutex_);
         initReady_ = false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(wakeMutex_);
+        if (!wakeThread_.joinable() && !wakeStop_) {
+            wakeThread_ = std::thread(&ScreenBlankManager::wakeWorkerFunc, this);
+        }
     }
 
     blankActive_.store(true);
@@ -273,6 +295,11 @@ bool ScreenBlankManager::engageBlanking(
 }
 
 void ScreenBlankManager::disengageBlanking() {
+    std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex_);
+    disengageBlankingLocked();
+}
+
+void ScreenBlankManager::disengageBlankingLocked() {
     blankActive_.store(false);
 
     DWORD tid = blankThreadId_.exchange(0);
@@ -280,14 +307,10 @@ void ScreenBlankManager::disengageBlanking() {
         PostThreadMessageW(tid, WM_QUIT, 0, 0);
     }
 
-    if (blankThread_.joinable()) {
-        if (blankThread_.get_id() != std::this_thread::get_id()) {
-            try {
-                blankThread_.join();
-            } catch (...) {}
-        } else {
-            blankThread_.detach();
-        }
+    if (blankThread_.joinable() && blankThread_.get_id() != std::this_thread::get_id()) {
+        try {
+            blankThread_.join();
+        } catch (...) {}
     }
 
     wakeDisplays();
@@ -331,6 +354,49 @@ void ScreenBlankManager::triggerEmergencyWake() {
     }
 }
 
+void ScreenBlankManager::requestAsyncEmergencyWake() {
+    bool expected = true;
+    if (!blankActive_.compare_exchange_strong(expected, false)) {
+        return;
+    }
+
+    wakeDisplays();
+
+    DWORD tid = blankThreadId_.load();
+    if (tid != 0) {
+        PostThreadMessageW(tid, WM_QUIT, 0, 0);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(wakeMutex_);
+        wakePending_ = true;
+    }
+    wakeCv_.notify_one();
+}
+
+void ScreenBlankManager::wakeWorkerFunc() {
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(wakeMutex_);
+            wakeCv_.wait(lk, [this] { return wakePending_ || wakeStop_; });
+            if (wakeStop_ && !wakePending_) {
+                break;
+            }
+            wakePending_ = false;
+        }
+        std::function<void()> cb;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            cb = emergencyWakeCallback_;
+        }
+        if (cb) {
+            try {
+                cb();
+            } catch (...) {}
+        }
+    }
+}
+
 void ScreenBlankManager::blankingThreadFunc() {
     DWORD tid = GetCurrentThreadId();
     blankThreadId_.store(tid);
@@ -344,10 +410,8 @@ void ScreenBlankManager::blankingThreadFunc() {
     hMouseHook_ = SetWindowsHookExW(WH_MOUSE_LL, BlankLowLevelMouseProc, GetModuleHandleW(nullptr), 0);
     hKbdHook_ = SetWindowsHookExW(WH_KEYBOARD_LL, BlankLowLevelKeyboardProc, GetModuleHandleW(nullptr), 0);
 
-    // 2. Create curtain window if CurtainOnly or Unified
-    if (mode == ScreenBlankMode::CurtainOnly || mode == ScreenBlankMode::Unified) {
-        createCurtainWindow();
-    }
+    // 2. Always create the curtain window; hardware DPMS is a no-op so DpmsOnly falls back to CurtainOnly
+    createCurtainWindow();
 
     // 3. Command displays to DPMS standby if DpmsOnly or Unified
     if (mode == ScreenBlankMode::DpmsOnly || mode == ScreenBlankMode::Unified) {
@@ -386,15 +450,24 @@ void ScreenBlankManager::blankingThreadFunc() {
 void ScreenBlankManager::createCurtainWindow() {
     if (hwndCurtain_) return;
 
-    std::string activeBrand = brandName_.empty() ? "CppDesk Enterprise Security" : brandName_;
-    std::string activeNotice = customNotice_.empty() ? "Screen output hidden and local physical inputs secured for authorized administration." : customNotice_;
+    std::string activeBrand;
+    std::string activeNotice;
+    bool showId = true;
+    uint64_t deskId = 0;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        activeBrand = brandName_.empty() ? "CppDesk Enterprise Security" : brandName_;
+        activeNotice = customNotice_.empty() ? "Screen output hidden and local physical inputs secured for authorized administration." : customNotice_;
+        showId = showDeskId_;
+        deskId = deskId_;
+    }
 
     s_curtainConfig.brandName = utf8ToWide(activeBrand);
     s_curtainConfig.noticeText = utf8ToWide(activeNotice);
-    s_curtainConfig.showDeskId = showDeskId_;
+    s_curtainConfig.showDeskId = showId;
 
-    if (deskId_ > 0) {
-        std::string rawId = std::to_string(deskId_);
+    if (deskId > 0) {
+        std::string rawId = std::to_string(deskId);
         std::string fmtId;
         for (size_t i = 0; i < rawId.size(); ++i) {
             if (i > 0 && (rawId.size() - i) % 3 == 0) fmtId += "-";
@@ -431,14 +504,15 @@ void ScreenBlankManager::createCurtainWindow() {
     );
 
     if (hwndCurtain_) {
+        curtainHwnd_.store(hwndCurtain_);
         SetWindowDisplayAffinity(hwndCurtain_, WDA_EXCLUDEFROMCAPTURE);
-        ShowWindow(hwndCurtain_, SW_SHOWMAXIMIZED);
         SetWindowPos(hwndCurtain_, HWND_TOPMOST, vx, vy, vw, vh, SWP_SHOWWINDOW | SWP_NOACTIVATE);
         UpdateWindow(hwndCurtain_);
     }
 }
 
 void ScreenBlankManager::destroyCurtainWindow() {
+    curtainHwnd_.store(nullptr);
     if (hwndCurtain_) {
         DestroyWindow(hwndCurtain_);
         hwndCurtain_ = nullptr;
@@ -457,10 +531,13 @@ void ScreenBlankManager::powerDownDisplays() {}
 void ScreenBlankManager::wakeDisplays() {}
 bool ScreenBlankManager::engageBlanking(ScreenBlankMode, const std::string&, const std::string&, bool, uint64_t) { return false; }
 void ScreenBlankManager::disengageBlanking() {}
+void ScreenBlankManager::disengageBlankingLocked() {}
 bool ScreenBlankManager::isBlankActive() const { return false; }
 ScreenBlankMode ScreenBlankManager::currentBlankMode() const { return ScreenBlankMode::CurtainOnly; }
 void ScreenBlankManager::setEmergencyWakeCallback(std::function<void()>) {}
 void ScreenBlankManager::triggerEmergencyWake() {}
+void ScreenBlankManager::requestAsyncEmergencyWake() {}
+void ScreenBlankManager::wakeWorkerFunc() {}
 void ScreenBlankManager::blankingThreadFunc() {}
 void ScreenBlankManager::createCurtainWindow() {}
 void ScreenBlankManager::destroyCurtainWindow() {}

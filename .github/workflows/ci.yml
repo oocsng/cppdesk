@@ -5,11 +5,19 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -21,12 +29,14 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "$env:RUNNER_TEMP\msys64\ucrt64\bin;$env:PATH"
-          ./build.ps1 -Test
+          ./build.ps1 -Test -BuildRelay
 
   linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: No fixed ports in tests
         run: bash scripts/check_test_ports.sh
       - name: Install dependencies
@@ -55,6 +65,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -70,6 +82,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install dependencies
         run: brew install zstd openssl@3
       - name: Build

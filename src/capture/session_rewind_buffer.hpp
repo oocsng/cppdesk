@@ -44,6 +44,8 @@ private:
     size_t start_ = 0;
     size_t count_ = 0;
     uint64_t lastPushedTs_ = 0;
+    bool hasLastPushed_ = false;
+    uint64_t generation_ = 0;
     mutable std::mutex mutex_;
 };
 

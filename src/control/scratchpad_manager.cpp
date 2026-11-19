@@ -3,12 +3,19 @@
 #include <iomanip>
 #include <chrono>
 #include <ctime>
+#include <limits>
 
 namespace cppdesk {
 
+namespace {
+constexpr uint32_t kMaxScratchpadRevisionJump = 1000000u;
+}
+
 ScratchpadUpdatePayload ScratchpadManager::updateLocalText(const std::string& newText, uint32_t localDeskId, uint32_t cursorPos) {
     std::lock_guard<std::mutex> lock(mutex_);
-    revision_++;
+    if (revision_ < std::numeric_limits<uint32_t>::max()) {
+        revision_++;
+    }
     text_ = newText;
     lastEditorDeskId_ = localDeskId;
     cursorPos_ = cursorPos;
@@ -23,8 +30,11 @@ ScratchpadUpdatePayload ScratchpadManager::updateLocalText(const std::string& ne
 
 bool ScratchpadManager::handleRemoteUpdate(const ScratchpadUpdatePayload& payload) {
     std::lock_guard<std::mutex> lock(mutex_);
-    // Reject older revisions
+    // Reject older revisions and suspicious jumps (e.g. UINT32_MAX poisoning)
     if (payload.revision < revision_) {
+        return false;
+    }
+    if ((payload.revision - revision_) > kMaxScratchpadRevisionJump) {
         return false;
     }
     // Accept equal or newer revision
@@ -42,7 +52,7 @@ std::string ScratchpadManager::getText() const {
 
 uint64_t ScratchpadManager::getRevision() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return revision_;
+    return static_cast<uint64_t>(revision_);
 }
 
 uint32_t ScratchpadManager::getLastEditor() const {
@@ -57,7 +67,9 @@ uint32_t ScratchpadManager::getCursorPos() const {
 
 void ScratchpadManager::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
-    revision_++;
+    if (revision_ < std::numeric_limits<uint32_t>::max()) {
+        revision_++;
+    }
     text_.clear();
     cursorPos_ = 0;
 }

@@ -142,17 +142,20 @@ struct PipeWireStream::Impl {
         pw_buffer* pb = self->api.dequeue(self->stream);
         if (!pb) return;
         const spa_buffer* sb = pb->buffer;
-        if (sb && sb->n_datas > 0 && self->width > 0 && self->height > 0) {
+        if (sb && sb->n_datas > 0 && self->width > 0 && self->height > 0 &&
+            self->format != PixelFormat::Unsupported) {
             const spa_data& d = sb->datas[0];
-            const bool broken = d.chunk->size == 0;   // an empty buffer: nothing new to show
-            const size_t stride = d.chunk->stride > 0 ? static_cast<size_t>(d.chunk->stride) : static_cast<size_t>(self->width) * 4;
-            const size_t offset = d.chunk->offset;
-            const size_t need = stride * (self->height - 1) + static_cast<size_t>(self->width) * 4;
-            if (d.data && !broken && offset + need <= d.maxsize) {
-                const uint8_t* src = static_cast<const uint8_t*>(d.data) + offset;
-                const PixelFormat fmt = self->format;
-                const int w = self->width, h = self->height;
-                self->sink->write(w, h, [&](uint8_t* dst) { convertToBgra(fmt, src, stride, w, h, dst); });
+            if (d.data && d.chunk && d.chunk->size > 0) {
+                const size_t minStride = static_cast<size_t>(self->width) * 4;
+                const size_t stride = d.chunk->stride > 0 ? static_cast<size_t>(d.chunk->stride) : minStride;
+                const size_t offset = d.chunk->offset;
+                const size_t need = stride * static_cast<size_t>(self->height - 1) + minStride;
+                if (stride >= minStride && offset <= d.maxsize && need <= d.maxsize - offset) {
+                    const uint8_t* src = static_cast<const uint8_t*>(d.data) + offset;
+                    const PixelFormat fmt = self->format;
+                    const int w = self->width, h = self->height;
+                    self->sink->write(w, h, [&](uint8_t* dst) { convertToBgra(fmt, src, stride, w, h, dst); });
+                }
             }
         }
         self->api.queue(self->stream, pb);

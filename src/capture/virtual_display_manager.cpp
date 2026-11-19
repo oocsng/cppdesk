@@ -8,6 +8,8 @@ namespace cppdesk {
 
 namespace {
 
+constexpr uint64_t kMaxVirtualSurfaceBytes = 128ULL * 1024ULL * 1024ULL;
+
 #if defined(_WIN32)
 void renderSyntheticDesktopInternal(VirtualDisplayInfo& info, HDC hdc, void* pBits, const std::string& hostStatusText) {
 #else
@@ -112,31 +114,13 @@ uint32_t VirtualDisplayManager::getPhysicalMonitorCount() {
 }
 
 bool VirtualDisplayManager::hasIddCxDriver() {
-#if !defined(_WIN32)
+    // IddCx driver IOCTLs are not implemented; all virtual displays use software surfaces.
     return false;
-#else
-    HANDLE h1 = CreateFileA("\\\\.\\ParsecVirtualDisplay",
-                            GENERIC_READ | GENERIC_WRITE,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE,
-                            nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h1 != INVALID_HANDLE_VALUE) {
-        CloseHandle(h1);
-        return true;
-    }
-    HANDLE h2 = CreateFileA("\\\\.\\RustDeskIddDisplay",
-                            GENERIC_READ | GENERIC_WRITE,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE,
-                            nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h2 != INVALID_HANDLE_VALUE) {
-        CloseHandle(h2);
-        return true;
-    }
-    return false;
-#endif
 }
 
 bool VirtualDisplayManager::allocateSoftwareSurface(SurfaceState& surface, uint32_t width, uint32_t height) {
-    if (width == 0 || height == 0 || width > 8192 || height > 8192) {
+    uint64_t totalBytes = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 4ULL;
+    if (width == 0 || height == 0 || width > 8192 || height > 8192 || totalBytes > kMaxVirtualSurfaceBytes) {
         return false;
     }
     releaseSoftwareSurface(surface);
@@ -297,7 +281,8 @@ bool VirtualDisplayManager::createVirtualDisplay(
     st.info.x = computeNextVirtualX_Locked(st.info.width);
     st.info.y = 0;
     st.info.isHeadlessFallback = false;
-    st.info.backend = (preferIddCx && hasIddCxDriver()) ? VirtualBackend::IddCx : VirtualBackend::Software;
+    (void)preferIddCx;
+    st.info.backend = VirtualBackend::Software;
     st.info.name = "Virtual Display " + std::to_string(displays_.size() + 1) + " (" +
                    std::to_string(st.info.width) + "x" + std::to_string(st.info.height) + ") [Virtual]";
 
@@ -331,15 +316,26 @@ bool VirtualDisplayManager::setVirtualDisplayMode(uint32_t displayId, uint32_t w
     if (it == displays_.end()) return false;
 
     auto& s = it->second;
-    s.info.width = (width > 0) ? width : s.info.width;
-    s.info.height = (height > 0) ? height : s.info.height;
-    if (refreshRate > 0) s.info.refreshRate = refreshRate;
+    uint32_t newW = (width > 0) ? width : s.info.width;
+    uint32_t newH = (height > 0) ? height : s.info.height;
+    uint32_t newHz = (refreshRate > 0) ? refreshRate : s.info.refreshRate;
+
+    SurfaceState next;
+    if (!allocateSoftwareSurface(next, newW, newH)) {
+        return false;
+    }
+
+    releaseSoftwareSurface(s);
+    s.hdc = next.hdc;
+    s.hbm = next.hbm;
+    s.pBits = next.pBits;
+    s.hOldBm = next.hOldBm;
+    s.info.width = newW;
+    s.info.height = newH;
+    s.info.refreshRate = newHz;
     s.info.name = "Virtual Display " + std::to_string(displayId) + " (" +
                   std::to_string(s.info.width) + "x" + std::to_string(s.info.height) + ") [Virtual]";
 
-    if (!allocateSoftwareSurface(s, s.info.width, s.info.height)) {
-        return false;
-    }
     renderSyntheticDesktopInternal(s.info, s.hdc, s.pBits, "");
     return true;
 }
@@ -388,7 +384,7 @@ bool VirtualDisplayManager::captureSoftwareSurface(uint32_t displayId, std::vect
     outW = static_cast<int>(s.info.width);
     outH = static_cast<int>(s.info.height);
     uint64_t totalBytes64 = static_cast<uint64_t>(outW) * static_cast<uint64_t>(outH) * 4ULL;
-    if (totalBytes64 == 0 || totalBytes64 > 128ULL * 1024ULL * 1024ULL) return false;
+    if (totalBytes64 == 0 || totalBytes64 > kMaxVirtualSurfaceBytes) return false;
     size_t totalBytes = static_cast<size_t>(totalBytes64);
     if (outBgra.size() != totalBytes) {
         outBgra.resize(totalBytes);

@@ -211,6 +211,8 @@ private:
     std::unique_ptr<MacCaptureStream> macStream_;
     uint32_t                  macStreamDisplay_ = 0xFFFFFFFFu;
     uint64_t                  macLastStartMs_ = 0;
+    int                       macLogicalW_ = 0;
+    int                       macLogicalH_ = 0;
 #endif
 
     // GDI handle recycling cache

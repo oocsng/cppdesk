@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 namespace cppdesk::ui {
 
@@ -66,7 +67,7 @@ public:
     void setTransform(const Transform2D& t) override;
     Transform2D transform() const override { return transform_; }
 
-    bool frameBalanced() const override { return clipDepth_ == 0 && layerDepth_ == 0; }
+    bool frameBalanced() const override { return stack_.empty(); }
 
 private:
     struct ImageEntry {
@@ -74,6 +75,7 @@ private:
         int width = 0;
         int height = 0;
     };
+    enum class Pushed { Clip, Opacity, OpacityNoop };
 
     ID2D1SolidColorBrush* brush(Color c);
     ID2D1PathGeometry* buildGeometry(const Path& p, bool filled) const;
@@ -87,8 +89,7 @@ private:
     std::unordered_map<uint32_t, ImageEntry> images_;
     uint32_t nextImage_ = 1;
     Transform2D transform_{};
-    int clipDepth_ = 0;
-    int layerDepth_ = 0;
+    std::vector<Pushed> stack_;
     bool inFrame_ = false;
     bool recreateNeeded_ = false;
 };

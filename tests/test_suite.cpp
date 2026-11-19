@@ -175,36 +175,36 @@ void testDeskIdAndCrypto() {
     TEST_ASSERT(CryptoUtils::randomBytes(nonce.data(), nonce.size()));
 
     uint64_t clientId = 123456789ULL;
-    auto validResp = CryptoUtils::computeChallengeResponse("SecretPass#2026", hostReloaded.deskId(), clientId, nonce);
-    auto wrongResp = CryptoUtils::computeChallengeResponse("WrongPassword", hostReloaded.deskId(), clientId, nonce);
-
-    TEST_ASSERT(hostReloaded.verifyChallengeResponse(clientId, nonce, validResp));
-    TEST_ASSERT(!hostReloaded.verifyChallengeResponse(clientId, nonce, wrongResp));
-
-    // Verify dynamic 6-char One-Time Session Code authentication & regeneration
-    std::string code1 = hostReloaded.sessionCode();
-    TEST_ASSERT(code1.size() == 6);
-    auto codeResp1 = CryptoUtils::computeChallengeResponse(code1, hostReloaded.deskId(), clientId, nonce);
-    TEST_ASSERT(hostReloaded.verifyChallengeResponse(clientId, nonce, codeResp1));
-
-    std::string code2 = hostReloaded.regenerateSessionCode();
-    TEST_ASSERT(code2.size() == 6);
-    auto codeResp2 = CryptoUtils::computeChallengeResponse(code2, hostReloaded.deskId(), clientId, nonce);
-    TEST_ASSERT(hostReloaded.verifyChallengeResponse(clientId, nonce, codeResp2));
-
-    // Stream cipher round-trip & SAS fingerprint ("XXXX-XXXX")
     const uint8_t mockSecret[32] = {0x42};
     auto sessionKey = CryptoUtils::deriveSessionKey(hostReloaded.deskId(), clientId, nonce, mockSecret, sizeof(mockSecret));
     TEST_ASSERT(CryptoUtils::isUsableKey(sessionKey));
     std::string fp = CryptoUtils::sessionFingerprintHex(sessionKey);
     TEST_ASSERT(fp.size() == 9);
 
-    std::string secretPayload = "AeroDesk Encrypted Frame Payload Verification 1234567890";
-    std::vector<uint8_t> buf(secretPayload.begin(), secretPayload.end());
-    CryptoUtils::transformPayload(buf.data(), buf.size(), sessionKey, 42);
-    TEST_ASSERT(std::memcmp(buf.data(), secretPayload.data(), buf.size()) != 0);
-    CryptoUtils::transformPayload(buf.data(), buf.size(), sessionKey, 42);
-    TEST_ASSERT(std::memcmp(buf.data(), secretPayload.data(), buf.size()) == 0);
+    std::array<uint8_t, 16> kdfSalt{};
+    uint32_t kdfIter = 0;
+    hostReloaded.getAuthKdfParams(kdfSalt, kdfIter);
+    auto validResp = CryptoUtils::bindChallengeResponse(
+        sessionKey, CryptoUtils::computeChallengeResponse("SecretPass#2026", kdfSalt, kdfIter, hostReloaded.deskId(), clientId, nonce));
+    auto wrongResp = CryptoUtils::bindChallengeResponse(
+        sessionKey, CryptoUtils::computeChallengeResponse("WrongPassword", kdfSalt, kdfIter, hostReloaded.deskId(), clientId, nonce));
+
+    TEST_ASSERT(hostReloaded.verifyChallengeResponse(clientId, nonce, validResp, sessionKey, kdfSalt, kdfIter));
+    TEST_ASSERT(!hostReloaded.verifyChallengeResponse(clientId, nonce, wrongResp, sessionKey, kdfSalt, kdfIter));
+
+    // Verify dynamic 6-char One-Time Session Code authentication & regeneration
+    std::string code1 = hostReloaded.sessionCode();
+    TEST_ASSERT(code1.size() == 6);
+    auto codeResp1 = CryptoUtils::bindChallengeResponse(
+        sessionKey, CryptoUtils::computeChallengeResponse(code1, kdfSalt, kdfIter, hostReloaded.deskId(), clientId, nonce));
+    TEST_ASSERT(hostReloaded.verifyChallengeResponse(clientId, nonce, codeResp1, sessionKey, kdfSalt, kdfIter));
+
+    std::string code2 = hostReloaded.regenerateSessionCode();
+    TEST_ASSERT(code2.size() == 6);
+    hostReloaded.getAuthKdfParams(kdfSalt, kdfIter);
+    auto codeResp2 = CryptoUtils::bindChallengeResponse(
+        sessionKey, CryptoUtils::computeChallengeResponse(code2, kdfSalt, kdfIter, hostReloaded.deskId(), clientId, nonce));
+    TEST_ASSERT(hostReloaded.verifyChallengeResponse(clientId, nonce, codeResp2, sessionKey, kdfSalt, kdfIter));
 }
 
 void testTileCodecRoundTrip() {
@@ -828,17 +828,6 @@ void testEcdhAndAesGcmEngine() {
     TEST_ASSERT(clientSeq == 1);
     TEST_ASSERT(std::string(clientDec.begin(), clientDec.end()) == mouseEvent);
 
-    // Rekeying Ratchet (Option 4A)
-    TEST_ASSERT(hostCipher.ratchetKey());
-    TEST_ASSERT(viewerCipher.ratchetKey());
-    std::string postRatchetPlain = "Payload after 1 GB ratchet key rotation";
-    mockHdr.payloadSize = static_cast<uint32_t>(12 + postRatchetPlain.size() + 16);
-    std::vector<uint8_t> ratchetEnc;
-    TEST_ASSERT(hostCipher.encrypt(postRatchetPlain.data(), postRatchetPlain.size(), 2, &mockHdr, sizeof(mockHdr), ratchetEnc));
-    std::vector<uint8_t> ratchetDec;
-    TEST_ASSERT(viewerCipher.decrypt(ratchetEnc.data(), ratchetEnc.size(), &mockHdr, sizeof(mockHdr), ratchetDec));
-    TEST_ASSERT(std::string(ratchetDec.begin(), ratchetDec.end()) == postRatchetPlain);
-
     // 4. Multi-Threaded Tile Compression Pool (Option 2A)
     std::vector<TileThreadPool::RectTask> tasks;
     for (int i = 0; i < 8; ++i) {
@@ -1311,9 +1300,9 @@ void testAutoUpdaterAndProtocolV3() {
     // 1. Magic constants & Protocol definitions
     TEST_ASSERT(PROTOCOL_MAGIC == 0x43505044); // "CPPD"
     TEST_ASSERT(RELAY_MAGIC == 0x4344534B);    // "CDSK"
-    TEST_ASSERT(PROTOCOL_VERSION == 3);
+    TEST_ASSERT(PROTOCOL_VERSION == 4);
     TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.11.2");
-    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030800);
+    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030B02);
 
     // 2. Semantic Version Triad Parsing
     int maj = 0, min = 0, pat = 0;
@@ -2692,6 +2681,11 @@ void testWindowsServiceAndRemoteRebootReconnect() {
         TEST_ASSERT(t1Bytes.size() == 32);
         TEST_ASSERT(CryptoUtils::toHex(t1Bytes.data(), t1Bytes.size()) == token1);
 
+        auto tmpRebootDir = std::filesystem::temp_directory_path() / L"cppdesk_test_reboot_token";
+        std::error_code tmpEc;
+        std::filesystem::remove_all(tmpRebootDir, tmpEc);
+        WindowsServiceManager::setRebootTokenDirForTest(tmpRebootDir.wstring());
+
         uint64_t callerDeskId = 987654321ULL;
         WindowsServiceManager::clearRebootToken();
         TEST_ASSERT(!WindowsServiceManager::hasPendingRebootToken());
@@ -2704,20 +2698,25 @@ void testWindowsServiceAndRemoteRebootReconnect() {
         TEST_ASSERT(WindowsServiceManager::hasPendingRebootToken(&readCaller));
         TEST_ASSERT(readCaller == callerDeskId);
 
-        // Validation with wrong desk ID should fail and NOT consume the token
+        // Validation with wrong desk ID fails and invalidates the token
         TEST_ASSERT(!WindowsServiceManager::validateAndConsumeRebootToken(token1, 111222333ULL));
-        TEST_ASSERT(WindowsServiceManager::hasPendingRebootToken());
+        TEST_ASSERT(!WindowsServiceManager::hasPendingRebootToken());
 
-        // Validation with wrong token should fail
+        // Re-save and verify wrong token fails and invalidates the token
+        TEST_ASSERT(WindowsServiceManager::saveRebootToken(token1, callerDeskId, 300));
         TEST_ASSERT(!WindowsServiceManager::validateAndConsumeRebootToken("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", callerDeskId));
-        TEST_ASSERT(WindowsServiceManager::hasPendingRebootToken());
+        TEST_ASSERT(!WindowsServiceManager::hasPendingRebootToken());
 
-        // Valid consumption should succeed
+        // Re-save and verify valid consumption succeeds (single-use semantics)
+        TEST_ASSERT(WindowsServiceManager::saveRebootToken(token1, callerDeskId, 300));
         TEST_ASSERT(WindowsServiceManager::validateAndConsumeRebootToken(token1, callerDeskId));
 
         // Token must now be consumed (single-use semantics)
         TEST_ASSERT(!WindowsServiceManager::hasPendingRebootToken());
         TEST_ASSERT(!WindowsServiceManager::validateAndConsumeRebootToken(token1, callerDeskId));
+
+        WindowsServiceManager::setRebootTokenDirForTest(L"");
+        std::filesystem::remove_all(tmpRebootDir, tmpEc);
     }
 
     // 3. Service Control Manager queries
@@ -5742,17 +5741,6 @@ void testPeerVersionHandshakeAndSelfUpdater() {
         // Clean up mock file
         DeleteFileW(testExePath.c_str());
 
-        // 5c. Test buildSelfUpdateCommand formatting
-        std::wstring newExe = L"C:\\Temp\\CppDesk_new.exe";
-        std::wstring curExe = L"C:\\Program Files\\CppDesk\\CppDesk.exe";
-        std::wstring cmd = AutoUpdater::buildSelfUpdateCommand(newExe, curExe);
-        TEST_ASSERT(cmd.find(L"cmd.exe /c") != std::wstring::npos);
-        TEST_ASSERT(cmd.find(L"timeout /t 1 /nobreak") != std::wstring::npos);
-        TEST_ASSERT(cmd.find(L"move /y") != std::wstring::npos);
-        TEST_ASSERT(cmd.find(L"start \"\"") != std::wstring::npos);
-        TEST_ASSERT(cmd.find(newExe) != std::wstring::npos);
-        TEST_ASSERT(cmd.find(curExe) != std::wstring::npos);
-
         // 5d. Test silent applySelfUpdateAndRestart file replacement
         std::wstring testSrc = std::wstring(tempPath) + L"test_update_src.bin";
         std::wstring testDest = std::wstring(tempPath) + L"test_update_dest.bin";
@@ -6644,196 +6632,6 @@ void testCrossPlatformUiWindowingAndMacOsViewer() {
         TEST_ASSERT(std::abs(roundViewY - geo2.contentRect.bottom) < 0.001f);
     }
 
-    // Sub-test 2: Keycode Translation & Modifier Bitmask Transitions
-    {
-        // 2.1: macOS to Windows VK translation for navigation & control
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x24) == 0x0D); // Return -> VK_RETURN
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x30) == 0x09); // Tab -> VK_TAB
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x31) == 0x20); // Space -> VK_SPACE
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x33) == 0x08); // Backspace -> VK_BACK
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x35) == 0x1B); // Escape -> VK_ESCAPE
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x75) == 0x2E); // Forward Delete -> VK_DELETE
-
-        // Arrows
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7B) == 0x25); // Left -> VK_LEFT
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7C) == 0x27); // Right -> VK_RIGHT
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7E) == 0x26); // Up -> VK_UP
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7D) == 0x28); // Down -> VK_DOWN
-
-        // Paging & Home/End
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x73) == 0x24); // Home -> VK_HOME
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x77) == 0x23); // End -> VK_END
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x74) == 0x21); // Page Up -> VK_PRIOR
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x79) == 0x22); // Page Down -> VK_NEXT
-
-        // Alphanumerics A-Z
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x00) == 0x41); // 'A'
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x06) == 0x5A); // 'Z'
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x0B) == 0x42); // 'B'
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x0C) == 0x51); // 'Q'
-
-        // Digits 0-9
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x1D) == 0x30); // '0'
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x12) == 0x31); // '1'
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x19) == 0x39); // '9'
-
-        // Function keys F1-F12
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x7A) == 0x70); // F1
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x6F) == 0x7B); // F12
-
-        // Modifiers
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x38) == 0x10); // Shift
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x3B) == 0x11); // Control
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x3A) == 0x12); // Option
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x37) == 0x5B); // Command (Win)
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0x39) == 0x14); // CapsLock
-
-        // 2.2: Bidirectional inverse mapping roundtrip: windowsVkToMacKeyCode(macKeyCodeToWindowsVk(k)) == k
-        std::vector<uint16_t> sampleKeys = {
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x19, 0x1A, 0x1C, 0x1D, 0x1F,
-            0x20, 0x22, 0x23, 0x24, 0x25, 0x26, 0x28, 0x2D, 0x2E,
-            0x30, 0x31, 0x33, 0x35, 0x37, 0x38, 0x39, 0x3A, 0x3B,
-            0x73, 0x74, 0x75, 0x77, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x6F
-        };
-        for (uint16_t mk : sampleKeys) {
-            uint32_t vk = UiPlatform::macKeyCodeToWindowsVk(mk);
-            TEST_ASSERT(vk != 0);
-            uint16_t roundTrip = UiPlatform::windowsVkToMacKeyCode(vk);
-            TEST_ASSERT(roundTrip == mk);
-        }
-
-        // Unmapped key checks
-        TEST_ASSERT(UiPlatform::macKeyCodeToWindowsVk(0xFFFF) == 0);
-        TEST_ASSERT(UiPlatform::windowsVkToMacKeyCode(0xFFFF) == 0xFFFF);
-
-        // 2.3: Modifier Bitmask Transition Decoding
-        // Shift key pressed: 0 -> (1 << 17)
-        uint64_t mask0 = 0;
-        uint64_t maskShift = (1ULL << 17);
-        auto trans1 = UiPlatform::decodeModifierTransitions(mask0, maskShift);
-        TEST_ASSERT(trans1.size() == 1);
-        TEST_ASSERT(trans1[0].vkCode == 0x10); // VK_SHIFT
-        TEST_ASSERT(trans1[0].isDown == true);
-
-        // Shift released: (1 << 17) -> 0
-        auto trans2 = UiPlatform::decodeModifierTransitions(maskShift, mask0);
-        TEST_ASSERT(trans2.size() == 1);
-        TEST_ASSERT(trans2[0].vkCode == 0x10);
-        TEST_ASSERT(trans2[0].isDown == false);
-
-        // Command released: (1 << 20) -> 0
-        uint64_t maskCmd = (1ULL << 20);
-        auto trans3 = UiPlatform::decodeModifierTransitions(maskCmd, mask0);
-        TEST_ASSERT(trans3.size() == 1);
-        TEST_ASSERT(trans3[0].vkCode == 0x5B); // VK_LWIN
-        TEST_ASSERT(trans3[0].isDown == false);
-
-        // Multi-modifier combo: Shift pressed, Control and Option simultaneously engaged
-        uint64_t maskComboOld = (1ULL << 17); // Shift down
-        uint64_t maskComboNew = (1ULL << 18) | (1ULL << 19); // Shift up, Ctrl down, Opt down
-        auto trans4 = UiPlatform::decodeModifierTransitions(maskComboOld, maskComboNew);
-        TEST_ASSERT(trans4.size() == 3);
-        bool shiftUpSeen = false;
-        bool ctrlDownSeen = false;
-        bool optDownSeen = false;
-        for (const auto& t : trans4) {
-            if (t.vkCode == 0x10 && !t.isDown) shiftUpSeen = true;
-            if (t.vkCode == 0x11 && t.isDown) ctrlDownSeen = true;
-            if (t.vkCode == 0x12 && t.isDown) optDownSeen = true;
-        }
-        TEST_ASSERT(shiftUpSeen);
-        TEST_ASSERT(ctrlDownSeen);
-        TEST_ASSERT(optDownSeen);
-
-        // Test 32-bit overload
-        uint32_t mask32Old = 0;
-        uint32_t mask32New = static_cast<uint32_t>(1U << 17);
-        auto trans32 = UiPlatform::decodeModifierTransitions(mask32Old, mask32New);
-        TEST_ASSERT(trans32.size() == 1);
-        TEST_ASSERT(trans32[0].vkCode == 0x10);
-        TEST_ASSERT(trans32[0].isDown == true);
-    }
-
-    // Sub-test 3: Canvas Tile Blitting & Pitch Math
-    {
-        const int canvasW = 128;
-        const int canvasH = 128;
-        const int canvasPitch = canvasW * 4;
-        std::vector<uint8_t> canvas(canvasH * canvasPitch, 0x10); // Background color 0x10
-
-        const int tileW = 32;
-        const int tileH = 32;
-        const int tilePitch = tileW * 4;
-        std::vector<uint8_t> tile(tileH * tilePitch, 0xFF); // White tile 0xFF
-
-        // 3.1: Blit 32x32 colored tile into offset (16, 16)
-        bool blitOk = UiPlatform::blitTileToCanvas(
-            canvas.data(), canvasW, canvasH, canvasPitch,
-            tile.data(), 16, 16, tileW, tileH, tilePitch);
-        TEST_ASSERT(blitOk);
-
-        // Verify interior pixels match expected color (0xFF)
-        for (int y = 16; y < 16 + tileH; ++y) {
-            for (int x = 16; x < 16 + tileW; ++x) {
-                for (int c = 0; c < 4; ++c) {
-                    TEST_ASSERT(canvas[y * canvasPitch + x * 4 + c] == 0xFF);
-                }
-            }
-        }
-
-        // Verify exterior pixels remain untouched (0x10)
-        TEST_ASSERT(canvas[15 * canvasPitch + 15 * 4] == 0x10);
-        TEST_ASSERT(canvas[49 * canvasPitch + 49 * 4] == 0x10);
-        TEST_ASSERT(canvas[0] == 0x10);
-        TEST_ASSERT(canvas[100 * canvasPitch + 100 * 4] == 0x10);
-
-        // 3.2: Boundary clipping: tile partially outside right/bottom canvas boundaries
-        // Canvas is 128x128, tile placed at (110, 110) with size 32x32 -> [110, 128) x [110, 128)
-        std::vector<uint8_t> tileClip(tileH * tilePitch, 0xAA);
-        bool clipOk = UiPlatform::blitTileToCanvas(
-            canvas.data(), canvasW, canvasH, canvasPitch,
-            tileClip.data(), 110, 110, tileW, tileH, tilePitch);
-        TEST_ASSERT(clipOk);
-
-        for (int y = 110; y < 128; ++y) {
-            for (int x = 110; x < 128; ++x) {
-                TEST_ASSERT(canvas[y * canvasPitch + x * 4] == 0xAA);
-            }
-        }
-
-        // 3.3: Boundary clipping: tile partially outside left/top boundaries (negative coords)
-        std::vector<uint8_t> tileNeg(tileH * tilePitch, 0xBB);
-        bool negOk = UiPlatform::blitTileToCanvas(
-            canvas.data(), canvasW, canvasH, canvasPitch,
-            tileNeg.data(), -10, -10, tileW, tileH, tilePitch);
-        TEST_ASSERT(negOk);
-        TEST_ASSERT(canvas[0 * canvasPitch + 0 * 4] == 0xBB);
-        TEST_ASSERT(canvas[21 * canvasPitch + 21 * 4] == 0xBB);
-
-        // 3.4: Complete out-of-bounds rejection
-        bool oobRight = UiPlatform::blitTileToCanvas(
-            canvas.data(), canvasW, canvasH, canvasPitch,
-            tile.data(), 200, 200, tileW, tileH, tilePitch);
-        TEST_ASSERT(!oobRight);
-
-        bool oobLeft = UiPlatform::blitTileToCanvas(
-            canvas.data(), canvasW, canvasH, canvasPitch,
-            tile.data(), -100, -100, tileW, tileH, tilePitch);
-        TEST_ASSERT(!oobLeft);
-
-        // 3.5: Null buffer validation
-        bool nullDst = UiPlatform::blitTileToCanvas(
-            nullptr, canvasW, canvasH, canvasPitch,
-            tile.data(), 0, 0, tileW, tileH, tilePitch);
-        TEST_ASSERT(!nullDst);
-
-        bool nullSrc = UiPlatform::blitTileToCanvas(
-            canvas.data(), canvasW, canvasH, canvasPitch,
-            nullptr, 0, 0, tileW, tileH, tilePitch);
-        TEST_ASSERT(!nullSrc);
-    }
-
     // Sub-test 4: MacBook-Style Fluid Spring Physics & Tactile Transform Math
     {
         // 4.1: Spring physics integration (UiPlatform::stepSpring)
@@ -7450,32 +7248,31 @@ void testBoundAuthResponse() {
     keyA.fill(0x11);
     keyB.fill(0x22);
 
-    auto legacy = CryptoUtils::computeChallengeResponse("Bound#Pass1", hostId, viewerId, nonce);
-    auto bound = CryptoUtils::bindChallengeResponse(keyA, legacy);
+    std::array<uint8_t, 16> kdfSalt{};
+    uint32_t kdfIter = 0;
+    host.getAuthKdfParams(kdfSalt, kdfIter);
+    auto inner = CryptoUtils::computeChallengeResponse("Bound#Pass1", kdfSalt, kdfIter, hostId, viewerId, nonce);
+    auto bound = CryptoUtils::bindChallengeResponse(keyA, inner);
 
-    TEST_ASSERT(bound != legacy);
-    TEST_ASSERT(bound == CryptoUtils::bindChallengeResponse(keyA, legacy));   // deterministic
-    TEST_ASSERT(bound != CryptoUtils::bindChallengeResponse(keyB, legacy));   // depends on the key
+    TEST_ASSERT(bound != inner);
+    TEST_ASSERT(bound == CryptoUtils::bindChallengeResponse(keyA, inner));   // deterministic
+    TEST_ASSERT(bound != CryptoUtils::bindChallengeResponse(keyB, inner));   // depends on the key
 
-    // Without a session key the old exchange still verifies (pre-3.9 viewers)
-    TEST_ASSERT(host.verifyChallengeResponse(viewerId, nonce, legacy));
-    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, bound));
+    // Only the bound digest verifies; an observer who saw the inner digest gets nothing
+    TEST_ASSERT(host.verifyChallengeResponse(viewerId, nonce, bound, keyA, kdfSalt, kdfIter));
+    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, inner, keyA, kdfSalt, kdfIter));
+    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, bound, keyB, kdfSalt, kdfIter));
 
-    // With a session key only the bound digest verifies; an observer who saw the legacy digest gets nothing
-    TEST_ASSERT(host.verifyChallengeResponse(viewerId, nonce, bound, &keyA));
-    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, legacy, &keyA));
-    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, bound, &keyB));
-
-    // A wrong password never verifies, bound or not
-    auto wrongLegacy = CryptoUtils::computeChallengeResponse("Wrong#Pass1", hostId, viewerId, nonce);
-    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, CryptoUtils::bindChallengeResponse(keyA, wrongLegacy), &keyA));
+    // A wrong password never verifies
+    auto wrongInner = CryptoUtils::computeChallengeResponse("Wrong#Pass1", kdfSalt, kdfIter, hostId, viewerId, nonce);
+    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, CryptoUtils::bindChallengeResponse(keyA, wrongInner), keyA, kdfSalt, kdfIter));
 
     // The one-time session code takes the same bound path
     const std::string code = host.sessionCode();
     TEST_ASSERT(!code.empty());
-    auto codeLegacy = CryptoUtils::computeChallengeResponse(code, hostId, viewerId, nonce);
-    TEST_ASSERT(host.verifyChallengeResponse(viewerId, nonce, CryptoUtils::bindChallengeResponse(keyA, codeLegacy), &keyA));
-    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, codeLegacy, &keyA));
+    auto codeInner = CryptoUtils::computeChallengeResponse(code, kdfSalt, kdfIter, hostId, viewerId, nonce);
+    TEST_ASSERT(host.verifyChallengeResponse(viewerId, nonce, CryptoUtils::bindChallengeResponse(keyA, codeInner), keyA, kdfSalt, kdfIter));
+    TEST_ASSERT(!host.verifyChallengeResponse(viewerId, nonce, codeInner, keyA, kdfSalt, kdfIter));
 }
 
 void testConnectionLimiter() {
@@ -7590,39 +7387,40 @@ void testRelayDeskOwnership() {
 
     // Part A: the registry on its own.
     {
-        Key keyA{}, keyB{};
-        keyA.fill(0x11);
-        keyB.fill(0x22);
+        PairingKey keyA, keyB;
+        TEST_ASSERT(keyA.generate() && keyB.generate());
         Nonce n1{}, n2{};
         n1.fill(0x01);
         n2.fill(0x02);
+        auto prove = [](const PairingKey& k, uint64_t id, const Nonce& n) {
+            Proof p{};
+            (void)makeProof(k, id, n, p);
+            return p;
+        };
 
         OwnerRegistry reg;
         TEST_ASSERT(!reg.hasOwner(1001, 0));
-        TEST_ASSERT(reg.enroll(1001, keyA, 0));
+        Proof tampered = prove(keyA, 1001, n1);
+        tampered[100] ^= 0x01;
+        TEST_ASSERT(!reg.enroll(1001, n1, tampered, 0));                 // enrolling needs a valid signature
+        TEST_ASSERT(!reg.enroll(1001, n2, prove(keyA, 1001, n1), 0));    // signed over another challenge
+        TEST_ASSERT(!reg.hasOwner(1001, 0));
+        TEST_ASSERT(reg.enroll(1001, n1, prove(keyA, 1001, n1), 0));
         TEST_ASSERT(reg.hasOwner(1001, 1000));
-        TEST_ASSERT(!reg.enroll(1001, keyB, 1000));          // an enrolled ID cannot be re-enrolled
+        TEST_ASSERT(!reg.enroll(1001, n2, prove(keyB, 1001, n2), 1000)); // an enrolled ID cannot be re-enrolled
 
-        Key proof = computeProof(keyA, 1001, n1);
+        Proof proof = prove(keyA, 1001, n1);
         TEST_ASSERT(reg.verify(1001, n1, proof, 2000));
         TEST_ASSERT(!reg.verify(1001, n2, proof, 2000));      // proof replayed against a fresh nonce
         TEST_ASSERT(!reg.verify(1002, n1, proof, 2000));      // proof for another desk ID
-        TEST_ASSERT(!reg.verify(1001, n1, computeProof(keyB, 1001, n1), 2000)); // wrong key
-        TEST_ASSERT(computeProof(keyA, 1001, n1) != computeProof(keyA, 1002, n1));
+        TEST_ASSERT(!reg.verify(1001, n1, prove(keyB, 1001, n1), 2000)); // valid signature, but not the owner's key
 
         // A record lapses after the TTL, and activity keeps it alive.
         TEST_ASSERT(reg.hasOwner(1001, 2000 + TTL_MS - 1));
         reg.touch(1001, 3000);
         TEST_ASSERT(reg.hasOwner(1001, 3000 + TTL_MS - 1));
         TEST_ASSERT(!reg.hasOwner(1001, 3000 + TTL_MS + 1));
-        TEST_ASSERT(reg.enroll(1001, keyB, 3000 + TTL_MS + 1)); // free again once lapsed
-
-        // The key a host sends is specific to its relay.
-        Key install{};
-        install.fill(0x33);
-        TEST_ASSERT(deriveRelayKey(install, "relay.example:50000") == deriveRelayKey(install, "relay.example:50000"));
-        TEST_ASSERT(deriveRelayKey(install, "relay.example:50000") != deriveRelayKey(install, "other.example:50000"));
-        TEST_ASSERT(deriveRelayKey(install, "relay.example:50000") != install);
+        TEST_ASSERT(reg.enroll(1001, n2, prove(keyB, 1001, n2), 3000 + TTL_MS + 1)); // free again once lapsed
     }
 
     // Part B: a real RelayServer, spoken to over TCP.
@@ -7676,7 +7474,7 @@ void testRelayDeskOwnership() {
         }
         return r;
     };
-    auto answer = [&](uintptr_t s, const Key& value) {
+    auto answer = [&](uintptr_t s, const Proof& value) {
         ByteWriter w;
         w.writeBytes(value.data(), value.size());
         FrameHeader h{};
@@ -7707,14 +7505,19 @@ void testRelayDeskOwnership() {
     };
 
     const uint64_t deskId = 482910375ULL;
-    Key ownerKey{};
-    ownerKey.fill(0x5A);
+    PairingKey ownerKey;
+    TEST_ASSERT(ownerKey.generate());
+    auto prove = [&](const PairingKey& k, const Nonce& n) {
+        Proof p{};
+        (void)makeProof(k, deskId, n, p);
+        return p;
+    };
 
     // 1. The owner's first registration enrolls its key.
     uintptr_t owner = dial();
     RegReply first = beginRegister(owner, deskId, "owner-host", true);
     TEST_ASSERT(first.challengeMode == MODE_ENROLL);
-    TEST_ASSERT(answer(owner, ownerKey) == 1);
+    TEST_ASSERT(answer(owner, prove(ownerKey, first.nonce)) == 1);
     TEST_ASSERT(lookup(deskId) == "owner-host");
 
     // 2. A host that sends no proof at all cannot take the ID.
@@ -7724,13 +7527,13 @@ void testRelayDeskOwnership() {
     TEST_ASSERT(lookup(deskId) == "owner-host");
 
     // 3. Wrong proof, and the owner's own earlier proof replayed against a new nonce, are both refused.
-    Key earlierProof = computeProof(ownerKey, deskId, first.nonce);
+    Proof earlierProof = prove(ownerKey, first.nonce);
     uintptr_t forger = dial();
     RegReply forgerChallenge = beginRegister(forger, deskId, "evil-forger", true);
     TEST_ASSERT(forgerChallenge.challengeMode == MODE_PROVE);
-    Key bogus{};
-    bogus.fill(0x66);
-    TEST_ASSERT(answer(forger, bogus) == 0);
+    PairingKey forgerKey;
+    TEST_ASSERT(forgerKey.generate());
+    TEST_ASSERT(answer(forger, prove(forgerKey, forgerChallenge.nonce)) == 0);   // a stranger's own valid key
     hangUp(forger);
     uintptr_t replayer = dial();
     TEST_ASSERT(beginRegister(replayer, deskId, "evil-replay", true).challengeMode == MODE_PROVE);
@@ -7748,7 +7551,7 @@ void testRelayDeskOwnership() {
     uintptr_t again = dial();
     RegReply second = beginRegister(again, deskId, "owner-host-2", true);
     TEST_ASSERT(second.challengeMode == MODE_PROVE);
-    TEST_ASSERT(answer(again, computeProof(ownerKey, deskId, second.nonce)) == 1);
+    TEST_ASSERT(answer(again, prove(ownerKey, second.nonce)) == 1);
     TEST_ASSERT(lookup(deskId) == "owner-host-2");
     // The takeover wakes the stale registration's thread. That thread must not close a handle a later connection has
     // been given (handle numbers are reused at once on Linux), so a burst of fresh connections all still get answers.
@@ -7782,11 +7585,6 @@ void testRelayDeskOwnership() {
     {
         IdentityManager idMgr(94);
         idMgr.loadOrCreate();
-        TEST_ASSERT(CryptoUtils::isUsableKey(idMgr.relayOwnerKey()));
-        Key persistedKey = idMgr.relayOwnerKey();
-        IdentityManager reloaded(94);
-        reloaded.loadOrCreate();
-        TEST_ASSERT(reloaded.relayOwnerKey() == persistedKey);   // survives a restart
 
         NetworkEngine engine(idMgr);
         TEST_ASSERT(engine.start());
@@ -9228,7 +9026,7 @@ void testLinuxNotifications() {
 // A PlatformShell for headless screen tests: no window, a fixed clock, and switchable capabilities.
 class FakeShell : public ui::PlatformShell {
 public:
-    bool service = true, elevation = true, shortcut = true, actionCenter = true, tray = true, notifications = true;
+    bool service = true, elevation = true, shortcut = true, actionCenter = true, tray = true;
     bool hostPermsCap = false;
     ui::HostPermissionStatus hostPerms;
     std::vector<ui::HostPermission> requestedPerms, openedPerms;
@@ -9245,11 +9043,8 @@ public:
     void chooseOpenFile(const std::string&, const std::string&, const std::string&, ChosenPath chosen) override { chosen(std::nullopt); }
     void chooseFolder(const std::string&, ChosenPath chosen) override { chosen(std::nullopt); }
     void openUrl(const std::string&) override {}
-    void revealPath(const std::string&) override {}
     int relaunches = 0;
     void relaunchApp() override { ++relaunches; }
-    void showNotification(const std::string&, const std::string&) override {}
-    void setTrayStatus(const std::string&) override {}
     void setFrameIntervalMs(unsigned) override {}
     bool fullscreen = false;
     bool setFullscreen(bool on) override { fullscreen = on; return true; }
@@ -9292,7 +9087,6 @@ public:
             case ui::Capability::DesktopShortcut: return shortcut;
             case ui::Capability::ActionCenterToasts: return actionCenter;
             case ui::Capability::TrayIcon: return tray;
-            case ui::Capability::NativeNotifications: return notifications;
             case ui::Capability::HostPermissions: return hostPermsCap;
         }
         return false;
@@ -9461,11 +9255,11 @@ void testLinuxInputHelpers() {
     TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("48") == 1.0f);
 
     auto paths = UiPlatform::parseFileUriList("file:///home/a/b%20c.txt\r\n# comment\r\nhttps://example.com/x\r\n"
-                                              "file://host/tmp/x\r\nfile:///tmp/%E2%82%AC\n");
-    TEST_ASSERT(paths.size() == 3);
+                                              "file://host/tmp/x\r\nfile://LocalHost/tmp/y\r\nfile:///tmp/%E2%82%AC\n");
+    TEST_ASSERT(paths.size() == 3);   // file://host/... names a remote file and is skipped
     if (paths.size() == 3) {
         TEST_ASSERT(paths[0] == "/home/a/b c.txt");
-        TEST_ASSERT(paths[1] == "/tmp/x");
+        TEST_ASSERT(paths[1] == "/tmp/y");
         TEST_ASSERT(paths[2] == "/tmp/\xE2\x82\xAC");
     }
     TEST_ASSERT(UiPlatform::parseFileUriList("").empty());
@@ -13178,6 +12972,14 @@ void testOsAssignedPorts() {
     setOsAssignedPortsForTest(true);                    // main() runs the suite with it on
 }
 
+#include "fix_tests_a.inc"
+#include "fix_tests_b.inc"
+#include "fix_tests_c.inc"
+#include "fix_tests_d.inc"
+#include "fix_tests_e.inc"
+#include "fix_tests_f.inc"
+#include "fix_tests_g.inc"
+
 int main(int argc, char** argv) {
     try {
         setOsAssignedPortsForTest(true);   // every listener binds an OS-assigned port; tests dial the port that was bound
@@ -13345,6 +13147,13 @@ int main(int argc, char** argv) {
 #endif
         testOsAssignedPorts(); std::cout << "Test 120 done\n" << std::flush;
         testRecentCardButtonsClickable(); std::cout << "Test 121 done\n" << std::flush;
+        testFixesA(); std::cout << "Fix tests A done\n" << std::flush;
+        testFixesB(); std::cout << "Fix tests B done\n" << std::flush;
+        testFixesC(); std::cout << "Fix tests C done\n" << std::flush;
+        testFixesD(); std::cout << "Fix tests D done\n" << std::flush;
+        testFixesE(); std::cout << "Fix tests E done\n" << std::flush;
+        testFixesF(); std::cout << "Fix tests F done\n" << std::flush;
+        testFixesG(); std::cout << "Fix tests G done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";

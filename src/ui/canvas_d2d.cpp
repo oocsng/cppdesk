@@ -91,8 +91,7 @@ void D2DCanvas::detach() {
     release(brush_);
     rt_ = nullptr;
     transform_ = Transform2D::identity();
-    clipDepth_ = 0;
-    layerDepth_ = 0;
+    stack_.clear();
 }
 
 bool D2DCanvas::consumeRecreateNeeded() {
@@ -107,21 +106,18 @@ ID2D1SolidColorBrush* D2DCanvas::brush(Color c) {
 }
 
 void D2DCanvas::unwindState() {
-    while (layerDepth_ > 0) {
-        rt_->PopLayer();
-        --layerDepth_;
-    }
-    while (clipDepth_ > 0) {
-        rt_->PopAxisAlignedClip();
-        --clipDepth_;
+    while (!stack_.empty()) {
+        const Pushed kind = stack_.back();
+        stack_.pop_back();
+        if (kind == Pushed::Clip) rt_->PopAxisAlignedClip();
+        else if (kind == Pushed::Opacity) rt_->PopLayer();
     }
 }
 
 void D2DCanvas::beginFrame(float, float, Color clear) {
     if (!rt_) return;
     transform_ = Transform2D::identity();
-    clipDepth_ = 0;
-    layerDepth_ = 0;
+    stack_.clear();
     rt_->BeginDraw();
     inFrame_ = true;
     rt_->SetTransform(D2D1::Matrix3x2F::Identity());
@@ -316,30 +312,37 @@ void D2DCanvas::destroyImage(ImageId id) {
 void D2DCanvas::pushClip(Rect r) {
     if (!rt_) return;
     rt_->PushAxisAlignedClip(d2dRect(r), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    ++clipDepth_;
+    stack_.push_back(Pushed::Clip);
 }
 
 void D2DCanvas::popClip() {
-    if (!rt_ || clipDepth_ == 0) return;
+    if (!rt_ || stack_.empty() || stack_.back() != Pushed::Clip) return;
     rt_->PopAxisAlignedClip();
-    --clipDepth_;
+    stack_.pop_back();
 }
 
 void D2DCanvas::pushOpacity(float opacity) {
     if (!rt_) return;
     ID2D1Layer* layer = nullptr;
-    if (FAILED(rt_->CreateLayer(nullptr, &layer)) || !layer) return;
+    if (FAILED(rt_->CreateLayer(nullptr, &layer)) || !layer) {
+        stack_.push_back(Pushed::OpacityNoop);
+        return;
+    }
     rt_->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                                          D2D1::IdentityMatrix(), std::clamp(opacity, 0.0f, 1.0f)),
                    layer);
     layer->Release();   // the render target holds its own reference while the layer is pushed
-    ++layerDepth_;
+    stack_.push_back(Pushed::Opacity);
 }
 
 void D2DCanvas::popOpacity() {
-    if (!rt_ || layerDepth_ == 0) return;
-    rt_->PopLayer();
-    --layerDepth_;
+    if (!rt_ || stack_.empty()) return;
+    if (stack_.back() == Pushed::Opacity) {
+        rt_->PopLayer();
+        stack_.pop_back();
+    } else if (stack_.back() == Pushed::OpacityNoop) {
+        stack_.pop_back();
+    }
 }
 
 void D2DCanvas::setTransform(const Transform2D& t) {

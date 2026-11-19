@@ -8,12 +8,18 @@
 #include <winsvc.h>
 #include <shlobj.h>
 #include <bcrypt.h>
+#include <sddl.h>
+#include <aclapi.h>
+#include <accctrl.h>
 
-#include <filesystem>
-#include <fstream>
+#include <array>
 #include <chrono>
-#include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <mutex>
+#include <string>
+#include <vector>
 
 namespace cppdesk {
 
@@ -21,57 +27,241 @@ namespace {
 
 static constexpr uint32_t REBOOT_TOKEN_MAGIC = 0x43505052; // "CPPR"
 
-static SERVICE_STATUS        g_svcStatus{};
-static SERVICE_STATUS_HANDLE g_svcStatusHandle = nullptr;
-static HANDLE                g_svcStopEvent = nullptr;
+static std::mutex   g_rebootTokenMutex;
+static std::wstring g_testTokenDir;
 
-static VOID WINAPI ServiceCtrlHandler(DWORD dwCtrl) {
-    switch (dwCtrl) {
-    case SERVICE_CONTROL_STOP:
-    case SERVICE_CONTROL_SHUTDOWN:
-        g_svcStatus.dwCurrentState = SERVICE_STOP_PENDING;
-        SetServiceStatus(g_svcStatusHandle, &g_svcStatus);
-        if (g_svcStopEvent) {
-            SetEvent(g_svcStopEvent);
-        }
-        break;
-    default:
-        break;
+bool constantTimeEquals32(const std::array<uint8_t, 32>& a, const std::array<uint8_t, 32>& b) {
+    uint8_t diff = 0;
+    for (size_t i = 0; i < 32; ++i) {
+        diff |= (a[i] ^ b[i]);
     }
+    return diff == 0;
 }
 
-static VOID WINAPI ServiceMain(DWORD dwArgc, LPWSTR* lpszArgv) {
-    (void)dwArgc;
-    (void)lpszArgv;
+bool getCurrentUserSid(std::vector<uint8_t>& outSidBytes, std::wstring& outSidString) {
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+    DWORD needed = 0;
+    GetTokenInformation(hToken, TokenUser, nullptr, 0, &needed);
+    if (needed == 0) {
+        CloseHandle(hToken);
+        return false;
+    }
+    std::vector<uint8_t> buf(needed);
+    bool ok = false;
+    if (GetTokenInformation(hToken, TokenUser, buf.data(), needed, &needed)) {
+        TOKEN_USER* tu = reinterpret_cast<TOKEN_USER*>(buf.data());
+        DWORD sidLen = GetLengthSid(tu->User.Sid);
+        outSidBytes.assign(reinterpret_cast<uint8_t*>(tu->User.Sid),
+                           reinterpret_cast<uint8_t*>(tu->User.Sid) + sidLen);
+        LPWSTR sidStr = nullptr;
+        if (ConvertSidToStringSidW(tu->User.Sid, &sidStr) && sidStr) {
+            outSidString = sidStr;
+            LocalFree(sidStr);
+            ok = true;
+        }
+    }
+    CloseHandle(hToken);
+    return ok;
+}
 
-    g_svcStatusHandle = RegisterServiceCtrlHandlerW(WindowsServiceManager::SERVICE_NAME, ServiceCtrlHandler);
-    if (!g_svcStatusHandle) return;
+bool buildStrictSecurityDescriptor(bool testOverride, PSECURITY_DESCRIPTOR* outSD) {
+    *outSD = nullptr;
+    std::wstring sddl;
+    if (testOverride) {
+        std::vector<uint8_t> sidBytes;
+        std::wstring sidStr;
+        if (!getCurrentUserSid(sidBytes, sidStr) || sidStr.empty()) {
+            return false;
+        }
+        // Protected DACL: SYSTEM and current user SID only.
+        sddl = L"D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;" + sidStr + L")";
+    } else {
+        // Production protected DACL: SYSTEM and Built-in Administrators only.
+        sddl = L"D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+    }
+    return ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl.c_str(), SDDL_REVISION_1, outSD, nullptr) != FALSE;
+}
 
-    g_svcStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-    g_svcStatus.dwCurrentState = SERVICE_START_PENDING;
-    g_svcStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
-    SetServiceStatus(g_svcStatusHandle, &g_svcStatus);
+bool isAclStrictlyRestricted(const std::wstring& path, bool testOverride) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return false;
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) return false;
 
-    g_svcStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_svcStopEvent) {
-        g_svcStatus.dwCurrentState = SERVICE_STOPPED;
-        SetServiceStatus(g_svcStatusHandle, &g_svcStatus);
-        return;
+    PSID pOwner = nullptr;
+    PACL pDacl = nullptr;
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+    DWORD err = GetNamedSecurityInfoW(
+        path.c_str(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+        &pOwner,
+        nullptr,
+        &pDacl,
+        nullptr,
+        &pSD
+    );
+    if (err != ERROR_SUCCESS || !pSD) {
+        if (pSD) LocalFree(pSD);
+        return false;
     }
 
-    g_svcStatus.dwCurrentState = SERVICE_RUNNING;
-    SetServiceStatus(g_svcStatusHandle, &g_svcStatus);
+    auto cleanup = [&]() { LocalFree(pSD); };
 
-    // Keep service running until stop event is signaled
-    WaitForSingleObject(g_svcStopEvent, INFINITE);
-
-    g_svcStatus.dwCurrentState = SERVICE_STOPPED;
-    SetServiceStatus(g_svcStatusHandle, &g_svcStatus);
-
-    if (g_svcStopEvent) {
-        CloseHandle(g_svcStopEvent);
-        g_svcStopEvent = nullptr;
+    if (!pDacl || !pOwner) {
+        cleanup();
+        return false;
     }
+
+    // Build allowed SIDs: SYSTEM + (current user in testOverride, Built-in Administrators in production)
+    BYTE sysSidBuf[SECURITY_MAX_SID_SIZE] = {};
+    DWORD sysSidSize = sizeof(sysSidBuf);
+    if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, sysSidBuf, &sysSidSize)) {
+        cleanup();
+        return false;
+    }
+
+    BYTE adminSidBuf[SECURITY_MAX_SID_SIZE] = {};
+    DWORD adminSidSize = sizeof(adminSidBuf);
+    if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, adminSidBuf, &adminSidSize)) {
+        cleanup();
+        return false;
+    }
+
+    std::vector<uint8_t> curUserSid;
+    std::wstring curUserSidStr;
+    if (testOverride && !getCurrentUserSid(curUserSid, curUserSidStr)) {
+        cleanup();
+        return false;
+    }
+
+    auto isAllowedSid = [&](PSID sid) -> bool {
+        if (!sid || !IsValidSid(sid)) return false;
+        if (EqualSid(sid, sysSidBuf)) return true;
+        if (testOverride) {
+            return !curUserSid.empty() && EqualSid(sid, curUserSid.data());
+        }
+        return EqualSid(sid, adminSidBuf) != FALSE;
+    };
+
+    // An elevated admin's new files are owned by Administrators rather than the user; that owner is trusted too.
+    if (!isAllowedSid(pOwner) && !EqualSid(pOwner, adminSidBuf)) {
+        cleanup();
+        return false;
+    }
+
+    ACL_SIZE_INFORMATION aclInfo{};
+    if (!GetAclInformation(pDacl, &aclInfo, sizeof(aclInfo), AclSizeInformation) || aclInfo.AceCount == 0) {
+        cleanup();
+        return false;
+    }
+
+    for (DWORD i = 0; i < aclInfo.AceCount; ++i) {
+        LPVOID pAce = nullptr;
+        if (!GetAce(pDacl, i, &pAce) || !pAce) {
+            cleanup();
+            return false;
+        }
+        auto* hdr = static_cast<PACE_HEADER>(pAce);
+        if (hdr->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+            PSID aceSid = &static_cast<ACCESS_ALLOWED_ACE*>(pAce)->SidStart;
+            if (!isAllowedSid(aceSid)) {
+                cleanup();
+                return false;
+            }
+        } else if (hdr->AceType == ACCESS_DENIED_ACE_TYPE) {
+            // Deny ACEs only narrow access, safe to ignore.
+        } else {
+            // Unexpected allow-object or unknown ACE type: fail closed.
+            cleanup();
+            return false;
+        }
+    }
+
+    cleanup();
+    return true;
+}
+
+bool readRebootTokenFile(const std::wstring& filePath, std::string& outToken, uint64_t& outDeskId, uint64_t& outExpireMs) {
+    HANDLE hFile = CreateFileW(
+        filePath.c_str(),
+        GENERIC_READ,
+        0, // Exclusive access
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr
+    );
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart < 24 || fileSize.QuadPart > 1024) {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    std::vector<uint8_t> buf(static_cast<size_t>(fileSize.QuadPart));
+    DWORD bytesRead = 0;
+    BOOL ok = ReadFile(hFile, buf.data(), static_cast<DWORD>(buf.size()), &bytesRead, nullptr);
+    CloseHandle(hFile);
+    if (!ok || bytesRead != buf.size()) {
+        CryptoUtils::secureZero(buf.data(), buf.size());
+        return false;
+    }
+
+    uint32_t magic = 0;
+    uint32_t tokenLen = 0;
+    std::memcpy(&magic, buf.data(), sizeof(magic));
+    std::memcpy(&tokenLen, buf.data() + 4, sizeof(tokenLen));
+    size_t expectedSize = sizeof(magic) + sizeof(tokenLen) + tokenLen + sizeof(outDeskId) + sizeof(outExpireMs);
+    if (magic != REBOOT_TOKEN_MAGIC || tokenLen == 0 || tokenLen > 256 || buf.size() != expectedSize) {
+        CryptoUtils::secureZero(buf.data(), buf.size());
+        return false;
+    }
+
+    outToken.assign(reinterpret_cast<const char*>(buf.data() + 8), tokenLen);
+    std::memcpy(&outDeskId, buf.data() + 8 + tokenLen, sizeof(outDeskId));
+    std::memcpy(&outExpireMs, buf.data() + 8 + tokenLen + sizeof(outDeskId), sizeof(outExpireMs));
+    CryptoUtils::secureZero(buf.data(), buf.size());
+    return true;
+}
+
+bool runBcdedit(const std::wstring& args) {
+    wchar_t sysDir[MAX_PATH] = {};
+    UINT len = GetSystemDirectoryW(sysDir, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return false;
+
+    std::wstring exePath = std::wstring(sysDir, len) + L"\\bcdedit.exe";
+    std::wstring cmdLine = L"\"" + exePath + L"\" " + args;
+    std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+    cmdBuf.push_back(L'\0');
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(
+            exePath.c_str(),
+            cmdBuf.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            nullptr,
+            &si,
+            &pi)) {
+        return false;
+    }
+
+    DWORD waitRes = WaitForSingleObject(pi.hProcess, 15000);
+    DWORD exitCode = 1;
+    bool ok = (waitRes == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &exitCode) && exitCode == 0);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return ok;
 }
 
 } // namespace
@@ -123,39 +313,10 @@ ServiceStatusState WindowsServiceManager::getServiceState() {
 }
 
 bool WindowsServiceManager::installService(const std::wstring& customExePath) {
-    wchar_t modPath[MAX_PATH] = {};
-    if (customExePath.empty()) {
-        GetModuleFileNameW(nullptr, modPath, MAX_PATH);
-    } else {
-        wcsncpy(modPath, customExePath.c_str(), MAX_PATH - 1);
-        modPath[MAX_PATH - 1] = L'\0';
-    }
-
-    std::wstring binPath = L"\"" + std::wstring(modPath) + L"\" --service-run";
-
-    SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
-    if (!hSCM) return false;
-
-    SC_HANDLE hSvc = CreateServiceW(
-        hSCM,
-        SERVICE_NAME,
-        DISPLAY_NAME,
-        SERVICE_ALL_ACCESS,
-        SERVICE_WIN32_OWN_PROCESS,
-        SERVICE_AUTO_START,
-        SERVICE_ERROR_NORMAL,
-        binPath.c_str(),
-        nullptr, nullptr, nullptr, nullptr, nullptr
-    );
-
-    if (!hSvc) {
-        CloseServiceHandle(hSCM);
-        return false;
-    }
-
-    CloseServiceHandle(hSvc);
-    CloseServiceHandle(hSCM);
-    return true;
+    (void)customExePath;
+    std::fprintf(stderr, "[CppDesk] Windows Service install is not supported in this build.\n");
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return false;
 }
 
 bool WindowsServiceManager::uninstallService() {
@@ -178,73 +339,116 @@ bool WindowsServiceManager::uninstallService() {
 }
 
 bool WindowsServiceManager::startService() {
-    SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (!hSCM) return false;
-
-    SC_HANDLE hSvc = OpenServiceW(hSCM, SERVICE_NAME, SERVICE_START);
-    if (!hSvc) {
-        CloseServiceHandle(hSCM);
-        return false;
-    }
-
-    bool ok = (StartServiceW(hSvc, 0, nullptr) != 0);
-    CloseServiceHandle(hSvc);
-    CloseServiceHandle(hSCM);
-    return ok;
+    std::fprintf(stderr, "[CppDesk] Windows Service start is not supported in this build.\n");
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return false;
 }
 
 bool WindowsServiceManager::stopService() {
-    SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (!hSCM) return false;
-
-    SC_HANDLE hSvc = OpenServiceW(hSCM, SERVICE_NAME, SERVICE_STOP);
-    if (!hSvc) {
-        CloseServiceHandle(hSCM);
-        return false;
-    }
-
-    SERVICE_STATUS ss{};
-    bool ok = (ControlService(hSvc, SERVICE_CONTROL_STOP, &ss) != 0);
-    CloseServiceHandle(hSvc);
-    CloseServiceHandle(hSCM);
-    return ok;
+    std::fprintf(stderr, "[CppDesk] Windows Service stop is not supported in this build.\n");
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return false;
 }
 
 int WindowsServiceManager::runServiceDispatcher() {
-    SERVICE_TABLE_ENTRYW serviceTable[] = {
-        { const_cast<LPWSTR>(SERVICE_NAME), ServiceMain },
-        { nullptr, nullptr }
-    };
-    return StartServiceCtrlDispatcherW(serviceTable) ? 0 : 1;
+    std::fprintf(stderr, "[CppDesk] Windows Service mode is not supported in this build.\n");
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return 1;
 }
 
 // ---------------- Reboot Token Management ----------------
 
-std::string WindowsServiceManager::getRebootTokenFilePath() {
-    char commonAppDir[MAX_PATH] = {};
-    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, commonAppDir))) {
-        std::filesystem::path dir = std::filesystem::path(commonAppDir) / "CppDesk";
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        return (dir / "reboot_token.bin").string();
+void WindowsServiceManager::setRebootTokenDirForTest(const std::wstring& dirPath) {
+    std::lock_guard<std::mutex> lk(g_rebootTokenMutex);
+    g_testTokenDir = dirPath;
+}
+
+std::wstring WindowsServiceManager::getRebootTokenDirPath(bool& outTestOverride) {
+    if (!g_testTokenDir.empty()) {
+        outTestOverride = true;
+        return g_testTokenDir;
     }
-    char tempDir[MAX_PATH] = {};
-    GetTempPathA(MAX_PATH, tempDir);
-    return (std::filesystem::path(tempDir) / "cppdesk_reboot_token.bin").string();
+    outTestOverride = false;
+    wchar_t commonAppDir[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, commonAppDir))) {
+        return (std::filesystem::path(commonAppDir) / L"CppDesk").wstring();
+    }
+    return L"";
 }
 
 std::string WindowsServiceManager::generateRebootTokenHex() {
     std::array<uint8_t, 32> randBytes{};
-    BCryptGenRandom(nullptr, randBytes.data(), static_cast<ULONG>(randBytes.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    return CryptoUtils::toHex(randBytes.data(), randBytes.size());
+    NTSTATUS status = BCryptGenRandom(
+        nullptr,
+        randBytes.data(),
+        static_cast<ULONG>(randBytes.size()),
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG
+    );
+    if (status < 0) {
+        CryptoUtils::secureZero(randBytes.data(), randBytes.size());
+        return "";
+    }
+    std::string hex = CryptoUtils::toHex(randBytes.data(), randBytes.size());
+    CryptoUtils::secureZero(randBytes.data(), randBytes.size());
+    return hex;
 }
 
 bool WindowsServiceManager::saveRebootToken(const std::string& tokenHex, uint64_t callerDeskId, uint32_t validSeconds) {
-    if (tokenHex.empty()) return false;
+    if (tokenHex.empty() || tokenHex.size() > 256) return false;
 
-    std::string path = getRebootTokenFilePath();
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) return false;
+    std::lock_guard<std::mutex> lk(g_rebootTokenMutex);
+    bool testOverride = false;
+    std::wstring dirPath = getRebootTokenDirPath(testOverride);
+    if (dirPath.empty()) return false;
+
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+    if (!buildStrictSecurityDescriptor(testOverride, &pSD) || !pSD) {
+        return false;
+    }
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = pSD;
+    sa.bInheritHandle = FALSE;
+
+    DWORD dirAttrs = GetFileAttributesW(dirPath.c_str());
+    if (dirAttrs == INVALID_FILE_ATTRIBUTES) {
+        if (!CreateDirectoryW(dirPath.c_str(), &sa) && GetLastError() != ERROR_ALREADY_EXISTS) {
+            LocalFree(pSD);
+            return false;
+        }
+    }
+
+    // Refuse pre-existing directories that do not have a strictly restricted DACL.
+    if (!isAclStrictlyRestricted(dirPath, testOverride)) {
+        LocalFree(pSD);
+        return false;
+    }
+
+    std::wstring filePath = (std::filesystem::path(dirPath) / L"reboot_token.bin").wstring();
+    if (GetFileAttributesW(filePath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (!isAclStrictlyRestricted(filePath, testOverride)) {
+            LocalFree(pSD);
+            return false;
+        }
+        if (!DeleteFileW(filePath.c_str())) {
+            LocalFree(pSD);
+            return false;
+        }
+    }
+
+    HANDLE hFile = CreateFileW(
+        filePath.c_str(),
+        GENERIC_WRITE,
+        0,
+        &sa,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr
+    );
+    LocalFree(pSD);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return false;
+    }
 
     uint32_t magic = REBOOT_TOKEN_MAGIC;
     uint32_t tokenLen = static_cast<uint32_t>(tokenHex.size());
@@ -252,89 +456,99 @@ bool WindowsServiceManager::saveRebootToken(const std::string& tokenHex, uint64_
         std::chrono::system_clock::now().time_since_epoch()).count());
     uint64_t expireMs = nowMs + static_cast<uint64_t>(validSeconds) * 1000ULL;
 
-    out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
-    out.write(reinterpret_cast<const char*>(&tokenLen), sizeof(tokenLen));
-    out.write(tokenHex.data(), tokenLen);
-    out.write(reinterpret_cast<const char*>(&callerDeskId), sizeof(callerDeskId));
-    out.write(reinterpret_cast<const char*>(&expireMs), sizeof(expireMs));
-    out.flush();
+    std::vector<uint8_t> payload;
+    payload.reserve(sizeof(magic) + sizeof(tokenLen) + tokenLen + sizeof(callerDeskId) + sizeof(expireMs));
+    auto append = [&](const void* p, size_t n) {
+        const uint8_t* b = static_cast<const uint8_t*>(p);
+        payload.insert(payload.end(), b, b + n);
+    };
+    append(&magic, sizeof(magic));
+    append(&tokenLen, sizeof(tokenLen));
+    append(tokenHex.data(), tokenLen);
+    append(&callerDeskId, sizeof(callerDeskId));
+    append(&expireMs, sizeof(expireMs));
 
-    return out.good();
+    DWORD written = 0;
+    BOOL ok = WriteFile(hFile, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr);
+    if (ok) FlushFileBuffers(hFile);
+    CloseHandle(hFile);
+    CryptoUtils::secureZero(payload.data(), payload.size());
+
+    if (!ok || written != payload.size() || !isAclStrictlyRestricted(filePath, testOverride)) {
+        DeleteFileW(filePath.c_str());
+        return false;
+    }
+    return true;
 }
 
 bool WindowsServiceManager::validateAndConsumeRebootToken(const std::string& tokenHex, uint64_t callerDeskId) {
     if (tokenHex.empty()) return false;
 
-    std::string path = getRebootTokenFilePath();
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) return false;
+    std::lock_guard<std::mutex> lk(g_rebootTokenMutex);
+    bool testOverride = false;
+    std::wstring dirPath = getRebootTokenDirPath(testOverride);
+    if (dirPath.empty()) return false;
 
-    uint32_t magic = 0;
-    uint32_t tokenLen = 0;
-    in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    in.read(reinterpret_cast<char*>(&tokenLen), sizeof(tokenLen));
-    if (magic != REBOOT_TOKEN_MAGIC || tokenLen == 0 || tokenLen > 256) {
-        in.close();
-        clearRebootToken();
+    std::wstring filePath = (std::filesystem::path(dirPath) / L"reboot_token.bin").wstring();
+    if (!isAclStrictlyRestricted(dirPath, testOverride) ||
+        !isAclStrictlyRestricted(filePath, testOverride)) {
         return false;
     }
 
-    std::string storedToken(tokenLen, '\0');
-    in.read(storedToken.data(), tokenLen);
+    std::string storedToken;
     uint64_t storedDeskId = 0;
     uint64_t expireMs = 0;
-    in.read(reinterpret_cast<char*>(&storedDeskId), sizeof(storedDeskId));
-    in.read(reinterpret_cast<char*>(&expireMs), sizeof(expireMs));
-    in.close();
+    bool readOk = readRebootTokenFile(filePath, storedToken, storedDeskId, expireMs);
+
+    // Always consume/invalidate the token on any attempt (prevents brute force and replay).
+    DeleteFileW(filePath.c_str());
+
+    if (!readOk) {
+        return false;
+    }
 
     uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
 
-    if (nowMs > expireMs) {
-        clearRebootToken();
-        return false; // Expired
-    }
-    if (storedDeskId != callerDeskId) {
-        return false; // Wrong caller
-    }
-    if (storedToken != tokenHex) {
-        return false; // Wrong token
+    auto storedHash = CryptoUtils::sha256(storedToken);
+    auto givenHash = CryptoUtils::sha256(tokenHex);
+    bool tokenMatches = constantTimeEquals32(storedHash, givenHash) && (storedToken.size() == tokenHex.size());
+    CryptoUtils::secureZero(storedToken.data(), storedToken.size());
+    CryptoUtils::secureZero(storedHash.data(), storedHash.size());
+    CryptoUtils::secureZero(givenHash.data(), givenHash.size());
+
+    if (nowMs > expireMs || storedDeskId != callerDeskId || !tokenMatches) {
+        return false;
     }
 
-    // Successfully validated: consume (delete) token for one-time use
-    clearRebootToken();
+    clearSafeBootIfActive();
     return true;
 }
 
 bool WindowsServiceManager::hasPendingRebootToken(uint64_t* outCallerDeskId) {
-    std::string path = getRebootTokenFilePath();
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) return false;
+    std::lock_guard<std::mutex> lk(g_rebootTokenMutex);
+    bool testOverride = false;
+    std::wstring dirPath = getRebootTokenDirPath(testOverride);
+    if (dirPath.empty()) return false;
 
-    uint32_t magic = 0;
-    uint32_t tokenLen = 0;
-    in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    in.read(reinterpret_cast<char*>(&tokenLen), sizeof(tokenLen));
-    if (magic != REBOOT_TOKEN_MAGIC || tokenLen == 0 || tokenLen > 256) {
-        in.close();
+    std::wstring filePath = (std::filesystem::path(dirPath) / L"reboot_token.bin").wstring();
+    if (!isAclStrictlyRestricted(dirPath, testOverride) ||
+        !isAclStrictlyRestricted(filePath, testOverride)) {
         return false;
     }
 
-    std::string storedToken(tokenLen, '\0');
-    in.read(storedToken.data(), tokenLen);
+    std::string storedToken;
     uint64_t storedDeskId = 0;
     uint64_t expireMs = 0;
-    in.read(reinterpret_cast<char*>(&storedDeskId), sizeof(storedDeskId));
-    in.read(reinterpret_cast<char*>(&expireMs), sizeof(expireMs));
+    bool readOk = readRebootTokenFile(filePath, storedToken, storedDeskId, expireMs);
+    CryptoUtils::secureZero(storedToken.data(), storedToken.size());
+    if (!readOk) return false;
 
     uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
-
     if (nowMs > expireMs) {
-        in.close();
         return false;
     }
-    in.close();
     if (outCallerDeskId) {
         *outCallerDeskId = storedDeskId;
     }
@@ -342,9 +556,19 @@ bool WindowsServiceManager::hasPendingRebootToken(uint64_t* outCallerDeskId) {
 }
 
 void WindowsServiceManager::clearRebootToken() {
-    std::string path = getRebootTokenFilePath();
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
+    std::lock_guard<std::mutex> lk(g_rebootTokenMutex);
+    bool testOverride = false;
+    std::wstring dirPath = getRebootTokenDirPath(testOverride);
+    if (dirPath.empty()) return;
+    std::wstring filePath = (std::filesystem::path(dirPath) / L"reboot_token.bin").wstring();
+    DeleteFileW(filePath.c_str());
+}
+
+bool WindowsServiceManager::clearSafeBootIfActive() {
+    if (GetSystemMetrics(SM_CLEANBOOT) == 0) {
+        return true; // Normal boot, nothing to clear.
+    }
+    return runBcdedit(L"/deletevalue {current} safeboot");
 }
 
 bool WindowsServiceManager::initiateHostReboot(uint32_t countdownSeconds, bool safeMode) {
@@ -360,8 +584,10 @@ bool WindowsServiceManager::initiateHostReboot(uint32_t countdownSeconds, bool s
     }
 
     if (safeMode) {
-        // Configure safeboot network via bcdedit command
-        WinExec("bcdedit /set {current} safeboot network", SW_HIDE);
+        // Configure safeboot network using full System32\bcdedit.exe path and wait for exit code.
+        if (!runBcdedit(L"/set {current} safeboot network")) {
+            return false;
+        }
     }
 
     char msg[128];

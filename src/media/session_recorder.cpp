@@ -22,60 +22,14 @@ static inline uint64_t getNowTickMs() {
 #include <iostream>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace cppdesk {
 
-#pragma pack(push, 1)
-struct MainAVIHeader {
-    uint32_t dwMicroSecPerFrame{0};
-    uint32_t dwMaxBytesPerSec{0};
-    uint32_t dwPaddingGranularity{0};
-    uint32_t dwFlags{0};
-    uint32_t dwTotalFrames{0};
-    uint32_t dwInitialFrames{0};
-    uint32_t dwStreams{0};
-    uint32_t dwSuggestedBufferSize{0};
-    uint32_t dwWidth{0};
-    uint32_t dwHeight{0};
-    uint32_t dwReserved[4]{0};
-};
-
-struct AVIStreamHeader {
-    uint32_t fccType{0};
-    uint32_t fccHandler{0};
-    uint32_t dwFlags{0};
-    uint16_t wPriority{0};
-    uint16_t wLanguage{0};
-    uint32_t dwInitialFrames{0};
-    uint32_t dwScale{0};
-    uint32_t dwRate{0};
-    uint32_t dwStart{0};
-    uint32_t dwLength{0};
-    uint32_t dwSuggestedBufferSize{0};
-    uint32_t dwQuality{0};
-    uint32_t dwSampleSize{0};
-    struct {
-        int16_t left{0};
-        int16_t top{0};
-        int16_t right{0};
-        int16_t bottom{0};
-    } rcFrame;
-};
-
-struct AviBmpInfoHeader {
-    uint32_t biSize{sizeof(AviBmpInfoHeader)};
-    int32_t  biWidth{0};
-    int32_t  biHeight{0};
-    uint16_t biPlanes{1};
-    uint16_t biBitCount{32};
-    uint32_t biCompression{0};
-    uint32_t biSizeImage{0};
-    int32_t  biXPelsPerMeter{0};
-    int32_t  biYPelsPerMeter{0};
-    uint32_t biClrUsed{0};
-    uint32_t biClrImportant{0};
-};
-#pragma pack(pop)
+namespace {
+constexpr uint64_t kMaxAviFileBytes = 0xFFFFFFF0ULL;
+constexpr uint64_t kMaxRecorderFrameBytes = 256ULL * 1024ULL * 1024ULL;
+} // namespace
 
 SessionRecorder::SessionRecorder() = default;
 
@@ -87,6 +41,8 @@ bool SessionRecorder::startRecording(const std::string& outputPath, int width, i
     stopRecording();
 
     if (width <= 0 || height <= 0) return false;
+    uint64_t frameBytes64 = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 4ULL;
+    if (frameBytes64 == 0 || frameBytes64 > kMaxRecorderFrameBytes) return false;
     if (fps <= 0) fps = 30;
 
     std::filesystem::path p(outputPath);
@@ -100,37 +56,49 @@ bool SessionRecorder::startRecording(const std::string& outputPath, int width, i
         return false;
     }
 
-    filePath_ = outputPath;
-    width_ = width;
-    height_ = height;
-    fps_ = fps;
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        while (!frameQueue_.empty()) frameQueue_.pop();
+        filePath_ = outputPath;
+        width_ = width;
+        height_ = height;
+        fps_ = fps;
+        workerStopping_.store(false);
+    }
+
     frameCount_.store(0);
+    droppedFrames_.store(0);
     bytesWritten_.store(0);
     startTick_ = getNowTickMs();
     indexEntries_.clear();
 
     writeAviHeaders(width, height, fps);
 
-    workerStopping_.store(false);
     recording_.store(true);
     workerThread_ = std::thread(&SessionRecorder::workerLoop, this);
     return true;
 }
 
 void SessionRecorder::pushFrame(const uint8_t* bgra, int width, int height) {
-    if (!recording_.load() || !bgra) return;
-    if (width != width_ || height != height_) return;
+    if (!recording_.load() || !bgra || width <= 0 || height <= 0) return;
+
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        if (!recording_.load() || workerStopping_.load() || width != width_ || height != height_) return;
+    }
 
     size_t frameBytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
     std::vector<uint8_t> frameBuf(bgra, bgra + frameBytes);
 
     {
         std::unique_lock<std::mutex> lock(queueMutex_);
+        if (!recording_.load() || workerStopping_.load() || width != width_ || height != height_) return;
         if (frameQueue_.size() >= 60) {
             queueCv_.wait_for(lock, std::chrono::milliseconds(20), [&]() {
-                return frameQueue_.size() < 60 || !recording_.load();
+                return frameQueue_.size() < 60 || !recording_.load() || workerStopping_.load();
             });
         }
+        if (!recording_.load() || workerStopping_.load() || width != width_ || height != height_) return;
         if (frameQueue_.size() >= 60) {
             droppedFrames_++;
             return;
@@ -141,11 +109,11 @@ void SessionRecorder::pushFrame(const uint8_t* bgra, int width, int height) {
 }
 
 void SessionRecorder::stopRecording() {
-    if (!recording_.exchange(false)) {
-        return;
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        recording_.store(false);
+        workerStopping_.store(true);
     }
-
-    workerStopping_.store(true);
     queueCv_.notify_all();
     try {
         if (workerThread_.joinable()) {
@@ -164,11 +132,16 @@ uint32_t SessionRecorder::elapsedSeconds() const {
 }
 
 std::string SessionRecorder::currentFilePath() const {
+    std::lock_guard<std::mutex> lock(queueMutex_);
     return filePath_;
 }
 
 void SessionRecorder::writeAviHeaders(int width, int height, int fps) {
     uint32_t zero = 0;
+    const uint64_t frameBytes64 = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 4ULL;
+    const uint64_t maxBps64 = frameBytes64 * static_cast<uint64_t>(fps);
+    const uint32_t frameBytes32 = static_cast<uint32_t>((std::min<uint64_t>)(frameBytes64, (std::numeric_limits<uint32_t>::max)()));
+    const uint32_t maxBps32 = static_cast<uint32_t>((std::min<uint64_t>)(maxBps64, (std::numeric_limits<uint32_t>::max)()));
 
     // 1. RIFF Header
     file_.write("RIFF", 4);
@@ -176,50 +149,50 @@ void SessionRecorder::writeAviHeaders(int width, int height, int fps) {
     file_.write("AVI ", 4);
 
     // 2. LIST 'hdrl'
-    uint32_t hdrlSize = 4 + (8 + sizeof(MainAVIHeader)) + (12 + (8 + sizeof(AVIStreamHeader)) + (8 + sizeof(AviBmpInfoHeader)));
+    uint32_t hdrlSize = 4 + (8 + sizeof(MainAviHeader)) + (12 + (8 + sizeof(AviStreamHeader)) + (8 + sizeof(AviBmpInfoHeader)));
     file_.write("LIST", 4);
     file_.write(reinterpret_cast<const char*>(&hdrlSize), 4);
     file_.write("hdrl", 4);
 
     // 'avih' chunk
-    MainAVIHeader avih{};
+    MainAviHeader avih{};
     avih.dwMicroSecPerFrame = 1000000 / fps;
-    avih.dwMaxBytesPerSec = static_cast<uint32_t>(width * height * 4 * fps);
+    avih.dwMaxBytesPerSec = maxBps32;
     avih.dwFlags = 0x810; // AVIF_HASINDEX | AVIF_TRUSTCKTYPE
     avih.dwTotalFrames = 0;
     avih.dwStreams = 1;
-    avih.dwSuggestedBufferSize = static_cast<uint32_t>(width * height * 4);
+    avih.dwSuggestedBufferSize = frameBytes32;
     avih.dwWidth = static_cast<uint32_t>(width);
     avih.dwHeight = static_cast<uint32_t>(height);
 
     file_.write("avih", 4);
-    uint32_t avihSize = sizeof(MainAVIHeader);
+    uint32_t avihSize = sizeof(MainAviHeader);
     file_.write(reinterpret_cast<const char*>(&avihSize), 4);
     file_.write(reinterpret_cast<const char*>(&avih), sizeof(avih));
 
     // LIST 'strl'
-    uint32_t strlSize = 4 + (8 + sizeof(AVIStreamHeader)) + (8 + sizeof(AviBmpInfoHeader));
+    uint32_t strlSize = 4 + (8 + sizeof(AviStreamHeader)) + (8 + sizeof(AviBmpInfoHeader));
     file_.write("LIST", 4);
     file_.write(reinterpret_cast<const char*>(&strlSize), 4);
     file_.write("strl", 4);
 
     // 'strh' chunk
-    AVIStreamHeader strh{};
+    AviStreamHeader strh{};
     strh.fccType = 0x73646976; // 'vids'
     strh.fccHandler = 0x20424944; // 'DIB '
     strh.dwScale = 1;
     strh.dwRate = static_cast<uint32_t>(fps);
     strh.dwLength = 0;
-    strh.dwSuggestedBufferSize = static_cast<uint32_t>(width * height * 4);
+    strh.dwSuggestedBufferSize = frameBytes32;
     strh.dwQuality = 10000;
-    strh.dwSampleSize = static_cast<uint32_t>(width * height * 4);
+    strh.dwSampleSize = frameBytes32;
     strh.rcFrame.left = 0;
     strh.rcFrame.top = 0;
     strh.rcFrame.right = static_cast<int16_t>(width);
     strh.rcFrame.bottom = static_cast<int16_t>(height);
 
     file_.write("strh", 4);
-    uint32_t strhSize = sizeof(AVIStreamHeader);
+    uint32_t strhSize = sizeof(AviStreamHeader);
     file_.write(reinterpret_cast<const char*>(&strhSize), 4);
     file_.write(reinterpret_cast<const char*>(&strh), sizeof(strh));
 
@@ -231,7 +204,7 @@ void SessionRecorder::writeAviHeaders(int width, int height, int fps) {
     bih.biPlanes = 1;
     bih.biBitCount = 32;
     bih.biCompression = 0; // BI_RGB
-    bih.biSizeImage = static_cast<uint32_t>(width * height * 4);
+    bih.biSizeImage = frameBytes32;
 
     file_.write("strf", 4);
     uint32_t strfSize = sizeof(AviBmpInfoHeader);
@@ -249,16 +222,33 @@ void SessionRecorder::writeAviHeaders(int width, int height, int fps) {
 void SessionRecorder::updateAviHeadersOnClose() {
     if (!file_.is_open()) return;
 
+    std::streampos idxPos = file_.tellp();
+    if (idxPos < 0 || static_cast<uint64_t>(idxPos) < moviDataOffset_ ||
+        static_cast<uint64_t>(idxPos) > kMaxAviFileBytes) {
+        file_.close();
+        return;
+    }
+
     // 1. Write idx1 chunk
-    uint32_t idxStart = static_cast<uint32_t>(file_.tellp());
+    uint32_t idxStart = static_cast<uint32_t>(idxPos);
+    uint64_t idxSize64 = static_cast<uint64_t>(indexEntries_.size()) * sizeof(AviIndexEntry);
+    if (idxSize64 > kMaxAviFileBytes - idxStart - 8ULL) {
+        file_.close();
+        return;
+    }
     file_.write("idx1", 4);
-    uint32_t idxSize = static_cast<uint32_t>(indexEntries_.size() * sizeof(AviIndexEntry));
+    uint32_t idxSize = static_cast<uint32_t>(idxSize64);
     file_.write(reinterpret_cast<const char*>(&idxSize), 4);
     if (!indexEntries_.empty()) {
         file_.write(reinterpret_cast<const char*>(indexEntries_.data()), idxSize);
     }
 
-    uint32_t totalFileSize = static_cast<uint32_t>(file_.tellp());
+    std::streampos endPos = file_.tellp();
+    if (endPos < 8 || static_cast<uint64_t>(endPos) > (std::numeric_limits<uint32_t>::max)()) {
+        file_.close();
+        return;
+    }
+    uint32_t totalFileSize = static_cast<uint32_t>(endPos);
     uint32_t riffSize = totalFileSize - 8;
     uint32_t moviSize = (idxStart - moviDataOffset_) + 4;
     uint32_t totalFrames = static_cast<uint32_t>(frameCount_.load());
@@ -267,11 +257,11 @@ void SessionRecorder::updateAviHeadersOnClose() {
     file_.seekp(4);
     file_.write(reinterpret_cast<const char*>(&riffSize), 4);
 
-    // 3. Patch MainAVIHeader dwTotalFrames (offset 48)
+    // 3. Patch MainAviHeader dwTotalFrames (offset 48)
     file_.seekp(48);
     file_.write(reinterpret_cast<const char*>(&totalFrames), 4);
 
-    // 4. Patch AVIStreamHeader dwLength (offset 140)
+    // 4. Patch AviStreamHeader dwLength (offset 140)
     file_.seekp(140);
     file_.write(reinterpret_cast<const char*>(&totalFrames), 4);
 
@@ -304,15 +294,32 @@ void SessionRecorder::workerLoop() {
         }
 
         if (file_.is_open() && file_.good() && !frame.empty()) {
+            const size_t expectedBytes = static_cast<size_t>(width_) * static_cast<size_t>(height_) * 4;
+            if (frame.size() < expectedBytes || expectedBytes == 0 ||
+                expectedBytes > (std::numeric_limits<uint32_t>::max)()) {
+                continue;
+            }
+
             std::streampos pos = file_.tellp();
-            if (pos == std::streampos(-1)) {
+            if (pos == std::streampos(-1) || pos < 0) {
                 break;
             }
-            uint32_t chunkStart = static_cast<uint32_t>(pos);
+            const uint64_t pos64 = static_cast<uint64_t>(pos);
+            const uint64_t projectedIdxBytes = 8ULL + (static_cast<uint64_t>(indexEntries_.size()) + 1ULL) * sizeof(AviIndexEntry);
+            if (pos64 + 8ULL + expectedBytes + projectedIdxBytes > kMaxAviFileBytes) {
+                // Stop cleanly before the 4 GiB RIFF/AVI 1.0 offset limit so headers stay valid.
+                std::lock_guard<std::mutex> lock(queueMutex_);
+                recording_.store(false);
+                workerStopping_.store(true);
+                while (!frameQueue_.empty()) frameQueue_.pop();
+                break;
+            }
+
+            uint32_t chunkStart = static_cast<uint32_t>(pos64);
             uint32_t relOffset = chunkStart - moviDataOffset_;
 
             file_.write("00dc", 4);
-            uint32_t frameBytes = static_cast<uint32_t>(width_ * height_ * 4);
+            uint32_t frameBytes = static_cast<uint32_t>(expectedBytes);
             file_.write(reinterpret_cast<const char*>(&frameBytes), 4);
 
             // Invert vertically for bottom-up DIB in memory and write in a single call
@@ -321,7 +328,7 @@ void SessionRecorder::workerLoop() {
             }
             const uint8_t* p = frame.data();
             uint8_t* dst = flippedBuffer_.data();
-            size_t rowBytes = static_cast<size_t>(width_ * 4);
+            size_t rowBytes = static_cast<size_t>(width_) * 4;
             for (int y = 0; y < height_; ++y) {
                 std::memcpy(dst + static_cast<size_t>(y) * rowBytes,
                             p + static_cast<size_t>(height_ - 1 - y) * rowBytes,

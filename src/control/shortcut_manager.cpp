@@ -18,6 +18,27 @@
 
 namespace cppdesk {
 
+#if defined(_WIN32)
+namespace {
+
+std::wstring getCurrentExecutablePath() {
+    std::vector<wchar_t> buf(MAX_PATH, L'\0');
+    while (buf.size() <= 32768) {
+        DWORD len = GetModuleFileNameW(NULL, buf.data(), static_cast<DWORD>(buf.size()));
+        if (len == 0) {
+            return {};
+        }
+        if (len < buf.size() - 1) {
+            return std::wstring(buf.data(), len);
+        }
+        buf.resize(buf.size() * 2, L'\0');
+    }
+    return {};
+}
+
+} // namespace
+#endif
+
 std::string ShortcutManager::sanitizeDeskId(const std::string& input) {
     std::string clean;
     for (char c : input) {
@@ -41,8 +62,8 @@ bool ShortcutManager::createDesktopShortcut(const std::string& deskId, const std
         return false;
     }
 
-    wchar_t exePath[MAX_PATH] = {0};
-    if (GetModuleFileNameW(NULL, exePath, MAX_PATH) == 0) {
+    std::wstring exePath = getCurrentExecutablePath();
+    if (exePath.empty()) {
         return false;
     }
 
@@ -94,7 +115,7 @@ bool ShortcutManager::createDesktopShortcut(const std::string& deskId, const std
     hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (LPVOID*)&psl);
     bool success = false;
     if (SUCCEEDED(hr) && psl) {
-        psl->SetPath(exePath);
+        psl->SetPath(exePath.c_str());
         std::wstring args = L"--connect " + std::wstring(cleanId.begin(), cleanId.end());
         psl->SetArguments(args.c_str());
         psl->SetDescription(L"Connect to CppDesk Remote");
@@ -137,8 +158,8 @@ bool ShortcutManager::setUriProtocolRegistered(bool enable) {
         return (st == ERROR_SUCCESS || st == ERROR_FILE_NOT_FOUND);
     }
 
-    wchar_t exePath[MAX_PATH] = {0};
-    if (GetModuleFileNameW(NULL, exePath, MAX_PATH) == 0) {
+    std::wstring exePath = getCurrentExecutablePath();
+    if (exePath.empty()) {
         return false;
     }
 
@@ -150,21 +171,30 @@ bool ShortcutManager::setUriProtocolRegistered(bool enable) {
     }
 
     const wchar_t* desc = L"URL:CppDesk Remote Connection";
-    RegSetValueExW(hKey, NULL, 0, REG_SZ, (const BYTE*)desc, (DWORD)((wcslen(desc) + 1) * sizeof(wchar_t)));
+    LSTATUS stDesc = RegSetValueExW(hKey, NULL, 0, REG_SZ, (const BYTE*)desc, (DWORD)((wcslen(desc) + 1) * sizeof(wchar_t)));
     const wchar_t* emptyVal = L"";
-    RegSetValueExW(hKey, L"URL Protocol", 0, REG_SZ, (const BYTE*)emptyVal, (DWORD)sizeof(wchar_t));
+    LSTATUS stProto = RegSetValueExW(hKey, L"URL Protocol", 0, REG_SZ, (const BYTE*)emptyVal, (DWORD)sizeof(wchar_t));
     RegCloseKey(hKey);
+    if (stDesc != ERROR_SUCCESS || stProto != ERROR_SUCCESS) {
+        RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\cppdesk");
+        return false;
+    }
 
     HKEY hCmdKey = nullptr;
     st = RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Classes\\cppdesk\\shell\\open\\command", 0, NULL, 0,
                          KEY_WRITE, NULL, &hCmdKey, NULL);
     if (st != ERROR_SUCCESS) {
+        RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\cppdesk");
         return false;
     }
 
-    std::wstring cmd = L"\"" + std::wstring(exePath) + L"\" \"%1\"";
-    RegSetValueExW(hCmdKey, NULL, 0, REG_SZ, (const BYTE*)cmd.c_str(), (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
+    std::wstring cmd = L"\"" + exePath + L"\" \"%1\"";
+    LSTATUS stCmd = RegSetValueExW(hCmdKey, NULL, 0, REG_SZ, (const BYTE*)cmd.c_str(), (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
     RegCloseKey(hCmdKey);
+    if (stCmd != ERROR_SUCCESS) {
+        RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\cppdesk");
+        return false;
+    }
 
     return true;
 #endif

@@ -1,7 +1,6 @@
 #include "ui_window.hpp"
 #include "theme.hpp"
 #include "recording_canvas.hpp"
-#include "../control/windows_service_manager.hpp"
 #include "../capture/screen_capture.hpp"
 #include <gdiplus.h>
 
@@ -9,6 +8,7 @@
 #include <dwmapi.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <shobjidl.h>
 #include <wincodec.h>
 #ifdef DeleteFile
@@ -32,29 +32,10 @@ namespace cppdesk {
 
 namespace {
 
-// Second-order damped harmonic oscillator (macOS CoreAnimation CASpringAnimation physics)
-bool stepSpring(float& pos, float& vel, float target, float omega, float zeta, float dt, float eps = 0.0012f) {
-    return cppdesk::UiPlatform::stepSpring(pos, vel, target, omega, zeta, dt, eps);
-}
-
-bool stepExp(float& current, float target, float speed, float dt) {
-    float diff = target - current;
-    if (std::fabs(diff) <= 0.003f) {
-        if (current != target) {
-            current = target;
-            return true;
-        }
-        return false;
-    }
-    float factor = 1.0f - std::exp(-speed * dt);
-    current += diff * factor;
-    return true;
-}
-
-float smoothStepEase(float t) {
-    t = std::clamp(t, 0.0f, 1.0f);
-    return t * t * (3.0f - 2.0f * t);
-}
+struct VersionMismatchData {
+    std::string hostVer;
+    std::string viewerVer;
+};
 
 std::wstring utf8ToWide(const std::string& str) {
     if (str.empty()) return L"";
@@ -163,20 +144,14 @@ public:
     }
 
     void openUrl(const std::string& url) override {
+        if (!UiPlatform::isSafeExternalUrl(url)) return;
         ShellExecuteW(nullptr, L"open", utf8ToWide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
 
-    void revealPath(const std::string& path) override {
-        std::wstring args = L"/select,\"" + utf8ToWide(path) + L"\"";
-        ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
-    }
-
+    // Starting a second copy now would hit the single-instance mutex; WinMain launches it after CloseHandle.
     void relaunchApp() override {
-        wchar_t exePath[MAX_PATH]{};
-        if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
-            ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
-        }
-        if (w_.hwnd_) DestroyWindow(w_.hwnd_);
+        w_.relaunchRequested_ = true;
+        w_.requestClose();
     }
 
     bool setFullscreen(bool on) override { return w_.hwnd_ ? w_.setFullscreenWindow(on) : false; }
@@ -185,7 +160,7 @@ public:
         if (w_.hwnd_) SetTimer(w_.hwnd_, 1, ms, nullptr);
     }
     void quitApp() override {
-        if (w_.hwnd_) DestroyWindow(w_.hwnd_);
+        w_.requestClose();
     }
     bool relaunchElevated() override { return InputInjector::relaunchAsAdmin(w_.hwnd_); }
     void playAlertSound() override { MessageBeep(MB_OK); }
@@ -272,100 +247,109 @@ public:
         return w_.loadAppIconPixels(bgra, width, height);
     }
     void checkForUpdates(bool manual) override {
-        HWND target = w_.hwnd_;
-        AutoUpdater::checkForUpdatesAsync("oocsng", "cppdesk", CPP_DESK_VERSION, [target, manual](const UpdateInfo& info) {
-            if (target && IsWindow(target)) {
+        std::shared_ptr<CppDeskWindow::LiveToken> token = w_.liveToken_;
+        AutoUpdater::checkForUpdatesAsync("oocsng", "cppdesk", CPP_DESK_VERSION, [token, manual](const UpdateInfo& info) {
+            std::lock_guard<std::mutex> alive(token->m);
+            CppDeskWindow* self = token->w;
+            if (self && self->hwnd_ && IsWindow(self->hwnd_)) {
                 auto* pInfo = new UpdateInfo(info);
-                if (!PostMessageW(target, WM_DESK_UPDATE_CHECK_DONE, reinterpret_cast<WPARAM>(pInfo), manual ? 1 : 0)) {
+                if (!PostMessageW(self->hwnd_, WM_DESK_UPDATE_CHECK_DONE, reinterpret_cast<WPARAM>(pInfo), manual ? 1 : 0)) {
                     delete pInfo;
                 }
             }
-        });
+        }, updateGate_);
     }
     void startUpdateDownload(const std::string& url, uint64_t, const std::string& sha256,
                              std::function<void(bool, const std::string&)> done) override {
-        wchar_t tempDir[MAX_PATH]{};
-        GetTempPathW(MAX_PATH, tempDir);
-        std::wstring targetPath = std::wstring(tempDir) + L"CppDesk_update.exe";
+        std::wstring targetPath = AutoUpdater::createStagingExePath();
+        if (targetPath.empty()) {
+            done(false, "Failed to prepare secure update staging directory");
+            return;
+        }
         wchar_t currentExe[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, currentExe, MAX_PATH);
-        std::wstring currExePath(currentExe);
-        HWND h = w_.hwnd_;
+        DWORD exeLen = GetModuleFileNameW(nullptr, currentExe, MAX_PATH);
+        if (exeLen == 0 || exeLen >= MAX_PATH) {
+            done(false, "Failed to resolve current executable path");
+            return;
+        }
+        std::wstring currExePath(currentExe, exeLen);
+        std::shared_ptr<CppDeskWindow::LiveToken> token = w_.liveToken_;
         AutoUpdater::downloadUpdateAssetAsync(
             url, targetPath,
-            [h](uint64_t downloaded, uint64_t total, double speed) {
-                if (!h) return;
+            [token](uint64_t downloaded, uint64_t total, double speed) {
+                std::lock_guard<std::mutex> alive(token->m);
+                CppDeskWindow* self = token->w;
+                if (!self || !self->hwnd_) return;
                 auto* p = new UpdateProgressData{ downloaded, total, speed };
-                if (!PostMessageW(h, WM_APP_UPDATE_PROGRESS, reinterpret_cast<WPARAM>(p), 0)) {
+                if (!PostMessageW(self->hwnd_, WM_APP_UPDATE_PROGRESS, reinterpret_cast<WPARAM>(p), 0)) {
                     delete p;
                 }
             },
-            [h, targetPath, currExePath, done](bool success, const std::string& err) {
+            [token, targetPath, currExePath, done](bool success, const std::string& err) {
                 if (!success) {
                     done(false, "Download failed: " + err);
                     return;
                 }
                 if (!AutoUpdater::validatePeBinary(targetPath)) {
+                    DeleteFileW(targetPath.c_str());
                     done(false, "Validation error: Corrupt PE binary");
                     return;
                 }
                 done(true, "Restarting CppDesk...");
                 if (AutoUpdater::launchSelfUpdate(targetPath, currExePath)) {
-                    if (h) PostMessageW(h, WM_CLOSE, 0, 0);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                    ExitProcess(0);
+                    std::lock_guard<std::mutex> alive(token->m);
+                    CppDeskWindow* self = token->w;
+                    if (self && self->hwnd_) PostMessageW(self->hwnd_, WM_APP_FORCE_QUIT, 0, 0);
                 } else {
                     done(false, "Failed to launch updater helper");
                 }
             },
-            sha256);
+            sha256,
+            updateGate_);
     }
-    ui::ServiceState serviceState() const override {
-        switch (WindowsServiceManager::getServiceState()) {
-            case ServiceStatusState::Running: return ui::ServiceState::Running;
-            case ServiceStatusState::Stopped: return ui::ServiceState::Stopped;
-            case ServiceStatusState::Pending: return ui::ServiceState::Pending;
-            default: return ui::ServiceState::NotInstalled;
-        }
+    void cancelUpdates() {
+        updateGate_->invalidate();
+        AutoUpdater::cancelPendingOperations();
     }
-    bool runServiceAction(ui::ServiceAction action) override {
-        switch (action) {
-            case ui::ServiceAction::Install: return WindowsServiceManager::installService();
-            case ui::ServiceAction::Uninstall: return WindowsServiceManager::uninstallService();
-            case ui::ServiceAction::Start: return WindowsServiceManager::startService();
-            case ui::ServiceAction::Stop: return WindowsServiceManager::stopService();
-        }
-        return false;
-    }
-    void showNotification(const std::string&, const std::string&) override {}
-    void setTrayStatus(const std::string&) override {}
+    // Windows background service mode is not supported (ServiceMain stub disabled).
+    ui::ServiceState serviceState() const override { return ui::ServiceState::NotInstalled; }
+    bool runServiceAction(ui::ServiceAction) override { return false; }
 
-    bool has(ui::Capability c) const override { return c != ui::Capability::HostPermissions; }   // macOS-only
+    bool has(ui::Capability c) const override {
+        return c != ui::Capability::HostPermissions && c != ui::Capability::WindowsService;
+    }
 
 private:
     CppDeskWindow& w_;
+    std::shared_ptr<AutoUpdater::CallbackGate> updateGate_ = std::make_shared<AutoUpdater::CallbackGate>();
 };
 
 CppDeskWindow::CppDeskWindow(IdentityManager& identity, NetworkEngine& network, const std::string& autoConnectTarget)
     : identity_(identity)
     , network_(network)
 {
+    liveToken_->w = this;
     shell_ = std::make_unique<WinShell>(*this);
     app_ = std::make_unique<AppUi>(identity_, network_, *shell_, autoConnectTarget);
 
     // Network callbacks arrive on worker threads; hand them to the UI thread as window messages.
-    network_.setOnScratchpadUpdateCallback([this](const ScratchpadUpdatePayload& p) {
-        if (!hwnd_) return;
+    std::shared_ptr<LiveToken> token = liveToken_;
+    network_.setOnScratchpadUpdateCallback([token](const ScratchpadUpdatePayload& p) {
+        std::lock_guard<std::mutex> alive(token->m);
+        CppDeskWindow* self = token->w;
+        if (!self || !self->hwnd_) return;
         auto* copy = new ScratchpadUpdatePayload(p);
-        if (!PostMessageW(hwnd_, WM_APP_SCRATCHPAD_UPDATE, reinterpret_cast<WPARAM>(copy), 0)) {
+        if (!PostMessageW(self->hwnd_, WM_APP_SCRATCHPAD_UPDATE, reinterpret_cast<WPARAM>(copy), 0)) {
             delete copy;
         }
     });
 
-    network_.setOnCommandPaletteOutputCallback([this](const CommandPaletteOutputPayload& p) {
-        if (!hwnd_) return;
+    network_.setOnCommandPaletteOutputCallback([token](const CommandPaletteOutputPayload& p) {
+        std::lock_guard<std::mutex> alive(token->m);
+        CppDeskWindow* self = token->w;
+        if (!self || !self->hwnd_) return;
         auto* copy = new CommandPaletteOutputPayload(p);
-        if (!PostMessageW(hwnd_, WM_APP_COMMAND_PALETTE, reinterpret_cast<WPARAM>(copy), 0)) {
+        if (!PostMessageW(self->hwnd_, WM_APP_COMMAND_PALETTE, reinterpret_cast<WPARAM>(copy), 0)) {
             delete copy;
         }
     });
@@ -377,7 +361,27 @@ CppDeskWindow::CppDeskWindow(IdentityManager& identity, NetworkEngine& network, 
     lastQpcCounter_ = now.QuadPart;
 }
 
+void CppDeskWindow::unregisterNetworkCallbacks() {
+    {
+        std::lock_guard<std::mutex> alive(liveToken_->m);
+        liveToken_->w = nullptr;
+    }
+    network_.setOnScratchpadUpdateCallback(nullptr);
+    network_.setOnCommandPaletteOutputCallback(nullptr);
+    network_.setOnFrameDecodedCallback(nullptr);
+    network_.setOnVersionMismatchCallback(nullptr);
+    network_.setOnVersionUpgradeNoticeCallback(nullptr);
+}
+
+void CppDeskWindow::requestClose() {
+    if (!hwnd_) return;
+    if (app_) app_->onCloseRequested();
+    DestroyWindow(hwnd_);
+}
+
 CppDeskWindow::~CppDeskWindow() {
+    if (shell_) static_cast<WinShell*>(shell_.get())->cancelUpdates();
+    unregisterNetworkCallbacks();
     app_.reset();
     releaseGraphics();
 }
@@ -469,18 +473,37 @@ bool CppDeskWindow::create(HINSTANCE hInstance, int nCmdShow) {
         app_->setNotificationManager(std::move(notif));
     }
 
-    network_.setOnFrameDecodedCallback([this]() {
-        if (app_->claimFrameRedraw() && hwnd_) {
-            PostMessageW(hwnd_, WM_APP_FRAME_READY, 0, 0);
+    {
+        std::lock_guard<std::mutex> alive(liveToken_->m);
+        liveToken_->w = this;
+    }
+    std::shared_ptr<LiveToken> token = liveToken_;
+    network_.setOnFrameDecodedCallback([token]() {
+        std::lock_guard<std::mutex> alive(token->m);
+        CppDeskWindow* self = token->w;
+        if (self && self->app_ && self->app_->claimFrameRedraw() && self->hwnd_) {
+            PostMessageW(self->hwnd_, WM_APP_FRAME_READY, 0, 0);
         }
     });
 
-    network_.setOnVersionMismatchCallback([this](const std::string& hostVer, const std::string& viewerVer) {
-        app_->onPeerVersionMismatch(hostVer, viewerVer);
+    network_.setOnVersionMismatchCallback([token](const std::string& hostVer, const std::string& viewerVer) {
+        std::lock_guard<std::mutex> alive(token->m);
+        CppDeskWindow* self = token->w;
+        if (!self || !self->hwnd_) return;
+        auto* copy = new VersionMismatchData{ hostVer, viewerVer };
+        if (!PostMessageW(self->hwnd_, WM_APP_VERSION_MISMATCH, reinterpret_cast<WPARAM>(copy), 0)) {
+            delete copy;
+        }
     });
 
-    network_.setOnVersionUpgradeNoticeCallback([this](const VersionUpgradeNoticePayload& notice) {
-        app_->onVersionUpgradeNotice(notice.senderVersion);
+    network_.setOnVersionUpgradeNoticeCallback([token](const VersionUpgradeNoticePayload& notice) {
+        std::lock_guard<std::mutex> alive(token->m);
+        CppDeskWindow* self = token->w;
+        if (!self || !self->hwnd_) return;
+        auto* copy = new std::string(notice.senderVersion);
+        if (!PostMessageW(self->hwnd_, WM_APP_VERSION_UPGRADE, reinterpret_cast<WPARAM>(copy), 0)) {
+            delete copy;
+        }
     });
 
     ShowWindow(hwnd_, nCmdShow);
@@ -642,9 +665,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_SETCURSOR: {
             if (LOWORD(lParam) == HTCLIENT) {
-                const ui::CursorShape shape = app_->cursorShape();
-                SetCursor(LoadCursor(nullptr, shape == ui::CursorShape::IBeam ? IDC_IBEAM
-                                             : shape == ui::CursorShape::Hand ? IDC_HAND : IDC_ARROW));
+                shell_->setCursor(app_->cursorShape());
                 return TRUE;
             }
             break;
@@ -655,7 +676,11 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_KILLFOCUS:
             app_->onFocusChanged(false);
             return 0;
-        case WM_ACTIVATE:   // as before the split, any activation change refreshes like a focus gain
+        case WM_ACTIVATE:
+            if (LOWORD(wParam) != WA_INACTIVE) {
+                app_->onFocusChanged(true);
+            }
+            break;
         case WM_SETFOCUS:
             app_->onFocusChanged(true);
             break;
@@ -671,8 +696,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 ShowWindow(hwnd_, SW_HIDE);
                 return 0;
             }
-            app_->onCloseRequested();
-            DestroyWindow(hwnd_);
+            requestClose();
             return 0;
         }
         case WM_COMMAND: {
@@ -684,7 +708,7 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 app_->toggleNotificationsMuted();
                 return 0;
             } else if (cmdId == IDM_TRAY_EXIT) {
-                DestroyWindow(hwnd_);
+                requestClose();
                 return 0;
             }
             break;
@@ -857,32 +881,33 @@ LRESULT CppDeskWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             app_->onFrameReady();
             return 0;
 
+        case WM_APP_VERSION_MISMATCH: {
+            std::unique_ptr<VersionMismatchData> own(reinterpret_cast<VersionMismatchData*>(wParam));
+            if (own && app_) app_->onPeerVersionMismatch(own->hostVer, own->viewerVer);
+            return 0;
+        }
+
+        case WM_APP_VERSION_UPGRADE: {
+            std::unique_ptr<std::string> own(reinterpret_cast<std::string*>(wParam));
+            if (own && app_) app_->onVersionUpgradeNotice(*own);
+            return 0;
+        }
+
+        case WM_APP_FORCE_QUIT:
+            requestClose();
+            return 0;
+
         case WM_DESTROY:
             KillTimer(hwnd_, 1);
-            app_->onWindowDestroyed();
+            if (shell_) static_cast<WinShell*>(shell_.get())->cancelUpdates();
+            unregisterNetworkCallbacks();
+            if (app_) app_->onWindowDestroyed();
+            hwnd_ = nullptr;
             PostQuitMessage(0);
             return 0;
     }
     return DefWindowProcW(hwnd_, msg, wParam, lParam);
 }
-
-// ---------------- Primitive Drawing, Vector Icons & macOS Surface Helpers ----------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ---------------- Main Paint Orchestrator ----------------
 
@@ -924,89 +949,6 @@ void CppDeskWindow::onPaint() {
 }
 
 
-// ---------------- macOS Unified Top Toolbar ----------------
-
-
-// ---------------- Minimalistic macOS Dashboard View ----------------
-
-
-// ---------------- Session Tab Bar (Feature 6) ----------------
-
-
-// ---------------- Remote Session View ----------------
-
-
-// ---------------- macOS System Settings View ----------------
-
-
-// ---------------- Floating macOS Side Sheet Drawer ----------------
-
-
-// ---------------- Remote File Sync & Folder Mirroring Drawer ----------------
-
-
-// ---------------- macOS Sheet Connection Approval Modal ----------------
-
-
-// ---------------- macOS Dynamic Island Floating Top Bar ----------------
-
-
-// ---------------- Dynamic Island Clipboard File Transfer Progress Pill ----------------
-
-
-// ---------------- macOS Keyboard Shortcuts Sheet Modal ----------------
-
-
-// ---------------- TCP Port Forwarding Manager Sheet Modal (v2.1.0) ----------------
-
-
-// ---------------- Address Book Edit Sheet Modal (v2.1.0) ----------------
-
-
-// ---------------- Dual-Pane File Explorer, Run Task & File Action Modals ----------------
-
-
-
-
-
-
-
-
-
-
-// ---------------- Mandatory Update Modal (v3.0.0) ----------------
-
-
-// ---------------- Remote Reboot & Reconnect Sheet Modal ----------------
-
-
-
-// ---------------- In-Session Session Recording Player & Transcoder ----------------
-
-
-
-
-// ---------------- Two-Factor Authentication (TOTP) UI & QR Rendering ----------------
-
-
-
-
-
-// ---------------- Whiteboard & Screen Annotation Overlay (v2.1.0) ----------------
-
-
-// ---------------- Real-Time Performance & Diagnostics HUD Overlay ----------------
-
-
-// ---------------- macOS Dynamic Capsule Toast Banner ----------------
-
-
-// ---------------- Master Volume Popup ----------------
-
-
-// ---------------- Input & Interaction Handlers ----------------
-
-
 D2D1_SIZE_U CppDeskWindow::clientSizePx() const {
     RECT rc{};
     if (hwnd_) GetClientRect(hwnd_, &rc);
@@ -1014,47 +956,31 @@ D2D1_SIZE_U CppDeskWindow::clientSizePx() const {
                        static_cast<UINT32>(std::max<LONG>(1, rc.bottom - rc.top)));
 }
 
-
 D2D1_SIZE_F CppDeskWindow::clientSizeDips() const {
     if (snapshotMode_) return D2D1::SizeF(kSnapshotWidth, kSnapshotHeight);
     D2D1_SIZE_U px = clientSizePx();
     return D2D1::SizeF(pxToDip(static_cast<float>(px.width), dpi_), pxToDip(static_cast<float>(px.height), dpi_));
 }
 
-
-
-
-
-
-
-
-
 void CppDeskWindow::onDropFiles(HDROP hDrop) {
     POINT pt{};
     DragQueryPoint(hDrop, &pt);
     std::vector<std::string> paths;
-    UINT count = DragQueryFileA(hDrop, 0xFFFFFFFF, nullptr, 0);
+    UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
     for (UINT i = 0; i < count; ++i) {
-        char filePath[MAX_PATH] = {};
-        if (DragQueryFileA(hDrop, i, filePath, MAX_PATH) > 0) {
-            paths.emplace_back(filePath);
+        UINT len = DragQueryFileW(hDrop, i, nullptr, 0);
+        if (len == 0) continue;
+        std::wstring wPath(static_cast<size_t>(len) + 1, L'\0');
+        UINT written = DragQueryFileW(hDrop, i, wPath.data(), len + 1);
+        if (written > 0) {
+            wPath.resize(written);
+            paths.emplace_back(wideToUtf8(wPath.c_str()));
         }
     }
     DragFinish(hDrop);
     // DragQueryPoint returns physical client pixels; the UI works in DIPs.
     app_->onFilesDropped(paths, toDip(pt.x), toDip(pt.y));
 }
-
-// ---------------- High-Level UI Actions ----------------
-
-
-
-
-
-
-
-
-
 
 bool CppDeskWindow::setFullscreenWindow(bool on) {
     DWORD style = static_cast<DWORD>(GetWindowLongPtrW(hwnd_, GWL_STYLE));
@@ -1099,12 +1025,6 @@ void CppDeskWindow::restoreFromTray(NotificationType contextType) {
 // ---------------- Offscreen UI Snapshots (regression checks) ----------------
 
 namespace {
-
-struct SnapshotState {
-    const char* name;
-    std::function<void(CppDeskWindow&)> setup;      // once, before the first frame
-    std::function<void(CppDeskWindow&)> perFrame;   // after each animation step, before drawing
-};
 
 bool writeBmp32(const std::wstring& path, const uint8_t* bgra, UINT width, UINT height, UINT stride) {
     BITMAPFILEHEADER bfh{};

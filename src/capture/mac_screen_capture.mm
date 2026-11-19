@@ -232,12 +232,16 @@ bool MacCaptureStream::start(uint32_t displayId, int fps, int maxLongEdge) {
         }
         impl_->queue = dispatch_queue_create("cppdesk.capture", DISPATCH_QUEUE_SERIAL);
         impl_->stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:impl_->output];
+        auto failStart = [&](MacCaptureState st) -> bool {
+            stop();
+            shared.setState(st);
+            return false;
+        };
+
         NSError* addError = nil;
         if (![impl_->stream addStreamOutput:impl_->output type:SCStreamOutputTypeScreen sampleHandlerQueue:impl_->queue error:&addError]) {
-            shared.setState(stateForError(addError));
             impl_->stream = nil;
-            impl_->output = nil;
-            return false;
+            return failStart(stateForError(addError));
         }
         if (wantAudio) {   // sound that cannot be added leaves the screen stream as it was
             if (@available(macOS 13.0, *)) {
@@ -262,19 +266,31 @@ bool MacCaptureStream::start(uint32_t displayId, int fps, int maxLongEdge) {
             dispatch_semaphore_signal(started);
         }];
         if (dispatch_semaphore_wait(started, dispatch_time(DISPATCH_TIME_NOW, kStepTimeoutSeconds * NSEC_PER_SEC)) != 0) {
-            shared.setState(MacCaptureState::Failed);
-            return false;
+            return failStart(MacCaptureState::Failed);
         }
         if (startError) {
-            shared.setState(stateForError(startError));
-            return false;
+            return failStart(stateForError(startError));
         }
-        shared.setState(MacCaptureState::Running);
-        return true;
+        MacCaptureState afterStart = MacCaptureState::Running;
+        {
+            std::lock_guard<std::mutex> lock(shared.mutex);
+            afterStart = static_cast<MacCaptureState>(shared.state.load());
+            if (afterStart == MacCaptureState::Starting) {
+                shared.setState(MacCaptureState::Running);
+                return true;
+            }
+        }
+        return failStart(afterStart);
     }
 }
 
 void MacCaptureStream::stop() {
+    Shared& shared = *impl_->shared;
+    {
+        std::lock_guard<std::mutex> lock(shared.mutex);
+        shared.accepting = false;
+        shared.audioSink = nullptr;
+    }
     @autoreleasepool {
         if (impl_->stream) {
             SCStream* stream = impl_->stream;
@@ -295,10 +311,7 @@ void MacCaptureStream::stop() {
         impl_->audioQueue = nil;
         impl_->audioOn = false;
     }
-    Shared& shared = *impl_->shared;
     std::lock_guard<std::mutex> lock(shared.mutex);
-    shared.accepting = false;
-    shared.audioSink = nullptr;
     shared.frame.clear();
     shared.width = shared.height = 0;
     shared.seq = shared.copiedSeq = 0;

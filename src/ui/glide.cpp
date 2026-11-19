@@ -52,11 +52,14 @@ bool horizontal(GlideEdge e) { return e == GlideEdge::Top || e == GlideEdge::Bot
 }
 
 float glideAlong(const ui::Rect& b, GlideEdge e, ui::Point p) {
-    float t = horizontal(e) ? (p.x - b.left) / b.width() : (p.y - b.top) / b.height();
+    const float span = horizontal(e) ? b.width() : b.height();
+    if (span <= 0.0f) return 0.0f;
+    const float t = horizontal(e) ? (p.x - b.left) / span : (p.y - b.top) / span;
     return std::clamp(t, 0.0f, 1.0f);
 }
 
 GlideEdge glideEdgeAt(const ui::Rect& b, ui::Point p) {
+    if (b.width() <= 0.0f || b.height() <= 0.0f) return GlideEdge::Off;
     for (GlideEdge e : kEdges) {
         float dist = e == GlideEdge::Left ? p.x - b.left : e == GlideEdge::Right ? (b.right - 1) - p.x
                    : e == GlideEdge::Top ? p.y - b.top : (b.bottom - 1) - p.y;

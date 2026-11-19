@@ -15,6 +15,26 @@ namespace cppdesk {
 
 namespace {
 
+constexpr size_t kMaxIncrIncomingBytes = 4u * 1024u * 1024u;
+constexpr size_t kMaxOutgoingIncr = 16u;
+constexpr auto kOutgoingIncrTimeout = std::chrono::seconds(30);
+
+std::atomic<Display*> g_clipboardDpy{nullptr};
+int (*g_prevXErrorHandler)(Display*, XErrorEvent*) = nullptr;
+
+int clipboardXErrorHandler(Display* d, XErrorEvent* e) {
+    if (d && d == g_clipboardDpy.load(std::memory_order_acquire)) {
+        if (e && (e->error_code == BadWindow || e->error_code == BadDrawable ||
+                  e->error_code == BadMatch || e->error_code == BadAccess)) {
+            return 0;
+        }
+    }
+    if (g_prevXErrorHandler) {
+        return g_prevXErrorHandler(d, e);
+    }
+    return 0;
+}
+
 // UTF-8 to Latin-1; characters outside Latin-1 (and malformed bytes) become '?'.
 std::string toLatin1(const std::string& utf8) {
     std::string out;
@@ -47,7 +67,15 @@ std::vector<std::string> pathsFromUriList(const std::string& list) {
         pos = end + 1;
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#' || line.compare(0, 7, "file://") != 0) continue;
-        const size_t slash = line.find('/', 7);   // after an optional host (file://localhost/...)
+        // Accept only local file:/// or file://localhost/ URIs; skip remote-host authorities.
+        size_t slash = std::string::npos;
+        if (line.size() > 7 && line[7] == '/') {
+            slash = 7;
+        } else if (line.size() > 16) {
+            std::string host = line.substr(7, 10);
+            for (char& ch : host) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (host == "localhost/") slash = 16;
+        }
         if (slash == std::string::npos) continue;
         std::string path;
         for (size_t i = slash; i < line.size(); ++i) {
@@ -90,6 +118,8 @@ X11Clipboard::X11Clipboard() {
     ensureXlibThreads();
     dpy_ = XOpenDisplay(nullptr);
     if (!dpy_) return;
+    g_clipboardDpy.store(dpy_, std::memory_order_release);
+    g_prevXErrorHandler = XSetErrorHandler(clipboardXErrorHandler);
     win_ = XCreateSimpleWindow(dpy_, DefaultRootWindow(dpy_), 0, 0, 1, 1, 0, 0, 0);
     clip_ = XInternAtom(dpy_, "CLIPBOARD", False);
     utf8_ = XInternAtom(dpy_, "UTF8_STRING", False);
@@ -100,15 +130,51 @@ X11Clipboard::X11Clipboard() {
     uriList_ = XInternAtom(dpy_, "text/uri-list", False);
     gnomeFiles_ = XInternAtom(dpy_, "x-special/gnome-copied-files", False);
     XSelectInput(dpy_, win_, PropertyChangeMask);   // INCR replies arrive as property changes
+    fetchWorker_ = std::thread([this] { runFetchWorker(); });
     thread_ = std::thread([this] { run(); });
 }
 
 X11Clipboard::~X11Clipboard() {
     if (!dpy_) return;
     stop_ = true;
+    fetchCv_.notify_all();
+    if (fetchWorker_.joinable()) fetchWorker_.join();
     if (thread_.joinable()) thread_.join();
+    g_clipboardDpy.store(nullptr, std::memory_order_release);
     XDestroyWindow(dpy_, win_);
     XCloseDisplay(dpy_);
+}
+
+void X11Clipboard::runFetchWorker() {
+    while (true) {
+        PendingFetch job;
+        {
+            std::unique_lock<std::mutex> lock(fetchMutex_);
+            fetchCv_.wait(lock, [this] { return stop_.load() || !fetchQueue_.empty(); });
+            if (stop_.load()) break;
+            job = std::move(fetchQueue_.front());
+            fetchQueue_.pop_front();
+        }
+        const auto paths = job.files ? job.files() : std::nullopt;
+        if (stop_.load()) break;
+        XEvent late{};
+        late.xselection.type = SelectionNotify;
+        late.xselection.requestor = job.requestor;
+        late.xselection.selection = job.selection;
+        late.xselection.target = job.target;
+        late.xselection.time = job.time;
+        late.xselection.property = None;
+        if (paths) {
+            const bool gnome = job.target == gnomeFiles_;
+            std::string body = gnome ? "copy" : "";
+            for (const auto& p : *paths) body += gnome ? "\n" + uriFromPath(p) : uriFromPath(p) + "\r\n";
+            XChangeProperty(dpy_, job.requestor, job.property, job.target, 8, PropModeReplace,
+                            reinterpret_cast<const unsigned char*>(body.data()), static_cast<int>(body.size()));
+            late.xselection.property = job.property;
+        }
+        XSendEvent(dpy_, job.requestor, False, NoEventMask, &late);
+        XFlush(dpy_);
+    }
 }
 
 bool X11Clipboard::setText(const std::string& utf8) {
@@ -180,20 +246,34 @@ std::optional<std::string> X11Clipboard::request(unsigned long target, int timeo
     const bool ownedNow = XGetSelectionOwner(dpy_, clip_) == win_;
     std::unique_lock<std::mutex> lock(m_);
     if (ownedNow && owned_) return ours_;
+    waitingReply_ = true;
+    pendingTarget_ = target;
     replied_ = false;
     reply_.reset();
     incoming_ = false;
     incomingText_.clear();
     XConvertSelection(dpy_, clip_, target, prop_, win_, CurrentTime);
     XFlush(dpy_);
-    if (!cv_.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this] { return replied_; })) return std::nullopt;
+    const bool got = cv_.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this] { return replied_; });
+    waitingReply_ = false;
+    pendingTarget_ = 0;
+    incoming_ = false;
+    incomingText_.clear();
+    if (!got) return std::nullopt;
     return reply_;
 }
 
 void X11Clipboard::run() {
     pollfd pfd{ ConnectionNumber(dpy_), POLLIN, 0 };
+    auto pruneOutgoing = [&] {
+        const auto now = std::chrono::steady_clock::now();
+        std::erase_if(outgoing_, [&](const Outgoing& o) {
+            return (now - o.lastActivity) > kOutgoingIncrTimeout;
+        });
+    };
     while (!stop_.load()) {
         if (XPending(dpy_) == 0) {
+            pruneOutgoing();
             poll(&pfd, 1, 100);
             continue;
         }
@@ -219,28 +299,14 @@ void X11Clipboard::run() {
                 files = files_;
             }
             if (own && files && (req.target == uriList_ || req.target == gnomeFiles_)) {
-                // The files are fetched from the peer first, so the answer comes from a worker thread when they are
-                // here; the requesting app waits for it.
-                std::thread([this, req, property, files = std::move(files)] {
-                    const auto paths = files();
-                    XEvent late{};
-                    late.xselection.type = SelectionNotify;
-                    late.xselection.requestor = req.requestor;
-                    late.xselection.selection = req.selection;
-                    late.xselection.target = req.target;
-                    late.xselection.time = req.time;
-                    late.xselection.property = None;
-                    if (paths) {
-                        const bool gnome = req.target == gnomeFiles_;
-                        std::string body = gnome ? "copy" : "";
-                        for (const auto& p : *paths) body += gnome ? "\n" + uriFromPath(p) : uriFromPath(p) + "\r\n";
-                        XChangeProperty(dpy_, req.requestor, property, req.target, 8, PropModeReplace,
-                                        reinterpret_cast<const unsigned char*>(body.data()), static_cast<int>(body.size()));
-                        late.xselection.property = property;
+                // Queue on the joinable fetch worker so ~X11Clipboard() drains it before XCloseDisplay().
+                {
+                    std::lock_guard<std::mutex> lock(fetchMutex_);
+                    if (fetchQueue_.size() < 16) {
+                        fetchQueue_.push_back({ req.requestor, req.selection, req.target, property, req.time, std::move(files) });
                     }
-                    XSendEvent(dpy_, req.requestor, False, NoEventMask, &late);
-                    XFlush(dpy_);
-                }).detach();
+                }
+                fetchCv_.notify_one();
                 continue;
             }
             const bool fits = text.size() + 1024 < static_cast<size_t>(XMaxRequestSize(dpy_)) * 4;
@@ -264,6 +330,10 @@ void X11Clipboard::run() {
                                     reinterpret_cast<const unsigned char*>(text.data()), static_cast<int>(text.size()));
                 } else {
                     // INCR: announce the size; each time the requestor deletes the property, the next piece follows.
+                    pruneOutgoing();
+                    while (outgoing_.size() >= kMaxOutgoingIncr) {
+                        outgoing_.erase(outgoing_.begin());
+                    }
                     XSelectInput(dpy_, req.requestor, PropertyChangeMask);
                     const long size = static_cast<long>(text.size());
                     XChangeProperty(dpy_, req.requestor, property, incr_, 32, PropModeReplace,
@@ -271,7 +341,7 @@ void X11Clipboard::run() {
                     std::erase_if(outgoing_, [&](const Outgoing& o) {
                         return o.requestor == req.requestor && o.property == property;
                     });
-                    outgoing_.push_back({ req.requestor, property, type, std::move(text), 0 });
+                    outgoing_.push_back({ req.requestor, property, type, std::move(text), 0, std::chrono::steady_clock::now() });
                 }
                 reply.xselection.property = property;
             }
@@ -289,6 +359,7 @@ void X11Clipboard::run() {
                                 reinterpret_cast<const unsigned char*>(it->text.data() + it->sent),
                                 static_cast<int>(piece));
                 it->sent += piece;
+                it->lastActivity = std::chrono::steady_clock::now();
                 if (piece == 0) {
                     XSelectInput(dpy_, it->requestor, NoEventMask);
                     outgoing_.erase(it);
@@ -306,8 +377,24 @@ void X11Clipboard::run() {
             unsigned char* data = nullptr;
             const bool ok = XGetWindowProperty(dpy_, win_, prop_, 0, 1 << 24, True, AnyPropertyType, &type, &format,
                                                &count, &after, &data) == Success;
-            if (ok && data && format == 8) incomingText_.append(reinterpret_cast<char*>(data), count);
+            bool capExceeded = false;
+            if (ok && data && format == 8) {
+                if (incomingText_.size() + count > kMaxIncrIncomingBytes) {
+                    capExceeded = true;
+                } else {
+                    incomingText_.append(reinterpret_cast<char*>(data), count);
+                }
+            }
             if (data) XFree(data);
+            if (capExceeded) {
+                incoming_ = false;
+                incomingText_.clear();
+                reply_.reset();
+                replied_ = true;
+                lock.unlock();
+                cv_.notify_all();
+                continue;
+            }
             if (ok && type == None) continue;   // a change for a property already read, not a piece
             if (!ok || count == 0) {
                 incoming_ = false;
@@ -322,6 +409,15 @@ void X11Clipboard::run() {
             owned_ = false;
             files_ = nullptr;
         } else if (ev.type == SelectionNotify) {
+            {
+                std::lock_guard<std::mutex> lock(m_);
+                if (!waitingReply_ || ev.xselection.selection != clip_ || ev.xselection.target != pendingTarget_) {
+                    if (ev.xselection.property != None) {
+                        XDeleteProperty(dpy_, win_, ev.xselection.property);
+                    }
+                    continue;
+                }
+            }
             std::optional<std::string> text;
             bool incr = false;
             if (ev.xselection.property != None) {
@@ -333,7 +429,9 @@ void X11Clipboard::run() {
                 if (XGetWindowProperty(dpy_, win_, prop_, 0, 1 << 24, True, AnyPropertyType, &type, &format, &count,
                                        &after, &data) == Success) {
                     incr = type == incr_;
-                    if (!incr && format == 8 && data) text.emplace(reinterpret_cast<char*>(data), count);
+                    if (!incr && format == 8 && data && count <= kMaxIncrIncomingBytes) {
+                        text.emplace(reinterpret_cast<char*>(data), count);
+                    }
                 }
                 if (data) XFree(data);
             }
@@ -345,8 +443,10 @@ void X11Clipboard::run() {
             }
             {
                 std::lock_guard<std::mutex> lock(m_);
-                reply_ = std::move(text);
-                replied_ = true;
+                if (waitingReply_ && ev.xselection.target == pendingTarget_) {
+                    reply_ = std::move(text);
+                    replied_ = true;
+                }
             }
             cv_.notify_all();
         }

@@ -36,10 +36,11 @@ TotpManager::~TotpManager() {
 }
 
 bool TotpManager::isConfigured() const {
+    std::lock_guard<std::mutex> lk(mutex_);
     return !secretBytes_.empty();
 }
 
-void TotpManager::clear() {
+void TotpManager::clearLocked() {
     if (!secretBytes_.empty()) {
         CryptoUtils::secureZero(secretBytes_.data(), secretBytes_.size());
         secretBytes_.clear();
@@ -51,18 +52,25 @@ void TotpManager::clear() {
     lastConsumedStep_ = 0;
 }
 
+void TotpManager::clear() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    clearLocked();
+}
+
 void TotpManager::setSecret(const std::string& base32Secret, TotpAlgorithm alg) {
-    clear();
+    std::lock_guard<std::mutex> lk(mutex_);
+    clearLocked();
     algorithm_ = alg;
     if (decodeBase32(base32Secret, secretBytes_)) {
         secretBase32_ = encodeBase32(secretBytes_.data(), secretBytes_.size());
     } else {
-        clear();
+        clearLocked();
     }
 }
 
 void TotpManager::setSecretRaw(const uint8_t* key, size_t keyLen, TotpAlgorithm alg) {
-    clear();
+    std::lock_guard<std::mutex> lk(mutex_);
+    clearLocked();
     algorithm_ = alg;
     if (key && keyLen > 0) {
         secretBytes_.assign(key, key + keyLen);
@@ -70,15 +78,21 @@ void TotpManager::setSecretRaw(const uint8_t* key, size_t keyLen, TotpAlgorithm 
     }
 }
 
-void TotpManager::generateNewSecret(TotpAlgorithm alg) {
-    clear();
+bool TotpManager::generateNewSecret(TotpAlgorithm alg) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    clearLocked();
     algorithm_ = alg;
     secretBytes_.resize(20); // 160-bit cryptographically secure random secret
-    CryptoUtils::randomBytes(secretBytes_.data(), secretBytes_.size());
+    if (!CryptoUtils::randomBytes(secretBytes_.data(), secretBytes_.size())) {
+        clearLocked();
+        return false;
+    }
     secretBase32_ = encodeBase32(secretBytes_.data(), secretBytes_.size());
+    return true;
 }
 
 std::string TotpManager::generateCode(uint64_t unixTime, int digits) const {
+    std::lock_guard<std::mutex> lk(mutex_);
     if (secretBytes_.empty()) {
         return "";
     }
@@ -96,6 +110,7 @@ std::string TotpManager::generateCode(uint64_t unixTime, int digits) const {
 }
 
 bool TotpManager::verifyCode(const std::string& code, uint64_t unixTime, int driftSteps) {
+    std::lock_guard<std::mutex> lk(mutex_);
     if (secretBytes_.empty() || code.empty()) {
         return false;
     }
@@ -153,6 +168,7 @@ bool TotpManager::verifyCode(const std::string& code, uint64_t unixTime, int dri
 }
 
 std::string TotpManager::buildOtpAuthUri(uint64_t deskId, const std::string& issuer) const {
+    std::lock_guard<std::mutex> lk(mutex_);
     std::string algStr = (algorithm_ == TotpAlgorithm::Sha256) ? "SHA256" : "SHA1";
     return "otpauth://totp/" + issuer + ":" + std::to_string(deskId) +
            "?secret=" + secretBase32_ +
@@ -210,13 +226,19 @@ bool TotpManager::decodeBase32(const std::string& input, std::vector<uint8_t>& o
     out.clear();
     uint32_t buffer = 0;
     int bitsLeft = 0;
+    bool seenPadding = false;
 
     for (char c : input) {
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '-') {
             continue;
         }
         if (c == '=') {
-            break; // Padding
+            seenPadding = true;
+            continue;
+        }
+        if (seenPadding) {
+            out.clear();
+            return false;
         }
         int val = -1;
         if (c >= 'A' && c <= 'Z') {
@@ -237,7 +259,7 @@ bool TotpManager::decodeBase32(const std::string& input, std::vector<uint8_t>& o
             out.push_back(static_cast<uint8_t>((buffer >> bitsLeft) & 0xFF));
         }
     }
-    return true;
+    return !out.empty();
 }
 
 bool TotpManager::computeHmac(

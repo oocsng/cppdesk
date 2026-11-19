@@ -13,19 +13,27 @@
 #elif defined(__APPLE__)
 #include <CommonCrypto/CommonDigest.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <cstdlib>
+#include "../core/spawn.hpp"
 #include "mac_clipboard.hpp"
 #else
 #include <unistd.h>
+#include <sys/stat.h>
 #include <cstdlib>
+#include "../core/spawn.hpp"
 #include "x11_clipboard.hpp"
+#include <openssl/evp.h>
 #endif
 
 #include <filesystem>
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstring>
 #include <chrono>
 #include <cmath>
+#include <limits>
 
 namespace cppdesk {
 
@@ -50,6 +58,18 @@ std::string sanitizeFilename(const std::string& rawName) {
             c = '_';
         }
     }
+    while (!base.empty() && (base.back() == ' ' || base.back() == '.')) base.pop_back();
+    if (base.empty()) base = "received_file.bin";
+    std::string stemUpper = base.substr(0, base.find('.'));
+    for (char& c : stemUpper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    static const char* kReserved[] = {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+    };
+    for (const char* r : kReserved) {
+        if (stemUpper == r) { base = "_" + base; break; }
+    }
     return base;
 }
 
@@ -63,6 +83,39 @@ std::string formatBytesSize(uint64_t bytes) {
         std::snprintf(buf, sizeof(buf), "%.2f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
     }
     return std::string(buf);
+}
+
+std::string wideToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+#if defined(_WIN32)
+    int len = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
+    std::string out(static_cast<size_t>(len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), out.data(), len, nullptr, nullptr);
+    return out;
+#else
+    std::string out;
+    out.reserve(w.size());
+    for (wchar_t wc : w) {
+        uint32_t cp = static_cast<uint32_t>(wc);
+        if (cp <= 0x7Fu) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp <= 0x7FFu) {
+            out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp <= 0xFFFFu) {
+            out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp <= 0x10FFFFu) {
+            out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        }
+    }
+    return out;
+#endif
 }
 
 } // namespace
@@ -116,20 +169,32 @@ struct FileTransferManager::IncrementalSha256 {
         if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
     }
 
-    void update(const void* data, size_t len) {
-        if (valid && data && len > 0) {
-            BCryptHashData(hHash, const_cast<PUCHAR>(static_cast<const uint8_t*>(data)), static_cast<ULONG>(len), 0);
+    bool ok() const { return valid; }
+
+    bool update(const void* data, size_t len) {
+        if (!valid) return false;
+        if (!data || len == 0) return true;
+        const auto* p = static_cast<const uint8_t*>(data);
+        while (len > 0) {
+            const ULONG chunk = static_cast<ULONG>(std::min<size_t>(len, 0x7FFFFFFFu));
+            if (BCryptHashData(hHash, const_cast<PUCHAR>(p), chunk, 0) < 0) {
+                valid = false;
+                return false;
+            }
+            p += chunk;
+            len -= chunk;
         }
+        return true;
     }
 
     std::string finishHex() {
+        if (!valid || !hHash) return {};
         std::array<uint8_t, 32> digest{};
-        if (valid && hHash) {
-            BCryptFinishHash(hHash, digest.data(), static_cast<ULONG>(digest.size()), 0);
-            BCryptDestroyHash(hHash);
-            hHash = nullptr;
-            valid = false;
-        }
+        NTSTATUS st = BCryptFinishHash(hHash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+        BCryptDestroyHash(hHash);
+        hHash = nullptr;
+        valid = false;
+        if (st < 0) return {};
         return CryptoUtils::toHex(digest.data(), digest.size());
     }
 };
@@ -145,38 +210,59 @@ struct FileTransferManager::IncrementalSha256 {
 
     ~IncrementalSha256() = default;
 
-    void update(const void* data, size_t len) {
-        if (valid && data && len > 0) {
-            CC_SHA256_Update(&ctx, data, static_cast<CC_LONG>(len));
+    bool ok() const { return valid; }
+
+    bool update(const void* data, size_t len) {
+        if (!valid) return false;
+        if (!data || len == 0) return true;
+        const auto* p = static_cast<const uint8_t*>(data);
+        while (len > 0) {
+            const CC_LONG chunk = static_cast<CC_LONG>(std::min<size_t>(len, 0x7FFFFFFFu));
+            CC_SHA256_Update(&ctx, p, chunk);
+            p += chunk;
+            len -= chunk;
         }
+        return true;
     }
 
     std::string finishHex() {
+        if (!valid) return {};
         std::array<uint8_t, 32> digest{};
-        if (valid) {
-            CC_SHA256_Final(digest.data(), &ctx);
-            valid = false;
-        }
+        CC_SHA256_Final(digest.data(), &ctx);
+        valid = false;
         return CryptoUtils::toHex(digest.data(), digest.size());
     }
 };
 #else
 struct FileTransferManager::IncrementalSha256 {
-    std::vector<uint8_t> buffer_;
+    EVP_MD_CTX* ctx_ = nullptr;
+    bool        valid = false;
 
-    IncrementalSha256() = default;
-    ~IncrementalSha256() = default;
+    IncrementalSha256() {
+        ctx_ = EVP_MD_CTX_new();
+        valid = ctx_ && EVP_DigestInit_ex(ctx_, EVP_sha256(), nullptr) == 1;
+    }
 
-    void update(const void* data, size_t len) {
-        if (data && len > 0) {
-            const auto* p = static_cast<const uint8_t*>(data);
-            buffer_.insert(buffer_.end(), p, p + len);
-        }
+    ~IncrementalSha256() {
+        if (ctx_) EVP_MD_CTX_free(ctx_);
+    }
+
+    bool ok() const { return valid; }
+
+    bool update(const void* data, size_t len) {
+        if (!valid) return false;
+        if (!data || len == 0) return true;
+        if (EVP_DigestUpdate(ctx_, data, len) != 1) valid = false;
+        return valid;
     }
 
     std::string finishHex() {
-        auto digest = CryptoUtils::sha256(buffer_.data(), buffer_.size());
-        buffer_.clear();
+        if (!valid) return {};
+        std::array<uint8_t, 32> digest{};
+        unsigned int outLen = 0;
+        const bool good = EVP_DigestFinal_ex(ctx_, digest.data(), &outLen) == 1 && outLen == digest.size();
+        valid = false;
+        if (!good) return {};
         return CryptoUtils::toHex(digest.data(), digest.size());
     }
 };
@@ -254,15 +340,16 @@ std::vector<ClipboardHistoryItem> ClipboardHistoryManager::search(const std::str
     std::lock_guard<std::mutex> lock(mutex_);
     if (query.empty()) return items_;
 
+    auto toLowerAscii = [](unsigned char c) { return static_cast<char>(std::tolower(c)); };
     std::string qLower = query;
-    std::transform(qLower.begin(), qLower.end(), qLower.begin(), ::tolower);
+    std::transform(qLower.begin(), qLower.end(), qLower.begin(), toLowerAscii);
 
     std::vector<ClipboardHistoryItem> res;
     for (const auto& it : items_) {
         std::string txtLower = it.text;
-        std::transform(txtLower.begin(), txtLower.end(), txtLower.begin(), ::tolower);
+        std::transform(txtLower.begin(), txtLower.end(), txtLower.begin(), toLowerAscii);
         std::string typeLower = it.typeBadge;
-        std::transform(typeLower.begin(), typeLower.end(), typeLower.begin(), ::tolower);
+        std::transform(typeLower.begin(), typeLower.end(), typeLower.begin(), toLowerAscii);
         if (txtLower.find(qLower) != std::string::npos || typeLower.find(qLower) != std::string::npos) {
             res.push_back(it);
         }
@@ -373,17 +460,22 @@ bool ClipboardManager::setClipboardUtf8(const std::string& utf8Text) {
         return false;
     }
 
+    bool ok = false;
     wchar_t* wBuf = static_cast<wchar_t*>(GlobalLock(hGlobal));
     if (wBuf) {
         MultiByteToWideChar(CP_UTF8, 0, utf8Text.c_str(), -1, wBuf, wLen);
         GlobalUnlock(hGlobal);
-        SetClipboardData(CF_UNICODETEXT, hGlobal);
+        if (SetClipboardData(CF_UNICODETEXT, hGlobal)) {
+            ok = true;
+        } else {
+            GlobalFree(hGlobal);
+        }
     } else {
         GlobalFree(hGlobal);
     }
 
     CloseClipboard();
-    return true;
+    return ok;
 }
 
 bool ClipboardManager::getClipboardImageJpeg(std::vector<uint8_t>& outJpeg, uint32_t& outW, uint32_t& outH, int maxDim) {
@@ -595,6 +687,13 @@ std::string FileTransferManager::receiveDirectory() const {
     return receiveDir_;
 }
 
+void FileTransferManager::pushItemLocked(FileTransferItem item) {
+    items_.insert(items_.begin(), std::move(item));
+    if (items_.size() > 150) {
+        items_.pop_back();
+    }
+}
+
 void FileTransferManager::openReceiveDirectoryInExplorer() const {
     std::string dir = receiveDirectory();
     std::error_code ec;
@@ -602,11 +701,9 @@ void FileTransferManager::openReceiveDirectoryInExplorer() const {
 #if defined(_WIN32)
     ShellExecuteA(nullptr, "open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #elif defined(__APPLE__)
-    std::string cmd = "open \"" + dir + "\"";
-    std::system(cmd.c_str());
+    cppdesk::spawn::detached({"open", dir});
 #else
-    std::string cmd = "xdg-open \"" + dir + "\"";
-    std::system(cmd.c_str());
+    cppdesk::spawn::detached({"xdg-open", dir});
 #endif
 }
 
@@ -648,6 +745,9 @@ uint32_t FileTransferManager::startOutgoingFile(const std::filesystem::path& p, 
     out->lastSampleBytes = 0;
     out->emaSpeedBps = 0.0;
     out->hasher = std::make_unique<IncrementalSha256>();
+    if (!out->hasher->ok()) {
+        return 0;
+    }
     out->stream.open(p, std::ios::binary);
     if (!out->stream.is_open()) {
         return 0;
@@ -673,10 +773,7 @@ uint32_t FileTransferManager::startOutgoingFile(const std::filesystem::path& p, 
         item.startTimeMs = out->startTimeMs;
         item.speedBps = 0.0;
         item.etaSeconds = -1.0;
-        items_.insert(items_.begin(), item);
-        if (items_.size() > 150) {
-            items_.pop_back();
-        }
+        pushItemLocked(std::move(item));
 
         outgoingQueue_.push_back(std::move(out));
     }
@@ -689,7 +786,24 @@ uint32_t FileTransferManager::startOutgoingFile(const std::filesystem::path& p, 
         w.writeU8(static_cast<uint8_t>(targetHint));
         w.writeF32(dropNx);
         w.writeF32(dropNy);
-        sendPacket(PacketType::FILE_OFFER, w.buffer());
+        if (!sendPacket(PacketType::FILE_OFFER, w.buffer())) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto it = outgoingQueue_.begin(); it != outgoingQueue_.end(); ++it) {
+                if ((*it)->transferId == tid) {
+                    (*it)->stream.close();
+                    outgoingQueue_.erase(it);
+                    break;
+                }
+            }
+            for (auto& item : items_) {
+                if (item.transferId == tid && item.isOutgoing) {
+                    item.status = TransferStatus::Failed;
+                    item.statusText = "Failed (Send Error)";
+                    break;
+                }
+            }
+            return 0;
+        }
     }
     return tid;
 }
@@ -730,6 +844,8 @@ bool FileTransferManager::pumpOutgoingChunks(const SendPacketFn& sendPacket, int
         uint64_t offset = 0;
         std::vector<uint8_t> chunkBuf;
         bool finished = false;
+        bool failed = false;
+        std::string failReason;
         std::string finalShaHex;
 
         {
@@ -740,32 +856,48 @@ bool FileTransferManager::pumpOutgoingChunks(const SendPacketFn& sendPacket, int
             tid = active->transferId;
             offset = active->offset;
 
-            if (active->offset < active->totalBytes && active->stream.good()) {
-                size_t toRead = static_cast<size_t>(
-                    std::min<uint64_t>(FILE_CHUNK_SIZE, active->totalBytes - active->offset)
-                );
-                chunkBuf.resize(toRead);
-                active->stream.read(reinterpret_cast<char*>(chunkBuf.data()), static_cast<std::streamsize>(toRead));
-                std::streamsize got = active->stream.gcount();
-                if (got > 0) {
-                    chunkBuf.resize(static_cast<size_t>(got));
-                    if (active->hasher) {
-                        active->hasher->update(chunkBuf.data(), chunkBuf.size());
-                    }
-                    active->offset += static_cast<uint64_t>(got);
+            if (active->offset < active->totalBytes) {
+                if (!active->stream.good()) {
+                    failed = true;
+                    failReason = "Failed (Read Error)";
                 } else {
-                    finished = true;
+                    size_t toRead = static_cast<size_t>(
+                        std::min<uint64_t>(FILE_CHUNK_SIZE, active->totalBytes - active->offset)
+                    );
+                    chunkBuf.resize(toRead);
+                    active->stream.read(reinterpret_cast<char*>(chunkBuf.data()), static_cast<std::streamsize>(toRead));
+                    std::streamsize got = active->stream.gcount();
+                    if (got > 0) {
+                        chunkBuf.resize(static_cast<size_t>(got));
+                        if (active->hasher && !active->hasher->update(chunkBuf.data(), chunkBuf.size())) {
+                            failed = true;
+                            failReason = "Failed (Hash Error)";
+                            chunkBuf.clear();
+                        } else {
+                            active->offset += static_cast<uint64_t>(got);
+                        }
+                    } else {
+                        // Premature EOF or I/O failure before totalBytes
+                        failed = true;
+                        failReason = "Failed (Read Error)";
+                        chunkBuf.clear();
+                    }
                 }
-            } else {
+            }
+
+            if (!failed && active->offset >= active->totalBytes) {
                 finished = true;
             }
 
-            if (active->offset >= active->totalBytes) {
-                finished = true;
-            }
-
-            if (finished && active->hasher) {
-                finalShaHex = active->hasher->finishHex();
+            if (finished) {
+                if (active->hasher) {
+                    finalShaHex = active->hasher->finishHex();
+                }
+                if (finalShaHex.empty()) {
+                    finished = false;
+                    failed = true;
+                    failReason = "Failed (Hash Error)";
+                }
             }
 
             uint64_t nowMs = currentTimeMs();
@@ -789,7 +921,12 @@ bool FileTransferManager::pumpOutgoingChunks(const SendPacketFn& sendPacket, int
                     } else {
                         item.etaSeconds = -1.0;
                     }
-                    if (finished) {
+                    if (failed) {
+                        item.status = TransferStatus::Failed;
+                        item.statusText = failReason;
+                        item.speedBps = 0.0;
+                        item.etaSeconds = -1.0;
+                    } else if (finished) {
                         item.status = TransferStatus::Completed;
                         item.sha256Hex = finalShaHex;
                         item.speedBps = 0.0;
@@ -811,11 +948,39 @@ bool FileTransferManager::pumpOutgoingChunks(const SendPacketFn& sendPacket, int
                 }
             }
 
-            if (finished) {
+            if (finished || failed) {
                 active->stream.close();
                 outgoingQueue_.erase(outgoingQueue_.begin());
             }
         }
+
+        if (failed) {
+            ByteWriter w;
+            w.writeU32(tid);
+            sendPacket(PacketType::FILE_CANCEL, w.buffer());
+            didWork = true;
+            continue;
+        }
+
+        auto failSend = [&](uint32_t failedTid) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto it = outgoingQueue_.begin(); it != outgoingQueue_.end(); ++it) {
+                if ((*it)->transferId == failedTid) {
+                    (*it)->stream.close();
+                    outgoingQueue_.erase(it);
+                    break;
+                }
+            }
+            for (auto& item : items_) {
+                if (item.transferId == failedTid && item.isOutgoing) {
+                    item.status = TransferStatus::Failed;
+                    item.statusText = "Failed (Send Error)";
+                    item.speedBps = 0.0;
+                    item.etaSeconds = -1.0;
+                    break;
+                }
+            }
+        };
 
         if (!chunkBuf.empty()) {
             ByteWriter w;
@@ -823,7 +988,10 @@ bool FileTransferManager::pumpOutgoingChunks(const SendPacketFn& sendPacket, int
             w.writeU64(offset);
             w.writeU32(static_cast<uint32_t>(chunkBuf.size()));
             w.writeBytes(chunkBuf.data(), chunkBuf.size());
-            sendPacket(PacketType::FILE_CHUNK, w.buffer());
+            if (!sendPacket(PacketType::FILE_CHUNK, w.buffer())) {
+                failSend(tid);
+                break;
+            }
             didWork = true;
         }
 
@@ -831,7 +999,10 @@ bool FileTransferManager::pumpOutgoingChunks(const SendPacketFn& sendPacket, int
             ByteWriter w;
             w.writeU32(tid);
             w.writeString(finalShaHex);
-            sendPacket(PacketType::FILE_COMPLETE, w.buffer());
+            if (!sendPacket(PacketType::FILE_COMPLETE, w.buffer())) {
+                failSend(tid);
+                break;
+            }
             didWork = true;
         }
     }
@@ -934,11 +1105,21 @@ void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalByt
     std::string cleanName = sanitizeFilename(fileName);
     std::filesystem::path targetPath = std::filesystem::path(baseDir) / cleanName;
 
+    // Reject duplicate active transferId
+    for (const auto& existing : incomingStreams_) {
+        if (existing->transferId == transferId) {
+            return;
+        }
+    }
+
     // Verify file size limit and available disk space
+    constexpr uint64_t kDiskReserveBytes = 16ULL * 1024 * 1024;
     bool spaceOk = (totalBytes <= MAX_TRANSFER_FILE_BYTES);
     if (spaceOk) {
         auto spaceInfo = std::filesystem::space(baseDir, ec);
-        if (!ec && spaceInfo.available > 0 && totalBytes + (16ULL * 1024 * 1024) > spaceInfo.available) {
+        if (!ec && (spaceInfo.available == 0 ||
+                    totalBytes > spaceInfo.available ||
+                    spaceInfo.available - totalBytes < kDiskReserveBytes)) {
             spaceOk = false;
         }
     }
@@ -951,7 +1132,7 @@ void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalByt
         item.isOutgoing = false;
         item.status = TransferStatus::Failed;
         item.statusText = "Rejected (Size/Disk Limit)";
-        items_.insert(items_.begin(), item);
+        pushItemLocked(std::move(item));
         return;
     }
 
@@ -963,21 +1144,49 @@ void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalByt
         item.isOutgoing = false;
         item.status = TransferStatus::Failed;
         item.statusText = "Rejected (Queue Full)";
-        items_.insert(items_.begin(), item);
+        pushItemLocked(std::move(item));
         return;
     }
 
-    // Avoid overwriting existing files by appending (1), (2), ...
-    if (std::filesystem::exists(targetPath, ec)) {
+    // Reserve a unique filename against both existing files/.part files and active incoming streams
+    auto isPathTaken = [&](const std::filesystem::path& cand) -> bool {
+        std::string candStr = cand.string();
+        std::string candPart = candStr + ".part";
+        std::error_code checkEc;
+        if (std::filesystem::exists(cand, checkEc) || std::filesystem::exists(candPart, checkEc)) {
+            return true;
+        }
+        for (const auto& active : incomingStreams_) {
+            if (active->savePath == candStr || active->partPath == candPart) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    bool foundUnique = !isPathTaken(targetPath);
+    if (!foundUnique) {
         std::string stem = targetPath.stem().string();
         std::string ext = targetPath.extension().string();
         for (int n = 1; n < 1000; ++n) {
             auto candidate = std::filesystem::path(baseDir) / (stem + " (" + std::to_string(n) + ")" + ext);
-            if (!std::filesystem::exists(candidate, ec)) {
+            if (!isPathTaken(candidate)) {
                 targetPath = candidate;
+                foundUnique = true;
                 break;
             }
         }
+    }
+    if (!foundUnique) {
+        FileTransferItem item;
+        item.transferId = transferId;
+        item.fileName = cleanName;
+        item.totalBytes = totalBytes;
+        item.isOutgoing = false;
+        item.status = TransferStatus::Failed;
+        item.statusText = "Rejected (Filename Collision)";
+        pushItemLocked(std::move(item));
+        return;
     }
 
     std::string partPathStr = targetPath.string() + ".part";
@@ -993,7 +1202,10 @@ void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalByt
     inc->lastSampleBytes = 0;
     inc->emaSpeedBps = 0.0;
     inc->hasher = std::make_unique<IncrementalSha256>();
-    inc->stream.open(partPathStr, std::ios::binary | std::ios::trunc);
+    bool hasherOk = inc->hasher && inc->hasher->ok();
+    if (hasherOk) {
+        inc->stream.open(partPathStr, std::ios::binary | std::ios::trunc);
+    }
 
     FileTransferItem item;
     item.transferId = transferId;
@@ -1005,18 +1217,15 @@ void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalByt
     item.startTimeMs = inc->startTimeMs;
     item.speedBps = 0.0;
     item.etaSeconds = -1.0;
-    if (inc->stream.is_open()) {
+    if (hasherOk && inc->stream.is_open()) {
         item.status = TransferStatus::InProgress;
         item.statusText = (totalBytes == 0) ? "Receiving (0 B)" : "Receiving (0%)";
         incomingStreams_.push_back(std::move(inc));
     } else {
         item.status = TransferStatus::Failed;
-        item.statusText = "Write Failed";
+        item.statusText = hasherOk ? "Write Failed" : "Hash Init Failed";
     }
-    items_.insert(items_.begin(), item);
-    if (items_.size() > 150) {
-        items_.pop_back();
-    }
+    pushItemLocked(std::move(item));
 }
 
 void FileTransferManager::handleFileChunk(uint32_t transferId, uint64_t offset, const uint8_t* chunkData, size_t chunkLen) {
@@ -1055,8 +1264,19 @@ void FileTransferManager::handleFileChunk(uint32_t transferId, uint64_t offset, 
                     incomingStreams_.erase(it);
                     return;
                 }
-                if (inc->hasher) {
-                    inc->hasher->update(chunkData, chunkLen);
+                if (inc->hasher && !inc->hasher->update(chunkData, chunkLen)) {
+                    inc->stream.close();
+                    std::error_code ec;
+                    std::filesystem::remove(inc->partPath, ec);
+                    for (auto& item : items_) {
+                        if (item.transferId == transferId && !item.isOutgoing) {
+                            item.status = TransferStatus::Failed;
+                            item.statusText = "Transfer aborted: hash error";
+                            break;
+                        }
+                    }
+                    incomingStreams_.erase(it);
+                    return;
                 }
                 inc->receivedBytes += chunkLen;
             }
@@ -1101,6 +1321,8 @@ void FileTransferManager::handleFileComplete(uint32_t transferId, const std::str
     std::string computedSha;
     std::string partPath;
     std::string finalPath;
+    uint64_t receivedBytes = 0;
+    uint64_t totalBytes = 0;
     bool foundStream = false;
 
     for (auto it = incomingStreams_.begin(); it != incomingStreams_.end(); ++it) {
@@ -1112,18 +1334,27 @@ void FileTransferManager::handleFileComplete(uint32_t transferId, const std::str
             }
             partPath = (*it)->partPath;
             finalPath = (*it)->savePath;
+            receivedBytes = (*it)->receivedBytes;
+            totalBytes = (*it)->totalBytes;
             foundStream = true;
             incomingStreams_.erase(it);
             break;
         }
     }
 
-    bool hashValid = !sha256Hex.empty() && (computedSha == sha256Hex);
+    bool bytesComplete = foundStream && (receivedBytes == totalBytes);
+    bool hashValid = bytesComplete && !sha256Hex.empty() && !computedSha.empty() && (computedSha == sha256Hex);
+    bool renameOk = false;
     std::error_code ec;
     if (foundStream) {
         if (hashValid) {
-            std::filesystem::remove(finalPath, ec);
             std::filesystem::rename(partPath, finalPath, ec);
+            if (!ec) {
+                renameOk = true;
+            } else {
+                std::error_code rmEc;
+                std::filesystem::remove(partPath, rmEc);
+            }
         } else {
             std::filesystem::remove(partPath, ec);
         }
@@ -1134,8 +1365,8 @@ void FileTransferManager::handleFileComplete(uint32_t transferId, const std::str
         if (item.transferId == transferId && !item.isOutgoing) {
             item.speedBps = 0.0;
             item.etaSeconds = -1.0;
-            if (hashValid) {
-                item.transferredBytes = item.totalBytes;
+            if (hashValid && renameOk) {
+                item.transferredBytes = receivedBytes;
                 item.status = TransferStatus::Completed;
                 item.sha256Hex = computedSha;
                 uint64_t totalElapsedMs = nowMs - item.startTimeMs;
@@ -1143,9 +1374,15 @@ void FileTransferManager::handleFileComplete(uint32_t transferId, const std::str
                     item.avgSpeedBps = (static_cast<double>(item.totalBytes) * 1000.0) / static_cast<double>(totalElapsedMs);
                 }
                 item.statusText = "Verified (" + formatBytesSize(item.totalBytes) + ") • " + FileTransferItem::formatSpeed(item.avgSpeedBps);
-            } else {
+            } else if (!bytesComplete) {
+                item.status = TransferStatus::Failed;
+                item.statusText = "Failed (Incomplete Transfer)";
+            } else if (!hashValid) {
                 item.status = TransferStatus::Failed;
                 item.statusText = "Failed (SHA-256 Mismatch)";
+            } else {
+                item.status = TransferStatus::Failed;
+                item.statusText = "Failed (Save Error)";
             }
             break;
         }
@@ -1219,8 +1456,48 @@ double FileTransferManager::aggregateActiveBandwidthBps() const {
 
 // ---------------- ClipboardFileTransferManager ----------------
 
-ClipboardFileTransferManager::ClipboardFileTransferManager() {
+#if !defined(_WIN32)
+namespace {
+
+std::filesystem::path privateStagingRoot() {
+    auto verifyOrCreate0700 = [](const std::filesystem::path& p) -> bool {
+        struct stat st{};
+        if (::lstat(p.c_str(), &st) == 0) {
+            if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) return false;
+            if (st.st_uid != geteuid()) return false;
+            if ((st.st_mode & 0077) != 0) {
+                if (::chmod(p.c_str(), 0700) != 0) return false;
+            }
+            return true;
+        }
+        return ::mkdir(p.c_str(), 0700) == 0;
+    };
+
+    if (const char* xdg = std::getenv("XDG_RUNTIME_DIR"); xdg && *xdg) {
+        std::filesystem::path p = std::filesystem::path(xdg) / "cppdesk_clipboard";
+        if (verifyOrCreate0700(p)) return p;
+    }
+    const char* tmp = std::getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    std::filesystem::path perUser = std::filesystem::path(tmp) / ("cppdesk_clipboard_" + std::to_string(geteuid()));
+    if (verifyOrCreate0700(perUser)) return perUser;
+
+    std::string tmpl = std::string(tmp) + "/cppdesk_stgroot_XXXXXX";
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    if (char* created = ::mkdtemp(buf.data())) {
+        return std::filesystem::path(created);
+    }
+    return {};
+}
+
+} // namespace
+#endif
+
+ClipboardFileTransferManager::ClipboardFileTransferManager()
+    : state_(std::make_shared<SharedState>()) {
     static std::atomic<uint32_t> instanceCount{0};
+    std::error_code ec;
 #if defined(_WIN32)
     wchar_t tempPath[MAX_PATH] = {};
     GetTempPathW(MAX_PATH, tempPath);
@@ -1228,21 +1505,10 @@ ClipboardFileTransferManager::ClipboardFileTransferManager() {
     const std::wstring ownPrefix = L"stg_" + std::to_wstring(GetCurrentProcessId()) + L"_";
     stagingDir_ = root + ownPrefix + std::to_wstring(++instanceCount) + L"\\";
     lastSequenceNumber_ = GetClipboardSequenceNumber();
-#else
-    const char* tmp = std::getenv("TMPDIR");
-    if (!tmp) tmp = "/tmp";
-    std::string s = std::string(tmp) + "/CppDesk_Clipboard/";
-    const std::wstring root(s.begin(), s.end());
-    const std::wstring ownPrefix = L"stg_" + std::to_wstring(getpid()) + L"_";
-    stagingDir_ = root + ownPrefix + std::to_wstring(++instanceCount) + L"/";
-    lastSequenceNumber_ = 1;
-#endif
-    std::error_code ec;
-    // What a crashed run left behind (its staging folders, or loose .part files from older versions). Only day-old
-    // entries go, so another running CppDesk's live transfer is never touched.
     try {
         const auto cutoff = std::filesystem::file_time_type::clock::now() - std::chrono::hours(24);
         for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
+            if (e.is_symlink(ec)) continue;
             const std::wstring name = e.path().filename().wstring();
             const bool leftover = (name.rfind(L"stg_", 0) == 0 && name.rfind(ownPrefix, 0) != 0) ||
                                   e.path().extension() == ".part";
@@ -1252,18 +1518,57 @@ ClipboardFileTransferManager::ClipboardFileTransferManager() {
         }
     } catch (...) {}
     std::filesystem::create_directories(stagingDir_, ec);
-}
-
-ClipboardFileTransferManager::~ClipboardFileTransferManager() {
-    reset();
-    std::error_code ec;
-    std::filesystem::remove_all(stagingDir_, ec);
-#if !defined(_WIN32)
-    clearOwnOffer();   // the offered files are fetched through this manager
+#else
+    const std::filesystem::path root = privateStagingRoot();
+    const std::string ownPrefix = "stg_" + std::to_string(getpid()) + "_";
+    if (!root.empty()) {
+        try {
+            const auto cutoff = std::filesystem::file_time_type::clock::now() - std::chrono::hours(24);
+            for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
+                if (e.is_symlink(ec)) continue;
+                const std::string name = e.path().filename().string();
+                const bool leftover = (name.rfind("stg_", 0) == 0 && name.rfind(ownPrefix, 0) != 0) ||
+                                      e.path().extension() == ".part";
+                if (!leftover) continue;
+                const auto written = e.last_write_time(ec);
+                if (!ec && written < cutoff) std::filesystem::remove_all(e.path(), ec);
+            }
+        } catch (...) {}
+        std::string tmpl = (root / (ownPrefix + std::to_string(++instanceCount) + "_XXXXXX")).string();
+        std::vector<char> buf(tmpl.begin(), tmpl.end());
+        buf.push_back('\0');
+        if (char* created = ::mkdtemp(buf.data())) {
+            std::string dirStr = std::string(created) + "/";
+            stagingDir_.assign(dirStr.begin(), dirStr.end());
+        }
+    }
+    lastSequenceNumber_ = 1;
 #endif
 }
 
+ClipboardFileTransferManager::~ClipboardFileTransferManager() {
+    clearOwnOffer();
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->destroyed = true;
+        state_->incoming.cancelled = true;
+        state_->incoming.inProgress = false;
+        state_->pendingReq.failed = true;
+        state_->pendingReq.active = false;
+        state_->activeSendFn = nullptr;
+        state_->chunkCv.notify_all();
+        state_->incoming = {};
+        state_->outgoing = {};
+    }
+    purgeStaging();
+    std::error_code ec;
+    if (!stagingDir_.empty()) {
+        std::filesystem::remove_all(stagingDir_, ec);
+    }
+}
+
 void ClipboardFileTransferManager::clearOwnOffer() {
+    if (!hasActiveOffer_.exchange(false)) return;
 #if defined(_WIN32)
     ShellClipboard::clearClipboard();
 #else
@@ -1273,8 +1578,9 @@ void ClipboardFileTransferManager::clearOwnOffer() {
 
 void ClipboardFileTransferManager::purgeStaging() {
     std::error_code ec;
-    if (std::filesystem::exists(stagingDir_, ec)) {
+    if (!stagingDir_.empty() && std::filesystem::exists(stagingDir_, ec)) {
         for (const auto& entry : std::filesystem::directory_iterator(stagingDir_, ec)) {
+            if (entry.is_symlink(ec)) continue;
             if (entry.path().extension() == ".part") {
                 std::filesystem::remove(entry.path(), ec);
             }
@@ -1300,7 +1606,7 @@ bool ClipboardFileTransferManager::pollLocalClipboardFiles(const SendPacketFn& s
     std::string manifest;
     for (const auto& f : files) {
         totalBytes += f.fileSize;
-        manifest += std::to_string(f.fileSize) + ":" + std::string(f.fileName.begin(), f.fileName.end()) + ";";
+        manifest += std::to_string(f.fileSize) + ":" + wideToUtf8(f.fileName) + ";";
     }
 
     constexpr uint64_t MAX_CAP = 2ULL * 1024ULL * 1024ULL * 1024ULL; // 2 GB
@@ -1308,20 +1614,20 @@ bool ClipboardFileTransferManager::pollLocalClipboardFiles(const SendPacketFn& s
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (manifest == outgoing_.manifestHash) {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (manifest == state_->outgoing.manifestHash) {
         return false;
     }
 
-    outgoing_.transferId = ++nextTransferId_;
-    outgoing_.files = files;
-    outgoing_.fullPaths = fullPaths;
-    outgoing_.totalBytes = totalBytes;
-    outgoing_.manifestHash = manifest;
+    state_->outgoing.transferId = ++nextTransferId_;
+    state_->outgoing.files = files;
+    state_->outgoing.fullPaths = fullPaths;
+    state_->outgoing.totalBytes = totalBytes;
+    state_->outgoing.manifestHash = manifest;
 
     if (sendPacket) {
         std::vector<uint8_t> pkt;
-        serializeClipboardFileList(outgoing_.transferId, outgoing_.files, pkt);
+        serializeClipboardFileList(state_->outgoing.transferId, state_->outgoing.files, pkt);
         sendPacket(PacketType::CLIPBOARD_FILE_LIST, pkt);
     }
     return true;
@@ -1379,56 +1685,64 @@ void ClipboardFileTransferManager::handleRemoteFileList(uint32_t transferId, con
     }
 
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        incoming_.transferId = transferId;
-        incoming_.files = sanitizedFiles;
-        incoming_.totalBytes = totalBytes;
-        incoming_.transferredBytes = 0;
-        incoming_.currentFileIndex = 0;
-        incoming_.currentFileName = std::string(sanitizedFiles[0].fileName.begin(), sanitizedFiles[0].fileName.end());
-        incoming_.inProgress = false;
-        incoming_.cancelled = false;
-        incoming_.startTimeMs = 0;
-        incoming_.transferRateMBs = 0.0f;
-        activeSendFn_ = sendPacket;
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->incoming.transferId = transferId;
+        state_->incoming.files = sanitizedFiles;
+        state_->incoming.totalBytes = totalBytes;
+        state_->incoming.transferredBytes = 0;
+        state_->incoming.currentFileIndex = 0;
+        state_->incoming.currentFileName = wideToUtf8(sanitizedFiles[0].fileName);
+        state_->incoming.inProgress = false;
+        state_->incoming.cancelled = false;
+        state_->incoming.startTimeMs = 0;
+        state_->incoming.transferRateMBs = 0.0f;
+        state_->activeSendFn = sendPacket;
     }
 
-    auto reader = [this](uint32_t fIndex, uint64_t off, uint32_t len, std::vector<uint8_t>& out) {
-        return this->fetchChunk(fIndex, off, len, out);
+    std::weak_ptr<SharedState> weakState = state_;
+    auto reader = [weakState](uint32_t fIndex, uint64_t off, uint32_t len, std::vector<uint8_t>& out) {
+        auto st = weakState.lock();
+        if (!st) return false;
+        return ClipboardFileTransferManager::fetchChunkFromState(*st, fIndex, off, len, out);
     };
 #if defined(_WIN32)
-    ShellClipboard::setVirtualClipboardFiles(sanitizedFiles, reader);
+    if (ShellClipboard::setVirtualClipboardFiles(sanitizedFiles, reader)) {
+        hasActiveOffer_.store(true);
+    }
 #else
     uint64_t generation = 0;
-    ShellClipboard::setVirtualClipboardFiles(sanitizedFiles, reader, &generation);
-    offerGeneration_.store(generation);
+    if (ShellClipboard::setVirtualClipboardFiles(sanitizedFiles, reader, &generation)) {
+        offerGeneration_.store(generation);
+        hasActiveOffer_.store(true);
+    }
 #endif
 }
 
-bool ClipboardFileTransferManager::fetchChunk(uint32_t fileIndex, uint64_t offset, uint32_t length, std::vector<uint8_t>& outData) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (incoming_.cancelled) return false;
+bool ClipboardFileTransferManager::fetchChunkFromState(SharedState& st, uint32_t fileIndex, uint64_t offset, uint32_t length, std::vector<uint8_t>& outData) {
+    std::unique_lock<std::mutex> lock(st.mutex);
+    if (st.destroyed || st.incoming.cancelled) return false;
 
-    incoming_.inProgress = true;
-    incoming_.currentFileIndex = fileIndex;
-    if (fileIndex < incoming_.files.size()) {
-        const auto& f = incoming_.files[fileIndex];
-        incoming_.currentFileName = std::string(f.fileName.begin(), f.fileName.end());
+    st.incoming.inProgress = true;
+    st.incoming.currentFileIndex = fileIndex;
+    if (fileIndex < st.incoming.files.size()) {
+        const auto& f = st.incoming.files[fileIndex];
+        st.incoming.currentFileName = wideToUtf8(f.fileName);
     }
-    if (incoming_.startTimeMs == 0) {
-        incoming_.startTimeMs = currentTimeMs();
+    if (st.incoming.startTimeMs == 0) {
+        st.incoming.startTimeMs = currentTimeMs();
     }
 
-    pendingReq_.transferId = incoming_.transferId;
-    pendingReq_.fileIndex = fileIndex;
-    pendingReq_.offset = offset;
-    pendingReq_.length = length;
-    pendingReq_.completed = false;
-    pendingReq_.failed = false;
-    pendingReq_.data.clear();
+    st.pendingReq.transferId = st.incoming.transferId;
+    st.pendingReq.fileIndex = fileIndex;
+    st.pendingReq.offset = offset;
+    st.pendingReq.length = length;
+    st.pendingReq.active = true;
+    st.pendingReq.completed = false;
+    st.pendingReq.failed = false;
+    st.pendingReq.data.clear();
 
-    SendPacketFn sendFn = activeSendFn_;
-    uint32_t tId = incoming_.transferId;
+    SendPacketFn sendFn = st.activeSendFn;
+    uint32_t tId = st.incoming.transferId;
     lock.unlock();
 
     if (sendFn) {
@@ -1439,45 +1753,72 @@ bool ClipboardFileTransferManager::fetchChunk(uint32_t fileIndex, uint64_t offse
         reqHdr.length = length;
         std::vector<uint8_t> pkt(sizeof(reqHdr));
         std::memcpy(pkt.data(), &reqHdr, sizeof(reqHdr));
-        sendFn(PacketType::CLIPBOARD_FILE_REQUEST, pkt);
+        if (!sendFn(PacketType::CLIPBOARD_FILE_REQUEST, pkt)) {
+            lock.lock();
+            st.pendingReq.active = false;
+            st.pendingReq.failed = true;
+            return false;
+        }
     } else {
+        lock.lock();
+        st.pendingReq.active = false;
         return false;
     }
 
     lock.lock();
-    bool ok = chunkCv_.wait_for(lock, std::chrono::seconds(15), [this]() {
-        return pendingReq_.completed || pendingReq_.failed || incoming_.cancelled;
+    bool ok = st.chunkCv.wait_for(lock, std::chrono::seconds(15), [&st]() {
+        return st.destroyed || st.pendingReq.completed || st.pendingReq.failed || st.incoming.cancelled;
     });
 
-    if (!ok || pendingReq_.failed || incoming_.cancelled) {
+    st.pendingReq.active = false;
+    if (!ok || st.destroyed || st.pendingReq.failed || st.incoming.cancelled) {
         return false;
     }
 
-    outData = std::move(pendingReq_.data);
-    incoming_.transferredBytes += outData.size();
+    outData = std::move(st.pendingReq.data);
+    st.incoming.transferredBytes += outData.size();
 
     uint64_t nowMs = currentTimeMs();
-    uint64_t elapsedMs = nowMs - incoming_.startTimeMs;
+    uint64_t elapsedMs = nowMs - st.incoming.startTimeMs;
     if (elapsedMs > 200) {
         double sec = static_cast<double>(elapsedMs) / 1000.0;
-        double mb = static_cast<double>(incoming_.transferredBytes) / (1024.0 * 1024.0);
-        incoming_.transferRateMBs = static_cast<float>(mb / sec);
+        double mb = static_cast<double>(st.incoming.transferredBytes) / (1024.0 * 1024.0);
+        st.incoming.transferRateMBs = static_cast<float>(mb / sec);
     }
 
-    if (incoming_.transferredBytes >= incoming_.totalBytes) {
-        incoming_.inProgress = false;
+    if (st.incoming.transferredBytes >= st.incoming.totalBytes) {
+        st.incoming.inProgress = false;
     }
     return true;
 }
 
+bool ClipboardFileTransferManager::fetchChunk(uint32_t fileIndex, uint64_t offset, uint32_t length, std::vector<uint8_t>& outData) {
+    return fetchChunkFromState(*state_, fileIndex, offset, length, outData);
+}
+
 void ClipboardFileTransferManager::handleFileRequest(uint32_t transferId, uint32_t fileIndex, uint64_t offset, uint32_t length, const SendPacketFn& sendPacket) {
     std::wstring path;
+    uint64_t expectedFileSize = 0;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (transferId != outgoing_.transferId || fileIndex >= outgoing_.fullPaths.size()) {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (transferId != state_->outgoing.transferId ||
+            fileIndex >= state_->outgoing.fullPaths.size() ||
+            fileIndex >= state_->outgoing.files.size()) {
             return;
         }
-        path = outgoing_.fullPaths[fileIndex];
+        path = state_->outgoing.fullPaths[fileIndex];
+        expectedFileSize = state_->outgoing.files[fileIndex].fileSize;
+    }
+
+    if (offset > expectedFileSize ||
+        offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+        if (sendPacket) {
+            ClipboardFileCancelHeader cancelHdr{ transferId, 3 }; // 3 = IO/range error
+            std::vector<uint8_t> pkt(sizeof(cancelHdr));
+            std::memcpy(pkt.data(), &cancelHdr, sizeof(cancelHdr));
+            sendPacket(PacketType::CLIPBOARD_FILE_CANCEL, pkt);
+        }
+        return;
     }
 
     std::ifstream file(std::filesystem::path(path), std::ios::binary);
@@ -1492,12 +1833,15 @@ void ClipboardFileTransferManager::handleFileRequest(uint32_t transferId, uint32
     }
 
     file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    uint32_t readSize = std::min<uint32_t>(length, 64 * 1024);
+    uint64_t remaining = expectedFileSize - offset;
+    uint32_t readSize = static_cast<uint32_t>(std::min<uint64_t>(std::min<uint32_t>(length, 64 * 1024), remaining));
     std::vector<uint8_t> buf(readSize);
-    file.read(reinterpret_cast<char*>(buf.data()), readSize);
-    std::streamsize bytesRead = file.gcount();
-    if (bytesRead < 0) bytesRead = 0;
-    buf.resize(static_cast<size_t>(bytesRead));
+    if (readSize > 0) {
+        file.read(reinterpret_cast<char*>(buf.data()), readSize);
+        std::streamsize bytesRead = file.gcount();
+        if (bytesRead < 0) bytesRead = 0;
+        buf.resize(static_cast<size_t>(bytesRead));
+    }
 
     auto digest = CryptoUtils::sha256(buf.data(), buf.size());
 
@@ -1519,47 +1863,59 @@ void ClipboardFileTransferManager::handleFileRequest(uint32_t transferId, uint32
 }
 
 void ClipboardFileTransferManager::handleFileChunk(uint32_t transferId, uint32_t fileIndex, uint64_t offset, const uint8_t* data, size_t len, const uint8_t sha256[32]) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (transferId != incoming_.transferId || incoming_.cancelled) {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (state_->destroyed || transferId != state_->incoming.transferId || state_->incoming.cancelled) {
+        return;
+    }
+
+    // Only accept chunks matching the active in-flight request within declared file bounds.
+    if (!state_->pendingReq.active ||
+        state_->pendingReq.transferId != transferId ||
+        state_->pendingReq.fileIndex != fileIndex ||
+        state_->pendingReq.offset != offset) {
+        return;
+    }
+
+    if (fileIndex >= state_->incoming.files.size() ||
+        len > state_->pendingReq.length ||
+        offset > state_->incoming.files[fileIndex].fileSize ||
+        len > state_->incoming.files[fileIndex].fileSize - offset ||
+        (len > 0 && !data)) {
+        state_->pendingReq.failed = true;
+        state_->pendingReq.active = false;
+        state_->chunkCv.notify_all();
         return;
     }
 
     auto digest = CryptoUtils::sha256(data, len);
     if (std::memcmp(digest.data(), sha256, 32) != 0) {
-        if (pendingReq_.transferId == transferId && pendingReq_.fileIndex == fileIndex && pendingReq_.offset == offset) {
-            pendingReq_.failed = true;
-            chunkCv_.notify_all();
-        }
+        state_->pendingReq.failed = true;
+        state_->pendingReq.active = false;
+        state_->chunkCv.notify_all();
         return;
     }
 
-    if (fileIndex < incoming_.files.size()) {
-        std::wstring partName = stagingDir_ + L"transfer_" + std::to_wstring(transferId) + L"_part_" + std::to_wstring(fileIndex) + L".part";
-        std::ofstream partFile(std::filesystem::path(partName), std::ios::binary | std::ios::in | std::ios::out);
-        if (!partFile.is_open()) {
-            partFile.open(std::filesystem::path(partName), std::ios::binary | std::ios::out);
-        }
-        if (partFile.is_open()) {
-            partFile.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
-            partFile.write(reinterpret_cast<const char*>(data), len);
-        }
-    }
-
-    if (pendingReq_.transferId == transferId && pendingReq_.fileIndex == fileIndex && pendingReq_.offset == offset) {
-        pendingReq_.data.assign(data, data + len);
-        pendingReq_.completed = true;
-        chunkCv_.notify_all();
-    }
+    state_->pendingReq.data.assign(data, data + len);
+    state_->pendingReq.completed = true;
+    state_->pendingReq.active = false;
+    state_->chunkCv.notify_all();
 }
 
 void ClipboardFileTransferManager::handleFileCancel(uint32_t transferId, uint32_t /*reasonCode*/) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (incoming_.transferId == transferId) {
-        incoming_.cancelled = true;
-        incoming_.inProgress = false;
-        pendingReq_.failed = true;
-        chunkCv_.notify_all();
-        purgeStaging();
+    bool shouldClear = false;
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (state_->incoming.transferId == transferId) {
+            state_->incoming.cancelled = true;
+            state_->incoming.inProgress = false;
+            state_->pendingReq.failed = true;
+            state_->pendingReq.active = false;
+            state_->chunkCv.notify_all();
+            purgeStaging();
+            shouldClear = true;
+        }
+    }
+    if (shouldClear) {
         clearOwnOffer();
     }
 }
@@ -1568,16 +1924,17 @@ void ClipboardFileTransferManager::cancelActiveTransfer(const SendPacketFn& send
     uint32_t tId = 0;
     SendPacketFn sendFn;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        incoming_.cancelled = true;
-        incoming_.inProgress = false;
-        pendingReq_.failed = true;
-        tId = incoming_.transferId;
-        sendFn = sendPacket ? sendPacket : activeSendFn_;
-        chunkCv_.notify_all();
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->incoming.cancelled = true;
+        state_->incoming.inProgress = false;
+        state_->pendingReq.failed = true;
+        state_->pendingReq.active = false;
+        tId = state_->incoming.transferId;
+        sendFn = sendPacket ? sendPacket : state_->activeSendFn;
+        state_->chunkCv.notify_all();
         purgeStaging();
-        clearOwnOffer();
     }
+    clearOwnOffer();
 
     if (sendFn && tId > 0) {
         ClipboardFileCancelHeader cancelHdr{ tId, 1 }; // 1 = user cancelled
@@ -1588,52 +1945,54 @@ void ClipboardFileTransferManager::cancelActiveTransfer(const SendPacketFn& send
 }
 
 void ClipboardFileTransferManager::reset() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    incoming_.cancelled = true;
-    incoming_.inProgress = false;
-    pendingReq_.failed = true;
-    chunkCv_.notify_all();
+    clearOwnOffer();
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    state_->incoming.cancelled = true;
+    state_->incoming.inProgress = false;
+    state_->pendingReq.failed = true;
+    state_->pendingReq.active = false;
+    state_->chunkCv.notify_all();
     purgeStaging();
-    incoming_ = {};
-    outgoing_ = {};
-    activeSendFn_ = nullptr;
+    state_->incoming = {};
+    state_->outgoing = {};
+    state_->activeSendFn = nullptr;
 }
 
 bool ClipboardFileTransferManager::isTransferActive() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return incoming_.inProgress && !incoming_.cancelled;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->incoming.inProgress && !state_->incoming.cancelled;
 }
 
 std::string ClipboardFileTransferManager::activeFileName() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return incoming_.currentFileName;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->incoming.currentFileName;
 }
 
 float ClipboardFileTransferManager::activeProgressFraction() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (incoming_.totalBytes == 0) return 0.0f;
-    float frac = static_cast<float>(static_cast<double>(incoming_.transferredBytes) / static_cast<double>(incoming_.totalBytes));
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (state_->incoming.totalBytes == 0) return 0.0f;
+    float frac = static_cast<float>(static_cast<double>(state_->incoming.transferredBytes) / static_cast<double>(state_->incoming.totalBytes));
     return std::clamp(frac, 0.0f, 1.0f);
 }
 
 float ClipboardFileTransferManager::activeTransferRateMBs() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return incoming_.transferRateMBs;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->incoming.transferRateMBs;
 }
 
 uint64_t ClipboardFileTransferManager::activeTransferredBytes() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return incoming_.transferredBytes;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->incoming.transferredBytes;
 }
 
 uint64_t ClipboardFileTransferManager::activeTotalBytes() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return incoming_.totalBytes;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->incoming.totalBytes;
 }
 
 uint32_t ClipboardFileTransferManager::activeTransferId() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return incoming_.transferId;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->incoming.transferId;
 }
 
 } // namespace cppdesk

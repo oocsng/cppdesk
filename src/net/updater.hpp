@@ -5,6 +5,8 @@
 #include <string>
 #include <functional>
 #include <vector>
+#include <memory>
+#include <mutex>
 
 namespace cppdesk {
 
@@ -27,6 +29,36 @@ using UpdateProgressCallback = std::function<void(uint64_t downloadedBytes, uint
 
 class AutoUpdater {
 public:
+    // Synchronizes async updater callbacks with caller lifetime to prevent post-destruction callbacks.
+    struct CallbackGate {
+        std::mutex mutex;
+        bool alive = true;
+
+        void invalidate() {
+            std::lock_guard<std::mutex> lk(mutex);
+            alive = false;
+        }
+
+        bool isAlive() {
+            std::lock_guard<std::mutex> lk(mutex);
+            return alive;
+        }
+
+        template <typename Fn>
+        bool runIfAlive(Fn&& fn) {
+            std::lock_guard<std::mutex> lk(mutex);
+            if (!alive) return false;
+            fn();
+            return true;
+        }
+    };
+
+    // Aborts any active WinHTTP sessions started by AutoUpdater.
+    static void cancelPendingOperations();
+
+    // Creates a unique staging path inside a user-private directory under %LOCALAPPDATA%\CppDesk\updates.
+    static std::wstring createStagingExePath();
+
     // Parses a semantic version string (e.g. "3.0.0", "v3.1.2") into major, minor, patch
     static bool parseVersionTriad(const std::string& verStr, int& major, int& minor, int& patch);
 
@@ -44,15 +76,17 @@ public:
         std::function<void(const UpdateInfo&)> onComplete,
         const std::string& repoOwner = "oocsng",
         const std::string& repoName = "cppdesk",
-        const std::string& currentVersion = CPP_DESK_VERSION);
+        const std::string& currentVersion = CPP_DESK_VERSION,
+        std::shared_ptr<CallbackGate> gate = nullptr);
 
     // Overload accepting (repoOwner, repoName, currentVersion, onComplete)
     static void checkForUpdatesAsync(
         const std::string& repoOwner,
         const std::string& repoName,
         const std::string& currentVersion,
-        std::function<void(const UpdateInfo&)> onComplete) {
-        checkForUpdatesAsync(std::move(onComplete), repoOwner, repoName, currentVersion);
+        std::function<void(const UpdateInfo&)> onComplete,
+        std::shared_ptr<CallbackGate> gate = nullptr) {
+        checkForUpdatesAsync(std::move(onComplete), repoOwner, repoName, currentVersion, std::move(gate));
     }
 
     // Simple JSON value extractor helper
@@ -63,22 +97,20 @@ public:
     static std::string extractAssetDownloadUrl(const std::string& json, const std::string& assetName = "CppDesk.exe", uint64_t* outSize = nullptr, std::string* outSha256 = nullptr);
 
     // Asynchronous asset downloader with progress reporting.
-    // A non-empty expectedSha256 must match the downloaded file or the file is deleted and the download fails.
+    // Requires HTTPS and a valid 64-hex expectedSha256; refuses missing digests and non-HTTPS URLs.
     static void downloadUpdateAssetAsync(
         const std::string& downloadUrl,
         const std::wstring& targetPath,
         UpdateProgressCallback onProgress,
         std::function<void(bool success, const std::string& error)> onComplete,
-        const std::string& expectedSha256 = "");
+        const std::string& expectedSha256 = "",
+        std::shared_ptr<CallbackGate> gate = nullptr);
 
     // True when the file's SHA-256 equals expectedHex (case-insensitive). False for an empty expectation or unreadable file.
     static bool fileMatchesSha256(const std::wstring& filePath, const std::string& expectedHex);
 
     // Validates PE binary integrity (DOS and NT headers)
     static bool validatePeBinary(const std::wstring& filePath);
-
-    // Builds helper command for detached replacement
-    static std::wstring buildSelfUpdateCommand(const std::wstring& newExePath, const std::wstring& currentExePath);
 
     // Applies self-update: waits for previous instance PID, replaces target binary, and optionally launches updated app
     static int applySelfUpdateAndRestart(

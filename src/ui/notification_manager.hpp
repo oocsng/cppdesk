@@ -13,6 +13,7 @@
 #include <string>
 #include <memory>
 #include <atomic>
+#include <mutex>
 
 namespace cppdesk {
 
@@ -67,6 +68,10 @@ public:
     NotificationType lastNotificationType() const { return lastType_.load(); }
     void clearLastNotificationType() { lastType_.store(NotificationType::GeneralInfo); }
 
+    static std::string truncateForNotification(const std::string& text, size_t maxBytes);
+    static std::string escapePangoMarkup(const std::string& text);
+    bool allowExternalSpawn(uint64_t nowMs);
+
 private:
 #if defined(_WIN32)
     HWND                    hwnd_ = nullptr;
@@ -82,6 +87,10 @@ private:
     std::atomic<bool>       muted_{false};
     std::atomic<NotificationType> lastType_{NotificationType::GeneralInfo};
     std::string             appTitle_ = "CppDesk";
+    std::mutex              spawnMutex_;
+    bool                    hasExternalSpawn_ = false;
+    uint64_t                lastExternalRefillMs_ = 0;
+    uint32_t                externalSpawnTokens_ = 3;
 };
 
 } // namespace cppdesk

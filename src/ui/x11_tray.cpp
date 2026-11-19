@@ -69,7 +69,7 @@ void X11Tray::dock() {
     unsigned long count = 0, after = 0;
     unsigned char* data = nullptr;
     if (XGetWindowProperty(dpy_, managerWin_, visualAtom_, 0, 1, False, XA_VISUALID, &type, &format, &count, &after,
-                           &data) == Success && data && count == 1) {
+                           &data) == Success && type == XA_VISUALID && format == 32 && data && count == 1) {
         XVisualInfo tmpl{};
         tmpl.visualid = static_cast<VisualID>(*reinterpret_cast<unsigned long*>(data));
         int n = 0;
@@ -175,9 +175,12 @@ void X11Tray::openMenu(int rootX, int rootY, const MenuInfo& info) {
     XStoreName(dpy_, menu_, "CppDesk tray menu");
     XMapRaised(dpy_, menu_);
     // Clicks anywhere come to the menu while it is open, so a click outside closes it.
-    XGrabPointer(dpy_, menu_, True, ButtonPressMask | PointerMotionMask, GrabModeAsync, GrabModeAsync, None, None,
-                 CurrentTime);
-    XGrabKeyboard(dpy_, menu_, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+    if (XGrabPointer(dpy_, menu_, True, ButtonPressMask | PointerMotionMask, GrabModeAsync, GrabModeAsync, None, None,
+                     CurrentTime) != GrabSuccess ||
+        XGrabKeyboard(dpy_, menu_, True, GrabModeAsync, GrabModeAsync, CurrentTime) != GrabSuccess) {
+        closeMenu();
+        return;
+    }
     hover_ = -1;
     XFlush(dpy_);
 }

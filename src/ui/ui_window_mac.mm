@@ -8,6 +8,7 @@
 #include "canvas_cg.hpp"
 #include "../control/input_injector.hpp"
 #include "../control/mac_permissions.hpp"
+#include "../control/shortcut_manager.hpp"
 #include "../core/crypto_identity.hpp"
 #include "../net/network_engine.hpp"
 
@@ -283,8 +284,12 @@ struct CppDeskWindowMacImpl {
 - (void)mouseUp:(NSEvent*)event { [self button:cppdesk::MouseButtonId::Left vk:0x01 down:NO event:event]; }
 - (void)rightMouseDown:(NSEvent*)event { [self button:cppdesk::MouseButtonId::Right vk:0x02 down:YES event:event]; }
 - (void)rightMouseUp:(NSEvent*)event { [self button:cppdesk::MouseButtonId::Right vk:0x02 down:NO event:event]; }
-- (void)otherMouseDown:(NSEvent*)event { [self button:cppdesk::MouseButtonId::Middle vk:0x04 down:YES event:event]; }
-- (void)otherMouseUp:(NSEvent*)event { [self button:cppdesk::MouseButtonId::Middle vk:0x04 down:NO event:event]; }
+- (void)otherMouseDown:(NSEvent*)event {
+    if (event.buttonNumber == 2) [self button:cppdesk::MouseButtonId::Middle vk:0x04 down:YES event:event];
+}
+- (void)otherMouseUp:(NSEvent*)event {
+    if (event.buttonNumber == 2) [self button:cppdesk::MouseButtonId::Middle vk:0x04 down:NO event:event];
+}
 
 - (void)mouseExited:(NSEvent*)event {
     if (impl_ && impl_->app) impl_->app->onMouseLeave();
@@ -349,9 +354,9 @@ struct CppDeskWindowMacImpl {
     NSEventModifierFlags mask = 0;
     switch (event.keyCode) {
         case 0x38: case 0x3C: mask = NSEventModifierFlagShift; break;
-        case 0x3B: case 0x3E: mask = NSEventModifierFlagControl; break;
+        case 0x3B: case 0x3E:
+        case 0x37: case 0x36: mask = NSEventModifierFlagControl | NSEventModifierFlagCommand; break;
         case 0x3A: case 0x3D: mask = NSEventModifierFlagOption; break;
-        case 0x37: case 0x36: mask = NSEventModifierFlagCommand; break;
         default: return;   // Caps Lock and the rest do not matter to the screens
     }
     const bool down = (event.modifierFlags & mask) != 0;
@@ -457,6 +462,19 @@ struct CppDeskWindowMacImpl {
     if (impl_) impl_->requestClose();
     return NSTerminateCancel;
 }
+// A clicked cppdesk:// link arrives here, not in argv, whether the app was running or launched for it.
+- (void)application:(NSApplication*)sender openURLs:(NSArray<NSURL*>*)urls {
+    if (!impl_ || !impl_->app) return;
+    for (NSURL* u in urls) {
+        if (!u.scheme || [u.scheme caseInsensitiveCompare:@"cppdesk"] != NSOrderedSame) continue;
+        const char* rest = u.resourceSpecifier.UTF8String;   // "//123456789"
+        const std::string deskId = cppdesk::ShortcutManager::sanitizeDeskId(rest ? rest : "");
+        if (deskId.size() != 9) continue;
+        [NSApp activateIgnoringOtherApps:YES];
+        impl_->app->connectTo(deskId);
+        return;
+    }
+}
 @end
 
 namespace cppdesk {
@@ -490,19 +508,31 @@ public:
             panel.canChooseFiles = YES;
             panel.canChooseDirectories = NO;
             panel.allowsMultipleSelection = NO;
-            // "*.avi" -> avi; "*.mp4;*.mov" -> both; "*" -> any file.
+            // "*.avi" -> avi; "*.mp4;*.mov" -> both; "*" or "*.*" -> any file.
+            bool anyFile = false;
             NSMutableArray* types = [NSMutableArray array];
             size_t pos = 0;
             while (pos < filterPattern.size()) {
                 size_t end = filterPattern.find(';', pos);
                 if (end == std::string::npos) end = filterPattern.size();
                 const std::string part = filterPattern.substr(pos, end - pos);
-                if (part.size() > 2 && part.compare(0, 2, "*.") == 0) [types addObject:toNs(part.substr(2))];
+                if (part == "*" || part == "*.*") {
+                    anyFile = true;
+                    break;
+                }
+                if (part.size() > 2 && part.compare(0, 2, "*.") == 0) {
+                    const std::string ext = part.substr(2);
+                    if (ext == "*") {
+                        anyFile = true;
+                        break;
+                    }
+                    [types addObject:toNs(ext)];
+                }
                 pos = end + 1;
             }
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            if (types.count) panel.allowedFileTypes = types;
+            if (!anyFile && types.count) panel.allowedFileTypes = types;
 #pragma clang diagnostic pop
             runPanel(panel, std::move(chosen));
         }
@@ -532,31 +562,24 @@ public:
                           {
                               std::lock_guard<std::mutex> alive(token->m);
                               w = token->w;
+                              if (!w || w->closed || !w->app) return;
                           }
-                          if (!w) return;   // the window closed while the panel was open
                           chosen(path);
                           w->invalidate();
                       }];
     }
     void openUrl(const std::string& url) override {
+        if (!UiPlatform::isSafeExternalUrl(url)) return;
         @autoreleasepool {
             NSURL* u = [NSURL URLWithString:toNs(url)];
             if (u) [[NSWorkspace sharedWorkspace] openURL:u];
-        }
-    }
-    void revealPath(const std::string& path) override {
-        @autoreleasepool {
-            NSURL* u = [NSURL fileURLWithPath:toNs(path)];
-            std::error_code ec;
-            if (std::filesystem::is_directory(std::filesystem::path(path), ec)) [[NSWorkspace sharedWorkspace] openURL:u];
-            else [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[ u ]];
         }
     }
     // Starting a second copy now would hit the single-instance lock; main re-executes after the loop instead.
     void relaunchApp() override {
         if (!w_) return;
         w_->relaunch = true;
-        w_->destroyWindow();
+        w_->requestClose();
     }
     void setFrameIntervalMs(unsigned ms) override {
         if (w_) w_->frameIntervalMs = std::max(1u, ms);
@@ -571,7 +594,7 @@ public:
         if (live()) w_->window.appearance = [NSAppearance appearanceNamed:dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
     }
     void quitApp() override {
-        if (w_) w_->destroyWindow();
+        if (w_) w_->requestClose();
     }
     bool relaunchElevated() override { return false; }
     void playAlertSound() override { NSBeep(); }
@@ -670,12 +693,9 @@ public:
     }
     ui::ServiceState serviceState() const override { return ui::ServiceState::NotInstalled; }
     bool runServiceAction(ui::ServiceAction) override { return false; }
-    void showNotification(const std::string&, const std::string&) override {}   // NotificationManager does it
-    void setTrayStatus(const std::string&) override {}                           // updated on the loop's tick
 
     bool has(ui::Capability c) const override {
         if (c == ui::Capability::TrayIcon) return w_ && w_->statusItem != nil;
-        if (c == ui::Capability::NativeNotifications) return true;
         if (c == ui::Capability::HostPermissions) return w_ != nullptr;   // not in snapshots: every screen looks alike
         return false;   // the Windows-only controls stay hidden
     }
@@ -721,9 +741,11 @@ private:
 void CppDeskWindowMacImpl::wake() {
     // Any thread may post an event to wake the loop; before the app exists the first pass drains the queue anyway.
     if (!NSApp) return;
-    NSEvent* ev = [NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint modifierFlags:0
-                                    timestamp:0 windowNumber:0 context:nil subtype:0 data1:0 data2:0];
-    [NSApp postEvent:ev atStart:NO];
+    @autoreleasepool {
+        NSEvent* ev = [NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint modifierFlags:0
+                                        timestamp:0 windowNumber:0 context:nil subtype:0 data1:0 data2:0];
+        [NSApp postEvent:ev atStart:NO];
+    }
 }
 
 void CppDeskWindowMacImpl::setCursorShape(ui::CursorShape shape) {
@@ -787,8 +809,12 @@ void CppDeskWindowMacImpl::paint() {
 
 // The window is gone: let the screens finish, then stop the loop.
 void CppDeskWindowMacImpl::destroyWindow() {
-    if (closed) return;
-    closed = true;
+    {
+        std::lock_guard<std::mutex> alive(liveToken->m);
+        liveToken->w = nullptr;
+        if (closed) return;
+        closed = true;
+    }
     if (!window) return;   // never created
     if (app) app->onWindowDestroyed();
     if (statusItem) {
@@ -900,36 +926,48 @@ CppDeskWindow::CppDeskWindow(IdentityManager& identity, NetworkEngine& network, 
     pImpl_->shell = std::make_unique<MacShell>(pImpl_.get(), false);
     pImpl_->app = std::make_unique<AppUi>(identity_, network_, *pImpl_->shell, autoConnectTarget);
 
-    // Network callbacks arrive on worker threads; hand them to the UI thread.
-    CppDeskWindowMacImpl* w = pImpl_.get();
-    network_.setOnScratchpadUpdateCallback([this](const ScratchpadUpdatePayload& p) {
-        post([this, p] { pImpl_->app->onScratchpadUpdate(p); });
+    // Network callbacks arrive on worker threads; hand them to the UI thread while guarded by liveToken.
+    std::shared_ptr<CppDeskWindowMacImpl::LiveToken> token = pImpl_->liveToken;
+    auto postLive = [token](std::function<void(CppDeskWindowMacImpl&)> fn) {
+        std::lock_guard<std::mutex> alive(token->m);
+        CppDeskWindowMacImpl* w = token->w;
+        if (!w || w->closed || !w->app) return;
+        {
+            std::lock_guard<std::mutex> lock(w->postMutex);
+            w->posted.push_back([w, fn = std::move(fn)]() {
+                if (!w->closed && w->app) fn(*w);
+            });
+        }
+        w->wake();
+    };
+    network_.setOnScratchpadUpdateCallback([postLive](const ScratchpadUpdatePayload& p) {
+        postLive([p](CppDeskWindowMacImpl& w) { w.app->onScratchpadUpdate(p); });
     });
-    network_.setOnCommandPaletteOutputCallback([this](const CommandPaletteOutputPayload& p) {
-        post([this, p] { pImpl_->app->onCommandPaletteOutput(p); });
+    network_.setOnCommandPaletteOutputCallback([postLive](const CommandPaletteOutputPayload& p) {
+        postLive([p](CppDeskWindowMacImpl& w) { w.app->onCommandPaletteOutput(p); });
     });
-    network_.setOnFrameDecodedCallback([this, w] {
-        if (w->app->claimFrameRedraw()) post([w] { w->app->onFrameReady(); });
+    network_.setOnFrameDecodedCallback([token] {
+        std::lock_guard<std::mutex> alive(token->m);
+        CppDeskWindowMacImpl* w = token->w;
+        if (!w || w->closed || !w->app || !w->app->claimFrameRedraw()) return;
+        {
+            std::lock_guard<std::mutex> lock(w->postMutex);
+            w->posted.push_back([w] {
+                if (!w->closed && w->app) w->app->onFrameReady();
+            });
+        }
+        w->wake();
     });
-    network_.setOnVersionMismatchCallback([this](const std::string& hostVer, const std::string& viewerVer) {
-        post([this, hostVer, viewerVer] { pImpl_->app->onPeerVersionMismatch(hostVer, viewerVer); });
+    network_.setOnVersionMismatchCallback([postLive](const std::string& hostVer, const std::string& viewerVer) {
+        postLive([hostVer, viewerVer](CppDeskWindowMacImpl& w) { w.app->onPeerVersionMismatch(hostVer, viewerVer); });
     });
-    network_.setOnVersionUpgradeNoticeCallback([this](const VersionUpgradeNoticePayload& notice) {
+    network_.setOnVersionUpgradeNoticeCallback([postLive](const VersionUpgradeNoticePayload& notice) {
         std::string version = notice.senderVersion;
-        post([this, version] { pImpl_->app->onVersionUpgradeNotice(version); });
+        postLive([version](CppDeskWindowMacImpl& w) { w.app->onVersionUpgradeNotice(version); });
     });
 }
 
 CppDeskWindow::~CppDeskWindow() {
-    {
-        std::lock_guard<std::mutex> alive(pImpl_->liveToken->m);
-        pImpl_->liveToken->w = nullptr;
-    }
-    network_.setOnScratchpadUpdateCallback(nullptr);
-    network_.setOnCommandPaletteOutputCallback(nullptr);
-    network_.setOnFrameDecodedCallback(nullptr);
-    network_.setOnVersionMismatchCallback(nullptr);
-    network_.setOnVersionUpgradeNoticeCallback(nullptr);
     close();
 }
 
@@ -1045,6 +1083,15 @@ bool CppDeskWindow::isKeyDown(uint16_t vk) const { return pImpl_ && vk < 256 && 
 void CppDeskWindow::close() {
     if (!pImpl_) return;
     CppDeskWindowMacImpl& w = *pImpl_;
+    {
+        std::lock_guard<std::mutex> alive(w.liveToken->m);
+        w.liveToken->w = nullptr;
+    }
+    network_.setOnScratchpadUpdateCallback(nullptr);
+    network_.setOnCommandPaletteOutputCallback(nullptr);
+    network_.setOnFrameDecodedCallback(nullptr);
+    network_.setOnVersionMismatchCallback(nullptr);
+    network_.setOnVersionUpgradeNoticeCallback(nullptr);
     w.destroyWindow();
     w.app.reset();   // the screens free their images through the canvas
     w.canvas.detach();

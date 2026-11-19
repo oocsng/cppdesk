@@ -5,6 +5,7 @@
 #include "crypto_compat.hpp"
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 #include <array>
@@ -108,8 +109,29 @@ public:
         const void* salt, size_t saltLen,
         const std::string& info);
 
-    // Salted password hash for storage & verification (never stores plaintext on disk)
-    static std::string hashPassword(const std::string& password, const std::string& salt);
+    static constexpr uint32_t kDefaultPbkdf2Iterations = 200000;
+    static constexpr uint32_t kMinPbkdf2Iterations     = 10000;
+    static constexpr uint32_t kMaxPbkdf2Iterations     = 2000000;
+    static constexpr size_t   kPbkdf2SaltLen           = 16;
+
+    // PBKDF2-HMAC-SHA256 key derivation
+    static bool pbkdf2Sha256(
+        const std::string& password,
+        const uint8_t* salt,
+        size_t saltLen,
+        uint32_t iterations,
+        std::array<uint8_t, 32>& outDerivedKey);
+
+    // Salted PBKDF2-HMAC-SHA256 password verifier for storage ("pbkdf2_sha256$<iter>$<saltHex>$<dkHex>")
+    static std::string hashPassword(
+        const std::string& password,
+        uint32_t iterations = kDefaultPbkdf2Iterations);
+
+    static bool parsePasswordVerifier(
+        const std::string& verifier,
+        uint32_t& outIterations,
+        std::array<uint8_t, 16>& outSalt,
+        std::array<uint8_t, 32>& outDerivedKey);
 
     // Challenge-response digest from precomputed verifier token: SHA256(passToken + hostId + clientId + nonce)
     static std::array<uint8_t, 32> computeChallengeResponseFromToken(
@@ -118,9 +140,11 @@ public:
         uint64_t clientId,
         const std::array<uint8_t, 32>& nonce);
 
-    // Challenge-response digest from plaintext password
+    // Challenge-response digest from plaintext password and PBKDF2 parameters
     static std::array<uint8_t, 32> computeChallengeResponse(
         const std::string& passwordPlain,
+        const std::array<uint8_t, 16>& salt,
+        uint32_t iterations,
         uint64_t hostId,
         uint64_t clientId,
         const std::array<uint8_t, 32>& nonce);
@@ -159,13 +183,6 @@ public:
 
     // 8-character uppercase SAS fingerprint ("XXXX-XXXX") derived from sessionKey to verify zero MITM
     static std::string sessionFingerprintHex(const std::array<uint8_t, 32>& sessionKey);
-
-    // Fast stream cipher for payload confidentiality (fallback / test)
-    static void transformPayload(
-        uint8_t* data,
-        size_t len,
-        const std::array<uint8_t, 32>& sessionKey,
-        uint64_t frameSequence);
 
     // Format 9-digit ID as "123 456 789"
     static std::string formatDeskId(uint64_t id);
@@ -297,9 +314,6 @@ public:
         std::vector<uint8_t>& outPlaintext,
         uint64_t* outSeq = nullptr);
 
-    // Periodic key ratcheting (Option 4A)
-    bool ratchetKey();
-
     const std::array<uint8_t, 32>& currentKey() const { return sessionKey_; }
 
 private:
@@ -308,7 +322,9 @@ private:
     std::array<uint8_t, 32> sessionKey_{};
     uintptr_t               hAesAlg_ = 0;
     uintptr_t               hAesKey_ = 0;
+    uintptr_t               hAesDecryptKey_ = 0;
     std::vector<uint8_t>    keyObjBuf_;
+    std::vector<uint8_t>    decryptKeyObjBuf_;
     AntiReplayWindow        replayWindow_;
 };
 
@@ -321,42 +337,43 @@ public:
     bool saveConfig() const { return save(); }
 
     int instanceId() const { return instanceId_; }
-    uint64_t deskId() const { return deskId_; }
-    std::string formattedDeskId() const { return CryptoUtils::formatDeskId(deskId_); }
-    const std::string& hostname() const { return hostname_; }
-    uint16_t listenPort() const { return listenPort_; }
-    void setListenPort(uint16_t port) { listenPort_ = port; }
+    uint64_t deskId() const { std::lock_guard<std::mutex> lk(stateMutex_); return deskId_; }
+    std::string formattedDeskId() const { return CryptoUtils::formatDeskId(deskId()); }
+    std::string hostname() const { std::lock_guard<std::mutex> lk(stateMutex_); return hostname_; }
+    uint16_t listenPort() const { std::lock_guard<std::mutex> lk(stateMutex_); return listenPort_; }
+    void setListenPort(uint16_t port) { std::lock_guard<std::mutex> lk(stateMutex_); listenPort_ = port; }
 
-    bool unattendedEnabled() const { return unattendedEnabled_; }
+    bool unattendedEnabled() const { std::lock_guard<std::mutex> lk(stateMutex_); return unattendedEnabled_; }
     void setUnattendedEnabled(bool enabled);
 
     // Returns active dynamic session code (or in-memory unattended password if set during this run)
-    const std::string& unattendedPassword() const { return unattendedPassword_.empty() ? sessionCode_ : unattendedPassword_; }
+    std::string unattendedPassword() const { std::lock_guard<std::mutex> lk(stateMutex_); return unattendedPassword_.empty() ? sessionCode_ : unattendedPassword_; }
     void setUnattendedPassword(const std::string& newPassword);
-    bool hasStoredPasswordVerifier() const { return !unattendedVerifier_.empty(); }
-    const std::string& passwordVerifier() const { return unattendedVerifier_; }
-
-    // Secret that proves this install owns its desk ID on a relay; created on first run, kept in the config file.
-    const std::array<uint8_t, 32>& relayOwnerKey() const { return relayOwnerKey_; }
+    bool hasStoredPasswordVerifier() const { std::lock_guard<std::mutex> lk(stateMutex_); return !unattendedVerifier_.empty(); }
+    std::string passwordVerifier() const { std::lock_guard<std::mutex> lk(stateMutex_); return unattendedVerifier_; }
 
     // Dynamic 6-character One-Time Session Password (in-memory only, regenerable anytime)
-    const std::string& sessionCode() const { return sessionCode_; }
+    std::string sessionCode() const { std::lock_guard<std::mutex> lk(stateMutex_); return sessionCode_; }
     std::string regenerateSessionCode();
     // Sets the session code directly; used by the UI snapshot harness for repeatable output.
-    void setSessionCode(const std::string& code) { sessionCode_ = code; }
+    void setSessionCode(const std::string& code) { std::lock_guard<std::mutex> lk(stateMutex_); sessionCode_ = code; }
 
-    // With boundSessionKey the client's digest must be bound to that key (see CryptoUtils::bindChallengeResponse);
-    // without it the legacy unbound digest is expected.
+    // Returns the active PBKDF2 salt and iteration count for AUTH_CHALLENGE.
+    void getAuthKdfParams(std::array<uint8_t, 16>& outSalt, uint32_t& outIterations) const;
+
+    // Verifies a bound challenge-response digest (unbound password mode is removed).
     bool verifyChallengeResponse(
         uint64_t clientId,
         const std::array<uint8_t, 32>& nonce,
         const std::array<uint8_t, 32>& clientDigest,
-        const std::array<uint8_t, 32>* boundSessionKey = nullptr) const;
+        const std::array<uint8_t, 32>& boundSessionKey,
+        const std::array<uint8_t, 16>& challengeSalt,
+        uint32_t challengeIterations) const;
 
-    const std::string& relayServerAddress() const { return relayServerAddr_; }
+    std::string relayServerAddress() const { std::lock_guard<std::mutex> lk(stateMutex_); return relayServerAddr_; }
     void setRelayServerAddress(const std::string& addr);
 
-    const std::vector<RecentSessionEntry>& recentSessions() const { return recentSessions_; }
+    std::vector<RecentSessionEntry> recentSessions() const { std::lock_guard<std::mutex> lk(stateMutex_); return recentSessions_; }
     void addOrUpdateRecentSession(uint64_t id, const std::string& host, const std::string& addr,
                                  const std::string& alias = "", const std::string& tag = "", const std::string& notes = "");
     void updateRecentSessionMetadata(uint64_t id, const std::string& alias, const std::string& tag, const std::string& notes);
@@ -364,14 +381,15 @@ public:
     void removeRecentSession(uint64_t id);
     void clearRecentSessions();
 
-    const AppSettings& settings() const { return settings_; }
+    AppSettings settings() const { std::lock_guard<std::mutex> lk(stateMutex_); return settings_; }
     void updateSettings(const AppSettings& newSettings);
     void resetSettingsToDefault();
 
     TotpManager& totpManager() { return totpManager_; }
     const TotpManager& totpManager() const { return totpManager_; }
 
-    std::string configFilePath() const { return configPath_; }
+    std::string configFilePath() const;
+    void setConfigPathForTest(const std::filesystem::path& path);
 
     // Pairing (thread-safe; getters return copies). The add/remove calls save the config.
     const PairingKey& pairingKey() const { return pairingKey_; }       // created on first run
@@ -391,17 +409,19 @@ private:
     uint16_t                        listenPort_ = 50990;
     bool                            unattendedEnabled_ = true;
     std::string                     unattendedPassword_; // In-memory only (never written in plaintext to disk)
-    std::string                     unattendedVerifier_; // Salted SHA-256 verifier persisted in config_*.ini
-    std::array<uint8_t, 32>         relayOwnerKey_{};    // Hex in the config file; see relayOwnerKey()
+    std::string                     unattendedVerifier_; // PBKDF2-HMAC-SHA256 verifier persisted in config_*.ini
+    std::array<uint8_t, 16>         sessionSalt_{};      // In-memory random salt for sessionCode_ when no unattended verifier is set
+    uint32_t                        sessionIterations_ = CryptoUtils::kDefaultPbkdf2Iterations;
     std::string                     sessionCode_;        // Dynamic 6-char One-Time Session Password
     std::string                     relayServerAddr_ = "127.0.0.1:50999";
     std::vector<RecentSessionEntry> recentSessions_;
     AppSettings                     settings_{};
     TotpManager                     totpManager_;
-    std::string                     configPath_;
+    std::filesystem::path           configPath_;
     PairingKey                      pairingKey_;         // Hex in the config file as pair_key
+    mutable std::mutex              saveMutex_;          // Lock order: saveMutex_ -> stateMutex_ -> pairMutex_
+    mutable std::mutex              stateMutex_;         // Guards mutable identity/settings/recent state
     mutable std::mutex              pairMutex_;          // Guards the two paired lists
-    mutable std::mutex              saveMutex_;          // Serialises save(); taken before pairMutex_, never after
     std::vector<PairedPeer>         pairedViewers_;
     std::vector<PairedPeer>         pairedHosts_;
 };

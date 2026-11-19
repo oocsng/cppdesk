@@ -64,7 +64,7 @@ public:
 private:
     bool controlLive();              // caller holds mu_
     bool resolveStream();            // caller holds mu_
-    void fail(ShareState state, const std::string& reason);   // caller holds mu_
+    void fail(std::unique_lock<std::mutex>& lk, ShareState state, const std::string& reason);   // unlocks lk before closing
 
     PortalOptions opts_;
     PortalSession portal_;

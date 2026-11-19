@@ -153,12 +153,6 @@ inline int ioctlsocket(SOCKET s, unsigned long cmd, unsigned long* argp) {
 
 #endif
 
-// Portable scatter-gather buffer structure
-struct SocketBuffer {
-    void* buf = nullptr;
-    size_t len = 0;
-};
-
 // Handle conversion helpers
 inline socket_t toSocket(uintptr_t s) {
     return (s == ~uintptr_t(0)) ? INVALID_SOCKET_VAL : static_cast<socket_t>(s);
