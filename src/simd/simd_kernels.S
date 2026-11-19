@@ -142,7 +142,19 @@ aerodesk_avx2_hash_tile:
 
 .Lhash_tail_loop:
     movzbl  (%rcx, %r11), %eax
+    testb   $1, %r11b
+    jz      .Lhash_tail_mix
+    testb   $2, %r11b
+    jz      .Lhash_tail_mix
+    movl    $0xFF, %eax                 # Normalize alpha channel (offset % 4 == 3) to 0xFF
+.Lhash_tail_mix:
+    addq    %r11, %rax                  # Mix byte position so swapped/reordered tail bytes differ
+    imulq   %r10, %rax                  # Spread bits with FNV-1a prime
     vmovq   %rax, %xmm1
+    vpxor   %ymm1, %ymm0, %ymm0
+    vpsllq  $13, %ymm0, %ymm2
+    vpsrlq  $51, %ymm0, %ymm4
+    vpor    %ymm4, %ymm2, %ymm0         # Rotate-left 13 bits per 64-bit lane
     vpaddq  %ymm1, %ymm0, %ymm0
     incq    %r11
     cmpq    %r8, %r11
