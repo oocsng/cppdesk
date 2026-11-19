@@ -12,6 +12,8 @@
 
 #include <vector>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -68,7 +70,13 @@ public:
     static std::vector<uint8_t> serializeClearPacket();
 
     // Host-Side Transparent Click-Through Overlay Window (Option 3 & 4)
-    bool isHostOverlayActive() const { return hwndOverlay_ != nullptr; }
+    bool isHostOverlayActive() const {
+#if defined(_WIN32)
+        return hwndOverlay_.load() != nullptr;
+#else
+        return hwndOverlay_ != nullptr;
+#endif
+    }
     void showHostOverlay();
     void hideHostOverlay();
     void updateHostOverlayCanvas();
@@ -94,9 +102,13 @@ private:
     float                   laserNormY_ = -1.0f;
     uint64_t                laserTimestampMs_ = 0;
 
-    // Host click-through transparent layered window
+    // Host click-through transparent layered window (owned exclusively by overlayThread_ on Windows)
 #if defined(_WIN32)
-    HWND                    hwndOverlay_ = nullptr;
+    std::mutex              overlayMutex_;
+    std::condition_variable overlayReadyCv_;
+    std::thread             overlayThread_;
+    std::atomic<HWND>       hwndOverlay_{nullptr};
+    bool                    overlayInitDone_ = false;
 #else
     void*                   hwndOverlay_ = nullptr;
 #endif
