@@ -27,9 +27,12 @@
 #include <array>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 #include <optional>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 #include "canvas.hpp"
 #include "platform_shell.hpp"
@@ -726,6 +729,28 @@ private:
     std::string             peerMismatchHostVer_;
     std::string             peerMismatchViewerVer_;
     bool                    showPeerMismatchModal_ = false;
+
+    // Cross-thread callback delivery (drained on the UI thread in onTick)
+    struct DownloadDoneBox {
+        std::mutex mtx;
+        bool alive = true;
+        bool ready = false;
+        bool ok = false;
+        std::string message;
+    };
+    std::shared_ptr<DownloadDoneBox> downloadDoneBox_ = std::make_shared<DownloadDoneBox>();
+
+    struct PendingPeerMismatch {
+        bool pending = false;
+        std::string hostVer;
+        std::string viewerVer;
+    };
+    std::mutex               pendingNetEventsMutex_;
+    PendingPeerMismatch      pendingPeerMismatch_;
+    std::vector<std::string> pendingUpgradeNotices_;
+
+    std::atomic<bool>        localSyncScanRunning_{false};
+    std::thread              localSyncScanThread_;
 
     // Remote Reboot & Reconnect Modal (v3.2.0)
     bool                    showRebootConfirmModal_ = false;

@@ -5182,20 +5182,31 @@ void AppUi::drawSyncDrawer(const UiRect& contentRect) {
                       status.state == SyncState::Comparing ||
                       status.state == SyncState::Transferring);
 
+    bool scanBusy = isRunning || localSyncScanRunning_.load();
     float actW = (rx - x - 8.0f) * 0.5f;
     UiRect btnScan = { x, y, x + actW, y + 30.0f };
     UiRect btnAction = { btnScan.right + 8.0f, y, rx, y + 30.0f };
 
-    drawButton("sync_btn_scan", btnScan, "Scan / Compare",
-               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
+    drawButton("sync_btn_scan", btnScan, scanBusy ? "Scanning..." : "Scan / Compare",
+               COL_SEC_BTN_BG, scanBusy ? COL_SEC_BTN_BG : COL_SEC_BTN_HV,
+               scanBusy ? COL_TEXT_MUTED : COL_TEXT_PRIMARY, 7.5f, [this, scanBusy]() {
+                   if (scanBusy) return;
                    if (syncLocalPathEdit_.empty() || syncRemotePathEdit_.empty()) {
                        showToast("Enter both local and remote folders", true);
                        return;
                    }
+                   if (localSyncScanThread_.joinable()) {
+                       localSyncScanThread_.join();
+                   }
+                   localSyncScanRunning_.store(true);
                    network_.requestRemoteScan(syncRemotePathEdit_);
-                   network_.fileSyncManager().requestScan(syncLocalPathEdit_);
+                   std::string localPath = syncLocalPathEdit_;
+                   localSyncScanThread_ = std::thread([this, localPath = std::move(localPath)]() {
+                       network_.fileSyncManager().requestScan(localPath);
+                       localSyncScanRunning_.store(false);
+                   });
                    showToast("Scanning folder trees...");
-               }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
+               }, ui::FontRole::Small, true, COL_BORDER, scanBusy ? COL_TEXT_MUTED : COL_PRIMARY_ACCENT);
 
     if (isRunning) {
         drawButton("sync_btn_cancel", btnAction, "Cancel Sync",
@@ -7236,14 +7247,14 @@ void AppUi::drawUpdateRequiredModal(float width, float height, float modalProgre
                    updateStatusMsg_ = "Connecting to download server...";
                    shell_->invalidate();
 
+                   auto doneBox = downloadDoneBox_;
                    shell_->startUpdateDownload(dlUrl, latestUpdateInfo_.assetSizeBytes, latestUpdateInfo_.assetSha256,
-                       [this](bool ok, const std::string& message) {
-                           updateStatusMsg_ = message;
-                           if (!ok) {
-                               isDownloadingUpdate_ = false;
-                               showToast(message, true);
-                           }
-                           shell_->invalidate();
+                       [doneBox](bool ok, const std::string& message) {
+                           std::lock_guard<std::mutex> lk(doneBox->mtx);
+                           if (!doneBox->alive) return;
+                           doneBox->ok = ok;
+                           doneBox->message = message;
+                           doneBox->ready = true;
                        });
                }, ui::FontRole::Small);
 
@@ -7392,10 +7403,10 @@ void AppUi::drawHwAccelRestartModal(float width, float height, float modalProgre
 void AppUi::openRecordingPlayer(const std::string& filePath) {
     if (!recordingPlayer_) {
         recordingPlayer_ = std::make_unique<SessionRecordingPlayer>();
+        recordingPlayer_->setOnFrameReady([this]() {
+            shell_->invalidate();
+        });
     }
-    recordingPlayer_->setOnFrameReady([this]() {
-        shell_->invalidate();
-    });
 
     if (!filePath.empty()) {
         if (!recordingPlayer_->open(filePath)) {
@@ -10015,6 +10026,59 @@ void AppUi::onResized() {
 
 void AppUi::onTick() {
     uint64_t tickNow = shell_->nowMs();
+    {
+        bool doneReady = false;
+        bool doneOk = false;
+        std::string doneMsg;
+        {
+            std::lock_guard<std::mutex> lk(downloadDoneBox_->mtx);
+            if (downloadDoneBox_->ready) {
+                doneReady = true;
+                doneOk = downloadDoneBox_->ok;
+                doneMsg = std::move(downloadDoneBox_->message);
+                downloadDoneBox_->ready = false;
+            }
+        }
+        if (doneReady) {
+            updateStatusMsg_ = doneMsg;
+            if (!doneOk) {
+                isDownloadingUpdate_ = false;
+                showToast(doneMsg, true);
+            }
+            shell_->invalidate();
+        }
+    }
+    {
+        PendingPeerMismatch mismatch;
+        std::vector<std::string> notices;
+        {
+            std::lock_guard<std::mutex> lk(pendingNetEventsMutex_);
+            if (pendingPeerMismatch_.pending) {
+                mismatch = std::move(pendingPeerMismatch_);
+                pendingPeerMismatch_ = {};
+            }
+            if (!pendingUpgradeNotices_.empty()) {
+                notices = std::move(pendingUpgradeNotices_);
+                pendingUpgradeNotices_.clear();
+            }
+        }
+        if (mismatch.pending) {
+            peerMismatchHostVer_ = mismatch.hostVer;
+            peerMismatchViewerVer_ = mismatch.viewerVer;
+            showPeerMismatchModal_ = true;
+            showUpdateRequiredModal_ = true;
+            std::string cleanVer = mismatch.hostVer;
+            if (!cleanVer.empty() && (cleanVer[0] == 'v' || cleanVer[0] == 'V')) {
+                cleanVer = cleanVer.substr(1);
+            }
+            latestUpdateInfo_.latestVersion = cleanVer;
+            triggerUpdateCheck(false);
+            shell_->invalidate();
+        }
+        for (const auto& senderVersion : notices) {
+            showToast("Notice from Viewer: Upgrade to CppDesk v" + senderVersion + " recommended.");
+        }
+    }
     if (const wayland::ShareNotice notice = currentShareNotice();
         notice.state != shareNoticeSeen_.state || notice.reason != shareNoticeSeen_.reason) {
         shareNoticeSeen_ = notice;
@@ -10382,21 +10446,19 @@ void AppUi::onUpdateProgress(const UpdateProgressData& p) {
 }
 
 void AppUi::onPeerVersionMismatch(const std::string& hostVer, const std::string& viewerVer) {
-    peerMismatchHostVer_ = hostVer;
-    peerMismatchViewerVer_ = viewerVer;
-    showPeerMismatchModal_ = true;
-    showUpdateRequiredModal_ = true;
-    std::string cleanVer = hostVer;
-    if (!cleanVer.empty() && (cleanVer[0] == 'v' || cleanVer[0] == 'V')) {
-        cleanVer = cleanVer.substr(1);
+    {
+        std::lock_guard<std::mutex> lk(pendingNetEventsMutex_);
+        pendingPeerMismatch_.pending = true;
+        pendingPeerMismatch_.hostVer = hostVer;
+        pendingPeerMismatch_.viewerVer = viewerVer;
     }
-    latestUpdateInfo_.latestVersion = cleanVer;
-    triggerUpdateCheck(false);
-    shell_->invalidate();
 }
 
 void AppUi::onVersionUpgradeNotice(const std::string& senderVersion) {
-    showToast("Notice from Viewer: Upgrade to CppDesk v" + senderVersion + " recommended.");
+    {
+        std::lock_guard<std::mutex> lk(pendingNetEventsMutex_);
+        pendingUpgradeNotices_.push_back(senderVersion);
+    }
 }
 
 // ---------------- Construction & frame loop ----------------
@@ -10442,6 +10504,13 @@ AppUi::AppUi(IdentityManager& identity, NetworkEngine& network, ui::PlatformShel
 }
 
 AppUi::~AppUi() {
+    {
+        std::lock_guard<std::mutex> lk(downloadDoneBox_->mtx);
+        downloadDoneBox_->alive = false;
+    }
+    if (localSyncScanThread_.joinable()) {
+        localSyncScanThread_.join();
+    }
     if (sessionRecorder_.isRecording()) {
         sessionRecorder_.stopRecording();
     }
