@@ -18,11 +18,6 @@ uint64_t nowMs() {
 WhiteboardManager::WhiteboardManager() = default;
 
 WhiteboardManager::~WhiteboardManager() {
-#if defined(_WIN32)
-    if (hwndOverlay_) {
-        SetWindowLongPtrW(hwndOverlay_, GWLP_USERDATA, 0);
-    }
-#endif
     hideHostOverlay();
 }
 
@@ -101,10 +96,13 @@ void WhiteboardManager::applyRemoteClear() {
 }
 
 void WhiteboardManager::setLaserPointer(float normX, float normY) {
-    std::lock_guard<std::mutex> lk(laserMutex_);
-    laserNormX_ = normX;
-    laserNormY_ = normY;
-    laserTimestampMs_ = nowMs();
+    {
+        std::lock_guard<std::mutex> lk(laserMutex_);
+        laserNormX_ = normX;
+        laserNormY_ = normY;
+        laserTimestampMs_ = nowMs();
+    }
+    updateHostOverlayCanvas();
 }
 
 bool WhiteboardManager::getLaserPointer(float& outX, float& outY, float& outAlpha) const {
@@ -187,9 +185,44 @@ void WhiteboardManager::hideHostOverlay() {}
 void WhiteboardManager::updateHostOverlayCanvas() {}
 #else
 
+constexpr UINT WM_OVERLAY_REPAINT = WM_APP + 1;
+constexpr UINT_PTR kLaserDecayTimerId = 1;
+
 LRESULT CALLBACK WhiteboardManager::OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_ERASEBKGND) {
         return 1;
+    }
+    if (msg == WM_OVERLAY_REPAINT) {
+        InvalidateRect(hwnd, nullptr, FALSE);
+        auto* mgr = reinterpret_cast<WhiteboardManager*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (mgr) {
+            float lx = 0.0f, ly = 0.0f, lAlpha = 0.0f;
+            if (mgr->getLaserPointer(lx, ly, lAlpha) && lAlpha > 0.05f) {
+                SetTimer(hwnd, kLaserDecayTimerId, 50, nullptr);
+            }
+        }
+        return 0;
+    }
+    if (msg == WM_TIMER && wParam == kLaserDecayTimerId) {
+        InvalidateRect(hwnd, nullptr, FALSE);
+        auto* mgr = reinterpret_cast<WhiteboardManager*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        float lx = 0.0f, ly = 0.0f, lAlpha = 0.0f;
+        if (!mgr || !mgr->getLaserPointer(lx, ly, lAlpha) || lAlpha <= 0.05f) {
+            KillTimer(hwnd, kLaserDecayTimerId);
+        }
+        return 0;
+    }
+    if (msg == WM_CLOSE) {
+        // Clear user data on the owning window thread before destroying so WM_PAINT cannot race ~WhiteboardManager.
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        KillTimer(hwnd, kLaserDecayTimerId);
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    if (msg == WM_DESTROY) {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        PostQuitMessage(0);
+        return 0;
     }
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps;
@@ -288,49 +321,82 @@ LRESULT CALLBACK WhiteboardManager::OverlayWndProc(HWND hwnd, UINT msg, WPARAM w
 }
 
 void WhiteboardManager::showHostOverlay() {
-    if (hwndOverlay_) return;
+    std::unique_lock<std::mutex> lock(overlayMutex_);
+    if (overlayThread_.joinable()) return;
 
-    HINSTANCE hInst = GetModuleHandleW(nullptr);
-    WNDCLASSEXW wc{};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = OverlayWndProc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = L"CppDesk_Whiteboard_Overlay";
-    RegisterClassExW(&wc);
+    overlayInitDone_ = false;
+    overlayThread_ = std::thread([this]() {
+        HINSTANCE hInst = GetModuleHandleW(nullptr);
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = OverlayWndProc;
+        wc.hInstance = hInst;
+        wc.lpszClassName = L"CppDesk_Whiteboard_Overlay";
+        RegisterClassExW(&wc);
 
-    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
-    hwndOverlay_ = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        wc.lpszClassName,
-        L"CppDesk Whiteboard Overlay",
-        WS_POPUP | WS_VISIBLE,
-        vx, vy, vw, vh,
-        nullptr, nullptr, hInst, nullptr
-    );
+        HWND hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            wc.lpszClassName,
+            L"CppDesk Whiteboard Overlay",
+            WS_POPUP | WS_VISIBLE,
+            vx, vy, vw, vh,
+            nullptr, nullptr, hInst, nullptr
+        );
 
-    if (hwndOverlay_) {
-        SetWindowLongPtrW(hwndOverlay_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-        // Use RGB(0,0,0) as transparent color key
-        SetLayeredWindowAttributes(hwndOverlay_, RGB(0, 0, 0), 255, LWA_COLORKEY);
-        ShowWindow(hwndOverlay_, SW_SHOWNOACTIVATE);
-        UpdateWindow(hwndOverlay_);
-    }
+        if (hwnd) {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+            SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_COLORKEY);
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            UpdateWindow(hwnd);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(overlayMutex_);
+            hwndOverlay_.store(hwnd);
+            overlayInitDone_ = true;
+        }
+        overlayReadyCv_.notify_all();
+
+        if (!hwnd) return;
+
+        MSG msg{};
+        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        hwndOverlay_.store(nullptr);
+    });
+
+    overlayReadyCv_.wait(lock, [this]() { return overlayInitDone_; });
 }
 
 void WhiteboardManager::hideHostOverlay() {
-    if (hwndOverlay_) {
-        DestroyWindow(hwndOverlay_);
-        hwndOverlay_ = nullptr;
+    std::thread th;
+    HWND hwnd = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        hwnd = hwndOverlay_.load();
+        th = std::move(overlayThread_);
     }
+    if (hwnd) {
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    }
+    if (th.joinable()) {
+        th.join();
+    }
+    hwndOverlay_.store(nullptr);
 }
 
 void WhiteboardManager::updateHostOverlayCanvas() {
-    if (hwndOverlay_) {
-        InvalidateRect(hwndOverlay_, nullptr, FALSE);
+    HWND hwnd = hwndOverlay_.load();
+    if (hwnd) {
+        PostMessageW(hwnd, WM_OVERLAY_REPAINT, 0, 0);
     }
 }
 #endif

@@ -171,11 +171,11 @@ public:
     // Scanning & Differential Planning
     bool startLocalScan();
     void setLocalEntries(std::vector<SyncFileEntry> entries);
-    const std::vector<SyncFileEntry>& localEntries() const;
+    std::vector<SyncFileEntry> localEntries() const;
 
     void handleScanResp(const SyncScanRespPayload& resp);
     void setRemoteEntries(std::vector<SyncFileEntry> entries);
-    const std::vector<SyncFileEntry>& remoteEntries() const;
+    std::vector<SyncFileEntry> remoteEntries() const;
 
     void generateDiffPlan();
 
@@ -206,36 +206,29 @@ public:
     std::string stagingRootOverride() const;
 
 private:
-    struct OutgoingBlock {
-        uint32_t syncId = 0;
-        uint32_t fileId = 0;
-        uint32_t blockIndex = 0;
-        uint64_t blockOffset = 0;
-        uint64_t totalFileSize = 0;
-        uint32_t totalBlocks = 0;
-        std::array<uint8_t, 32> blockHash{};
-        std::vector<uint8_t> blockData;
-    };
-
     struct OutgoingFileTask {
         uint32_t fileId = 0;
         std::string relativePath;
-        std::string fullSourcePath;
+        std::filesystem::path fullSourcePath;
         uint64_t totalSize = 0;
+        uint64_t targetFileSize = 0;
         uint64_t mtimeSec = 0;
         uint32_t totalBlocks = 0;
         std::vector<std::array<uint8_t, 32>> targetHashes;
+        std::vector<uint32_t> dirtyIndices;
+        size_t dirtyCursor = 0;
         bool hashesRequested = false;
         bool hashesReceived = false;
-        bool queuedBlocks = false;
+        bool scanDone = false;
     };
 
     struct IncomingStagingFile {
         uint32_t syncId = 0;
         uint32_t fileId = 0;
+        uint64_t createdOrder = 0;
         std::string relativePath;
-        std::string targetFullPath;
-        std::string partFullPath;
+        std::filesystem::path targetFullPath;
+        std::filesystem::path partFullPath;
         uint64_t totalSize = 0;
         uint64_t mtimeSec = 0;
         uint32_t totalBlocks = 0;
@@ -244,9 +237,21 @@ private:
         bool initialized = false;
     };
 
-    void queueBlocksForTask(OutgoingFileTask& task);
+    static bool computeDirtyBlockIndices(
+        const std::filesystem::path& fullSourcePath,
+        uint64_t totalSize,
+        uint64_t targetFileSize,
+        const std::vector<std::array<uint8_t, 32>>& targetHashes,
+        std::vector<uint32_t>& outDirtyIndices);
+    void registerIncomingFileLocked(
+        uint32_t fileId,
+        const std::string& relativePath,
+        uint64_t totalSize,
+        uint64_t mtimeSec,
+        uint32_t syncId = 0);
     std::string resolveTargetRoot() const;
     void cancelSyncLocked();
+    void removePartFilesLocked();
 
     mutable std::mutex mutex_;
     std::string localRoot_;
@@ -257,6 +262,7 @@ private:
     SyncState state_ = SyncState::Idle;
     uint32_t activeSyncId_ = 0;
     uint32_t nextFileId_ = 1;
+    uint64_t nextIncomingOrder_ = 1;
 
     std::vector<SyncFileEntry> localEntries_;
     std::vector<SyncFileEntry> remoteEntries_;
@@ -278,7 +284,6 @@ private:
     // Outgoing Queues
     std::deque<SyncActionReqPayload> pendingActions_;
     std::deque<OutgoingFileTask> outgoingFiles_;
-    std::deque<OutgoingBlock> pendingBlocks_;
 
     // Incoming Staging
     std::unordered_map<uint32_t, IncomingStagingFile> incomingFiles_;

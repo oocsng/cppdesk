@@ -4,6 +4,7 @@
 #include <cstring>
 #include <algorithm>
 #include <filesystem>
+#include <limits>
 #include <type_traits>
 
 #if defined(__APPLE__)
@@ -13,6 +14,8 @@
 #endif
 #if !defined(_WIN32)
 #include <unistd.h>
+#include <sys/stat.h>
+#include <cstdlib>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -118,9 +121,41 @@ OfferedFiles& offered() {
     return o;
 }
 
-std::filesystem::path offerFolder(uint64_t generation) {
-    return std::filesystem::temp_directory_path() / "CppDesk_Clipboard" /
-           ("paste_" + std::to_string(getpid()) + "_" + std::to_string(generation));
+// Returns a user-private (0700, owned by geteuid(), non-symlink) base directory for clipboard paste staging.
+std::filesystem::path privatePasteBaseDir() {
+    auto verifyOrCreate0700 = [](const std::filesystem::path& p) -> bool {
+        struct stat st{};
+        if (::lstat(p.c_str(), &st) == 0) {
+            if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) return false;
+            if (st.st_uid != geteuid()) return false;
+            if ((st.st_mode & 0077) != 0) {
+                if (::chmod(p.c_str(), 0700) != 0) return false;
+            }
+            return true;
+        }
+        if (::mkdir(p.c_str(), 0700) == 0) {
+            return true;
+        }
+        return false;
+    };
+
+    if (const char* xdg = std::getenv("XDG_RUNTIME_DIR"); xdg && *xdg) {
+        std::filesystem::path candidate = std::filesystem::path(xdg) / "cppdesk_clipboard";
+        if (verifyOrCreate0700(candidate)) return candidate;
+    }
+    const char* tmp = std::getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    std::filesystem::path perUser = std::filesystem::path(tmp) / ("cppdesk_clipboard_" + std::to_string(geteuid()));
+    if (verifyOrCreate0700(perUser)) return perUser;
+
+    // Fallback: atomic unique 0700 directory via mkdtemp
+    std::string tmpl = std::string(tmp) + "/cppdesk_clip_XXXXXX";
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    if (char* created = ::mkdtemp(buf.data())) {
+        return std::filesystem::path(created);
+    }
+    return {};
 }
 
 // Runs on whichever thread an app's paste arrives on; blocks until every file is here.
@@ -141,19 +176,36 @@ std::optional<std::vector<std::string>> fetchOffered(uint64_t generation) {
         return o.generation == generation;
     };
 
+    const std::filesystem::path baseDir = privatePasteBaseDir();
+    if (baseDir.empty() || !reader) return std::nullopt;
+
     // Earlier offers' folders go: those files have left the clipboard.
-    const std::filesystem::path folder = offerFolder(generation);
     std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(folder.parent_path(), ec)) {
+    const std::string mine = "paste_" + std::to_string(getpid()) + "_";
+    for (const auto& entry : std::filesystem::directory_iterator(baseDir, ec)) {
+        if (entry.is_symlink(ec)) continue;
         const std::string name = entry.path().filename().string();
-        const std::string mine = "paste_" + std::to_string(getpid()) + "_";
-        if (name.compare(0, mine.size(), mine) == 0 && entry.path() != folder) std::filesystem::remove_all(entry.path(), ec);
+        if (name.compare(0, mine.size(), mine) == 0) {
+            std::filesystem::remove_all(entry.path(), ec);
+        }
     }
-    std::filesystem::create_directories(folder, ec);
-    bool ok = !ec && reader;
+
+    std::string tmpl = (baseDir / (mine + std::to_string(generation) + "_XXXXXX")).string();
+    std::vector<char> tmplBuf(tmpl.begin(), tmpl.end());
+    tmplBuf.push_back('\0');
+    char* created = ::mkdtemp(tmplBuf.data());
+    if (!created) return std::nullopt;
+    const std::filesystem::path folder(created);
+
+    constexpr uint64_t MAX_CAP = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+    bool ok = true;
     std::vector<std::string> paths;
     for (const auto& f : files) {
         if (!ok) break;
+        if (f.fileSize > MAX_CAP) {
+            ok = false;
+            break;
+        }
         const std::string name = std::filesystem::path(f.fileName).filename().string();
         const std::filesystem::path target = folder / ShellClipboard::resolveConflictFilename(folder.string(), name);
         std::ofstream out(target, std::ios::binary | std::ios::trunc);
@@ -161,7 +213,8 @@ std::optional<std::vector<std::string>> fetchOffered(uint64_t generation) {
         for (uint64_t offset = 0; ok && offset < f.fileSize;) {
             std::vector<uint8_t> chunk;
             const auto want = static_cast<uint32_t>(std::min<uint64_t>(64 * 1024, f.fileSize - offset));
-            ok = stillOffered() && reader(f.fileIndex, offset, want, chunk) && !chunk.empty();
+            ok = stillOffered() && reader(f.fileIndex, offset, want, chunk) &&
+                 !chunk.empty() && chunk.size() <= want && chunk.size() <= (f.fileSize - offset);
             if (!ok) break;
             out.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
             offset += chunk.size();
@@ -266,7 +319,8 @@ template <typename StringType>
 StringType resolveConflictFilenameImpl(const StringType& directory, const StringType& filename) {
     std::filesystem::path dir(directory);
     std::filesystem::path target = dir / filename;
-    if (!std::filesystem::exists(target)) {
+    std::error_code ec;
+    if (!std::filesystem::exists(target, ec) || ec) {
         return filename;
     }
     const auto stem = target.stem();
@@ -278,7 +332,8 @@ StringType resolveConflictFilenameImpl(const StringType& directory, const String
         } else {
             candidate = stem.string() + " (" + std::to_string(i) + ")" + ext.string();
         }
-        if (!std::filesystem::exists(dir / candidate)) {
+        ec.clear();
+        if (!std::filesystem::exists(dir / candidate, ec) && !ec) {
             return candidate;
         }
     }
@@ -346,6 +401,11 @@ HRESULT STDMETHODCALLTYPE VirtualFileStream::Read(void* pv, ULONG cb, ULONG* pcb
         return E_FAIL;
     }
 
+    if (chunkData.empty()) {
+        if (pcbRead) *pcbRead = 0;
+        return E_FAIL;
+    }
+
     size_t actual = std::min<size_t>(toRead, chunkData.size());
     std::memcpy(pv, chunkData.data(), actual);
     currentOffset_ += actual;
@@ -358,15 +418,29 @@ HRESULT STDMETHODCALLTYPE VirtualFileStream::Write(const void* /*pv*/, ULONG /*c
 }
 
 HRESULT STDMETHODCALLTYPE VirtualFileStream::Seek(LARGE_INTEGER dlibMove, DWORD dwOrigin, ULARGE_INTEGER* plibNewPosition) {
-    int64_t newPos = 0;
+    uint64_t base = 0;
     switch (dwOrigin) {
-        case STREAM_SEEK_SET: newPos = dlibMove.QuadPart; break;
-        case STREAM_SEEK_CUR: newPos = static_cast<int64_t>(currentOffset_) + dlibMove.QuadPart; break;
-        case STREAM_SEEK_END: newPos = static_cast<int64_t>(desc_.fileSize) + dlibMove.QuadPart; break;
+        case STREAM_SEEK_SET: base = 0; break;
+        case STREAM_SEEK_CUR: base = currentOffset_; break;
+        case STREAM_SEEK_END: base = desc_.fileSize; break;
         default: return STG_E_INVALIDFUNCTION;
     }
-    if (newPos < 0) return STG_E_INVALIDFUNCTION;
-    currentOffset_ = static_cast<uint64_t>(newPos);
+    const int64_t delta = dlibMove.QuadPart;
+    uint64_t newPos = 0;
+    if (delta >= 0) {
+        const uint64_t uDelta = static_cast<uint64_t>(delta);
+        if (uDelta > std::numeric_limits<uint64_t>::max() - base) {
+            return STG_E_INVALIDFUNCTION;
+        }
+        newPos = base + uDelta;
+    } else {
+        const uint64_t uNeg = static_cast<uint64_t>(-(delta + 1)) + 1ULL;
+        if (uNeg > base) {
+            return STG_E_INVALIDFUNCTION;
+        }
+        newPos = base - uNeg;
+    }
+    currentOffset_ = newPos;
     if (plibNewPosition) plibNewPosition->QuadPart = currentOffset_;
     return S_OK;
 }
@@ -455,7 +529,12 @@ HRESULT STDMETHODCALLTYPE ShellEnumFormatEtc::Next(ULONG celt, FORMATETC* rgelt,
 }
 
 HRESULT STDMETHODCALLTYPE ShellEnumFormatEtc::Skip(ULONG celt) {
-    currentIndex_ = std::min(formats_.size(), currentIndex_ + celt);
+    const size_t remaining = (currentIndex_ < formats_.size()) ? (formats_.size() - currentIndex_) : 0;
+    if (static_cast<size_t>(celt) > remaining) {
+        currentIndex_ = formats_.size();
+        return S_FALSE;
+    }
+    currentIndex_ += static_cast<size_t>(celt);
     return S_OK;
 }
 
@@ -466,7 +545,9 @@ HRESULT STDMETHODCALLTYPE ShellEnumFormatEtc::Reset() {
 
 HRESULT STDMETHODCALLTYPE ShellEnumFormatEtc::Clone(IEnumFORMATETC** ppenum) {
     if (!ppenum) return E_POINTER;
-    *ppenum = new ShellEnumFormatEtc(formats_);
+    auto* cloned = new ShellEnumFormatEtc(formats_);
+    cloned->currentIndex_ = currentIndex_;
+    *ppenum = cloned;
     return S_OK;
 }
 

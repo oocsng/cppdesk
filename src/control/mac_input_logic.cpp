@@ -74,8 +74,8 @@ uint16_t macHostKeyCodeForVk(uint16_t vk) {
 }
 
 PointXY macPointForNormalized(float nx, float ny, const PointRect& d) {
-    const double cx = std::clamp(static_cast<double>(nx), 0.0, 1.0);
-    const double cy = std::clamp(static_cast<double>(ny), 0.0, 1.0);
+    const double cx = std::isfinite(nx) ? std::clamp(static_cast<double>(nx), 0.0, 1.0) : 0.0;
+    const double cy = std::isfinite(ny) ? std::clamp(static_cast<double>(ny), 0.0, 1.0) : 0.0;
     return PointXY{ d.x + cx * std::max(1.0, d.w - 1.0), d.y + cy * std::max(1.0, d.h - 1.0) };
 }
 

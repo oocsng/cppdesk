@@ -29,7 +29,7 @@ public:
     ~CommandPaletteManager() = default;
 
     // Catalog queries
-    const std::vector<OmnibarCommand>& getCatalog() const;
+    std::vector<OmnibarCommand> getCatalog() const;
     std::vector<OmnibarCommand> search(const std::string& query) const;
     void registerCommand(const OmnibarCommand& cmd);
 

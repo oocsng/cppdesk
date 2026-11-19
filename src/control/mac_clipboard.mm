@@ -20,7 +20,10 @@
     if (!fetch) return;
     const auto paths = fetch();   // every item asks; the files are fetched once
     if (!paths || index >= paths->size()) return;
-    NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:(*paths)[index].c_str()]];
+    NSURL* url = [NSURL fileURLWithFileSystemRepresentation:(*paths)[index].c_str()
+                                                isDirectory:NO
+                                              relativeToURL:nil];
+    if (!url) return;
     [item setString:url.absoluteString forType:type];
 }
 - (void)pasteboardFinishedWithDataProvider:(NSPasteboard*)pasteboard {
