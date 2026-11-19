@@ -7588,39 +7588,40 @@ void testRelayDeskOwnership() {
 
     // Part A: the registry on its own.
     {
-        Key keyA{}, keyB{};
-        keyA.fill(0x11);
-        keyB.fill(0x22);
+        PairingKey keyA, keyB;
+        TEST_ASSERT(keyA.generate() && keyB.generate());
         Nonce n1{}, n2{};
         n1.fill(0x01);
         n2.fill(0x02);
+        auto prove = [](const PairingKey& k, uint64_t id, const Nonce& n) {
+            Proof p{};
+            (void)makeProof(k, id, n, p);
+            return p;
+        };
 
         OwnerRegistry reg;
         TEST_ASSERT(!reg.hasOwner(1001, 0));
-        TEST_ASSERT(reg.enroll(1001, keyA, 0));
+        Proof tampered = prove(keyA, 1001, n1);
+        tampered[100] ^= 0x01;
+        TEST_ASSERT(!reg.enroll(1001, n1, tampered, 0));                 // enrolling needs a valid signature
+        TEST_ASSERT(!reg.enroll(1001, n2, prove(keyA, 1001, n1), 0));    // signed over another challenge
+        TEST_ASSERT(!reg.hasOwner(1001, 0));
+        TEST_ASSERT(reg.enroll(1001, n1, prove(keyA, 1001, n1), 0));
         TEST_ASSERT(reg.hasOwner(1001, 1000));
-        TEST_ASSERT(!reg.enroll(1001, keyB, 1000));          // an enrolled ID cannot be re-enrolled
+        TEST_ASSERT(!reg.enroll(1001, n2, prove(keyB, 1001, n2), 1000)); // an enrolled ID cannot be re-enrolled
 
-        Key proof = computeProof(keyA, 1001, n1);
+        Proof proof = prove(keyA, 1001, n1);
         TEST_ASSERT(reg.verify(1001, n1, proof, 2000));
         TEST_ASSERT(!reg.verify(1001, n2, proof, 2000));      // proof replayed against a fresh nonce
         TEST_ASSERT(!reg.verify(1002, n1, proof, 2000));      // proof for another desk ID
-        TEST_ASSERT(!reg.verify(1001, n1, computeProof(keyB, 1001, n1), 2000)); // wrong key
-        TEST_ASSERT(computeProof(keyA, 1001, n1) != computeProof(keyA, 1002, n1));
+        TEST_ASSERT(!reg.verify(1001, n1, prove(keyB, 1001, n1), 2000)); // valid signature, but not the owner's key
 
         // A record lapses after the TTL, and activity keeps it alive.
         TEST_ASSERT(reg.hasOwner(1001, 2000 + TTL_MS - 1));
         reg.touch(1001, 3000);
         TEST_ASSERT(reg.hasOwner(1001, 3000 + TTL_MS - 1));
         TEST_ASSERT(!reg.hasOwner(1001, 3000 + TTL_MS + 1));
-        TEST_ASSERT(reg.enroll(1001, keyB, 3000 + TTL_MS + 1)); // free again once lapsed
-
-        // The key a host sends is specific to its relay.
-        Key install{};
-        install.fill(0x33);
-        TEST_ASSERT(deriveRelayKey(install, "relay.example:50000") == deriveRelayKey(install, "relay.example:50000"));
-        TEST_ASSERT(deriveRelayKey(install, "relay.example:50000") != deriveRelayKey(install, "other.example:50000"));
-        TEST_ASSERT(deriveRelayKey(install, "relay.example:50000") != install);
+        TEST_ASSERT(reg.enroll(1001, n2, prove(keyB, 1001, n2), 3000 + TTL_MS + 1)); // free again once lapsed
     }
 
     // Part B: a real RelayServer, spoken to over TCP.
@@ -7674,7 +7675,7 @@ void testRelayDeskOwnership() {
         }
         return r;
     };
-    auto answer = [&](uintptr_t s, const Key& value) {
+    auto answer = [&](uintptr_t s, const Proof& value) {
         ByteWriter w;
         w.writeBytes(value.data(), value.size());
         FrameHeader h{};
@@ -7705,14 +7706,19 @@ void testRelayDeskOwnership() {
     };
 
     const uint64_t deskId = 482910375ULL;
-    Key ownerKey{};
-    ownerKey.fill(0x5A);
+    PairingKey ownerKey;
+    TEST_ASSERT(ownerKey.generate());
+    auto prove = [&](const PairingKey& k, const Nonce& n) {
+        Proof p{};
+        (void)makeProof(k, deskId, n, p);
+        return p;
+    };
 
     // 1. The owner's first registration enrolls its key.
     uintptr_t owner = dial();
     RegReply first = beginRegister(owner, deskId, "owner-host", true);
     TEST_ASSERT(first.challengeMode == MODE_ENROLL);
-    TEST_ASSERT(answer(owner, ownerKey) == 1);
+    TEST_ASSERT(answer(owner, prove(ownerKey, first.nonce)) == 1);
     TEST_ASSERT(lookup(deskId) == "owner-host");
 
     // 2. A host that sends no proof at all cannot take the ID.
@@ -7722,13 +7728,13 @@ void testRelayDeskOwnership() {
     TEST_ASSERT(lookup(deskId) == "owner-host");
 
     // 3. Wrong proof, and the owner's own earlier proof replayed against a new nonce, are both refused.
-    Key earlierProof = computeProof(ownerKey, deskId, first.nonce);
+    Proof earlierProof = prove(ownerKey, first.nonce);
     uintptr_t forger = dial();
     RegReply forgerChallenge = beginRegister(forger, deskId, "evil-forger", true);
     TEST_ASSERT(forgerChallenge.challengeMode == MODE_PROVE);
-    Key bogus{};
-    bogus.fill(0x66);
-    TEST_ASSERT(answer(forger, bogus) == 0);
+    PairingKey forgerKey;
+    TEST_ASSERT(forgerKey.generate());
+    TEST_ASSERT(answer(forger, prove(forgerKey, forgerChallenge.nonce)) == 0);   // a stranger's own valid key
     hangUp(forger);
     uintptr_t replayer = dial();
     TEST_ASSERT(beginRegister(replayer, deskId, "evil-replay", true).challengeMode == MODE_PROVE);
@@ -7746,7 +7752,7 @@ void testRelayDeskOwnership() {
     uintptr_t again = dial();
     RegReply second = beginRegister(again, deskId, "owner-host-2", true);
     TEST_ASSERT(second.challengeMode == MODE_PROVE);
-    TEST_ASSERT(answer(again, computeProof(ownerKey, deskId, second.nonce)) == 1);
+    TEST_ASSERT(answer(again, prove(ownerKey, second.nonce)) == 1);
     TEST_ASSERT(lookup(deskId) == "owner-host-2");
     // The takeover wakes the stale registration's thread. That thread must not close a handle a later connection has
     // been given (handle numbers are reused at once on Linux), so a burst of fresh connections all still get answers.
@@ -7780,11 +7786,6 @@ void testRelayDeskOwnership() {
     {
         IdentityManager idMgr(94);
         idMgr.loadOrCreate();
-        TEST_ASSERT(CryptoUtils::isUsableKey(idMgr.relayOwnerKey()));
-        Key persistedKey = idMgr.relayOwnerKey();
-        IdentityManager reloaded(94);
-        reloaded.loadOrCreate();
-        TEST_ASSERT(reloaded.relayOwnerKey() == persistedKey);   // survives a restart
 
         NetworkEngine engine(idMgr);
         TEST_ASSERT(engine.start());

@@ -633,10 +633,7 @@ bool IdentityManager::loadOrCreate() {
                         unattendedVerifier_.clear();
                         droppedLegacyVerifier = true;
                     }
-                } else if (key == "relay_owner_key") {
-                auto bytes = CryptoUtils::fromHex(val);
-                if (bytes.size() == relayOwnerKey_.size()) std::copy(bytes.begin(), bytes.end(), relayOwnerKey_.begin());
-            } else if (key == "unattended_password") {
+                } else if (key == "unattended_password") {
                 legacyPlainPassword = val;
             } else if (key == "relay_server") {
                 if (!val.empty()) {
@@ -815,14 +812,6 @@ bool IdentityManager::loadOrCreate() {
             }
         }
 
-        if (!CryptoUtils::isUsableKey(relayOwnerKey_)) {
-            if (!CryptoUtils::randomBytes(relayOwnerKey_.data(), relayOwnerKey_.size())) {
-                CryptoUtils::secureZero(relayOwnerKey_.data(), relayOwnerKey_.size());
-                return false;
-            }
-            modified = true;
-        }
-
         if (!pairingKey_.isValid()) {
             pairingKey_.generate();
             modified = true;
@@ -890,7 +879,6 @@ bool IdentityManager::save() const {
         out << "listen_port=" << listenPort_ << "\n";
         out << "unattended_enabled=" << (unattendedEnabled_ ? "1" : "0") << "\n";
         out << "unattended_verifier=" << sanitizeIniLine(unattendedVerifier_) << "\n";
-        out << "relay_owner_key=" << CryptoUtils::toHex(relayOwnerKey_.data(), relayOwnerKey_.size()) << "\n";
         out << "relay_server=" << sanitizeIniLine(settings_.relayServer.empty() ? relayServerAddr_ : settings_.relayServer) << "\n";
         out << "relay_auth_key=" << sanitizeIniLine(settings_.relayAuthKey) << "\n";
         out << "stun_server=" << sanitizeIniLine(settings_.stunServer) << "\n";

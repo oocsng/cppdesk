@@ -905,14 +905,14 @@ void RelayServer::handleClientSocket(uintptr_t sock, std::string peerIp, bool& r
                 sendAllBytes(toWinSock(sock), cw.buffer().data(), cw.buffer().size());
 
                 FrameHeader pHdr{};
-                relayowner::Key proof{};
+                relayowner::Proof proof{};
                 bool proven = recvAllBytes(toWinSock(sock), &pHdr, sizeof(pHdr)) &&
                               pHdr.magic == PROTOCOL_MAGIC &&
                               pHdr.type == static_cast<uint8_t>(PacketType::RELAY_REGISTER_PROOF) &&
                               pHdr.payloadSize == proof.size() &&
                               recvAllBytes(toWinSock(sock), proof.data(), proof.size());
                 if (proven) {
-                    proven = enrolling ? owners_.enroll(deskId, proof, nowTickMs())
+                    proven = enrolling ? owners_.enroll(deskId, nonce, proof, nowTickMs())
                                        : owners_.verify(deskId, nonce, proof, nowTickMs());
                 }
                 if (!proven) {
@@ -1527,12 +1527,6 @@ void NetworkEngine::relayRegistrationLoop() {
         w.writeU16(identity_.listenPort());
         w.writeU8(relayowner::OWNER_CAP);
 
-        // The key this relay is shown is derived for it alone, from the secret kept in the config file.
-        std::string relayName = rHost;
-        std::transform(relayName.begin(), relayName.end(), relayName.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        relayName += ":" + std::to_string(rPort);
-        const relayowner::Key relayKey = relayowner::deriveRelayKey(identity_.relayOwnerKey(), relayName);
         const std::string relayAuthKey = identity_.settings().relayAuthKey;
 
         auto sendRelayFrame = [&](uintptr_t targetSock, PacketType type, const std::vector<uint8_t>& body, std::mutex& mu) {
@@ -1584,9 +1578,9 @@ void NetworkEngine::relayRegistrationLoop() {
                 challengeAnswered = true;
                 relayowner::Nonce nonce{};
                 std::copy(pay.begin() + 1, pay.end(), nonce.begin());
-                relayowner::Key reply = (pay[0] == relayowner::MODE_ENROLL)
-                    ? relayKey
-                    : relayowner::computeProof(relayKey, identity_.deskId(), nonce);
+                // Enrolling or proving, the answer is the same: our public key and a signature over the challenge.
+                relayowner::Proof reply{};
+                if (!relayowner::makeProof(identity_.pairingKey(), identity_.deskId(), nonce, reply)) break;
                 if (!sendFrame(localRelaySock, PacketType::RELAY_REGISTER_PROOF, 0, reply.data(), reply.size(), regMutex)) break;
                 continue;
             }

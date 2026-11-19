@@ -38,19 +38,21 @@ static void testFixesC_RelayAuthAndOwnership() {
     // #66: OwnerRegistry full table fails closed after pruning expired entries.
     {
         OwnerRegistry reg(2);
-        Key k1{}, k2{}, k3{};
-        k1.fill(0x11);
-        k2.fill(0x22);
-        k3.fill(0x33);
+        PairingKey key;
+        TEST_ASSERT(key.generate());
+        Nonce n{};
+        n.fill(0x07);
+        Proof p10{}, p20{}, p30{};
+        TEST_ASSERT(makeProof(key, 10, n, p10) && makeProof(key, 20, n, p20) && makeProof(key, 30, n, p30));
 
-        TEST_ASSERT(reg.enroll(10, k1, 0));
-        TEST_ASSERT(reg.enroll(20, k2, 1000));
-        TEST_ASSERT(!reg.enroll(30, k3, 2000));
+        TEST_ASSERT(reg.enroll(10, n, p10, 0));
+        TEST_ASSERT(reg.enroll(20, n, p20, 1000));
+        TEST_ASSERT(!reg.enroll(30, n, p30, 2000));
         TEST_ASSERT(!reg.hasOwner(30, 2000));
 
         // Once ID 10 expires, pruning frees a slot while preserving live ID 20.
         const uint64_t afterExpiry = TTL_MS + 500;
-        TEST_ASSERT(reg.enroll(30, k3, afterExpiry));
+        TEST_ASSERT(reg.enroll(30, n, p30, afterExpiry));
         TEST_ASSERT(reg.hasOwner(30, afterExpiry));
         TEST_ASSERT(reg.hasOwner(20, afterExpiry));
         TEST_ASSERT(!reg.hasOwner(10, afterExpiry));

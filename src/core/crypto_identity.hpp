@@ -352,9 +352,6 @@ public:
     bool hasStoredPasswordVerifier() const { std::lock_guard<std::mutex> lk(stateMutex_); return !unattendedVerifier_.empty(); }
     std::string passwordVerifier() const { std::lock_guard<std::mutex> lk(stateMutex_); return unattendedVerifier_; }
 
-    // Secret that proves this install owns its desk ID on a relay; created on first run, kept in the config file.
-    std::array<uint8_t, 32> relayOwnerKey() const { std::lock_guard<std::mutex> lk(stateMutex_); return relayOwnerKey_; }
-
     // Dynamic 6-character One-Time Session Password (in-memory only, regenerable anytime)
     std::string sessionCode() const { std::lock_guard<std::mutex> lk(stateMutex_); return sessionCode_; }
     std::string regenerateSessionCode();
@@ -415,7 +412,6 @@ private:
     std::string                     unattendedVerifier_; // PBKDF2-HMAC-SHA256 verifier persisted in config_*.ini
     std::array<uint8_t, 16>         sessionSalt_{};      // In-memory random salt for sessionCode_ when no unattended verifier is set
     uint32_t                        sessionIterations_ = CryptoUtils::kDefaultPbkdf2Iterations;
-    std::array<uint8_t, 32>         relayOwnerKey_{};    // Hex in the config file; see relayOwnerKey()
     std::string                     sessionCode_;        // Dynamic 6-char One-Time Session Password
     std::string                     relayServerAddr_ = "127.0.0.1:50999";
     std::vector<RecentSessionEntry> recentSessions_;

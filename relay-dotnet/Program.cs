@@ -34,17 +34,18 @@ internal static class Program
     private static string _authKey = string.Empty;
 
     private const byte OwnerCap = 1;        // trailing byte on RELAY_REGISTER: "I can prove ownership"
-    private const byte ModeProve = 0;       // challenge: answer with HMAC(key, label || deskId || nonce)
-    private const byte ModeEnroll = 1;      // challenge: answer with the key itself
+    private const byte ModeProve = 0;       // challenge: the ID has an owner, whose key must sign
+    private const byte ModeEnroll = 1;      // challenge: the ID is free, and the signing key becomes its owner
     private const int OwnerNonceLength = 16;
-    private const int OwnerKeyLength = 32;
+    private const int OwnerProofLength = 128; // public key (X || Y) || ECDSA P-256 signature (r || s)
     private static int _ownerMaxRecords = 100_000;
     private static readonly TimeSpan OwnerTtl = TimeSpan.FromDays(7);   // an ID nobody has used for this long is free again
-    private static readonly byte[] OwnerLabel = Encoding.ASCII.GetBytes("CppDesk-relay-owner-v1");
+    private static readonly byte[] OwnerLabel = Encoding.ASCII.GetBytes("CppDesk-relay-owner-v2");
     private static readonly TimeSpan ControlWriteTimeout = TimeSpan.FromSeconds(5);
 
-    // Desk IDs whose owner key this relay holds. A host's first registration enrolls its key (trust on first
-    // use); later ones must answer a fresh challenge, so knowing an ID is not enough to take it over.
+    // Desk IDs and their owners' public signing keys. A host's first registration enrolls its key (trust on first
+    // use); every registration signs a fresh challenge, so knowing an ID is not enough to take it over, and
+    // nothing secret crosses the unencrypted relay link.
     // shortcut: in memory only, so a relay restart forgets every owner and the first registrant wins again; persist when relays run for months.
     private sealed record OwnerRecord(byte[] Key, DateTime LastSeenUtc);
     private static readonly Dictionary<ulong, OwnerRecord> Owners = new();
@@ -295,8 +296,8 @@ internal static class Program
                         await WriteFrameAsync(stream, PacketRelayRegisterChallenge, 0, challenge, firstFrameCts.Token);
 
                         var (pOk, pType, _, proof) = await ReadFrameAsync(stream, firstFrameCts.Token);
-                        bool proven = pOk && pType == PacketRelayRegisterProof && proof.Length == OwnerKeyLength &&
-                                      (enrolling ? EnrollOwner(deskId, proof) : VerifyOwner(deskId, nonce, proof));
+                        bool proven = pOk && pType == PacketRelayRegisterProof &&
+                                      (enrolling ? EnrollOwner(deskId, nonce, proof) : VerifyOwner(deskId, nonce, proof));
                         if (!proven)
                         {
                             await WriteFrameAsync(stream, PacketRelayRegisterAck, 0, new byte[] { 0 }, firstFrameCts.Token);
@@ -814,13 +815,33 @@ internal static class Program
         }
     }
 
-    private static byte[] ComputeOwnerProof(byte[] key, ulong deskId, byte[] nonce)
+    // SHA-256(label || deskId || nonce), the same bytes the C++ host signs.
+    private static byte[] OwnerDigest(ulong deskId, byte[] nonce)
     {
         byte[] msg = new byte[OwnerLabel.Length + 8 + nonce.Length];
         OwnerLabel.CopyTo(msg, 0);
         BinaryPrimitives.WriteUInt64LittleEndian(msg.AsSpan(OwnerLabel.Length, 8), deskId);
         nonce.CopyTo(msg, OwnerLabel.Length + 8);
-        return HMACSHA256.HashData(key, msg);
+        return SHA256.HashData(msg);
+    }
+
+    // The public key a proof carries when its signature over the challenge is valid, else null.
+    private static byte[]? CheckOwnerProof(ulong deskId, byte[] nonce, byte[] proof)
+    {
+        if (proof.Length != OwnerProofLength) return null;
+        try
+        {
+            using var ec = ECDsa.Create(new ECParameters
+            {
+                Curve = ECCurve.NamedCurves.nistP256,
+                Q = new ECPoint { X = proof[..32], Y = proof[32..64] },
+            });
+            return ec.VerifyHash(OwnerDigest(deskId, nonce), proof.AsSpan(64)) ? proof[..64] : null;
+        }
+        catch (CryptographicException)
+        {
+            return null;   // not a point on the curve
+        }
     }
 
     private static bool HasLiveOwner(ulong deskId)
@@ -839,9 +860,11 @@ internal static class Program
         return rec;
     }
 
-    // False when the ID already has a live owner or the table is full after pruning expired records.
-    private static bool EnrollOwner(ulong deskId, byte[] key)
+    // False when the signature is bad, the ID already has a live owner, or the table is full after pruning.
+    private static bool EnrollOwner(ulong deskId, byte[] nonce, byte[] proof)
     {
+        byte[]? key = CheckOwnerProof(deskId, nonce, proof);
+        if (key is null) return false;
         lock (Owners)
         {
             if (LiveOwnerLocked(deskId) is not null) return false;
@@ -863,11 +886,13 @@ internal static class Program
 
     private static bool VerifyOwner(ulong deskId, byte[] nonce, byte[] proof)
     {
+        byte[]? key = CheckOwnerProof(deskId, nonce, proof);
+        if (key is null) return false;
         lock (Owners)
         {
             var rec = LiveOwnerLocked(deskId);
             if (rec is null) return false;
-            if (!CryptographicOperations.FixedTimeEquals(ComputeOwnerProof(rec.Key, deskId, nonce), proof)) return false;
+            if (!CryptographicOperations.FixedTimeEquals(rec.Key, key)) return false;
             Owners[deskId] = rec with { LastSeenUtc = DateTime.UtcNow };
             return true;
         }
@@ -884,8 +909,18 @@ internal static class Program
     private static async Task<bool> RunOwnershipSelfTestAsync(int port)
     {
         const ulong deskId = 731904286UL;
-        byte[] key = new byte[OwnerKeyLength];
-        Array.Fill(key, (byte)0x5A);
+        using var ownerKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        using var forgerKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+
+        byte[] Prove(ECDsa k, byte[] nonce)
+        {
+            ECPoint q = k.ExportParameters(false).Q;
+            byte[] p = new byte[OwnerProofLength];
+            q.X!.CopyTo(p, 0);
+            q.Y!.CopyTo(p, 32);
+            k.SignHash(OwnerDigest(deskId, nonce)).CopyTo(p, 64);
+            return p;
+        }
 
         async Task<(TcpClient Client, NetworkStream Stream)> Dial()
         {
@@ -954,7 +989,7 @@ internal static class Program
         {
             var first = await Register(ownerStream, deskId, "owner-host", true);
             if (first.Mode != ModeEnroll) return Fail("first registration was not asked to enroll");
-            if (await Answer(ownerStream, key) != 1) return Fail("enrollment was refused");
+            if (await Answer(ownerStream, Prove(ownerKey, first.Data)) != 1) return Fail("enrollment was refused");
             if (await Lookup(deskId) != "owner-host") return Fail("enrolled host not found");
 
             // A host that sends no proof cannot take the ID.
@@ -966,13 +1001,13 @@ internal static class Program
             }
 
             // A wrong proof and the owner's earlier proof replayed against a new nonce are refused.
-            byte[] earlierProof = ComputeOwnerProof(key, deskId, first.Data);
+            byte[] earlierProof = Prove(ownerKey, first.Data);
             var (c2, s2) = await Dial();
             using (c2)
             {
                 var r = await Register(s2, deskId, "evil-forger", true);
                 if (r.Mode != ModeProve) return Fail("owned ID was not challenged to prove");
-                if (await Answer(s2, new byte[OwnerKeyLength]) != 0) return Fail("wrong proof was accepted");
+                if (await Answer(s2, Prove(forgerKey, r.Data)) != 0) return Fail("a stranger's key was accepted");
             }
             var (c3, s3) = await Dial();
             using (c3)
@@ -989,7 +1024,7 @@ internal static class Program
             {
                 var r = await Register(s4, deskId, "owner-host-2", true);
                 if (r.Mode != ModeProve) return Fail("owner was not challenged to prove");
-                if (await Answer(s4, ComputeOwnerProof(key, deskId, r.Data)) != 1) return Fail("owner's valid proof was refused");
+                if (await Answer(s4, Prove(ownerKey, r.Data)) != 1) return Fail("owner's valid proof was refused");
                 if (await Lookup(deskId) != "owner-host-2") return Fail("owner did not take the registration back");
             }
         }
