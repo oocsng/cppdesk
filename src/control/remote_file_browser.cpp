@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <ctime>
 
@@ -72,8 +73,14 @@ std::string trimTrailingSeps(std::string p) {
     return p;
 }
 
+bool isRootOrEmptyPath(const std::filesystem::path& p) {
+    if (p.empty() || !p.is_absolute()) return true;
+    std::filesystem::path rel = p.relative_path();
+    return rel.empty() || rel == "." || p == p.root_path();
+}
+
 // Resolves a client-supplied path to an absolute path that is not a drive or share root.
-// "C:\" trims to "C:" (drive-relative), which is not absolute, so drive roots are refused as well.
+// Rejects ".." traversal segments and symlinks that resolve to a filesystem/drive root.
 bool resolveNonRootPath(const std::string& utf8, std::filesystem::path& out, std::string& outError) {
     std::string trimmed = trimTrailingSeps(utf8);
     if (trimmed.empty()) {
@@ -81,11 +88,38 @@ bool resolveNonRootPath(const std::string& utf8, std::filesystem::path& out, std
         return false;
     }
     std::filesystem::path p = toPath(trimmed);
-    if (!p.is_absolute() || !p.has_relative_path()) {
+    if (!p.is_absolute()) {
         outError = "Refusing to operate on a relative path or a drive root: " + utf8;
         return false;
     }
-    out = std::move(p);
+    for (const auto& part : p) {
+        if (part == "..") {
+            outError = "Refusing to operate on a path containing '..': " + utf8;
+            return false;
+        }
+    }
+    std::filesystem::path norm = p.lexically_normal();
+    while (!norm.has_filename() && norm != norm.root_path() && norm.has_parent_path()) {
+        norm = norm.parent_path();
+    }
+    if (isRootOrEmptyPath(norm)) {
+        outError = "Refusing to operate on a relative path or a drive root: " + utf8;
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::path canon = std::filesystem::weakly_canonical(norm, ec);
+    if (ec) {
+        outError = "Failed to canonicalize path: " + ec.message();
+        return false;
+    }
+    while (!canon.has_filename() && canon != canon.root_path() && canon.has_parent_path()) {
+        canon = canon.parent_path();
+    }
+    if (isRootOrEmptyPath(canon)) {
+        outError = "Refusing to operate on a root path: " + utf8;
+        return false;
+    }
+    out = std::move(norm);
     return true;
 }
 
@@ -193,7 +227,13 @@ bool RemoteFileBrowserManager::listLocalDirectory(const std::string& path,
     }
 
     std::error_code ec;
-    std::filesystem::path dirPath = toPath(path);
+    std::string lookupPath = path;
+#if defined(_WIN32)
+    if (lookupPath.size() == 2 && std::isalpha(static_cast<unsigned char>(lookupPath[0])) && lookupPath[1] == ':') {
+        lookupPath.push_back('\\');
+    }
+#endif
+    std::filesystem::path dirPath = toPath(lookupPath);
     if (!std::filesystem::exists(dirPath, ec)) {
         outError = "Directory not found: " + path;
         return false;
@@ -251,7 +291,8 @@ bool RemoteFileBrowserManager::listLocalDirectory(const std::string& path,
             auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
                 lwt - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now()
             );
-            item.mtimeSec = static_cast<uint64_t>(std::chrono::system_clock::to_time_t(sctp));
+            auto t = std::chrono::system_clock::to_time_t(sctp);
+            item.mtimeSec = (t > 0) ? static_cast<uint64_t>(t) : 0ULL;
         } else {
             item.mtimeSec = 0;
         }
@@ -365,12 +406,13 @@ std::string RemoteFileBrowserManager::formatFileSize(uint64_t bytes) {
 
 std::string RemoteFileBrowserManager::formatFileTimestamp(uint64_t mtimeSec) {
     if (mtimeSec == 0) return "-";
+    if (mtimeSec > static_cast<uint64_t>(std::numeric_limits<time_t>::max())) return "-";
     time_t raw = static_cast<time_t>(mtimeSec);
     struct tm tmInfo{};
 #if defined(_WIN32)
-    localtime_s(&tmInfo, &raw);
+    if (localtime_s(&tmInfo, &raw) != 0) return "-";
 #else
-    localtime_r(&raw, &tmInfo);
+    if (localtime_r(&raw, &tmInfo) == nullptr) return "-";
 #endif
     char buf[64];
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d",
