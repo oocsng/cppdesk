@@ -83,6 +83,8 @@ void AppUi::hardResetViewerUiState() {
     rewindFrozen_ = false;
     rewindOffsetMs_ = 0;
     showRewindScrubber_ = false;
+    remoteCanvasPressedMask_ = 0;
+    whiteboardStrokeActive_ = false;
 }
 
 void AppUi::switchTab(ActiveTab newTab) {
@@ -1783,13 +1785,25 @@ void AppUi::drawRemoteSessionView(const UiRect& bounds, float alpha) {
         drawText(peerTitle, { bx, hudBar.top, bx + 170.0f, hudBar.bottom }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
         bx += 174.0f;
 
-        drawPulseDot(bx + 4.0f, hudBar.centerY(), 3.6f, COL_SUCCESS, alpha);
-        if (appSett.showSessionHud) {
+        ui::Color stateDotCol = COL_WARNING;
+        const char* stateLabel = "Connecting...";
+        if (stats.state == ViewerConnectionState::Connected) {
+            stateDotCol = COL_SUCCESS;
+            stateLabel = "Connected";
+        } else if (stats.state == ViewerConnectionState::Error) {
+            stateDotCol = COL_DANGER;
+            stateLabel = "Error";
+        } else if (stats.state == ViewerConnectionState::Disconnected) {
+            stateDotCol = COL_TEXT_MUTED;
+            stateLabel = "Disconnected";
+        }
+        drawPulseDot(bx + 4.0f, hudBar.centerY(), 3.6f, stateDotCol, alpha);
+        if (appSett.showSessionHud && stats.state == ViewerConnectionState::Connected) {
             char fpsBuf[48];
             std::snprintf(fpsBuf, sizeof(fpsBuf), "Connected • %.0f FPS", stats.fps);
             drawText(fpsBuf, { bx + 13.0f, hudBar.top, bx + 165.0f, hudBar.bottom }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         } else {
-            drawText("Connected", { bx + 13.0f, hudBar.top, bx + 110.0f, hudBar.bottom }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+            drawText(stateLabel, { bx + 13.0f, hudBar.top, bx + 120.0f, hudBar.bottom }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         }
 
         // Pinned Disconnect Button on far right
@@ -1950,10 +1964,13 @@ void AppUi::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
             true, COL_BORDER, COL_TEXT_ACCENT,
             [this, bounds]() {
-                float targetW = bounds.width();
-                float targetH = std::max(480.0f, bounds.height() - 48.0f);
-                network_.requestHostResolution(static_cast<uint32_t>(targetW), static_cast<uint32_t>(targetH), 2);
-                showToast("Requested host resolution match (" + std::to_string(static_cast<int>(targetW)) + "x" + std::to_string(static_cast<int>(targetH)) + ")");
+                float dpiScale = shell_->dpiScale();
+                float dipW = (stageRect_.width() > 1.0f) ? stageRect_.width() : bounds.width();
+                float dipH = (stageRect_.height() > 1.0f) ? stageRect_.height() : std::max(480.0f, bounds.height() - 48.0f);
+                uint32_t targetW = static_cast<uint32_t>(std::max(640.0f, std::round(dipW * dpiScale)));
+                uint32_t targetH = static_cast<uint32_t>(std::max(480.0f, std::round(dipH * dpiScale)));
+                network_.requestHostResolution(targetW, targetH, 2);
+                showToast("Requested host resolution match (" + std::to_string(targetW) + "x" + std::to_string(targetH) + ")");
             }
         });
 
@@ -6575,6 +6592,8 @@ void AppUi::closeFleetGrid() {
     fleetFrameRects_.clear();
     fleetFocused_ = 0;
     fleetPressedDesk_ = 0;
+    fleetOpenDesk_ = 0;
+    fleetOpenAtMs_ = 0;
     fleetTypeAll_ = false;
 }
 
@@ -8602,6 +8621,29 @@ void AppUi::onMouseButton(MouseButtonId btn, bool isDown, float x, float y) {
         return; // Block all other interaction while mandatory update is pending
     }
 
+    // Release active whiteboard stroke or remote canvas button even if released outside the canvas
+    if (!isDown) {
+        if (whiteboardStrokeActive_ && btn == MouseButtonId::Left) {
+            whiteboardStrokeActive_ = false;
+            auto finished = network_.whiteboardManager().finishStroke();
+            if (!finished.points.empty()) {
+                network_.sendWhiteboardStroke(finished);
+            }
+            shell_->invalidate();
+        }
+        const uint8_t btnBit = static_cast<uint8_t>(1u << static_cast<uint8_t>(btn));
+        if ((remoteCanvasPressedMask_ & btnBit) != 0) {
+            remoteCanvasPressedMask_ &= static_cast<uint8_t>(~btnBit);
+            if (activeTab_ == ActiveTab::RemoteSession && remoteInputEnabled_ &&
+                renderedCanvasRect_.width() > 1.0f && renderedCanvasRect_.height() > 1.0f) {
+                float nx = std::clamp((x - renderedCanvasRect_.left) / renderedCanvasRect_.width(), 0.0f, 1.0f);
+                float ny = std::clamp((y - renderedCanvasRect_.top) / renderedCanvasRect_.height(), 0.0f, 1.0f);
+                flushPendingMouseMove();
+                network_.sendMouseButton(btn, false, nx, ny);
+            }
+        }
+    }
+
     // Grid tiles: a press goes to the PC under it only, and its release to that same PC, wherever the pointer is now
     auto fleetPoint = [&](uint64_t desk, float& nx, float& ny) {
         auto it = std::find(fleetTileIds_.begin(), fleetTileIds_.end(), desk);
@@ -8717,10 +8759,12 @@ void AppUi::onMouseButton(MouseButtonId btn, bool isDown, float x, float y) {
                         network_.whiteboardManager().setActiveColor(whiteboardColor_);
                         network_.whiteboardManager().setActiveThickness(whiteboardThickness_);
                         network_.whiteboardManager().startStroke(nx, ny);
+                        whiteboardStrokeActive_ = true;
                         if (whiteboardTool_ == WhiteboardTool::LaserPointer) {
                             network_.sendWhiteboardLaser(nx, ny);
                         }
-                    } else {
+                    } else if (whiteboardStrokeActive_) {
+                        whiteboardStrokeActive_ = false;
                         auto finished = network_.whiteboardManager().finishStroke();
                         if (!finished.points.empty()) {
                             network_.sendWhiteboardStroke(finished);
@@ -8731,8 +8775,11 @@ void AppUi::onMouseButton(MouseButtonId btn, bool isDown, float x, float y) {
                 return;
             }
             if (remoteInputEnabled_) {
-                flushPendingMouseMove();
-                network_.sendMouseButton(btn, isDown, nx, ny);
+                if (isDown) {
+                    remoteCanvasPressedMask_ |= static_cast<uint8_t>(1u << static_cast<uint8_t>(btn));
+                    flushPendingMouseMove();
+                    network_.sendMouseButton(btn, true, nx, ny);
+                }
             }
         }
     }
@@ -9217,9 +9264,18 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
         if (shell_->isKeyDown(VK_CONTROL) && !shell_->isKeyDown(VK_MENU)) {
             if (vk == VK_TAB) {
                 bool shiftDown = shell_->isKeyDown(VK_SHIFT) != 0;
-                uint32_t tid = shiftDown ? sessionTabs_.prevTab() : sessionTabs_.nextTab();
-                if (tid != 0) {
-                    switchToSessionTab(tid);
+                const auto& tabs = sessionTabs_.tabs();
+                if (tabs.size() > 1) {
+                    size_t curIdx = 0;
+                    for (size_t i = 0; i < tabs.size(); ++i) {
+                        if (tabs[i].id == sessionTabs_.activeTabId()) {
+                            curIdx = i;
+                            break;
+                        }
+                    }
+                    size_t nextIdx = shiftDown ? ((curIdx + tabs.size() - 1) % tabs.size())
+                                               : ((curIdx + 1) % tabs.size());
+                    switchToSessionTab(tabs[nextIdx].id);
                 }
                 return;
             }
@@ -9289,33 +9345,7 @@ void AppUi::switchToSessionTab(uint32_t tabId, bool force, bool silent) {
     scaleMode_ = newTab->scaleMode;
     remoteInputEnabled_ = newTab->remoteInputEnabled;
 
-    // 4. Restore cached frame buffer
-    if (!newTab->cachedFrameBgra.empty() && newTab->cachedW > 0 && newTab->cachedH > 0) {
-        frameBufferBgra_ = newTab->cachedFrameBgra;
-        frameBufferW_ = newTab->cachedW;
-        frameBufferH_ = newTab->cachedH;
-        displayedFrameSeq_ = newTab->lastFrameSeq;
-        remoteCursor_ = newTab->cursor;
-
-        if (canvas_ && canvas_) {
-            releaseImage(remoteBitmap_);
-            remoteBitmap_ = canvas_->createImage(frameBufferW_, frameBufferH_, true);
-            canvas_->updateImage(remoteBitmap_, frameBufferBgra_.data(), frameBufferW_ * 4,
-                                 ui::Rect{0.0f, 0.0f, static_cast<float>(frameBufferW_), static_cast<float>(frameBufferH_)});
-            bitmapW_ = frameBufferW_;
-            bitmapH_ = frameBufferH_;
-        }
-    } else {
-        frameBufferBgra_.clear();
-        frameBufferW_ = 0;
-        frameBufferH_ = 0;
-        displayedFrameSeq_ = 0;
-        releaseImage(remoteBitmap_);
-        bitmapW_ = 0;
-        bitmapH_ = 0;
-    }
-
-    // 5. Check if connection target matches current network engine connection
+    // 4. Switch network connection first so hardResetViewerUiState() does not wipe the restored frame
     auto vStats = network_.viewerStats();
     bool isSameDesk = (newTab->deskId != 0 && vStats.remoteDeskId == newTab->deskId &&
                        vStats.state == ViewerConnectionState::Connected && network_.isViewerActive());
@@ -9332,6 +9362,32 @@ void AppUi::switchToSessionTab(uint32_t tabId, bool force, bool silent) {
         if (!newTab->targetInput.empty()) {
             network_.connectToRemote(newTab->targetInput, newTab->password, newTab->requirePairedDeskId);
         }
+    }
+
+    // 5. Restore cached frame buffer
+    if (!newTab->cachedFrameBgra.empty() && newTab->cachedW > 0 && newTab->cachedH > 0) {
+        frameBufferBgra_ = newTab->cachedFrameBgra;
+        frameBufferW_ = newTab->cachedW;
+        frameBufferH_ = newTab->cachedH;
+        displayedFrameSeq_ = newTab->lastFrameSeq;
+        remoteCursor_ = newTab->cursor;
+
+        if (canvas_) {
+            releaseImage(remoteBitmap_);
+            remoteBitmap_ = canvas_->createImage(frameBufferW_, frameBufferH_, true);
+            canvas_->updateImage(remoteBitmap_, frameBufferBgra_.data(), frameBufferW_ * 4,
+                                 ui::Rect{0.0f, 0.0f, static_cast<float>(frameBufferW_), static_cast<float>(frameBufferH_)});
+            bitmapW_ = frameBufferW_;
+            bitmapH_ = frameBufferH_;
+        }
+    } else if (isSameDesk) {
+        frameBufferBgra_.clear();
+        frameBufferW_ = 0;
+        frameBufferH_ = 0;
+        displayedFrameSeq_ = 0;
+        releaseImage(remoteBitmap_);
+        bitmapW_ = 0;
+        bitmapH_ = 0;
     }
 
     switchTab(ActiveTab::RemoteSession);
@@ -10009,8 +10065,21 @@ void AppUi::drawHostPermissionCard(const UiRect& box, const ui::HostPermissionCa
 void AppUi::onFocusChanged(bool focused) {
     if (!focused) {
         mouseLeftDown_ = false;
+        draggingRewindScrubber_ = false;
+        draggingPlayerScrubber_ = false;
         draggingSettingsScrollbar_ = false;
         pressedWidgetId_.clear();
+        if (fleetPressedDesk_ != 0) {
+            fleet_.sendMouseButtonTo(fleetPressedDesk_, MouseButtonId::Left, false, 0.5f, 0.5f);
+            fleetPressedDesk_ = 0;
+        }
+        if (whiteboardStrokeActive_) {
+            whiteboardStrokeActive_ = false;
+            auto finished = network_.whiteboardManager().finishStroke();
+            if (!finished.points.empty()) network_.sendWhiteboardStroke(finished);
+        }
+        remoteCanvasPressedMask_ = 0;
+        shell_->setMouseCapture(false);
         network_.sendReleaseAllModifiers();
         fleet_.releaseModifiers(0);
         shell_->invalidate();
@@ -10040,9 +10109,21 @@ void AppUi::onMouseLeave() {
 }
 
 void AppUi::onCaptureLost() {
+    mouseLeftDown_ = false;
     draggingRewindScrubber_ = false;
+    draggingPlayerScrubber_ = false;
     draggingSettingsScrollbar_ = false;
     pressedWidgetId_.clear();
+    if (fleetPressedDesk_ != 0) {
+        fleet_.sendMouseButtonTo(fleetPressedDesk_, MouseButtonId::Left, false, 0.5f, 0.5f);
+        fleetPressedDesk_ = 0;
+    }
+    if (whiteboardStrokeActive_) {
+        whiteboardStrokeActive_ = false;
+        auto finished = network_.whiteboardManager().finishStroke();
+        if (!finished.points.empty()) network_.sendWhiteboardStroke(finished);
+    }
+    remoteCanvasPressedMask_ = 0;
     shell_->invalidate();
 }
 
@@ -10211,6 +10292,7 @@ void AppUi::onTick() {
             activeTab->state = ViewerConnectionState::Disconnected;
         }
         if (sessionTabs_.tabCount() <= 1) {
+            hardResetViewerUiState();
             sessionTabs_.closeAllTabs();
             switchTab(ActiveTab::Dashboard);
         }
@@ -10826,8 +10908,8 @@ void AppUi::onFilesDropped(const std::vector<std::string>& paths, float dropX, f
     if (sentCount > 0) {
         if (droppedOnCanvas) {
             canvasDropEffectActive_ = true;
-            // Kept in physical pixels, as the drop effect has always been positioned.
-            canvasDropPos_ = { dropX * shell_->dpiScale(), dropY * shell_->dpiScale() };
+            // Already in DIPs (matching renderedCanvasRect_ and drawRemoteSessionView).
+            canvasDropPos_ = { dropX, dropY };
             canvasDropTick_ = shell_->nowMs();
             canvasDropCount_ = sentCount;
             showToast("Dropped " + std::to_string(sentCount) + " file(s) onto Remote Desktop");

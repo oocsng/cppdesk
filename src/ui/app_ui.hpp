@@ -181,7 +181,7 @@ public:
     void onFocusChanged(bool focused);
     void onMouseLeave();
     void onCaptureLost();
-    bool isTextInputFocused() const { return hoveredIsTextInput_; }
+    bool isTextInputFocused() const { return focusedField_ != FocusedField::None && focusedField_ != FocusedField::RemoteCanvas; }
     ui::CursorShape cursorShape() const;
 
     // Window events.
@@ -489,6 +489,8 @@ private:
     bool                    mouseInsideClient_ = false;
     bool                    trackingMouseLeave_ = false;
     bool                    mouseLeftDown_ = false;
+    uint8_t                 remoteCanvasPressedMask_ = 0;
+    bool                    whiteboardStrokeActive_ = false;
     uint64_t                lastMouseSendTick_ = 0;
 
     // High-precision timing & second-order spring states (pos + velocity)
