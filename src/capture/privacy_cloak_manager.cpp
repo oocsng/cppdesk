@@ -30,7 +30,44 @@ std::wstring utf8ToWide(const std::string& str) {
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), w.data(), len);
     return w;
 #else
-    return std::wstring(str.begin(), str.end());
+    std::wstring out;
+    size_t i = 0;
+    while (i < str.size()) {
+        unsigned char c = static_cast<unsigned char>(str[i]);
+        uint32_t cp = 0;
+        if (c < 0x80) {
+            cp = c;
+            ++i;
+        } else if ((c & 0xE0) == 0xC0 && i + 1 < str.size() &&
+                   (static_cast<unsigned char>(str[i + 1]) & 0xC0) == 0x80) {
+            cp = ((c & 0x1Fu) << 6) | (static_cast<unsigned char>(str[i + 1]) & 0x3Fu);
+            if (cp < 0x80) cp = 0xFFFD;
+            i += 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < str.size() &&
+                   (static_cast<unsigned char>(str[i + 1]) & 0xC0) == 0x80 &&
+                   (static_cast<unsigned char>(str[i + 2]) & 0xC0) == 0x80) {
+            cp = ((c & 0x0Fu) << 12) |
+                 ((static_cast<unsigned char>(str[i + 1]) & 0x3Fu) << 6) |
+                 (static_cast<unsigned char>(str[i + 2]) & 0x3Fu);
+            if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+            i += 3;
+        } else if ((c & 0xF8) == 0xF0 && i + 3 < str.size() &&
+                   (static_cast<unsigned char>(str[i + 1]) & 0xC0) == 0x80 &&
+                   (static_cast<unsigned char>(str[i + 2]) & 0xC0) == 0x80 &&
+                   (static_cast<unsigned char>(str[i + 3]) & 0xC0) == 0x80) {
+            cp = ((c & 0x07u) << 18) |
+                 ((static_cast<unsigned char>(str[i + 1]) & 0x3Fu) << 12) |
+                 ((static_cast<unsigned char>(str[i + 2]) & 0x3Fu) << 6) |
+                 (static_cast<unsigned char>(str[i + 3]) & 0x3Fu);
+            if (cp < 0x10000 || cp > 0x10FFFF) cp = 0xFFFD;
+            i += 4;
+        } else {
+            cp = 0xFFFD;
+            ++i;
+        }
+        out.push_back(static_cast<wchar_t>(cp));
+    }
+    return out;
 #endif
 }
 
@@ -249,7 +286,10 @@ void PrivacyCloakManager::redactCaptureBuffer(
                     uint8_t avgB = static_cast<uint8_t>(sumB / pixelCount);
                     uint8_t avgG = static_cast<uint8_t>(sumG / pixelCount);
                     uint8_t avgR = static_cast<uint8_t>(sumR / pixelCount);
-                    uint32_t mosaicPixel = (0xFF << 24) | (avgR << 16) | (avgG << 8) | avgB;
+                    uint32_t mosaicPixel = (0xFFu << 24) |
+                                           (static_cast<uint32_t>(avgR) << 16) |
+                                           (static_cast<uint32_t>(avgG) << 8) |
+                                           static_cast<uint32_t>(avgB);
 
                     for (int dy = 0; dy < blockH; ++dy) {
                         uint32_t* row = reinterpret_cast<uint32_t*>(bgra + (static_cast<size_t>(by + dy) * width + bx) * 4);

@@ -8,6 +8,8 @@
 #include <immintrin.h>
 #if defined(__GNUC__) || defined(__clang__)
 #include <cpuid.h>
+#elif defined(_MSC_VER)
+#include <intrin.h>
 #endif
 #endif
 
@@ -124,7 +126,7 @@ private:
 #endif
 
     static bool detectAvx2Cpu() {
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
         unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
         if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
             // Check OSXSAVE (bit 27) and AVX (bit 28)
@@ -137,6 +139,18 @@ private:
                         return (ebx & (1U << 5)) != 0; // AVX2 bit 5
                     }
                 }
+            }
+        }
+#elif defined(_MSC_VER) && defined(_M_X64)
+        int cpuInfo[4] = {0, 0, 0, 0};
+        __cpuid(cpuInfo, 1);
+        // Check OSXSAVE (bit 27) and AVX (bit 28)
+        if ((cpuInfo[2] & (1 << 27)) && (cpuInfo[2] & (1 << 28))) {
+            unsigned long long xcr0 = _xgetbv(0);
+            // Check XMM and YMM state enabled by OS (bits 1 and 2)
+            if ((xcr0 & 0x6ULL) == 0x6ULL) {
+                __cpuidex(cpuInfo, 7, 0);
+                return (cpuInfo[1] & (1 << 5)) != 0; // AVX2 bit 5
             }
         }
 #endif

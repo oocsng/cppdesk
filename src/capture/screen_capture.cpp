@@ -82,6 +82,7 @@ static void safeJpegErrorExit(j_common_ptr cinfo) {
 
 #include <cstring>
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <condition_variable>
@@ -121,6 +122,38 @@ bool findJpegEncoderClsid(CLSID* pClsid) {
 }
 #endif
 
+constexpr size_t kMaxJpegPixels = 64u * 1024u * 1024u; // 64M pixels (256 MB BGRA)
+
+// Validate JPEG SOI (0xFF 0xD8) and parse SOF dimensions before handing untrusted bytes to platform decoders.
+bool parseJpegDimensions(const uint8_t* data, size_t len, int& outW, int& outH) {
+    if (!data || len < 4 || data[0] != 0xFF || data[1] != 0xD8) return false;
+    size_t pos = 2;
+    while (pos < len) {
+        if (data[pos] != 0xFF) return false;
+        while (pos < len && data[pos] == 0xFF) ++pos;
+        if (pos >= len) return false;
+        uint8_t marker = data[pos++];
+        if (marker == 0xD9 || marker == 0xDA) return false; // EOI or SOS before SOF
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD8)) continue; // standalone markers
+        if (pos + 2 > len) return false;
+        uint16_t segLen = static_cast<uint16_t>((static_cast<uint16_t>(data[pos]) << 8) | data[pos + 1]);
+        if (segLen < 2 || pos + segLen > len) return false;
+        const bool isSof = (marker >= 0xC0 && marker <= 0xCF) &&
+                           marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
+        if (isSof) {
+            if (segLen < 7) return false;
+            int h = (static_cast<int>(data[pos + 3]) << 8) | data[pos + 4];
+            int w = (static_cast<int>(data[pos + 5]) << 8) | data[pos + 6];
+            if (w <= 0 || h <= 0) return false;
+            outW = w;
+            outH = h;
+            return true;
+        }
+        pos += segLen;
+    }
+    return false;
+}
+
 uint64_t hashTileBgra(const uint8_t* frame, int frameStride, int startX, int startY, int w, int h) {
     const uint8_t* tileTopLeft = frame + static_cast<size_t>(startY) * frameStride + static_cast<size_t>(startX) * 4;
     if (SimdKernels::hasAvx2()) {
@@ -128,27 +161,28 @@ uint64_t hashTileBgra(const uint8_t* frame, int frameStride, int startX, int sta
     }
 
     uint64_t hash = 14695981039346656037ULL;
+    const int rowBytes = w * 4;
+    const int qwords = rowBytes / 8;
+    const int remBytes = rowBytes % 8;
     for (int ry = 0; ry < h; ++ry) {
-        const uint64_t* rowPtr = reinterpret_cast<const uint64_t*>(
-            frame + (startY + ry) * frameStride + startX * 4
-        );
-        int qwords = (w * 4) / 8;
+        const uint8_t* rowPtr = frame + static_cast<size_t>(startY + ry) * frameStride + static_cast<size_t>(startX) * 4;
         for (int i = 0; i < qwords; ++i) {
-            // Mask out unused alpha variations if needed, or hash full BGRA
-            uint64_t v = rowPtr[i] | 0xFF000000FF000000ULL;
+            uint64_t v = 0;
+            std::memcpy(&v, rowPtr + static_cast<size_t>(i) * 8, sizeof(uint64_t));
+            v |= 0xFF000000FF000000ULL;
             hash ^= v;
             hash *= 1099511628211ULL;
         }
-        int remBytes = (w * 4) % 8;
         if (remBytes > 0) {
-            const uint8_t* tail = reinterpret_cast<const uint8_t*>(rowPtr + qwords);
+            const uint8_t* tail = rowPtr + static_cast<size_t>(qwords) * 8;
             for (int b = 0; b < remBytes; ++b) {
-                hash ^= tail[b];
+                uint8_t byteVal = ((b & 3) == 3) ? 0xFF : tail[b];
+                hash ^= byteVal;
                 hash *= 1099511628211ULL;
             }
         }
     }
-    return hash;
+    return hash | 1ULL;
 }
 
 struct ThreadZstdContext {
@@ -172,15 +206,6 @@ struct ThreadZstdContext {
 };
 
 thread_local ThreadZstdContext tl_zstd;
-
-constexpr int      MAX_JPEG_DECODE_DIM      = 8192;
-constexpr uint64_t MAX_JPEG_DECODE_PIXELS   = 8192ULL * 8192ULL;
-constexpr size_t   MAX_TILE_DECODE_PIXELS   = 1024ULL * 1024ULL; // 4 MB BGRA max per tile
-constexpr size_t   MAX_TILE_SCRATCH_RETAIN  = 1024ULL * 1024ULL; // 1 MB retained per worker
-
-inline bool hasJpegSoi(const uint8_t* data, size_t len) {
-    return data && len >= 2 && data[0] == 0xFF && data[1] == 0xD8;
-}
 
 } // namespace
 
@@ -271,9 +296,13 @@ std::vector<uint8_t> TileCodec::encodeJpeg(const uint8_t* bgra, int width, int h
 }
 
 bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<uint8_t>& outBgra, int& outW, int& outH) {
-    if (!hasJpegSoi(jpegData, jpegLen)) return false;
     std::lock_guard<std::mutex> gdiLock(g_gdiplusCodecMutex);
     initGdiPlus();
+    if (!jpegData || jpegLen == 0 || jpegLen > static_cast<size_t>((std::numeric_limits<UINT>::max)())) return false;
+
+    int hdrW = 0, hdrH = 0;
+    if (!parseJpegDimensions(jpegData, jpegLen, hdrW, hdrH)) return false;
+    if (static_cast<size_t>(hdrW) * static_cast<size_t>(hdrH) > kMaxJpegPixels) return false;
 
     IStream* pStream = SHCreateMemStream(jpegData, static_cast<UINT>(jpegLen));
     if (!pStream) return false;
@@ -281,13 +310,15 @@ bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<
     bool ok = false;
     Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromStream(pStream, FALSE);
     if (bmp && bmp->GetLastStatus() == Gdiplus::Ok) {
-        outW = static_cast<int>(bmp->GetWidth());
-        outH = static_cast<int>(bmp->GetHeight());
-        if (outW > 0 && outH > 0 && outW <= MAX_JPEG_DECODE_DIM && outH <= MAX_JPEG_DECODE_DIM &&
-            static_cast<uint64_t>(outW) * static_cast<uint64_t>(outH) <= MAX_JPEG_DECODE_PIXELS) {
-            Gdiplus::Rect rect(0, 0, outW, outH);
+        int bmpW = static_cast<int>(bmp->GetWidth());
+        int bmpH = static_cast<int>(bmp->GetHeight());
+        if (bmpW > 0 && bmpH > 0 && bmpW == hdrW && bmpH == hdrH &&
+            static_cast<size_t>(bmpW) * static_cast<size_t>(bmpH) <= kMaxJpegPixels) {
+            Gdiplus::Rect rect(0, 0, bmpW, bmpH);
             Gdiplus::BitmapData bdata{};
             if (bmp->LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bdata) == Gdiplus::Ok) {
+                outW = bmpW;
+                outH = bmpH;
                 outBgra.resize(static_cast<size_t>(outW) * outH * 4);
                 for (int r = 0; r < outH; ++r) {
                     const uint8_t* srcRow = static_cast<const uint8_t*>(bdata.Scan0) + r * bdata.Stride;
@@ -309,11 +340,16 @@ bool TileCodec::decodeJpegIntoCanvas(
     uint8_t* canvasBgra, int canvasW, int canvasH,
     uint16_t x, uint16_t y, uint16_t width, uint16_t height)
 {
-    if (!hasJpegSoi(jpegData, jpegLen) || !canvasBgra || width == 0 || height == 0) return false;
-    if (static_cast<size_t>(width) * height > MAX_TILE_DECODE_PIXELS) return false;
-    if (static_cast<int>(x) + width > canvasW || static_cast<int>(y) + height > canvasH) return false;
     std::lock_guard<std::mutex> gdiLock(g_gdiplusCodecMutex);
     initGdiPlus();
+    if (!jpegData || jpegLen == 0 || jpegLen > static_cast<size_t>((std::numeric_limits<UINT>::max)()) ||
+        !canvasBgra || width == 0 || height == 0) return false;
+    if (static_cast<int>(x) + width > canvasW || static_cast<int>(y) + height > canvasH) return false;
+
+    int hdrW = 0, hdrH = 0;
+    if (!parseJpegDimensions(jpegData, jpegLen, hdrW, hdrH)) return false;
+    if (hdrW != width || hdrH != height ||
+        static_cast<size_t>(hdrW) * static_cast<size_t>(hdrH) > kMaxJpegPixels) return false;
 
     IStream* pStream = SHCreateMemStream(jpegData, static_cast<UINT>(jpegLen));
     if (!pStream) return false;
@@ -344,55 +380,54 @@ bool TileCodec::decodeJpegIntoCanvas(
 
 #elif (defined(__linux__) || defined(__unix__)) && __has_include(<jpeglib.h>)
 
-std::vector<uint8_t> TileCodec::encodeJpeg(const uint8_t* bgra, int width, int height, int quality) {
-    if (!bgra || width <= 0 || height <= 0) return {};
+namespace {
 
-    struct jpeg_compress_struct cinfo;
-    struct jpeg_error_mgr jerr;
-    cinfo.err = jpeg_std_error(&jerr);
+bool encodeJpegLibjpeg(
+    const uint8_t* bgra, int width, int height, int quality,
+    uint8_t* rowBuffer, unsigned char** outBuf, unsigned long* outSize)
+{
+    struct jpeg_compress_struct cinfo{};
+    SafeJpegErrorManager jerr{};
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = safeJpegErrorExit;
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_compress(&cinfo);
+        return false;
+    }
     jpeg_create_compress(&cinfo);
+    jpeg_mem_dest(&cinfo, outBuf, outSize);
 
-    unsigned char* outbuffer = nullptr;
-    unsigned long outsize = 0;
-    jpeg_mem_dest(&cinfo, &outbuffer, &outsize);
-
-    cinfo.image_width = width;
-    cinfo.image_height = height;
+    cinfo.image_width = static_cast<JDIMENSION>(width);
+    cinfo.image_height = static_cast<JDIMENSION>(height);
     cinfo.input_components = 3;
     cinfo.in_color_space = JCS_RGB;
     jpeg_set_defaults(&cinfo);
     jpeg_set_quality(&cinfo, std::clamp(quality, 15, 100), TRUE);
     jpeg_start_compress(&cinfo, TRUE);
 
-    std::vector<uint8_t> rowBuffer(width * 3);
     while (cinfo.next_scanline < cinfo.image_height) {
-        const uint8_t* srcRow = bgra + cinfo.next_scanline * width * 4;
+        const uint8_t* srcRow = bgra + static_cast<size_t>(cinfo.next_scanline) * width * 4;
         for (int i = 0; i < width; ++i) {
             rowBuffer[i * 3 + 0] = srcRow[i * 4 + 2]; // R
             rowBuffer[i * 3 + 1] = srcRow[i * 4 + 1]; // G
             rowBuffer[i * 3 + 2] = srcRow[i * 4 + 0]; // B
         }
-        JSAMPROW rowPtr = rowBuffer.data();
+        JSAMPROW rowPtr = rowBuffer;
         jpeg_write_scanlines(&cinfo, &rowPtr, 1);
     }
     jpeg_finish_compress(&cinfo);
     jpeg_destroy_compress(&cinfo);
-
-    std::vector<uint8_t> result;
-    if (outbuffer && outsize > 0) {
-        result.assign(outbuffer, outbuffer + outsize);
-        free(outbuffer);
-    }
-    return result;
+    return true;
 }
 
-bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<uint8_t>& outBgra, int& outW, int& outH) {
-    if (!hasJpegSoi(jpegData, jpegLen)) return false;
-
-    // Declare C++ buffers before setjmp so longjmp never skips their destructors.
-    std::vector<uint8_t> rowBuffer;
-    struct jpeg_decompress_struct cinfo;
-    SafeJpegErrorManager jerr;
+bool decodeJpegLibjpeg(
+    const uint8_t* jpegData, size_t jpegLen,
+    int expectW, int expectH,
+    uint8_t* rowBuffer, uint8_t* bgraDst, int dstStridePixels, int dstX, int dstY, bool useOpaqueBlit,
+    uint8_t* bgraRowTmp)
+{
+    struct jpeg_decompress_struct cinfo{};
+    SafeJpegErrorManager jerr{};
     cinfo.err = jpeg_std_error(&jerr.pub);
     jerr.pub.error_exit = safeJpegErrorExit;
     if (setjmp(jerr.setjmp_buffer)) {
@@ -400,17 +435,14 @@ bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<
         return false;
     }
     jpeg_create_decompress(&cinfo);
-    jpeg_mem_src(&cinfo, jpegData, jpegLen);
+    jpeg_mem_src(&cinfo, jpegData, static_cast<unsigned long>(jpegLen));
 
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
         jpeg_destroy_decompress(&cinfo);
         return false;
     }
 
-    if (cinfo.image_width == 0 || cinfo.image_height == 0 ||
-        cinfo.image_width > static_cast<JDIMENSION>(MAX_JPEG_DECODE_DIM) ||
-        cinfo.image_height > static_cast<JDIMENSION>(MAX_JPEG_DECODE_DIM) ||
-        static_cast<uint64_t>(cinfo.image_width) * static_cast<uint64_t>(cinfo.image_height) > MAX_JPEG_DECODE_PIXELS) {
+    if (static_cast<int>(cinfo.image_width) != expectW || static_cast<int>(cinfo.image_height) != expectH) {
         jpeg_destroy_decompress(&cinfo);
         return false;
     }
@@ -418,32 +450,76 @@ bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<
     cinfo.out_color_space = JCS_RGB;
     jpeg_start_decompress(&cinfo);
 
-    outW = static_cast<int>(cinfo.output_width);
-    outH = static_cast<int>(cinfo.output_height);
-    if (outW <= 0 || outH <= 0 || outW > MAX_JPEG_DECODE_DIM || outH > MAX_JPEG_DECODE_DIM ||
-        static_cast<uint64_t>(outW) * static_cast<uint64_t>(outH) > MAX_JPEG_DECODE_PIXELS) {
+    if (static_cast<int>(cinfo.output_width) != expectW || static_cast<int>(cinfo.output_height) != expectH) {
         jpeg_destroy_decompress(&cinfo);
         return false;
     }
-    outBgra.resize(static_cast<size_t>(outW) * outH * 4);
 
-    rowBuffer.resize(static_cast<size_t>(outW) * 3);
     while (cinfo.output_scanline < cinfo.output_height) {
         int r = static_cast<int>(cinfo.output_scanline);
-        JSAMPROW rowPtr = rowBuffer.data();
+        JSAMPROW rowPtr = rowBuffer;
         jpeg_read_scanlines(&cinfo, &rowPtr, 1);
 
-        uint8_t* dstRow = outBgra.data() + static_cast<size_t>(r) * outW * 4;
-        for (int i = 0; i < outW; ++i) {
-            dstRow[i * 4 + 0] = rowBuffer[i * 3 + 2]; // B
-            dstRow[i * 4 + 1] = rowBuffer[i * 3 + 1]; // G
-            dstRow[i * 4 + 2] = rowBuffer[i * 3 + 0]; // R
-            dstRow[i * 4 + 3] = 0xFF;                 // A
+        uint8_t* dstRow = bgraDst + (static_cast<size_t>(dstY + r) * dstStridePixels + dstX) * 4;
+        if (useOpaqueBlit) {
+            for (int i = 0; i < expectW; ++i) {
+                bgraRowTmp[i * 4 + 0] = rowBuffer[i * 3 + 2]; // B
+                bgraRowTmp[i * 4 + 1] = rowBuffer[i * 3 + 1]; // G
+                bgraRowTmp[i * 4 + 2] = rowBuffer[i * 3 + 0]; // R
+                bgraRowTmp[i * 4 + 3] = 0xFF;                 // A
+            }
+            SimdKernels::blitRowBgraOpaque(dstRow, bgraRowTmp, expectW);
+        } else {
+            for (int i = 0; i < expectW; ++i) {
+                dstRow[i * 4 + 0] = rowBuffer[i * 3 + 2]; // B
+                dstRow[i * 4 + 1] = rowBuffer[i * 3 + 1]; // G
+                dstRow[i * 4 + 2] = rowBuffer[i * 3 + 0]; // R
+                dstRow[i * 4 + 3] = 0xFF;                 // A
+            }
         }
     }
 
     jpeg_finish_decompress(&cinfo);
     jpeg_destroy_decompress(&cinfo);
+    return true;
+}
+
+} // namespace
+
+std::vector<uint8_t> TileCodec::encodeJpeg(const uint8_t* bgra, int width, int height, int quality) {
+    if (!bgra || width <= 0 || height <= 0) return {};
+
+    std::vector<uint8_t> rowBuffer(static_cast<size_t>(width) * 3);
+    unsigned char* outbuffer = nullptr;
+    unsigned long outsize = 0;
+
+    bool ok = encodeJpegLibjpeg(bgra, width, height, quality, rowBuffer.data(), &outbuffer, &outsize);
+
+    std::vector<uint8_t> result;
+    if (ok && outbuffer && outsize > 0) {
+        result.assign(outbuffer, outbuffer + outsize);
+    }
+    if (outbuffer) {
+        free(outbuffer);
+    }
+    return result;
+}
+
+bool TileCodec::decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<uint8_t>& outBgra, int& outW, int& outH) {
+    if (!jpegData || jpegLen == 0 || jpegLen > (std::numeric_limits<unsigned long>::max)()) return false;
+
+    int hdrW = 0, hdrH = 0;
+    if (!parseJpegDimensions(jpegData, jpegLen, hdrW, hdrH)) return false;
+    if (static_cast<size_t>(hdrW) * static_cast<size_t>(hdrH) > kMaxJpegPixels) return false;
+
+    std::vector<uint8_t> rowBuffer(static_cast<size_t>(hdrW) * 3);
+    std::vector<uint8_t> decoded(static_cast<size_t>(hdrW) * hdrH * 4);
+    if (!decodeJpegLibjpeg(jpegData, jpegLen, hdrW, hdrH, rowBuffer.data(), decoded.data(), hdrW, 0, 0, false, nullptr)) {
+        return false;
+    }
+    outW = hdrW;
+    outH = hdrH;
+    outBgra = std::move(decoded);
     return true;
 }
 
@@ -452,58 +528,18 @@ bool TileCodec::decodeJpegIntoCanvas(
     uint8_t* canvasBgra, int canvasW, int canvasH,
     uint16_t x, uint16_t y, uint16_t width, uint16_t height)
 {
-    if (!hasJpegSoi(jpegData, jpegLen) || !canvasBgra || width == 0 || height == 0) return false;
-    if (static_cast<size_t>(width) * height > MAX_TILE_DECODE_PIXELS) return false;
+    if (!jpegData || jpegLen == 0 || jpegLen > (std::numeric_limits<unsigned long>::max)() ||
+        !canvasBgra || width == 0 || height == 0) return false;
     if (static_cast<int>(x) + width > canvasW || static_cast<int>(y) + height > canvasH) return false;
 
-    std::vector<uint8_t> rowBuffer;
-    std::vector<uint8_t> bgraRow;
-    struct jpeg_decompress_struct cinfo;
-    SafeJpegErrorManager jerr;
-    cinfo.err = jpeg_std_error(&jerr.pub);
-    jerr.pub.error_exit = safeJpegErrorExit;
-    if (setjmp(jerr.setjmp_buffer)) {
-        jpeg_destroy_decompress(&cinfo);
-        return false;
-    }
-    jpeg_create_decompress(&cinfo);
-    jpeg_mem_src(&cinfo, jpegData, jpegLen);
+    int hdrW = 0, hdrH = 0;
+    if (!parseJpegDimensions(jpegData, jpegLen, hdrW, hdrH)) return false;
+    if (hdrW != width || hdrH != height ||
+        static_cast<size_t>(hdrW) * static_cast<size_t>(hdrH) > kMaxJpegPixels) return false;
 
-    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
-        jpeg_destroy_decompress(&cinfo);
-        return false;
-    }
-
-    if (cinfo.image_width != width || cinfo.image_height != height) {
-        jpeg_destroy_decompress(&cinfo);
-        return false;
-    }
-
-    cinfo.out_color_space = JCS_RGB;
-    jpeg_start_decompress(&cinfo);
-
-    rowBuffer.resize(static_cast<size_t>(width) * 3);
-    bgraRow.resize(static_cast<size_t>(width) * 4);
-
-    while (cinfo.output_scanline < cinfo.output_height) {
-        int r = static_cast<int>(cinfo.output_scanline);
-        JSAMPROW rowPtr = rowBuffer.data();
-        jpeg_read_scanlines(&cinfo, &rowPtr, 1);
-
-        for (int i = 0; i < width; ++i) {
-            bgraRow[i * 4 + 0] = rowBuffer[i * 3 + 2]; // B
-            bgraRow[i * 4 + 1] = rowBuffer[i * 3 + 1]; // G
-            bgraRow[i * 4 + 2] = rowBuffer[i * 3 + 0]; // R
-            bgraRow[i * 4 + 3] = 0xFF;                 // A
-        }
-
-        uint8_t* dstRow = canvasBgra + (static_cast<size_t>(y + r) * canvasW + x) * 4;
-        SimdKernels::blitRowBgraOpaque(dstRow, bgraRow.data(), width);
-    }
-
-    jpeg_finish_decompress(&cinfo);
-    jpeg_destroy_decompress(&cinfo);
-    return true;
+    std::vector<uint8_t> rowBuffer(static_cast<size_t>(width) * 3);
+    std::vector<uint8_t> bgraRow(static_cast<size_t>(width) * 4);
+    return decodeJpegLibjpeg(jpegData, jpegLen, width, height, rowBuffer.data(), canvasBgra, canvasW, x, y, true, bgraRow.data());
 }
 
 #elif defined(__APPLE__) && __has_include(<ImageIO/ImageIO.h>)
@@ -639,6 +675,10 @@ EncodedTile TileCodec::encodeRect(
     tile.height = height;
 
     size_t rawSize = static_cast<size_t>(width) * height * 4;
+    if (!bgraRect || rawSize == 0) {
+        tile.encoding = TileEncoding::RawBGRA;
+        return tile;
+    }
 
     if (preset == QualityPreset::Ultra) {
         auto zstdData = compressZstd(bgraRect, rawSize, 1);
@@ -707,7 +747,7 @@ bool TileCodec::decodeTileIntoCanvas(
     int canvasH)
 {
     if (!canvasBgra || width == 0 || height == 0) return false;
-    if (static_cast<size_t>(width) * height > MAX_TILE_DECODE_PIXELS) return false;
+    if (static_cast<size_t>(width) * height > 1024u * 1024u) return false; // 4 MB BGRA max per tile
     if (static_cast<int>(x) + width > canvasW ||
         static_cast<int>(y) + height > canvasH) {
         return false;
@@ -715,6 +755,7 @@ bool TileCodec::decodeTileIntoCanvas(
 
     size_t rectBytes = static_cast<size_t>(width) * height * 4;
     thread_local std::vector<uint8_t> tl_decodeScratch;
+    constexpr size_t kMaxTileScratchRetain = 1024u * 1024u; // keep at most 1 MB per worker thread
     const uint8_t* pixelSrc = nullptr;
 
     if (encoding == TileEncoding::Jpeg) {
@@ -725,9 +766,7 @@ bool TileCodec::decodeTileIntoCanvas(
             tl_decodeScratch.resize(rectBytes);
         }
         if (!decompressZstd(tileData, dataSize, tl_decodeScratch.data(), rectBytes)) {
-            if (tl_decodeScratch.capacity() > MAX_TILE_SCRATCH_RETAIN) {
-                std::vector<uint8_t>().swap(tl_decodeScratch);
-            }
+            if (tl_decodeScratch.capacity() > kMaxTileScratchRetain) std::vector<uint8_t>().swap(tl_decodeScratch);
             return false;
         }
         pixelSrc = tl_decodeScratch.data();
@@ -745,9 +784,7 @@ bool TileCodec::decodeTileIntoCanvas(
         const uint8_t* srcRow = pixelSrc + static_cast<size_t>(r) * rowBytes;
         SimdKernels::blitRowBgraOpaque(dstRow, srcRow, width);
     }
-    if (tl_decodeScratch.capacity() > MAX_TILE_SCRATCH_RETAIN) {
-        std::vector<uint8_t>().swap(tl_decodeScratch);
-    }
+    if (tl_decodeScratch.capacity() > kMaxTileScratchRetain) std::vector<uint8_t>().swap(tl_decodeScratch);
     return true;
 }
 
@@ -782,7 +819,10 @@ TileThreadPool::TileThreadPool() {
 }
 
 TileThreadPool::~TileThreadPool() {
-    stop_.store(true);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_.store(true);
+    }
     cvTask_.notify_all();
     for (auto& t : workers_) {
         try {
@@ -905,7 +945,24 @@ void TileThreadPool::parallelEncode(std::vector<RectTask>& tasks) {
 
 void TileThreadPool::parallelDecode(std::vector<DecodeTask>& tasks) {
     if (tasks.empty()) return;
-    if (tasks.size() == 1 || workers_.empty()) {
+
+    auto hasOverlappingRects = [&]() -> bool {
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            const auto& a = tasks[i];
+            const int ax1 = a.rx, ay1 = a.ry, ax2 = a.rx + a.rw, ay2 = a.ry + a.rh;
+            for (size_t j = i + 1; j < tasks.size(); ++j) {
+                const auto& b = tasks[j];
+                if (a.canvasBgra != b.canvasBgra) continue;
+                const int bx1 = b.rx, by1 = b.ry, bx2 = b.rx + b.rw, by2 = b.ry + b.rh;
+                if (ax1 < bx2 && bx1 < ax2 && ay1 < by2 && by1 < ay2) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    if (tasks.size() == 1 || workers_.empty() || hasOverlappingRects()) {
         for (auto& t : tasks) {
             if (t.data && t.canvasBgra) {
                 TileCodec::decodeTileIntoCanvas(
@@ -947,6 +1004,7 @@ struct ScreenCapturer::DxgiImpl {
     ID3D11DeviceContext*    context = nullptr;
     IDXGIOutputDuplication* duplication = nullptr;
     ID3D11Texture2D*        stagingTex = nullptr;
+    DXGI_FORMAT             format = DXGI_FORMAT_B8G8R8A8_UNORM;
 #endif
     int                     texW = 0;
     int                     texH = 0;
@@ -958,6 +1016,7 @@ struct ScreenCapturer::DxgiImpl {
         if (duplication) { duplication->Release(); duplication = nullptr; }
         if (context) { context->Release(); context = nullptr; }
         if (device) { device->Release(); device = nullptr; }
+        format = DXGI_FORMAT_B8G8R8A8_UNORM;
 #endif
         texW = 0;
         texH = 0;
@@ -1204,6 +1263,10 @@ bool ScreenCapturer::selectMonitor(int monitorIndex) {
     }
     activeMonitorIdx_ = monitorIndex;
     activeMonitor_ = monitors_[monitorIndex];
+#if defined(__APPLE__)
+    macLogicalW_ = activeMonitor_.width;
+    macLogicalH_ = activeMonitor_.height;
+#endif
     frameW_ = activeMonitor_.width;
     frameH_ = activeMonitor_.height;
     currentFrame_.assign(static_cast<size_t>(frameW_) * frameH_ * 4, 0);
@@ -1246,7 +1309,7 @@ bool ScreenCapturer::initDxgiForMonitor(int monitorIndex) {
 
     IDXGIAdapter1* matchedAdapter = nullptr;
     IDXGIOutput* matchedOutput = nullptr;
-    int globalOutIdx = 0;
+    (void)monitorIndex;
 
     for (UINT a = 0; ; ++a) {
         IDXGIAdapter1* adapter = nullptr;
@@ -1255,13 +1318,18 @@ bool ScreenCapturer::initDxgiForMonitor(int monitorIndex) {
         for (UINT o = 0; ; ++o) {
             IDXGIOutput* output = nullptr;
             if (adapter->EnumOutputs(o, &output) == DXGI_ERROR_NOT_FOUND) break;
-            if (globalOutIdx == monitorIndex) {
+            DXGI_OUTPUT_DESC outDesc{};
+            if (SUCCEEDED(output->GetDesc(&outDesc)) &&
+                outDesc.AttachedToDesktop &&
+                outDesc.DesktopCoordinates.left == activeMonitor_.x &&
+                outDesc.DesktopCoordinates.top == activeMonitor_.y &&
+                (outDesc.DesktopCoordinates.right - outDesc.DesktopCoordinates.left) == activeMonitor_.width &&
+                (outDesc.DesktopCoordinates.bottom - outDesc.DesktopCoordinates.top) == activeMonitor_.height) {
                 matchedAdapter = adapter;
                 matchedOutput = output;
                 break;
             }
             output->Release();
-            ++globalOutIdx;
         }
         if (matchedOutput) break;
         adapter->Release();
@@ -1345,6 +1413,7 @@ bool ScreenCapturer::initDxgiForMonitor(int monitorIndex) {
         return false;
     }
 
+    dxgi_->format = srcFmt;
     dxgi_->texW = static_cast<int>(texDesc.Width);
     dxgi_->texH = static_cast<int>(texDesc.Height);
     dxgiInitialized_ = true;
@@ -1408,10 +1477,23 @@ bool ScreenCapturer::captureViaDxgi(bool& outFrameUpdated, std::vector<RECT>& ou
                 prevTileHashes_.clear();
             }
             size_t rowBytes = static_cast<size_t>(frameW_) * 4;
-            for (int r = 0; r < frameH_; ++r) {
-                const uint8_t* srcRow = static_cast<const uint8_t*>(mapped.pData) + r * mapped.RowPitch;
-                uint8_t* dstRow = currentFrame_.data() + static_cast<size_t>(r) * rowBytes;
-                std::memcpy(dstRow, srcRow, rowBytes);
+            if (dxgi_->format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                for (int r = 0; r < frameH_; ++r) {
+                    const uint8_t* srcRow = static_cast<const uint8_t*>(mapped.pData) + r * mapped.RowPitch;
+                    uint8_t* dstRow = currentFrame_.data() + static_cast<size_t>(r) * rowBytes;
+                    for (int c = 0; c < frameW_; ++c) {
+                        dstRow[c * 4 + 0] = srcRow[c * 4 + 2];
+                        dstRow[c * 4 + 1] = srcRow[c * 4 + 1];
+                        dstRow[c * 4 + 2] = srcRow[c * 4 + 0];
+                        dstRow[c * 4 + 3] = srcRow[c * 4 + 3];
+                    }
+                }
+            } else {
+                for (int r = 0; r < frameH_; ++r) {
+                    const uint8_t* srcRow = static_cast<const uint8_t*>(mapped.pData) + r * mapped.RowPitch;
+                    uint8_t* dstRow = currentFrame_.data() + static_cast<size_t>(r) * rowBytes;
+                    std::memcpy(dstRow, srcRow, rowBytes);
+                }
             }
             dxgi_->context->Unmap(dxgi_->stagingTex, 0);
             hasValidFrame_ = true;
@@ -1424,32 +1506,39 @@ bool ScreenCapturer::captureViaDxgi(bool& outFrameUpdated, std::vector<RECT>& ou
                 }
 
                 UINT moveBufSize = frameInfo.TotalMetadataBufferSize;
-                hr = dxgi_->duplication->GetFrameMoveRects(
+                HRESULT hrMove = dxgi_->duplication->GetFrameMoveRects(
                     moveBufSize,
                     reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(dxgi_->metadataBuf.data()),
                     &moveBufSize
                 );
-                UINT moveCount = SUCCEEDED(hr) ? (moveBufSize / sizeof(DXGI_OUTDUPL_MOVE_RECT)) : 0;
-
-                UINT dirtyBufSize = frameInfo.TotalMetadataBufferSize - moveBufSize;
-                BYTE* dirtyStart = dxgi_->metadataBuf.data() + moveBufSize;
-                hr = dxgi_->duplication->GetFrameDirtyRects(
-                    dirtyBufSize,
-                    reinterpret_cast<RECT*>(dirtyStart),
-                    &dirtyBufSize
-                );
-                UINT dirtyCount = SUCCEEDED(hr) ? (dirtyBufSize / sizeof(RECT)) : 0;
-
-                const auto* pMoves = reinterpret_cast<const DXGI_OUTDUPL_MOVE_RECT*>(dxgi_->metadataBuf.data());
-                for (UINT i = 0; i < moveCount; ++i) {
-                    outDirtyRects.push_back(pMoves[i].DestinationRect);
+                if (SUCCEEDED(hrMove) && moveBufSize <= frameInfo.TotalMetadataBufferSize) {
+                    UINT moveCount = moveBufSize / sizeof(DXGI_OUTDUPL_MOVE_RECT);
+                    UINT remBufSize = frameInfo.TotalMetadataBufferSize - moveBufSize;
+                    UINT dirtyBufSize = remBufSize;
+                    BYTE* dirtyStart = dxgi_->metadataBuf.data() + moveBufSize;
+                    HRESULT hrDirty = S_OK;
+                    if (remBufSize > 0) {
+                        hrDirty = dxgi_->duplication->GetFrameDirtyRects(
+                            dirtyBufSize,
+                            reinterpret_cast<RECT*>(dirtyStart),
+                            &dirtyBufSize
+                        );
+                    }
+                    if (SUCCEEDED(hrDirty) && dirtyBufSize <= remBufSize) {
+                        UINT dirtyCount = dirtyBufSize / sizeof(RECT);
+                        const auto* pMoves = reinterpret_cast<const DXGI_OUTDUPL_MOVE_RECT*>(dxgi_->metadataBuf.data());
+                        for (UINT i = 0; i < moveCount; ++i) {
+                            outDirtyRects.push_back(pMoves[i].DestinationRect);
+                        }
+                        const auto* pDirty = reinterpret_cast<const RECT*>(dirtyStart);
+                        for (UINT i = 0; i < dirtyCount; ++i) {
+                            outDirtyRects.push_back(pDirty[i]);
+                        }
+                        outHasExplicitDirtyRects = true;
+                    } else {
+                        outDirtyRects.clear();
+                    }
                 }
-
-                const auto* pDirty = reinterpret_cast<const RECT*>(dirtyStart);
-                for (UINT i = 0; i < dirtyCount; ++i) {
-                    outDirtyRects.push_back(pDirty[i]);
-                }
-                outHasExplicitDirtyRects = true;
             }
         }
     }
@@ -1641,6 +1730,16 @@ bool ScreenCapturer::captureViaCoreGraphics() {
     if (!haveFrame && !fillMacTestPattern(currentFrame_, w, h)) return false;
     // Frames are in pixels while the monitor's x, y (and the pointer) are in points; the host loop sees the pixel
     // size here and tells the viewer, and the injector reads the display's points from CoreGraphics itself.
+    {
+        CGRect bounds = CGDisplayBounds(displayId);
+        activeMonitor_.x = static_cast<int32_t>(bounds.origin.x);
+        activeMonitor_.y = static_cast<int32_t>(bounds.origin.y);
+        macLogicalW_ = std::max(1, static_cast<int>(bounds.size.width));
+        macLogicalH_ = std::max(1, static_cast<int>(bounds.size.height));
+    }
+    if (w != frameW_ || h != frameH_) {
+        prevTileHashes_.clear();
+    }
     frameW_ = w;
     frameH_ = h;
     activeMonitor_.width = w;
@@ -1651,6 +1750,54 @@ bool ScreenCapturer::captureViaCoreGraphics() {
     return false;
 #endif
 }
+
+#if (defined(__linux__) || defined(__unix__)) && __has_include(<X11/Xlib.h>)
+namespace {
+
+uint8_t extractX11Channel(unsigned long pixel, unsigned long mask) {
+    if (mask == 0) return 0;
+    int shift = 0;
+    unsigned long m = mask;
+    while ((m & 1UL) == 0) {
+        m >>= 1;
+        ++shift;
+    }
+    unsigned long val = (pixel & mask) >> shift;
+    return (m == 255UL) ? static_cast<uint8_t>(val)
+                        : static_cast<uint8_t>((val * 255UL + m / 2UL) / m);
+}
+
+bool copyXImageToBgra(XImage* img, int capW, int capH, uint8_t* dst) {
+    if (!img || !img->data || capW <= 0 || capH <= 0 || capW > img->width || capH > img->height) return false;
+    const bool fastBgra32 = (img->bits_per_pixel == 32) &&
+                            (img->bytes_per_line >= capW * 4) &&
+                            (img->byte_order == LSBFirst) &&
+                            (img->red_mask == 0x00FF0000UL) &&
+                            (img->green_mask == 0x0000FF00UL) &&
+                            (img->blue_mask == 0x000000FFUL);
+    if (fastBgra32) {
+        for (int r = 0; r < capH; ++r) {
+            const uint8_t* srcRow = reinterpret_cast<const uint8_t*>(img->data + static_cast<size_t>(r) * img->bytes_per_line);
+            uint8_t* dstRow = dst + static_cast<size_t>(r) * capW * 4;
+            std::memcpy(dstRow, srcRow, static_cast<size_t>(capW) * 4);
+        }
+        return true;
+    }
+    for (int r = 0; r < capH; ++r) {
+        uint8_t* dstRow = dst + static_cast<size_t>(r) * capW * 4;
+        for (int c = 0; c < capW; ++c) {
+            unsigned long px = XGetPixel(img, c, r);
+            dstRow[c * 4 + 0] = extractX11Channel(px, img->blue_mask);
+            dstRow[c * 4 + 1] = extractX11Channel(px, img->green_mask);
+            dstRow[c * 4 + 2] = extractX11Channel(px, img->red_mask);
+            dstRow[c * 4 + 3] = 0xFF;
+        }
+    }
+    return true;
+}
+
+} // namespace
+#endif
 
 bool ScreenCapturer::captureViaX11() {
 #if (defined(__linux__) || defined(__unix__)) && __has_include(<X11/Xlib.h>)
@@ -1684,25 +1831,28 @@ bool ScreenCapturer::captureViaX11() {
         XImage* img = XShmCreateImage(dpy, DefaultVisual(dpy, screen), DefaultDepth(dpy, screen),
                                       ZPixmap, nullptr, &shminfo, capW, capH);
         if (img) {
-            shminfo.shmid = shmget(IPC_PRIVATE, img->bytes_per_line * img->height, IPC_CREAT | 0777);
+            size_t shmBytes = (img->bytes_per_line > 0 && img->height > 0)
+                ? static_cast<size_t>(img->bytes_per_line) * static_cast<size_t>(img->height)
+                : 0;
+            shminfo.shmid = (shmBytes > 0) ? shmget(IPC_PRIVATE, shmBytes, IPC_CREAT | 0600) : -1;
             if (shminfo.shmid >= 0) {
                 shminfo.shmaddr = img->data = static_cast<char*>(shmat(shminfo.shmid, nullptr, 0));
                 shminfo.readOnly = False;
-                if (shminfo.shmaddr != reinterpret_cast<char*>(-1) && XShmAttach(dpy, &shminfo)) {
+                bool attached = (shminfo.shmaddr != reinterpret_cast<char*>(-1) && XShmAttach(dpy, &shminfo));
+                if (attached) {
+                    XSync(dpy, False);
+                }
+                // Mark for destruction immediately after X server attaches so crashes cannot leak SHM.
+                shmctl(shminfo.shmid, IPC_RMID, nullptr);
+                if (attached) {
                     if (XShmGetImage(dpy, root, img, capX, capY, AllPlanes)) {
-                        for (int r = 0; r < capH; ++r) {
-                            const uint8_t* srcRow = reinterpret_cast<const uint8_t*>(img->data + r * img->bytes_per_line);
-                            uint8_t* dstRow = currentFrame_.data() + static_cast<size_t>(r) * frameW_ * 4;
-                            std::memcpy(dstRow, srcRow, static_cast<size_t>(frameW_) * 4);
-                        }
-                        captured = true;
+                        captured = copyXImageToBgra(img, capW, capH, currentFrame_.data());
                     }
                     XShmDetach(dpy, &shminfo);
                 }
                 if (shminfo.shmaddr != reinterpret_cast<char*>(-1)) {
                     shmdt(shminfo.shmaddr);
                 }
-                shmctl(shminfo.shmid, IPC_RMID, nullptr);
             }
             img->data = nullptr;
             XDestroyImage(img);
@@ -1713,13 +1863,8 @@ bool ScreenCapturer::captureViaX11() {
     if (!captured) {
         XImage* img = XGetImage(dpy, root, capX, capY, capW, capH, AllPlanes, ZPixmap);
         if (img) {
-            for (int r = 0; r < capH; ++r) {
-                const uint8_t* srcRow = reinterpret_cast<const uint8_t*>(img->data + r * img->bytes_per_line);
-                uint8_t* dstRow = currentFrame_.data() + static_cast<size_t>(r) * frameW_ * 4;
-                std::memcpy(dstRow, srcRow, static_cast<size_t>(frameW_) * 4);
-            }
+            captured = copyXImageToBgra(img, capW, capH, currentFrame_.data());
             XDestroyImage(img);
-            captured = true;
         }
     }
 
@@ -1815,9 +1960,11 @@ CursorState ScreenCapturer::captureCursorState() const {
         CFRelease(ev);
         int relX = static_cast<int>(pt.x) - activeMonitor_.x;
         int relY = static_cast<int>(pt.y) - activeMonitor_.y;
+        int denomW = (macLogicalW_ > 0) ? macLogicalW_ : std::max(1, frameW_);
+        int denomH = (macLogicalH_ > 0) ? macLogicalH_ : std::max(1, frameH_);
         cs.visible = true;
-        cs.normX = std::clamp(static_cast<float>(relX) / std::max(1, frameW_), 0.0f, 1.0f);
-        cs.normY = std::clamp(static_cast<float>(relY) / std::max(1, frameH_), 0.0f, 1.0f);
+        cs.normX = std::clamp(static_cast<float>(relX) / denomW, 0.0f, 1.0f);
+        cs.normY = std::clamp(static_cast<float>(relY) / denomH, 0.0f, 1.0f);
     }
 #elif defined(__linux__) || defined(__unix__)
 #if defined(__linux__)
