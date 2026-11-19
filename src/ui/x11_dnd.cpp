@@ -50,7 +50,7 @@ bool XdndTarget::handleClientMessage(const XEvent& ev) {
             unsigned long count = 0, after = 0;
             unsigned char* data = nullptr;
             if (XGetWindowProperty(dpy_, source_, typeList_, 0, 1024, False, XA_ATOM, &actual, &format, &count, &after,
-                                   &data) == Success && data) {
+                                   &data) == Success && actual == XA_ATOM && format == 32 && data) {
                 const Atom* types = reinterpret_cast<const Atom*>(data);
                 for (unsigned long i = 0; i < count; ++i) offersUris_ = offersUris_ || types[i] == uriList_;
             }

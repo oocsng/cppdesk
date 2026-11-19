@@ -88,11 +88,38 @@ bool decodeAppIcon(std::vector<uint8_t>& bgra, int& width, int& height) {
     return ok;
 }
 
-// XShmAttach fails with BadAccess when the X server cannot see our shared memory (remote displays, WSLg).
-bool g_xError = false;
-int recordXError(Display*, XErrorEvent*) {
-    g_xError = true;
+// Persistent non-fatal X error handler so dying external windows (tray manager, DnD source) never abort the app,
+// while still letting XShmAttach probe shared memory support cleanly.
+std::atomic<bool> g_xError{false};
+std::atomic<bool> g_suppressXErrorLog{false};
+int handleXError(Display* dpy, XErrorEvent* ev) {
+    g_xError.store(true);
+    if (!g_suppressXErrorLog.load() && dpy && ev) {
+        char buf[256]{};
+        XGetErrorText(dpy, ev->error_code, buf, sizeof(buf));
+        std::cerr << "CppDesk X11 error: " << buf << " (req " << static_cast<int>(ev->request_code) << ")\n";
+    }
     return 0;
+}
+
+void ensureXErrorHandler() {
+    static std::once_flag once;
+    std::call_once(once, [] { XSetErrorHandler(handleXError); });
+}
+
+// Fallback physical keycode -> Windows VK mapping (evdev keycode = X11 keycode - 8) when non-Latin layouts have no Latin XKB group.
+uint16_t fallbackVkFromX11Keycode(unsigned int keycode) {
+    switch (keycode) {
+        case 10: return '1'; case 11: return '2'; case 12: return '3'; case 13: return '4'; case 14: return '5';
+        case 15: return '6'; case 16: return '7'; case 17: return '8'; case 18: return '9'; case 19: return '0';
+        case 24: return 'Q'; case 25: return 'W'; case 26: return 'E'; case 27: return 'R'; case 28: return 'T';
+        case 29: return 'Y'; case 30: return 'U'; case 31: return 'I'; case 32: return 'O'; case 33: return 'P';
+        case 38: return 'A'; case 39: return 'S'; case 40: return 'D'; case 41: return 'F'; case 42: return 'G';
+        case 43: return 'H'; case 44: return 'J'; case 45: return 'K'; case 46: return 'L';
+        case 52: return 'Z'; case 53: return 'X'; case 54: return 'C'; case 55: return 'V'; case 56: return 'B';
+        case 57: return 'N'; case 58: return 'M';
+        default: return 0;
+    }
 }
 
 } // namespace
@@ -159,11 +186,16 @@ struct CppDeskWindowLinuxImpl {
         liveToken->w = this;
     }
 
-    void wake() {
+    void wakeLocked() {
         if (wakeFds[1] >= 0) {
             const char c = 1;
             (void)!write(wakeFds[1], &c, 1);
         }
+    }
+
+    void wake() {
+        std::lock_guard<std::mutex> lock(postMutex);
+        wakeLocked();
     }
 
     void invalidate() {
@@ -198,7 +230,7 @@ struct CppDeskWindowLinuxImpl {
         unsigned char* data = nullptr;
         bool found = false;
         if (XGetWindowProperty(dpy, RootWindow(dpy, screen), netSupported, 0, 4096, False, XA_ATOM, &type, &format,
-                               &count, &after, &data) == Success && data) {
+                               &count, &after, &data) == Success && type == XA_ATOM && format == 32 && data) {
             const Atom* atoms = reinterpret_cast<const Atom*>(data);
             for (unsigned long i = 0; i < count && !found; ++i) found = atoms[i] == atom;
         }
@@ -236,8 +268,8 @@ struct CppDeskWindowLinuxImpl {
     // A 32-bit image the size of the window, shared with the X server when it can see our memory.
     void allocateBackBuffer(int w, int h) {
         freeBackBuffer();
-        widthPx = std::max(1, w);
-        heightPx = std::max(1, h);
+        widthPx = std::clamp(w, 1, 16384);
+        heightPx = std::clamp(h, 1, 16384);
         useShm = false;
         if (XShmQueryExtension(dpy)) {
             image = XShmCreateImage(dpy, visual, depth, ZPixmap, nullptr, &shm, widthPx, heightPx);
@@ -248,12 +280,12 @@ struct CppDeskWindowLinuxImpl {
                     image->data = shm.shmaddr;
                     shm.readOnly = False;
                     XSync(dpy, False);
-                    g_xError = false;
-                    auto old = XSetErrorHandler(recordXError);
+                    g_suppressXErrorLog.store(true);
+                    g_xError.store(false);
                     XShmAttach(dpy, &shm);
                     XSync(dpy, False);
-                    XSetErrorHandler(old);
-                    useShm = !g_xError;
+                    useShm = !g_xError.load();
+                    g_suppressXErrorLog.store(false);
                     shmctl(shm.shmid, IPC_RMID, nullptr);   // freed once both sides detach
                     if (!useShm) shmdt(shm.shmaddr);
                 } else if (shm.shmid >= 0) {
@@ -267,8 +299,14 @@ struct CppDeskWindowLinuxImpl {
             }
         }
         if (!image) {
-            char* data = static_cast<char*>(std::calloc(static_cast<size_t>(widthPx) * heightPx, 4));
+            const size_t pixels = static_cast<size_t>(widthPx) * static_cast<size_t>(heightPx);
+            char* data = static_cast<char*>(std::calloc(pixels, 4));
+            if (!data) return;
             image = XCreateImage(dpy, visual, depth, ZPixmap, 0, data, widthPx, heightPx, 32, widthPx * 4);
+            if (!image) {
+                std::free(data);
+                return;
+            }
         }
         surface = cairo_image_surface_create_for_data(reinterpret_cast<unsigned char*>(image->data), CAIRO_FORMAT_RGB24,
                                                       widthPx, heightPx, image->bytes_per_line);
@@ -299,8 +337,12 @@ struct CppDeskWindowLinuxImpl {
 
     // The window is gone: let the screens finish, then stop the loop.
     void destroyWindow() {
-        if (closed) return;
-        closed = true;
+        {
+            std::lock_guard<std::mutex> alive(liveToken->m);
+            liveToken->w = nullptr;
+            if (closed) return;
+            closed = true;
+        }
         if (!dpy || !win) return;   // never created
         if (app) app->onWindowDestroyed();
         tray.reset();
@@ -341,7 +383,7 @@ struct CppDeskWindowLinuxImpl {
         unsigned char* data = nullptr;
         bool iconic = false;
         if (XGetWindowProperty(dpy, win, wmState, 0, 2, False, wmState, &type, &format, &count, &after, &data) ==
-                Success && data && count >= 1) {
+                Success && type == wmState && format == 32 && data && count >= 1) {
             iconic = *reinterpret_cast<long*>(data) == IconicState;
         }
         if (data) XFree(data);
@@ -362,7 +404,7 @@ struct CppDeskWindowLinuxImpl {
         switch (action) {
             case X11Tray::Action::Restore: restoreFromTray(); break;
             case X11Tray::Action::ToggleMute: if (app) app->toggleNotificationsMuted(); break;
-            case X11Tray::Action::Quit: destroyWindow(); break;
+            case X11Tray::Action::Quit: requestClose(); break;
             case X11Tray::Action::Nothing: break;
         }
         return consumed;
@@ -467,21 +509,26 @@ public:
                 chosen(path);
                 w->invalidate();
             });
-            w->wake();
+            w->wakeLocked();
         }).detach();
     }
     bool dialogOpen_ = false;   // UI thread only
-    void openUrl(const std::string& url) override { spawn::detached({ "xdg-open", url }); }
+    void openUrl(const std::string& url) override {
+        if (!UiPlatform::isSafeExternalUrl(url)) return;
+        spawn::detached({ "xdg-open", url });
+    }
     void revealPath(const std::string& path) override {
         std::error_code ec;
         const std::filesystem::path p(path);
-        spawn::detached({ "xdg-open", std::filesystem::is_directory(p, ec) ? p.string() : p.parent_path().string() });
+        std::string dir = std::filesystem::is_directory(p, ec) ? p.string() : p.parent_path().string();
+        if (dir.empty()) dir = ".";
+        spawn::detached({ "xdg-open", dir });
     }
     // Starting a second copy now would hit the single-instance lock; main re-executes after the loop instead.
     void relaunchApp() override {
         if (!w_) return;
         w_->relaunch = true;
-        w_->destroyWindow();
+        w_->requestClose();
     }
     void setFrameIntervalMs(unsigned ms) override {
         if (w_) w_->frameIntervalMs = std::max(1u, ms);
@@ -495,7 +542,7 @@ public:
         if (live()) w_->setThemeVariant(dark);
     }
     void quitApp() override {
-        if (w_) w_->destroyWindow();
+        if (w_) w_->requestClose();
     }
     bool relaunchElevated() override { return false; }
     void playAlertSound() override {
@@ -601,7 +648,7 @@ public:
                 if (w->app) w->app->onUpdateCheckDone(info, manual);
                 w->invalidate();
             });
-            w->wake();
+            w->wakeLocked();
         });
     }
     void startUpdateDownload(const std::string&, uint64_t, const std::string&,
@@ -610,12 +657,10 @@ public:
     }
     ui::ServiceState serviceState() const override { return ui::ServiceState::NotInstalled; }
     bool runServiceAction(ui::ServiceAction) override { return false; }
-    void showNotification(const std::string&, const std::string&) override {}
-    void setTrayStatus(const std::string&) override {}
 
     bool has(ui::Capability c) const override {
         if (c == ui::Capability::TrayIcon) return w_ && w_->trayDocked();
-        if (c == ui::Capability::NativeNotifications) return spawn::onPath("notify-send");
+        if (c == ui::Capability::NativeNotifications) return hasNotifySend_;
         return false;   // the Windows-only controls stay hidden
     }
 
@@ -649,6 +694,7 @@ private:
 
     CppDeskWindowLinuxImpl* w_ = nullptr;
     bool snapshotMode_ = false;
+    bool hasNotifySend_ = spawn::onPath("notify-send");
 };
 
 void CppDeskWindowLinuxImpl::handleEvent(XEvent& ev) {
@@ -710,9 +756,16 @@ void CppDeskWindowLinuxImpl::handleEvent(XEvent& ev) {
         case KeyPress:
         case KeyRelease: {
             const bool down = ev.type == KeyPress;
-            const uint16_t vk = InputInjector::mapX11KeySymToVk(static_cast<uint32_t>(XLookupKeysym(&ev.xkey, 0)));
+            uint16_t vk = InputInjector::mapX11KeySymToVk(static_cast<uint32_t>(XLookupKeysym(&ev.xkey, 0)));
+            if (vk == 0) {
+                for (int group = 0; group < 4 && vk == 0; ++group) {
+                    const KeySym baseKs = XkbKeycodeToKeysym(dpy, ev.xkey.keycode, group, 0);
+                    if (baseKs != NoSymbol) vk = InputInjector::mapX11KeySymToVk(static_cast<uint32_t>(baseKs));
+                }
+            }
+            if (vk == 0) vk = fallbackVkFromX11Keycode(ev.xkey.keycode);
             // A release whose press the input method consumed never reached the screens; drop it too.
-            if (vk != 0 && (down || keys[vk])) {
+            if (vk != 0 && vk < keys.size() && (down || keys[vk])) {
                 keys[vk] = down;
                 app->onKey(KeyEvent{ vk, 0, down, InputInjector::isExtendedVk(vk) });
             }
@@ -763,7 +816,10 @@ bool CppDeskWindowLinuxImpl::processEvents(int timeoutMs) {
         std::lock_guard<std::mutex> lock(postMutex);
         work.swap(posted);
     }
-    for (auto& fn : work) fn();
+    for (auto& fn : work) {
+        if (closed) break;
+        fn();
+    }
 
     while (!closed && XPending(dpy) > 0) {
         XEvent ev;
@@ -791,42 +847,51 @@ CppDeskWindow::CppDeskWindow(IdentityManager& identity, NetworkEngine& network, 
     pImpl_->shell = std::make_unique<LinuxShell>(pImpl_.get(), false);
     pImpl_->app = std::make_unique<AppUi>(identity_, network_, *pImpl_->shell, autoConnectTarget);
 
-    // Network callbacks arrive on worker threads; hand them to the UI thread.
-    CppDeskWindowLinuxImpl* w = pImpl_.get();
-    network_.setOnScratchpadUpdateCallback([this](const ScratchpadUpdatePayload& p) {
-        post([this, p] { pImpl_->app->onScratchpadUpdate(p); });
+    // Network callbacks arrive on worker threads; hand them to the UI thread while guarded by liveToken.
+    std::shared_ptr<CppDeskWindowLinuxImpl::LiveToken> token = pImpl_->liveToken;
+    auto postLive = [token](std::function<void(CppDeskWindowLinuxImpl&)> fn) {
+        std::lock_guard<std::mutex> alive(token->m);
+        CppDeskWindowLinuxImpl* w = token->w;
+        if (!w || w->closed || !w->app) return;
+        std::lock_guard<std::mutex> lock(w->postMutex);
+        w->posted.push_back([w, fn = std::move(fn)]() {
+            if (!w->closed && w->app) fn(*w);
+        });
+        w->wakeLocked();
+    };
+    network_.setOnScratchpadUpdateCallback([postLive](const ScratchpadUpdatePayload& p) {
+        postLive([p](CppDeskWindowLinuxImpl& w) { w.app->onScratchpadUpdate(p); });
     });
-    network_.setOnCommandPaletteOutputCallback([this](const CommandPaletteOutputPayload& p) {
-        post([this, p] { pImpl_->app->onCommandPaletteOutput(p); });
+    network_.setOnCommandPaletteOutputCallback([postLive](const CommandPaletteOutputPayload& p) {
+        postLive([p](CppDeskWindowLinuxImpl& w) { w.app->onCommandPaletteOutput(p); });
     });
-    network_.setOnFrameDecodedCallback([this, w] {
-        if (w->app->claimFrameRedraw()) post([w] { w->app->onFrameReady(); });
+    network_.setOnFrameDecodedCallback([token] {
+        std::lock_guard<std::mutex> alive(token->m);
+        CppDeskWindowLinuxImpl* w = token->w;
+        if (!w || w->closed || !w->app || !w->app->claimFrameRedraw()) return;
+        std::lock_guard<std::mutex> lock(w->postMutex);
+        w->posted.push_back([w] {
+            if (!w->closed && w->app) w->app->onFrameReady();
+        });
+        w->wakeLocked();
     });
-    network_.setOnVersionMismatchCallback([this](const std::string& hostVer, const std::string& viewerVer) {
-        post([this, hostVer, viewerVer] { pImpl_->app->onPeerVersionMismatch(hostVer, viewerVer); });
+    network_.setOnVersionMismatchCallback([postLive](const std::string& hostVer, const std::string& viewerVer) {
+        postLive([hostVer, viewerVer](CppDeskWindowLinuxImpl& w) { w.app->onPeerVersionMismatch(hostVer, viewerVer); });
     });
-    network_.setOnVersionUpgradeNoticeCallback([this](const VersionUpgradeNoticePayload& notice) {
+    network_.setOnVersionUpgradeNoticeCallback([postLive](const VersionUpgradeNoticePayload& notice) {
         std::string version = notice.senderVersion;
-        post([this, version] { pImpl_->app->onVersionUpgradeNotice(version); });
+        postLive([version](CppDeskWindowLinuxImpl& w) { w.app->onVersionUpgradeNotice(version); });
     });
 }
 
 CppDeskWindow::~CppDeskWindow() {
-    {
-        std::lock_guard<std::mutex> alive(pImpl_->liveToken->m);
-        pImpl_->liveToken->w = nullptr;
-    }
-    network_.setOnScratchpadUpdateCallback(nullptr);
-    network_.setOnCommandPaletteOutputCallback(nullptr);
-    network_.setOnFrameDecodedCallback(nullptr);
-    network_.setOnVersionMismatchCallback(nullptr);
-    network_.setOnVersionUpgradeNoticeCallback(nullptr);
     close();
 }
 
 bool CppDeskWindow::create(void* displayContext, int /*showCommand*/) {
     CppDeskWindowLinuxImpl& w = *pImpl_;
     ensureXlibThreads();
+    ensureXErrorHandler();
     // Typed text must come out as UTF-8 whatever the user's locale says.
     std::setlocale(LC_CTYPE, "");
     if (std::strcmp(nl_langinfo(CODESET), "UTF-8") != 0) std::setlocale(LC_CTYPE, "C.UTF-8");
@@ -973,11 +1038,9 @@ int CppDeskWindow::messageLoop() {
 }
 
 void CppDeskWindow::post(std::function<void()> fn) {
-    {
-        std::lock_guard<std::mutex> lock(pImpl_->postMutex);
-        pImpl_->posted.push_back(std::move(fn));
-    }
-    pImpl_->wake();
+    std::lock_guard<std::mutex> lock(pImpl_->postMutex);
+    pImpl_->posted.push_back(std::move(fn));
+    pImpl_->wakeLocked();
 }
 
 void CppDeskWindow::requestQuit() {
@@ -994,6 +1057,15 @@ bool CppDeskWindow::relaunchRequested() const { return pImpl_ && pImpl_->relaunc
 void CppDeskWindow::close() {
     if (!pImpl_) return;
     CppDeskWindowLinuxImpl& w = *pImpl_;
+    {
+        std::lock_guard<std::mutex> alive(w.liveToken->m);
+        w.liveToken->w = nullptr;
+    }
+    network_.setOnScratchpadUpdateCallback(nullptr);
+    network_.setOnCommandPaletteOutputCallback(nullptr);
+    network_.setOnFrameDecodedCallback(nullptr);
+    network_.setOnVersionMismatchCallback(nullptr);
+    network_.setOnVersionUpgradeNoticeCallback(nullptr);
     w.destroyWindow();
     w.app.reset();   // the screens free their images through the canvas
     w.canvas.detach();
@@ -1008,8 +1080,13 @@ void CppDeskWindow::close() {
     w.xic = nullptr;
     w.xim = nullptr;
     w.gc = nullptr;
-    for (int fd : w.wakeFds) if (fd >= 0) ::close(fd);
-    w.wakeFds[0] = w.wakeFds[1] = -1;
+    {
+        std::lock_guard<std::mutex> lock(w.postMutex);
+        for (int& fd : w.wakeFds) {
+            if (fd >= 0) ::close(fd);
+            fd = -1;
+        }
+    }
 }
 
 int CppDeskWindow::runUiSnapshots(IdentityManager& identity, NetworkEngine& network, const std::string& outDir) {
