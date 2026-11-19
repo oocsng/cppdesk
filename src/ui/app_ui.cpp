@@ -331,20 +331,31 @@ bool AppUi::stepAnimations(float dt) {
         }
     }
 
-    // 7. Per-widget macOS tactile hover & press springs
-    for (auto& kv : widgetAnims_) {
-        const std::string& id = kv.first;
-        WidgetAnimState& st = kv.second;
+    // 7. Per-widget macOS tactile hover & press springs (evict settled non-toggle entries)
+    for (auto it = widgetAnims_.begin(); it != widgetAnims_.end(); ) {
+        const std::string& id = it->first;
+        WidgetAnimState& st = it->second;
 
         float wantHover = (id == hoveredWidgetId_) ? 1.0f : 0.0f;
         float wantPress = (mouseLeftDown_ && id == pressedWidgetId_ && id == hoveredWidgetId_) ? 1.0f : 0.0f;
 
-        if (stepSpring(st.hoverT, st.hoverVel, wantHover, theme::motion::hover.omega, theme::motion::hover.zeta, dt)) active = true;
-        if (stepSpring(st.pressT, st.pressVel, wantPress, theme::motion::press.omega, theme::motion::press.zeta, dt)) active = true;
+        bool stActive = false;
+        if (stepSpring(st.hoverT, st.hoverVel, wantHover, theme::motion::hover.omega, theme::motion::hover.zeta, dt)) stActive = true;
+        if (stepSpring(st.pressT, st.pressVel, wantPress, theme::motion::press.omega, theme::motion::press.zeta, dt)) stActive = true;
 
         if (st.rippleT < 1.0f) {
             st.rippleT = std::min(1.0f, st.rippleT + dt * 3.6f);
-            active = true;
+            stActive = true;
+        }
+        if (stActive) active = true;
+
+        if (!stActive && !st.toggleInitialized &&
+            id != hoveredWidgetId_ && id != pressedWidgetId_ &&
+            std::fabs(st.hoverT) <= 0.001f && std::fabs(st.pressT) <= 0.001f &&
+            std::fabs(st.focusT) <= 0.001f && st.rippleT >= 1.0f) {
+            it = widgetAnims_.erase(it);
+        } else {
+            ++it;
         }
     }
 
@@ -1385,7 +1396,7 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
 
     UiRect remotePwField = { remoteIdField.right + 10.0f, cy, remoteIdField.right + 10.0f + pwW, cy + 42.0f };
     drawTextField("field_remote_pw", FocusedField::RemotePassword, remotePwField,
-                  remotePasswordInput_, "Password or code", !showRemotePassword_);
+                  remotePasswordInput_, "Password or code", true);
 
     UiRect connectBtn = { remotePwField.right + 10.0f, cy, crx, cy + 42.0f };
     drawButton("btn_connect", connectBtn, "Connect",
@@ -3163,7 +3174,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         if (!voiceMonitorAttempted_) {
             voiceMonitorAttempted_ = true;
             if (!network_.startVoiceMonitor()) {
-                voiceMonitorError_ = "No microphone available";
+                // Microphone unavailable; VU meter remains at zero.
             }
         }
 
@@ -9721,7 +9732,6 @@ void AppUi::sendTerminalFromInput() {
     if (terminalInputText_.empty()) return;
     network_.sendTerminalCommand(terminalInputText_);
     terminalInputText_.clear();
-    terminalHistoryIndex_ = -1;
     shell_->invalidate();
 }
 
@@ -10574,7 +10584,6 @@ void AppUi::onTick() {
         shell_->invalidate();
     }
     prevHasPendingIncoming_ = pending.active;
-    modalWasActive_ = pending.active;
 
     bool toastActive = (!toastText_.empty() && tickNow <= toastExpireTick_ + 500);
     bool inLiveSession = (vStats.state != ViewerConnectionState::Disconnected) ||
@@ -10703,7 +10712,6 @@ void AppUi::onScratchpadUpdate(const ScratchpadUpdatePayload& p) {
     if (focusedField_ != FocusedField::ScratchpadText) {
         scratchpadTextEdit_ = p.text;
     }
-    lastSeenScratchpadRev_ = p.revision;
     shell_->invalidate();
 }
 

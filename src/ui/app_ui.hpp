@@ -402,7 +402,6 @@ private:
     bool                    showFileDrawer_ = false;
     bool                    remoteInputEnabled_ = true;
     bool                    showLocalPassword_ = false;
-    bool                    showRemotePassword_ = false;
     bool                    isFullscreen_ = false;
 
     std::string             autoConnectTarget_;
@@ -415,10 +414,6 @@ private:
     uint8_t                 relayModeEdit_ = 0;
     std::string             privacyBrandEdit_;
     std::string             privacyNoticeEdit_;
-    bool                    relayDiagnosticRunning_ = false;
-    std::string             relayDiagnosticStatus_;
-    int                     relayDiagnosticLatency_ = -1;
-    bool                    relayDiagnosticSuccess_ = false;
     std::string             chatInput_;
     int32_t                 chatScrollOffset_ = 0;
     std::string             clipSearchQuery_;
@@ -458,12 +453,7 @@ private:
 
     // Pending incoming request local permission checkboxes
     uint8_t                 modalPermissions_ = PERM_ALL;
-    bool                    modalWasActive_ = false;
     uint32_t                lastSeenUnreadChat_ = 0;
-    bool                    prevIncomingPending_ = false;
-    size_t                  lastNotifiedChatCount_ = 0;
-    size_t                  prevActiveTransfers_ = 0;
-    ViewerConnectionState   prevNotifiedViewerState_ = ViewerConnectionState::Disconnected;
 
     // Remote video canvas cache
     uint64_t                displayedFrameSeq_ = 0;
@@ -473,12 +463,6 @@ private:
     CursorState             remoteCursor_{};
     UiRect                  renderedCanvasRect_{};
     UiRect                  stageRect_{};
-
-    // Rolling network telemetry history
-    static constexpr size_t SPARKLINE_SAMPLES = 36;
-    std::array<float, SPARKLINE_SAMPLES> rttHistory_{};
-    std::array<float, SPARKLINE_SAMPLES> fpsHistory_{};
-    uint64_t                lastTelemetrySampleTick_ = 0;
 
     // Hit-test regions & macOS Spring Physics Animation Engine state
     std::vector<ClickRegion>                        clickRegions_;
@@ -566,7 +550,6 @@ private:
 
     // Remote Terminal UI state (v2.1.0)
     std::string             terminalInputText_;
-    int                     terminalHistoryIndex_ = -1;
     float                   terminalScrollOffset_ = 0.0f;
 
     // Remote Hardware Diagnostics & Process Telemetry UI state (Feature 1)
@@ -575,7 +558,6 @@ private:
     // Settings Tab vertical scroll & section state
     SettingsSection              settingsSection_ = SettingsSection::Appearance;
     bool                         voiceMonitorAttempted_ = false;
-    std::string                  voiceMonitorError_;
     std::vector<AudioDeviceDesc> cachedInputDevices_;
     std::vector<AudioDeviceDesc> cachedOutputDevices_;
     bool                         showAudioInputMenu_ = false;
@@ -718,7 +700,7 @@ private:
     float                   updateModalAnimT_ = 0.0f;
     float                   updateModalAnimVel_ = 0.0f;
     bool                    isCheckingUpdates_ = false;
-    std::string             updateStatusText_ = "Version v3.11.2 (Up to date)";
+    std::string             updateStatusText_ = std::string("Version v") + CPP_DESK_VERSION + " (Up to date)";
     UpdateInfo              latestUpdateInfo_{};
     float                   startupUpdateCheckTimer_ = 2.0f;
     bool                    startupCheckTriggered_ = false;
@@ -787,7 +769,6 @@ private:
     bool                    totpEnrollSuccess_ = false;
     std::vector<uint8_t>    totpQrMatrix_;
     int                     totpQrMatrixSize_ = 0;
-    bool                    showTotpRegenConfirm_ = false;
 
     // Viewer TOTP Challenge Modal state
     bool                    showTotpModal_ = false;
@@ -819,8 +800,6 @@ private:
 
     // Dual-Peer Collaborative Scratchpad UI
     std::string             scratchpadTextEdit_;
-    uint64_t                lastSeenScratchpadRev_ = 0;
-    float                   scratchpadScrollOffset_ = 0.0f;
 
     // Spotlight Omnibar Command Palette UI
     bool                    showOmnibarModal_ = false;
