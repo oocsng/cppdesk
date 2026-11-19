@@ -147,7 +147,8 @@ bool isAclStrictlyRestricted(const std::wstring& path, bool testOverride) {
         return EqualSid(sid, adminSidBuf) != FALSE;
     };
 
-    if (!isAllowedSid(pOwner)) {
+    // An elevated admin's new files are owned by Administrators rather than the user; that owner is trusted too.
+    if (!isAllowedSid(pOwner) && !EqualSid(pOwner, adminSidBuf)) {
         cleanup();
         return false;
     }
