@@ -116,14 +116,15 @@ bool DisplayResolutionManager::changeResolution(uint32_t width, uint32_t height,
         return restoreResolution(deviceName);
     }
 
-    activeDeviceName_ = deviceName;
-    const wchar_t* pDev = activeDeviceName_.empty() ? nullptr : activeDeviceName_.c_str();
+    const wchar_t* pDev = deviceName.empty() ? nullptr : deviceName.c_str();
 
     DEVMODEW dm{};
     dm.dmSize = sizeof(DEVMODEW);
     if (!EnumDisplaySettingsW(pDev, ENUM_CURRENT_SETTINGS, &dm)) {
         return false;
     }
+    const uint32_t devOrigW = dm.dmPelsWidth;
+    const uint32_t devOrigH = dm.dmPelsHeight;
 
     dm.dmPelsWidth = width;
     dm.dmPelsHeight = height;
@@ -144,6 +145,11 @@ bool DisplayResolutionManager::changeResolution(uint32_t width, uint32_t height,
     if (testRes == DISP_CHANGE_SUCCESSFUL) {
         LONG applyRes = ChangeDisplaySettingsExW(pDev, &dm, nullptr, 0, nullptr);
         if (applyRes == DISP_CHANGE_SUCCESSFUL) {
+            if (!resolutionChanged_.load()) {
+                originalWidth_ = devOrigW;
+                originalHeight_ = devOrigH;
+            }
+            activeDeviceName_ = deviceName;
             currentWidth_.store(dm.dmPelsWidth);
             currentHeight_.store(dm.dmPelsHeight);
             resolutionChanged_.store(true);

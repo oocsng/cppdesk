@@ -1,6 +1,7 @@
 #include "wayland_helpers.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace cppdesk::wayland {
@@ -39,7 +40,8 @@ StreamPoint pointForNormalized(float nx, float ny, const StreamInfo& s, int fram
     const int w = s.logicalW > 0 ? s.logicalW : frameW;
     const int h = s.logicalH > 0 ? s.logicalH : frameH;
     auto axis = [](float n, int size) {
-        return size > 1 ? static_cast<double>(std::clamp(n, 0.0f, 1.0f)) * (size - 1) : 0.0;
+        if (!std::isfinite(n) || size <= 1) return 0.0;
+        return static_cast<double>(std::clamp(n, 0.0f, 1.0f)) * (size - 1);
     };
     return {s.nodeId, axis(nx, w), axis(ny, h)};
 }

@@ -132,7 +132,9 @@ struct PortalSession::Impl {
     }
 
     std::string requestPath(const std::string& token) const {
-        std::string sender = g_dbus_connection_get_unique_name(wconn);
+        const char* uniqueName = wconn ? g_dbus_connection_get_unique_name(wconn) : nullptr;
+        if (!uniqueName || !*uniqueName) return "";
+        std::string sender(uniqueName);
         std::string clean;
         for (char c : sender) if (c != ':') clean += (c == '.') ? '_' : c;
         return std::string(kPath) + "/request/" + clean + "/" + token;
@@ -147,10 +149,16 @@ struct PortalSession::Impl {
         const std::string token = nextToken();
         g_variant_builder_add(options, "{sv}", "handle_token", g_variant_new_string(token.c_str()));
         const std::string path = requestPath(token);
+        if (path.empty() || !g_variant_is_object_path(path.c_str())) {
+            g_variant_builder_clear(options);
+            failure = "Invalid D-Bus unique name.";
+            return false;
+        }
         guint sub = g_dbus_connection_signal_subscribe(
             wconn, kDest, kRequest, "Response", path.c_str(), nullptr, G_DBUS_SIGNAL_FLAGS_NONE,
             [](GDBusConnection*, const gchar*, const gchar*, const gchar*, const gchar*, GVariant* params, gpointer data) {
                 auto* r = static_cast<Response*>(data);
+                if (!params || !g_variant_is_of_type(params, G_VARIANT_TYPE("(ua{sv})"))) return;
                 GVariant* results = nullptr;
                 guint32 code = 2;
                 g_variant_get(params, "(u@a{sv})", &code, &results);
@@ -186,7 +194,7 @@ struct PortalSession::Impl {
 
     bool getVersion(const char* iface, uint32_t& version) {
         auto c = call("org.freedesktop.DBus.Properties", "Get", g_variant_new("(ss)", iface, "version"));
-        if (!c->done || c->error || !c->reply) return false;
+        if (!c->done || c->error || !c->reply || !g_variant_is_of_type(c->reply, G_VARIANT_TYPE("(v)"))) return false;
         GVariant* v = nullptr;
         g_variant_get(c->reply, "(v)", &v);
         bool ok = v && g_variant_is_of_type(v, G_VARIANT_TYPE_UINT32);
@@ -207,6 +215,9 @@ struct PortalSession::Impl {
         struct Pending {
             bool done = false;
             GDBusConnection* conn = nullptr;
+            ~Pending() {
+                if (conn) g_object_unref(conn);
+            }
         };
         auto pending = std::make_shared<Pending>();
         auto* holder = new std::shared_ptr<Pending>(pending);
@@ -225,7 +236,10 @@ struct PortalSession::Impl {
             },
             holder);
         waitFor([&] { return pending->done; }, opts.stepTimeoutMs);
-        if (pending->done) wconn = pending->conn;
+        if (pending->done && pending->conn) {
+            wconn = pending->conn;
+            pending->conn = nullptr;
+        }
         return wconn != nullptr;
     }
 
@@ -262,7 +276,8 @@ struct PortalSession::Impl {
                 return false;
             }
             const char* handle = nullptr;
-            if (r.code != 0 || !r.results || !g_variant_lookup(r.results, "session_handle", "&s", &handle)) {
+            if (r.code != 0 || !r.results || !g_variant_lookup(r.results, "session_handle", "&s", &handle) ||
+                !handle || !g_variant_is_object_path(handle)) {
                 publish(ShareState::Failed, "The desktop could not start screen sharing.");
                 return false;
             }
@@ -357,7 +372,8 @@ struct PortalSession::Impl {
         // 4. the video connection
         auto fdCall = call(kScreenCast, "OpenPipeWireRemote", g_variant_new("(o@a{sv})", sessionPath.c_str(), emptyOptions()));
         int fd = -1;
-        if (fdCall->done && !fdCall->error && fdCall->reply && fdCall->fds) {
+        if (fdCall->done && !fdCall->error && fdCall->reply && fdCall->fds &&
+            g_variant_is_of_type(fdCall->reply, G_VARIANT_TYPE("(h)"))) {
             gint32 index = -1;
             g_variant_get(fdCall->reply, "(h)", &index);
             fd = g_unix_fd_list_get(fdCall->fds, index, nullptr);

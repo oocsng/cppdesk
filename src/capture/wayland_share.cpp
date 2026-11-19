@@ -62,10 +62,12 @@ ShareNotice WaylandShare::notice() const {
     return portal_.notice();
 }
 
-void WaylandShare::fail(ShareState state, const std::string& reason) {
+void WaylandShare::fail(std::unique_lock<std::mutex>& lk, ShareState state, const std::string& reason) {
     override_ = state;
     overrideReason_ = reason;
+    lk.unlock();
     portal_.close();   // the session is useless now; this also takes any control away
+    if (source_) source_->stop();
 }
 
 bool WaylandShare::resolveStream() {
@@ -78,7 +80,7 @@ bool WaylandShare::resolveStream() {
 }
 
 bool WaylandShare::latestFrame(std::vector<uint8_t>& bgra, int& width, int& height) {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::unique_lock<std::mutex> lk(mu_);
     if (closed_ || override_ != ShareState::Idle) return false;
     const ShareState s = portal_.state();
     if (s != ShareState::Running && s != ShareState::ViewOnly) return false;
@@ -93,19 +95,19 @@ bool WaylandShare::latestFrame(std::vector<uint8_t>& bgra, int& width, int& heig
         // The person has answered by now, so this is a failure, not "unavailable": falling back to X11 would put the
         // peer's input on the desktop whatever they allowed.
         if (!source_->start(fd, stream_.nodeId)) {
-            fail(ShareState::Failed, "The desktop allowed sharing, but its picture could not be received.");
+            fail(lk, ShareState::Failed, "The desktop allowed sharing, but its picture could not be received.");
             return false;
         }
     }
     if (source_->broken()) {
-        fail(ShareState::Failed, "The picture of your screen stopped arriving.");
+        fail(lk, ShareState::Failed, "The picture of your screen stopped arriving.");
         return false;
     }
     bool isNew = false;
     if (!source_->sink()->copy(bgra, width, height, isNew)) {
         const auto waited = std::chrono::steady_clock::now() - sourceStartedAt_;
         if (!gotFrame_ && waited > std::chrono::milliseconds(opts_.firstFrameTimeoutMs)) {
-            fail(ShareState::Failed, "The picture of your screen never arrived.");
+            fail(lk, ShareState::Failed, "The picture of your screen never arrived.");
         }
         return false;
     }
