@@ -651,10 +651,6 @@ private:
     // The host's sound (48 kHz 16-bit stereo) as AUDIO_STREAM_CHUNK; sends nothing while the viewer has muted.
     void sendHostSoundChunk(const int16_t* stereo48k, size_t frames);
 
-    // Host Privacy Curtain Window
-    void createPrivacyCurtainWindow();
-    void destroyPrivacyCurtainWindow();
-
     // Audio Capture & Playback state
     std::thread             hostAudioThread_;
     std::mutex              hostWorkerThreadMutex_;   // guards hostAudioThread_, hostTerminalThread_, hostTunnelThread_
@@ -686,12 +682,8 @@ private:
 
     // Privacy Mode state
     std::atomic<bool>       hostPrivacyModeActive_{false};
-#if defined(_WIN32)
-    HWND                    hwndPrivacyCurtain_ = nullptr;
-#else
-    void*                   hwndPrivacyCurtain_ = nullptr;
-#endif
     std::atomic<bool>       viewerPrivacyModeActive_{false};
+    mutable std::mutex      privacyCurtainMutex_;
     std::string             privacyCurtainNotice_;
     std::string             privacyCurtainBrand_;
     bool                    privacyCurtainShowId_ = true;

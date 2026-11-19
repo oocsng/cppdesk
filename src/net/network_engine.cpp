@@ -125,14 +125,6 @@ bool sendAllBytes(socket_t s, const void* buf, size_t len) {
 }
 
 #if defined(_WIN32)
-struct CurtainWindowConfig {
-    std::wstring brandName = L"CppDesk Enterprise Security";
-    std::wstring noticeText = L"Screen output hidden and local physical inputs secured for authorized administration.";
-    std::wstring deskIdText = L"";
-    bool showDeskId = true;
-};
-static CurtainWindowConfig s_curtainConfig;
-
 static std::wstring utf8ToWide(const std::string& str) {
     if (str.empty()) return L"";
     int req = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), nullptr, 0);
@@ -141,160 +133,7 @@ static std::wstring utf8ToWide(const std::string& str) {
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), &out[0], req);
     return out;
 }
-
-static LRESULT CALLBACK PrivacyCurtainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-        case WM_ERASEBKGND:
-            return 1;
-        case WM_PAINT: {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hwnd, &ps);
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-            int w = std::max<int>(1, rc.right - rc.left);
-            int h = std::max<int>(1, rc.bottom - rc.top);
-
-            // Double buffering memory DC to eliminate flicker
-            HDC memDC = CreateCompatibleDC(hdc);
-            HBITMAP memBmp = CreateCompatibleBitmap(hdc, w, h);
-            HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
-
-            // 1. OLED Deep Dark Background (#0B0E14)
-            HBRUSH bgBrush = CreateSolidBrush(RGB(11, 14, 20));
-            FillRect(memDC, &rc, bgBrush);
-            DeleteObject(bgBrush);
-
-            // 2. Central Frosted Security Card Container
-            int cardW = std::clamp(w - 60, 360, 680);
-            int cardH = std::clamp(h - 60, 300, 420);
-            int cardX = (w - cardW) / 2;
-            int cardY = (h - cardH) / 2;
-            RECT cardRc = { cardX, cardY, cardX + cardW, cardY + cardH };
-
-            HBRUSH cardBrush = CreateSolidBrush(RGB(20, 24, 34));
-            HPEN cardPen = CreatePen(PS_SOLID, 1, RGB(36, 45, 61));
-            HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, cardBrush);
-            HPEN oldPen = (HPEN)SelectObject(memDC, cardPen);
-            RoundRect(memDC, cardRc.left, cardRc.top, cardRc.right, cardRc.bottom, 22, 22);
-            SelectObject(memDC, oldBrush);
-            SelectObject(memDC, oldPen);
-            DeleteObject(cardBrush);
-            DeleteObject(cardPen);
-
-            // 3. Central Shield Polygon Icon (Emerald Accent #10B981)
-            int shieldCX = cardX + cardW / 2;
-            int shieldCY = cardY + 58;
-            POINT shieldPts[5] = {
-                { shieldCX, shieldCY - 26 },
-                { shieldCX + 24, shieldCY - 14 },
-                { shieldCX + 16, shieldCY + 18 },
-                { shieldCX, shieldCY + 28 },
-                { shieldCX - 16, shieldCY + 18 }
-            };
-            HBRUSH shieldBrush = CreateSolidBrush(RGB(16, 185, 129));
-            HPEN shieldPen = CreatePen(PS_SOLID, 2, RGB(5, 150, 105));
-            oldBrush = (HBRUSH)SelectObject(memDC, shieldBrush);
-            oldPen = (HPEN)SelectObject(memDC, shieldPen);
-            Polygon(memDC, shieldPts, 5);
-
-            // Inner lock core
-            HBRUSH innerBrush = CreateSolidBrush(RGB(20, 24, 34));
-            SelectObject(memDC, innerBrush);
-            Ellipse(memDC, shieldCX - 5, shieldCY - 4, shieldCX + 5, shieldCY + 6);
-            SelectObject(memDC, oldBrush);
-            SelectObject(memDC, oldPen);
-            DeleteObject(shieldBrush);
-            DeleteObject(shieldPen);
-            DeleteObject(innerBrush);
-
-            // 4. Branded Typography & Badges
-            SetBkMode(memDC, TRANSPARENT);
-
-            // Brand Title (Segoe UI Bold 24pt, #F8FAFC)
-            HFONT hFontBrand = CreateFontW(25, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                           CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            HFONT hOldFont = (HFONT)SelectObject(memDC, hFontBrand);
-            SetTextColor(memDC, RGB(248, 250, 252));
-            RECT brandRc = { cardX + 24, shieldCY + 36, cardX + cardW - 24, shieldCY + 70 };
-            DrawTextW(memDC, s_curtainConfig.brandName.c_str(), -1, &brandRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-            // Status Pill: [ SECURED PRIVACY CURTAIN ACTIVE ]
-            HFONT hFontPill = CreateFontW(13, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            SelectObject(memDC, hFontPill);
-            SetTextColor(memDC, RGB(16, 185, 129));
-            RECT pillRc = { cardX + 24, brandRc.bottom + 2, cardX + cardW - 24, brandRc.bottom + 20 };
-            DrawTextW(memDC, L"[ SECURED PRIVACY CURTAIN ACTIVE ]", -1, &pillRc, DT_CENTER | DT_SINGLELINE);
-
-            // Custom Security Notice (#CBD5E1, Segoe UI 15pt)
-            HFONT hFontNotice = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            SelectObject(memDC, hFontNotice);
-            SetTextColor(memDC, RGB(203, 213, 225));
-            RECT noticeRc = { cardX + 32, pillRc.bottom + 12, cardX + cardW - 32, pillRc.bottom + 76 };
-            DrawTextW(memDC, s_curtainConfig.noticeText.c_str(), -1, &noticeRc, DT_CENTER | DT_WORDBREAK);
-
-            // Desk ID Pill Badge
-            HFONT hFontId = nullptr;
-            if (s_curtainConfig.showDeskId && !s_curtainConfig.deskIdText.empty()) {
-                RECT idBox = { cardX + cardW / 2 - 130, noticeRc.bottom + 8, cardX + cardW / 2 + 130, noticeRc.bottom + 34 };
-                HBRUSH idBrush = CreateSolidBrush(RGB(28, 33, 46));
-                HPEN idPen = CreatePen(PS_SOLID, 1, RGB(45, 55, 75));
-                HBRUSH prevBrush = (HBRUSH)SelectObject(memDC, idBrush);
-                HPEN prevPen = (HPEN)SelectObject(memDC, idPen);
-                RoundRect(memDC, idBox.left, idBox.top, idBox.right, idBox.bottom, 8, 8);
-                SelectObject(memDC, prevBrush);
-                SelectObject(memDC, prevPen);
-                DeleteObject(idBrush);
-                DeleteObject(idPen);
-
-                hFontId = CreateFontW(14, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
-                                      DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                      CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-                SelectObject(memDC, hFontId);
-                SetTextColor(memDC, RGB(148, 163, 184));
-                DrawTextW(memDC, s_curtainConfig.deskIdText.c_str(), -1, &idBox, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            }
-
-            // Host Physical Abort Failsafe
-            HFONT hFontFailsafe = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            SelectObject(memDC, hFontFailsafe);
-            SetTextColor(memDC, RGB(100, 116, 139));
-            RECT hintRc = { cardX + 24, cardRc.bottom - 36, cardX + cardW - 24, cardRc.bottom - 12 };
-            DrawTextW(memDC, L"Local emergency failsafe: Press Ctrl+Alt+Del on host physical keyboard to unlock workstation.", -1, &hintRc, DT_CENTER | DT_SINGLELINE);
-
-            // Transfer backbuffer to screen
-            BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
-
-            // Cleanup GDI objects
-            SelectObject(memDC, hOldFont);
-            DeleteObject(hFontBrand);
-            DeleteObject(hFontPill);
-            DeleteObject(hFontNotice);
-            if (hFontId) DeleteObject(hFontId);
-            DeleteObject(hFontFailsafe);
-            SelectObject(memDC, oldBmp);
-            DeleteObject(memBmp);
-            DeleteDC(memDC);
-            EndPaint(hwnd, &ps);
-            return 0;
-        }
-        case WM_SETCURSOR:
-            SetCursor(nullptr);
-            return TRUE;
-        case WM_CLOSE:
-            return 0;
-        default:
-            return DefWindowProcW(hwnd, msg, wParam, lParam);
-    }
-}
-
-#endif // _WIN32 curtain window
+#endif
 
 bool recvAllBytes(socket_t s, void* buf, size_t len) {
     char* p = static_cast<char*>(buf);
@@ -384,15 +223,17 @@ bool parseHostPort(const std::string& input, std::string& outHost, uint16_t& out
     auto colon = input.rfind(':');
     if (colon != std::string::npos) {
         outHost = input.substr(0, colon);
-        try {
-            int p = std::stoi(input.substr(colon + 1));
-            if (p > 0 && p <= 65535) {
-                outPort = static_cast<uint16_t>(p);
-                return !outHost.empty();
-            }
-        } catch (...) {
-            return false;
+        std::string portStr = input.substr(colon + 1);
+        if (outHost.empty() || portStr.empty()) return false;
+        uint32_t portVal = 0;
+        for (char c : portStr) {
+            if (c < '0' || c > '9') return false;
+            portVal = portVal * 10 + static_cast<uint32_t>(c - '0');
+            if (portVal > 65535) return false;
         }
+        if (portVal == 0) return false;
+        outPort = static_cast<uint16_t>(portVal);
+        return true;
     }
     outHost = input;
     outPort = defaultPort;
@@ -607,11 +448,13 @@ bool NetworkEngine::recvFrame(
     if (!recvAllBytes(s, &outHeader, sizeof(outHeader))) {
         return false;
     }
-    if (outHeader.magic != PROTOCOL_MAGIC || outHeader.payloadSize > MAX_PACKET_PAYLOAD_SIZE) {
+    const bool expectEncrypted = (cipher && cipher->isInitialized() && recvSeq);
+    const size_t maxWirePayload = expectEncrypted ? (MAX_PACKET_PAYLOAD_SIZE + 28) : MAX_PACKET_PAYLOAD_SIZE;
+    if (outHeader.magic != PROTOCOL_MAGIC || outHeader.payloadSize > maxWirePayload) {
         return false;
     }
 
-    if (cipher && cipher->isInitialized() && recvSeq) {
+    if (expectEncrypted) {
         // Post-authentication frames must carry FLAG_ENCRYPTED
         if ((outHeader.flags & FLAG_ENCRYPTED) == 0 || outHeader.payloadSize < 28) {
             return false;
@@ -1193,7 +1036,7 @@ void NetworkEngine::stop() {
         stopHostAudioCapture();
         stopHostTerminal();
         stopHostTunnelProxy();
-        destroyPrivacyCurtainWindow();
+        hostPrivacyModeActive_.store(false);
         ScreenBlankManager::instance().setEmergencyWakeCallback(nullptr);
         ScreenBlankManager::instance().disengageBlanking();
         ScreenBlankManager::wakeDisplays();
@@ -1629,7 +1472,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
             voiceIntercom_.stopCapture();
             voiceIntercom_.stopPlayback();
         }
-        destroyPrivacyCurtainWindow();
+        hostPrivacyModeActive_.store(false);
         ScreenBlankManager::instance().setEmergencyWakeCallback(nullptr);
         ScreenBlankManager::instance().disengageBlanking();
         ScreenBlankManager::wakeDisplays();
@@ -3865,6 +3708,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         sasFingerprint = CryptoUtils::sessionFingerprintHex(viewerSessionKey_);
                     }
 
+                    int activeMonIdx = 0;
                     {
                         std::lock_guard<std::mutex> lock(viewerStatsMutex_);
                         viewerStats_.state = ViewerConnectionState::Connected;
@@ -3881,8 +3725,10 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         viewerStats_.pairedSession = (pairing == ViewerPairingDecision::UsePaired);
                         viewerStats_.hostAllowsNewPairing = hostAdvertisesPairing && (pairFlags & PAIR_FLAG_ALLOW_NEW);
                         viewerStats_.offerPairing = viewerStats_.hostAllowsNewPairing && viewerHostKeyVerified_ &&
+                            (perms & PERM_INPUT) != 0 &&
                             !viewerStats_.pairedSession && !identity_.findPairedHost(remoteId);
                         pairingState_.store(PairingRequestState::Idle);
+                        activeMonIdx = viewerStats_.activeMonitorIndex;
                     }
                     // Viewer-only engines share one identity across threads; its recents list and save() are unlocked.
                     if (!viewerOnly_.load()) {
@@ -3894,7 +3740,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
 
                     requestVideoSettings(
                         identity_.settings().defaultQuality,
-                        viewerStats_.activeMonitorIndex,
+                        activeMonIdx,
                         true,
                         clampTargetFps(identity_.settings().targetFps),
                         identity_.settings().adaptiveFps ? 1 : 0
@@ -5175,6 +5021,7 @@ bool NetworkEngine::isHostAudioSuspended() const {
 }
 
 void NetworkEngine::configurePrivacyCurtain(const std::string& notice, const std::string& brand, bool showId) {
+    std::lock_guard<std::mutex> lk(privacyCurtainMutex_);
     privacyCurtainNotice_ = notice;
     privacyCurtainBrand_ = brand;
     privacyCurtainShowId_ = showId;
@@ -5187,12 +5034,19 @@ void NetworkEngine::requestTogglePrivacyMode(ScreenBlankMode blankMode) {
         blankMode = ScreenBlankMode::CurtainOnly;
     }
 
-    std::string notice = !privacyCurtainNotice_.empty() ? privacyCurtainNotice_ : s.privacyCustomNotice;
-    std::string brand = !privacyCurtainBrand_.empty() ? privacyCurtainBrand_ : s.privacyBrandName;
+    std::string notice;
+    std::string brand;
+    bool showId = true;
+    {
+        std::lock_guard<std::mutex> lk(privacyCurtainMutex_);
+        notice = !privacyCurtainNotice_.empty() ? privacyCurtainNotice_ : s.privacyCustomNotice;
+        brand = !privacyCurtainBrand_.empty() ? privacyCurtainBrand_ : s.privacyBrandName;
+        showId = privacyCurtainShowId_;
+    }
     PrivacyModeConfigPayload p{};
     p.enable = current ? 0 : 1;
     p.acknowledge = 0;
-    p.showDeskId = privacyCurtainShowId_ ? 1 : 0;
+    p.showDeskId = showId ? 1 : 0;
     p.blankMode = static_cast<uint8_t>(blankMode);
     std::snprintf(p.customNotice, sizeof(p.customNotice), "%s", notice.c_str());
     std::snprintf(p.brandName, sizeof(p.brandName), "%s", brand.c_str());
@@ -5211,13 +5065,22 @@ bool NetworkEngine::isHostPrivacyModeActive() const {
 
 void NetworkEngine::setHostPrivacyMode(bool enable, const std::string& notice, const std::string& brand, bool showId, ScreenBlankMode blankMode) {
     if (enable) {
-        if (!notice.empty()) privacyCurtainNotice_ = notice;
-        else if (privacyCurtainNotice_.empty()) privacyCurtainNotice_ = identity_.settings().privacyCustomNotice;
+        std::string activeNotice;
+        std::string activeBrand;
+        bool activeShowId = showId;
+        {
+            std::lock_guard<std::mutex> lk(privacyCurtainMutex_);
+            if (!notice.empty()) privacyCurtainNotice_ = notice;
+            else if (privacyCurtainNotice_.empty()) privacyCurtainNotice_ = identity_.settings().privacyCustomNotice;
 
-        if (!brand.empty()) privacyCurtainBrand_ = brand;
-        else if (privacyCurtainBrand_.empty()) privacyCurtainBrand_ = identity_.settings().privacyBrandName;
+            if (!brand.empty()) privacyCurtainBrand_ = brand;
+            else if (privacyCurtainBrand_.empty()) privacyCurtainBrand_ = identity_.settings().privacyBrandName;
 
-        privacyCurtainShowId_ = showId;
+            privacyCurtainShowId_ = showId;
+            activeNotice = privacyCurtainNotice_;
+            activeBrand = privacyCurtainBrand_;
+            activeShowId = privacyCurtainShowId_;
+        }
 
         // Auto-provision virtual display if host is headless
         if ((blankMode == ScreenBlankMode::DpmsOnly || blankMode == ScreenBlankMode::Unified) &&
@@ -5225,93 +5088,13 @@ void NetworkEngine::setHostPrivacyMode(bool enable, const std::string& notice, c
             VirtualDisplayManager::instance().ensureHeadlessDisplay(1920, 1080, 60);
         }
 
-        ScreenBlankManager::instance().engageBlanking(blankMode, privacyCurtainNotice_, privacyCurtainBrand_, privacyCurtainShowId_, identity_.deskId());
+        ScreenBlankManager::instance().engageBlanking(blankMode, activeNotice, activeBrand, activeShowId, identity_.deskId());
         hostPrivacyModeActive_.store(true);
     } else {
         ScreenBlankManager::instance().disengageBlanking();
-        destroyPrivacyCurtainWindow();
         hostPrivacyModeActive_.store(false);
     }
 }
-
-#if defined(_WIN32)
-void NetworkEngine::createPrivacyCurtainWindow() {
-    if (hwndPrivacyCurtain_) return;
-
-    // Populate global curtain configuration for double-buffered GDI window
-    std::string activeBrand = privacyCurtainBrand_.empty() ? identity_.settings().privacyBrandName : privacyCurtainBrand_;
-    std::string activeNotice = privacyCurtainNotice_.empty() ? identity_.settings().privacyCustomNotice : privacyCurtainNotice_;
-    s_curtainConfig.brandName = utf8ToWide(activeBrand.empty() ? "CppDesk Enterprise Security" : activeBrand);
-    s_curtainConfig.noticeText = utf8ToWide(activeNotice.empty() ? "Screen output hidden and local physical inputs secured for authorized administration." : activeNotice);
-    s_curtainConfig.showDeskId = privacyCurtainShowId_;
-
-    uint64_t deskId = identity_.deskId();
-    if (deskId > 0) {
-        std::string rawId = std::to_string(deskId);
-        std::string fmtId;
-        for (size_t i = 0; i < rawId.size(); ++i) {
-            if (i > 0 && (rawId.size() - i) % 3 == 0) fmtId += "-";
-            fmtId += rawId[i];
-        }
-        s_curtainConfig.deskIdText = L"Workstation Desk ID: " + utf8ToWide(fmtId);
-    } else {
-        s_curtainConfig.deskIdText = L"";
-    }
-
-    WNDCLASSEXW wc{};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = PrivacyCurtainWndProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"CppDeskPrivacyCurtainClass";
-    wc.hCursor = nullptr;
-    RegisterClassExW(&wc);
-
-    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int vw = std::max<int>(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
-    int vh = std::max<int>(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
-
-    hwndPrivacyCurtain_ = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        L"CppDeskPrivacyCurtainClass",
-        L"CppDesk Privacy Curtain",
-        WS_POPUP,
-        vx, vy, vw, vh,
-        nullptr, nullptr,
-        GetModuleHandleW(nullptr),
-        nullptr
-    );
-
-    if (hwndPrivacyCurtain_) {
-        SetWindowDisplayAffinity(hwndPrivacyCurtain_, WDA_EXCLUDEFROMCAPTURE);
-        ShowWindow(hwndPrivacyCurtain_, SW_SHOWMAXIMIZED);
-        SetWindowPos(hwndPrivacyCurtain_, HWND_TOPMOST, vx, vy, vw, vh, SWP_SHOWWINDOW | SWP_NOACTIVATE);
-        UpdateWindow(hwndPrivacyCurtain_);
-    }
-
-    BlockInput(TRUE);
-    hostPrivacyModeActive_.store(true);
-}
-#else
-void NetworkEngine::createPrivacyCurtainWindow() {}
-#endif
-
-#if defined(_WIN32)
-void NetworkEngine::destroyPrivacyCurtainWindow() {
-    BlockInput(FALSE);
-    if (hwndPrivacyCurtain_) {
-        DestroyWindow(hwndPrivacyCurtain_);
-        hwndPrivacyCurtain_ = nullptr;
-    }
-    ScreenBlankManager::instance().disengageBlanking();
-    hostPrivacyModeActive_.store(false);
-}
-#else
-void NetworkEngine::destroyPrivacyCurtainWindow() {
-    ScreenBlankManager::instance().disengageBlanking();
-    hostPrivacyModeActive_.store(false);
-}
-#endif
 
 // stop() and the host session's own cleanup both stop these workers. Moving the thread out under a lock gives exactly
 // one of them the join; two threads joining one std::thread is undefined (on Linux the second never returns).
@@ -6551,7 +6334,7 @@ namespace {
 std::string macSysctlString(const char* name) {
     size_t len = 0;
     if (sysctlbyname(name, nullptr, &len, nullptr, 0) != 0 || len == 0) return {};
-    std::string out(len, ' ');
+    std::string out(len, '\0');
     if (sysctlbyname(name, out.data(), &len, nullptr, 0) != 0) return {};
     out.resize(strnlen(out.c_str(), len));
     return out;
@@ -6785,7 +6568,20 @@ SystemDiagnosticsPayload NetworkEngine::sampleHostDiagnostics() {
         std::lock_guard<std::mutex> hwLock(s_hwInfoMutex);
         if (s_cachedCpuCores == 0) {
             // CPU brand string
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
             char cpuBrand[49] = {0};
+#if defined(_MSC_VER)
+            int regs[4] = {0};
+            __cpuid(regs, static_cast<int>(0x80000000));
+            if (static_cast<unsigned int>(regs[0]) >= 0x80000004) {
+                __cpuid(reinterpret_cast<int*>(cpuBrand),      static_cast<int>(0x80000002));
+                __cpuid(reinterpret_cast<int*>(cpuBrand + 16), static_cast<int>(0x80000003));
+                __cpuid(reinterpret_cast<int*>(cpuBrand + 32), static_cast<int>(0x80000004));
+                char* p = cpuBrand;
+                while (*p == ' ') p++;
+                s_cachedCpuModel = p;
+            }
+#elif defined(__GNUC__) || defined(__clang__)
             unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
             if (__get_cpuid(0x80000000, &eax, &ebx, &ecx, &edx) && eax >= 0x80000004) {
                 __get_cpuid(0x80000002, (unsigned int*)(cpuBrand), (unsigned int*)(cpuBrand + 4), (unsigned int*)(cpuBrand + 8), (unsigned int*)(cpuBrand + 12));
@@ -6795,8 +6591,10 @@ SystemDiagnosticsPayload NetworkEngine::sampleHostDiagnostics() {
                 while (*p == ' ') p++;
                 s_cachedCpuModel = p;
             }
+#endif
+#endif
             if (s_cachedCpuModel.empty()) {
-                s_cachedCpuModel = "x86_64 Processor";
+                s_cachedCpuModel = "Processor";
             }
 
             // CPU cores
@@ -6830,11 +6628,20 @@ SystemDiagnosticsPayload NetworkEngine::sampleHostDiagnostics() {
             HKEY hKey = nullptr;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
                 wchar_t prodName[128] = {0};
-                DWORD sz = sizeof(prodName);
-                if (RegQueryValueExW(hKey, L"ProductName", nullptr, nullptr, (LPBYTE)prodName, &sz) == ERROR_SUCCESS) {
+                DWORD sz = sizeof(prodName) - sizeof(wchar_t);
+                DWORD prodType = 0;
+                if (RegQueryValueExW(hKey, L"ProductName", nullptr, &prodType, (LPBYTE)prodName, &sz) == ERROR_SUCCESS &&
+                    (prodType == REG_SZ || prodType == REG_EXPAND_SZ)) {
+                    prodName[(sizeof(prodName) / sizeof(wchar_t)) - 1] = L'\0';
                     wchar_t buildLab[64] = {0};
-                    DWORD bsz = sizeof(buildLab);
-                    RegQueryValueExW(hKey, L"CurrentBuild", nullptr, nullptr, (LPBYTE)buildLab, &bsz);
+                    DWORD bsz = sizeof(buildLab) - sizeof(wchar_t);
+                    DWORD buildType = 0;
+                    if (RegQueryValueExW(hKey, L"CurrentBuild", nullptr, &buildType, (LPBYTE)buildLab, &bsz) == ERROR_SUCCESS &&
+                        (buildType == REG_SZ || buildType == REG_EXPAND_SZ)) {
+                        buildLab[(sizeof(buildLab) / sizeof(wchar_t)) - 1] = L'\0';
+                    } else {
+                        buildLab[0] = L'\0';
+                    }
                     int req = WideCharToMultiByte(CP_UTF8, 0, prodName, -1, nullptr, 0, nullptr, nullptr);
                     if (req > 1) {
                         std::string osStr(req - 1, '\0');
@@ -6876,7 +6683,7 @@ bool NetworkEngine::executeProcessKill(uint32_t pid, uint8_t callerPermissions) 
     if ((callerPermissions & PERM_INPUT) == 0) {
         return false;
     }
-    if (pid == 0 || pid == 4) {
+    if (pid <= 1 || pid == 4 || pid > static_cast<uint32_t>(INT32_MAX)) {
         return false;
     }
 #if defined(_WIN32)
@@ -6897,7 +6704,11 @@ bool NetworkEngine::executeProcessKill(uint32_t pid, uint8_t callerPermissions) 
     CloseHandle(hProc);
     return success != FALSE;
 #else
-    return kill(static_cast<pid_t>(pid), SIGKILL) == 0;
+    const pid_t targetPid = static_cast<pid_t>(pid);
+    if (targetPid <= 1) {
+        return false;
+    }
+    return kill(targetPid, SIGKILL) == 0;
 #endif
 }
 
