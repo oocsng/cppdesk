@@ -671,7 +671,7 @@ bool NetworkEngine::isIpRateLimited(const std::string& ip) {
         return true;
     }
     if (it->second.lockedUntilMs != 0 && now >= it->second.lockedUntilMs) {
-        it->second = BruteForceRecord{};
+        authRateMap_.erase(it);
     }
     return false;
 }
@@ -683,6 +683,30 @@ void NetworkEngine::recordAuthResultForIp(const std::string& ip, bool success) {
         return;
     }
     uint64_t now = nowTickMs();
+    // Bound authRateMap_ growth by evicting expired records when large.
+    static constexpr size_t kMaxRateMapEntries = 4096;
+    if (authRateMap_.size() >= 1024) {
+        for (auto it = authRateMap_.begin(); it != authRateMap_.end(); ) {
+            const bool lockExpired = (it->second.lockedUntilMs != 0 && now >= it->second.lockedUntilMs);
+            const bool windowExpired = (it->second.lockedUntilMs == 0 && it->second.windowStartMs != 0 && now - it->second.windowStartMs > 60000);
+            if (lockExpired || windowExpired) {
+                it = authRateMap_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (authRateMap_.size() >= kMaxRateMapEntries && authRateMap_.find(ip) == authRateMap_.end()) {
+            auto oldest = authRateMap_.begin();
+            for (auto it = authRateMap_.begin(); it != authRateMap_.end(); ++it) {
+                if (it->second.windowStartMs < oldest->second.windowStartMs) {
+                    oldest = it;
+                }
+            }
+            if (oldest != authRateMap_.end()) {
+                authRateMap_.erase(oldest);
+            }
+        }
+    }
     auto& rec = authRateMap_[ip];
     if (rec.windowStartMs == 0 || (now - rec.windowStartMs > 60000)) {
         rec.windowStartMs = now;
@@ -1707,14 +1731,20 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
             std::lock_guard<std::mutex> lk(peerVersionMutex_);
             remotePeerAppVersion_ = viewerAppVersion;
         }
-        if (protoVer != PROTOCOL_VERSION) {
+        if (protoVer != PROTOCOL_VERSION || viewerPubBlob.empty()) {
             cleanup();
             return;
         }
 
-        // 2. Send AUTH_CHALLENGE (including Host Ephemeral ECDH Public Key)
+        // 2. Send AUTH_CHALLENGE (including Host Ephemeral ECDH Public Key and PBKDF2 params)
         std::array<uint8_t, 32> nonce{};
-        CryptoUtils::randomBytes(nonce.data(), nonce.size());
+        if (!CryptoUtils::randomBytes(nonce.data(), nonce.size())) {
+            cleanup();
+            return;
+        }
+        std::array<uint8_t, 16> challengeSalt{};
+        uint32_t challengeIterations = CryptoUtils::kDefaultPbkdf2Iterations;
+        identity_.getAuthKdfParams(challengeSalt, challengeIterations);
 
         {
             ByteWriter w;
@@ -1738,14 +1768,36 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
             w.writeBytes(pk.publicKey().data(), pk.publicKey().size());
             w.writeU16(static_cast<uint16_t>(hostSig.size()));
             w.writeBytes(hostSig.data(), hostSig.size());
+            w.writeBytes(challengeSalt.data(), challengeSalt.size());
+            w.writeU32(challengeIterations);
             if (!sendFrame(clientSock, PacketType::AUTH_CHALLENGE, 0, w.buffer().data(), w.buffer().size(), hostSendMutex_)) {
                 cleanup();
                 return;
             }
         }
 
-        // 3. Receive AUTH_RESPONSE
-        if (!recvFrame(clientSock, hdr, handshakePayload) || static_cast<PacketType>(hdr.type) != PacketType::AUTH_RESPONSE) {
+        // Derive ECDH session key and enable AES-256-GCM before receiving AUTH_RESPONSE, reboot tokens, or TOTP codes.
+        if (!hostEcdh.computeSharedSessionKey(
+                viewerPubBlob.data(), viewerPubBlob.size(),
+                identity_.deskId(), viewerId, nonce, hostSessionKey_) ||
+            !CryptoUtils::isUsableKey(hostSessionKey_)) {
+            cleanup();
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(hostCipherMutex_);
+            if (!hostCipher_.initialize(hostSessionKey_, /*isHost=*/true)) {
+                cleanup();
+                return;
+            }
+            hostSendSeq_ = 0;
+            hostEncrypted_.store(true);
+        }
+        uint64_t hostRecvSeq = 0;
+
+        // 3. Receive AUTH_RESPONSE (encrypted)
+        if (!recvFrame(clientSock, hdr, handshakePayload, &hostCipher_, &hostRecvSeq) ||
+            static_cast<PacketType>(hdr.type) != PacketType::AUTH_RESPONSE) {
             cleanup();
             return;
         }
@@ -1755,34 +1807,38 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         std::array<uint8_t, 32> clientDigest{};
         authReader.readBytes(clientDigest.data(), clientDigest.size());
 
+        // Relayed sessions share clientIp == "Relay-Bridge"; scope rate limits per viewerId to prevent cross-viewer DoS.
+        const std::string rateKey = (clientIp == "Relay-Bridge") ? ("Relay:" + std::to_string(viewerId)) : clientIp;
+
         bool accepted = false;
         bool pairedLogin = false;
         uint8_t grantedPerms = PERM_ALL;
         AuthResultCode resultCode = AuthResultCode::RejectedByUser;
         std::string resultMsg;
 
-        if (isIpRateLimited(clientIp)) {
+        if (isIpRateLimited(rateKey)) {
             accepted = false;
             resultCode = AuthResultCode::RateLimited;
             resultMsg = "Too many failed password attempts. Locked for 60s.";
-        } else if (hasPassword == 2) {
+        } else if (hasPassword == AUTH_MODE_REBOOT_TOKEN) {
             std::string tokenHex = CryptoUtils::toHex(clientDigest.data(), clientDigest.size());
 #if defined(_WIN32)
             if (WindowsServiceManager::validateAndConsumeRebootToken(tokenHex, viewerId)) {
 #else
             if (false) {
 #endif
-                recordAuthResultForIp(clientIp, true);
+                recordAuthResultForIp(rateKey, true);
                 accepted = true;
                 grantedPerms = PERM_ALL;
                 resultCode = AuthResultCode::Accepted;
                 resultMsg = "Authenticated via Reboot Resume Token";
             } else {
-                recordAuthResultForIp(clientIp, false);
+                recordAuthResultForIp(rateKey, false);
                 accepted = false;
                 resultCode = AuthResultCode::InvalidPassword;
                 resultMsg = "Invalid or expired reboot resume token";
             }
+            CryptoUtils::secureZero(tokenHex.data(), tokenHex.size());
         } else if (hasPassword == AUTH_MODE_PAIRED) {
             // Must stay before the password branch: a paired login never falls through to password checks.
             PairingKey::Signature viewerSig{};
@@ -1794,7 +1850,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                    CryptoUtils::pairingTranscript('V', identity_.deskId(), viewerId, nonce,
                                                                   hostEcdh.localPublicKey(), viewerPubBlob),
                                    viewerSig);
-            recordAuthResultForIp(clientIp, pairedOk);
+            recordAuthResultForIp(rateKey, pairedOk);
             if (pairedOk) {
                 accepted = true;
                 pairedLogin = true;
@@ -1806,33 +1862,25 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                 resultCode = AuthResultCode::InvalidPassword;
                 resultMsg = "This PC is not paired with the host.";
             }
-        } else if (hasPassword != 0) {
-            // Mode 3 binds the digest to the ECDH key so a passive observer cannot test password guesses offline.
-            std::array<uint8_t, 32> boundKey{};
-            const bool bound = (hasPassword == AUTH_MODE_PASSWORD_BOUND);
-            const bool boundKeyOk = !bound ||
-                (!viewerPubBlob.empty() &&
-                 hostEcdh.computeSharedSessionKey(viewerPubBlob.data(), viewerPubBlob.size(),
-                                                  identity_.deskId(), viewerId, nonce, boundKey) &&
-                 CryptoUtils::isUsableKey(boundKey));
-            const bool digestOk = boundKeyOk &&
-                identity_.verifyChallengeResponse(viewerId, nonce, clientDigest, bound ? &boundKey : nullptr);
-            CryptoUtils::secureZero(boundKey.data(), boundKey.size());
+        } else if (hasPassword == AUTH_MODE_PASSWORD_BOUND) {
+            // Unbound password mode 1 is removed; only ECDH-bound PBKDF2 digests are accepted.
+            const bool digestOk = identity_.verifyChallengeResponse(
+                viewerId, nonce, clientDigest, hostSessionKey_, challengeSalt, challengeIterations);
             if (digestOk) {
                 // Unattended password verified successfully!
                 if (identity_.settings().totpEnabled && identity_.totpManager().isConfigured()) {
-                    // Host requires Two-Factor Authentication!
+                    // Host requires Two-Factor Authentication (encrypted over active AES-GCM session)
                     bool totpVerified = false;
                     int totpAttempts = 0;
                     const int maxTotpAttempts = 3;
 
-                    // Send initial AUTH_RESULT with TotpRequired
+                    // Send initial AUTH_RESULT with TotpRequired (encrypted)
                     {
                         ByteWriter w;
                         w.writeU8(static_cast<uint8_t>(AuthResultCode::TotpRequired));
                         w.writeU8(0);
                         w.writeString("Two-Factor Authentication Required");
-                        if (!sendFrame(clientSock, PacketType::AUTH_RESULT, 0, w.buffer().data(), w.buffer().size(), hostSendMutex_)) {
+                        if (!sendHostEncryptedPacket(PacketType::AUTH_RESULT, 0, w.buffer().data(), w.buffer().size())) {
                             cleanup();
                             return;
                         }
@@ -1842,11 +1890,13 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                     setSocketTimeoutMs(toWinSock(clientSock), 45000);
 
                     while (totpAttempts < maxTotpAttempts && running_.load()) {
-                        if (!recvFrame(clientSock, hdr, handshakePayload)) {
+                        if (!recvFrame(clientSock, hdr, handshakePayload, &hostCipher_, &hostRecvSeq)) {
+                            recordAuthResultForIp(rateKey, false);
                             cleanup();
                             return;
                         }
                         if (static_cast<PacketType>(hdr.type) != PacketType::TOTP_VERIFY) {
+                            recordAuthResultForIp(rateKey, false);
                             cleanup();
                             return;
                         }
@@ -1860,12 +1910,16 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             break;
                         } else {
                             totpAttempts++;
+                            recordAuthResultForIp(rateKey, false);
+                            if (isIpRateLimited(rateKey)) {
+                                break;
+                            }
                             if (totpAttempts < maxTotpAttempts) {
                                 ByteWriter w;
                                 w.writeU8(static_cast<uint8_t>(AuthResultCode::TotpInvalid));
                                 w.writeU8(0);
                                 w.writeString("Invalid Two-Factor Authentication Code. Please try again.");
-                                if (!sendFrame(clientSock, PacketType::AUTH_RESULT, 0, w.buffer().data(), w.buffer().size(), hostSendMutex_)) {
+                                if (!sendHostEncryptedPacket(PacketType::AUTH_RESULT, 0, w.buffer().data(), w.buffer().size())) {
                                     cleanup();
                                     return;
                                 }
@@ -1874,33 +1928,39 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                     }
 
                     if (totpVerified) {
-                        recordAuthResultForIp(clientIp, true);
+                        recordAuthResultForIp(rateKey, true);
                         accepted = true;
                         grantedPerms = identity_.settings().defaultPermissions;
                         resultCode = AuthResultCode::Accepted;
                         resultMsg = "Authenticated via Unattended Password and TOTP 2FA";
                     } else {
-                        recordAuthResultForIp(clientIp, false);
                         accepted = false;
-                        resultCode = AuthResultCode::InvalidPassword;
-                        resultMsg = "Two-Factor Authentication failed (exceeded attempts or invalid code)";
+                        resultCode = isIpRateLimited(rateKey) ? AuthResultCode::RateLimited : AuthResultCode::InvalidPassword;
+                        resultMsg = (resultCode == AuthResultCode::RateLimited)
+                            ? "Too many failed authentication attempts. Locked for 60s."
+                            : "Two-Factor Authentication failed (exceeded attempts or invalid code)";
                     }
                 } else {
                     // Standard unattended access without 2FA
-                    recordAuthResultForIp(clientIp, true);
+                    recordAuthResultForIp(rateKey, true);
                     accepted = true;
                     grantedPerms = identity_.settings().defaultPermissions;
                     resultCode = AuthResultCode::Accepted;
                     resultMsg = "Authenticated via Encrypted Challenge-Response";
                 }
             } else {
-                recordAuthResultForIp(clientIp, false);
+                recordAuthResultForIp(rateKey, false);
                 accepted = false;
-                resultCode = isIpRateLimited(clientIp) ? AuthResultCode::RateLimited : AuthResultCode::InvalidPassword;
+                resultCode = isIpRateLimited(rateKey) ? AuthResultCode::RateLimited : AuthResultCode::InvalidPassword;
                 resultMsg = (resultCode == AuthResultCode::RateLimited)
                     ? "Too many failed password attempts. Locked for 60s."
                     : "Invalid Unattended or Session Password";
             }
+        } else if (hasPassword != AUTH_MODE_NONE) {
+            recordAuthResultForIp(rateKey, false);
+            accepted = false;
+            resultCode = AuthResultCode::ProtocolError;
+            resultMsg = "Unsupported authentication mode";
         } else if (autoAcceptIncoming_.load() || identity_.settings().autoAcceptIncoming) {
             accepted = true;
             grantedPerms = identity_.settings().defaultPermissions;
@@ -1909,7 +1969,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         } else {
             // Interactive approval via UI popup modal!
             setSocketTimeoutMs(toWinSock(clientSock), 0);
-            sendFrame(clientSock, PacketType::AUTH_WAITING, 0, nullptr, 0, hostSendMutex_);
+            sendHostEncryptedPacket(PacketType::AUTH_WAITING, 0, nullptr, 0);
 
             {
                 std::lock_guard<std::mutex> lock(approvalMutex_);
@@ -1942,13 +2002,13 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
             }
         }
 
-        // 4. Send AUTH_RESULT (plaintext before activating stream cipher)
+        // 4. Send AUTH_RESULT (encrypted)
         {
             ByteWriter w;
             w.writeU8(static_cast<uint8_t>(resultCode));
             w.writeU8(grantedPerms);
             w.writeString(resultMsg);
-            if (!sendFrame(clientSock, PacketType::AUTH_RESULT, 0, w.buffer().data(), w.buffer().size(), hostSendMutex_)) {
+            if (!sendHostEncryptedPacket(PacketType::AUTH_RESULT, 0, w.buffer().data(), w.buffer().size())) {
                 cleanup();
                 return;
             }
@@ -1961,24 +2021,8 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
             return;
         }
 
-        // Clear handshake timeout & activate mandatory end-to-end AES-256-GCM AEAD encryption!
+        // Clear handshake timeout; AES-256-GCM session cipher is already active.
         setSocketTimeoutMs(toWinSock(clientSock), 0);
-        if (viewerPubBlob.empty() ||
-            !hostEcdh.computeSharedSessionKey(
-                viewerPubBlob.data(), viewerPubBlob.size(),
-                identity_.deskId(), viewerId, nonce, hostSessionKey_) ||
-            !CryptoUtils::isUsableKey(hostSessionKey_)) {
-            cleanup();
-            return;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(hostCipherMutex_);
-            hostCipher_.initialize(hostSessionKey_, /*isHost=*/true);
-            hostSendSeq_ = 0;
-            hostEncrypted_.store(true);
-        }
-        uint64_t hostRecvSeq = 0;
         std::string sasFingerprint = CryptoUtils::sessionFingerprintHex(hostSessionKey_);
 
         hostLivePermissions_.store(grantedPerms);
@@ -3443,7 +3487,9 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                     }
                     SOCKET ls = connectTcpWithTimeout(rHost, rPort, 1500);
                     if (ls != INVALID_SOCKET) {
+                        setSocketTimeoutMs(ls, 5000);
                         uintptr_t lSock = fromWinSock(ls);
+                        viewerSock_.store(lSock);
                         ByteWriter lw;
                         lw.writeU64(targetDeskId);
                         std::mutex lm;
@@ -3463,6 +3509,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                 } catch (...) {}
                             }
                         }
+                        viewerSock_.store(~uintptr_t(0));
                         closeWinSock(lSock);
                     }
 
@@ -3479,7 +3526,9 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         }
                         SOCKET bs = connectTcpWithTimeout(rHost, rPort, 1500);
                         if (bs != INVALID_SOCKET) {
+                            setSocketTimeoutMs(bs, 5000);
                             uintptr_t bSock = fromWinSock(bs);
+                            viewerSock_.store(bSock);
                             ByteWriter bw;
                             bw.writeU64(targetDeskId);
                             std::mutex bm;
@@ -3496,6 +3545,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                 }
                             }
                             if (connectedSock == INVALID_SOCKET) {
+                                viewerSock_.store(~uintptr_t(0));
                                 closeWinSock(bSock);
                             }
                         }
@@ -3523,8 +3573,20 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
         }
 
         uintptr_t vSock = fromWinSock(connectedSock);
+        setSocketTimeoutMs(connectedSock, 8000);
         viewerSock_.store(vSock);
         viewerEncrypted_.store(false);
+
+        auto abortHandshake = [&]() {
+            viewerEncrypted_.store(false);
+            {
+                std::lock_guard<std::mutex> lock(viewerCipherMutex_);
+                viewerCipher_.reset();
+                CryptoUtils::secureZero(viewerSessionKey_.data(), viewerSessionKey_.size());
+            }
+            closeWinSock(vSock);
+            viewerSock_.store(~uintptr_t(0));
+        };
 
         try {
             if (!isReconnecting) {
@@ -3537,8 +3599,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                 if (!isReconnecting) {
                     setStatus(ViewerConnectionState::Error, "Failed to initialize key exchange.");
                 }
-                closeWinSock(vSock);
-                viewerSock_.store(~uintptr_t(0));
+                abortHandshake();
                 return false;
             }
 
@@ -3566,8 +3627,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                     } else if (!isReconnecting) {
                         setStatus(ViewerConnectionState::Error, "Connection closed during handshake.");
                     }
-                    closeWinSock(vSock);
-                    viewerSock_.store(~uintptr_t(0));
+                    abortHandshake();
                     return false;
                 }
             }
@@ -3579,8 +3639,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                 if (!isReconnecting) {
                     setStatus(ViewerConnectionState::Error, "Failed to receive authentication challenge.");
                 }
-                closeWinSock(vSock);
-                viewerSock_.store(~uintptr_t(0));
+                abortHandshake();
                 return false;
             }
 
@@ -3591,8 +3650,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                 if (!isReconnecting) {
                     setStatus(ViewerConnectionState::Error, msg.empty() ? "Host busy or rate-limited." : msg);
                 }
-                closeWinSock(vSock);
-                viewerSock_.store(~uintptr_t(0));
+                abortHandshake();
                 return false;
             }
 
@@ -3600,8 +3658,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                 if (!isReconnecting) {
                     setStatus(ViewerConnectionState::Error, "Unexpected handshake packet.");
                 }
-                closeWinSock(vSock);
-                viewerSock_.store(~uintptr_t(0));
+                abortHandshake();
                 return false;
             }
 
@@ -3626,7 +3683,22 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                 std::lock_guard<std::mutex> lk(peerVersionMutex_);
                 remotePeerAppVersion_ = hostAppVersion;
             }
-            const uint8_t hostAuthCaps = chalReader.hasRemaining(1) ? chalReader.readU8() : 0;
+            // Missing capability byte or missing AUTH_CAP_BOUND_RESPONSE must fail closed, never downgrade.
+            if (!chalReader.hasRemaining(1)) {
+                if (!isReconnecting) {
+                    setStatus(ViewerConnectionState::Error, "Host authentication challenge missing required capabilities.");
+                }
+                abortHandshake();
+                return false;
+            }
+            const uint8_t hostAuthCaps = chalReader.readU8();
+            if ((hostAuthCaps & AUTH_CAP_BOUND_RESPONSE) == 0) {
+                if (!isReconnecting) {
+                    setStatus(ViewerConnectionState::Error, "Host does not support bound authentication.");
+                }
+                abortHandshake();
+                return false;
+            }
 
             // Pairing: check the host's key and session signature before sending any credential.
             const bool hostAdvertisesPairing = (hostAuthCaps & AUTH_CAP_PAIRING) != 0;
@@ -3645,6 +3717,27 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                                    hostPubBlob, viewerEcdh.localPublicKey()),
                     hostSig);
             }
+            // Read mandatory PBKDF2 salt + iteration count from AUTH_CHALLENGE.
+            std::array<uint8_t, 16> challengeSalt{};
+            uint32_t challengeIterations = 0;
+            if (!chalReader.hasRemaining(challengeSalt.size() + sizeof(challengeIterations))) {
+                if (!isReconnecting) {
+                    setStatus(ViewerConnectionState::Error, "Host challenge missing KDF parameters.");
+                }
+                abortHandshake();
+                return false;
+            }
+            chalReader.readBytes(challengeSalt.data(), challengeSalt.size());
+            challengeIterations = chalReader.readU32();
+            if (challengeIterations < CryptoUtils::kMinPbkdf2Iterations ||
+                challengeIterations > CryptoUtils::kMaxPbkdf2Iterations) {
+                if (!isReconnecting) {
+                    setStatus(ViewerConnectionState::Error, "Host sent invalid KDF parameters.");
+                }
+                abortHandshake();
+                return false;
+            }
+
             // A dialled desk ID is resolved over unauthenticated discovery: if it is pinned, the PC that answers must
             // claim that same ID, or a rogue could answer for it under another ID and dodge the pin.
             const bool pinnedIdAnsweredByOther =
@@ -3663,12 +3756,36 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         ? "This PC's identity doesn't match the one you paired with, so the connection was refused. If it was reinstalled, forget the pairing and pair again."
                         : "This PC no longer offers pairing, so the connection was refused. Forget the pairing to connect with a password.");
                 }
-                closeWinSock(vSock);
-                viewerSock_.store(~uintptr_t(0));
+                abortHandshake();
                 return false;
             }
 
-            // 3. Compute & send AUTH_RESPONSE
+            // Activate mandatory AES-256-GCM encryption before sending AUTH_RESPONSE, reboot tokens, or TOTP codes.
+            if (hostPubBlob.empty() ||
+                !viewerEcdh.computeSharedSessionKey(
+                    hostPubBlob.data(), hostPubBlob.size(),
+                    remoteId, identity_.deskId(), nonce, viewerSessionKey_) ||
+                !CryptoUtils::isUsableKey(viewerSessionKey_)) {
+                if (!isReconnecting) {
+                    setStatus(ViewerConnectionState::Error, "Failed to establish secure session.");
+                }
+                abortHandshake();
+                return false;
+            }
+            std::string sasFingerprint;
+            {
+                std::lock_guard<std::mutex> lock(viewerCipherMutex_);
+                if (!viewerCipher_.initialize(viewerSessionKey_, /*isHost=*/false)) {
+                    abortHandshake();
+                    return false;
+                }
+                viewerSendSeq_ = 0;
+                viewerEncrypted_.store(true);
+                sasFingerprint = CryptoUtils::sessionFingerprintHex(viewerSessionKey_);
+            }
+            uint64_t viewerRecvSeq = 0;
+
+            // 3. Compute & send AUTH_RESPONSE (encrypted)
             {
                 ByteWriter w;
                 std::string tokenCopy;
@@ -3687,8 +3804,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         if (!isReconnecting) {
                             setStatus(ViewerConnectionState::Error, "Failed to establish secure session.");
                         }
-                        closeWinSock(vSock);
-                        viewerSock_.store(~uintptr_t(0));
+                        abortHandshake();
                         return false;
                     }
                     w.writeU8(AUTH_MODE_PAIRED);
@@ -3697,7 +3813,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                     w.writeU16(static_cast<uint16_t>(sig.size()));
                     w.writeBytes(sig.data(), sig.size());
                 } else if (!tokenCopy.empty()) {
-                    w.writeU8(2);
+                    w.writeU8(AUTH_MODE_REBOOT_TOKEN);
                     auto tokenBytes = CryptoUtils::fromHex(tokenCopy);
                     if (tokenBytes.size() == 32) {
                         w.writeBytes(tokenBytes.data(), 32);
@@ -3706,56 +3822,40 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         std::memcpy(tb.data(), tokenBytes.data(), std::min<size_t>(32, tokenBytes.size()));
                         w.writeBytes(tb.data(), 32);
                     }
+                    CryptoUtils::secureZero(tokenCopy.data(), tokenCopy.size());
+                    if (!tokenBytes.empty()) CryptoUtils::secureZero(tokenBytes.data(), tokenBytes.size());
                 } else if (!password.empty()) {
-                    auto digest = CryptoUtils::computeChallengeResponse(password, remoteId, identity_.deskId(), nonce);
-                    if (hostAuthCaps & AUTH_CAP_BOUND_RESPONSE) {
-                        // Never fall back to the unbound digest once the host offered the bound one.
-                        std::array<uint8_t, 32> boundKey{};
-                        if (hostPubBlob.empty() ||
-                            !viewerEcdh.computeSharedSessionKey(hostPubBlob.data(), hostPubBlob.size(),
-                                                                remoteId, identity_.deskId(), nonce, boundKey) ||
-                            !CryptoUtils::isUsableKey(boundKey)) {
-                            if (!isReconnecting) {
-                                setStatus(ViewerConnectionState::Error, "Failed to establish secure session.");
-                            }
-                            closeWinSock(vSock);
-                            viewerSock_.store(~uintptr_t(0));
-                            return false;
-                        }
-                        w.writeU8(AUTH_MODE_PASSWORD_BOUND);
-                        digest = CryptoUtils::bindChallengeResponse(boundKey, digest);
-                        CryptoUtils::secureZero(boundKey.data(), boundKey.size());
-                    } else {
-                        w.writeU8(AUTH_MODE_PASSWORD);
-                    }
+                    auto digest = CryptoUtils::computeChallengeResponse(
+                        password, challengeSalt, challengeIterations, remoteId, identity_.deskId(), nonce);
+                    w.writeU8(AUTH_MODE_PASSWORD_BOUND);
+                    digest = CryptoUtils::bindChallengeResponse(viewerSessionKey_, digest);
                     w.writeBytes(digest.data(), digest.size());
                 } else {
-                    w.writeU8(0);
+                    w.writeU8(AUTH_MODE_NONE);
                     std::array<uint8_t, 32> zero{};
                     w.writeBytes(zero.data(), zero.size());
                 }
-                if (!sendFrame(vSock, PacketType::AUTH_RESPONSE, 0, w.buffer().data(), w.buffer().size(), viewerSendMutex_)) {
+                if (!sendViewerEncryptedPacket(PacketType::AUTH_RESPONSE, 0, w.buffer().data(), w.buffer().size())) {
                     if (!isReconnecting) {
                         setStatus(ViewerConnectionState::Error, "Failed to send authentication response.");
                     }
-                    closeWinSock(vSock);
-                    viewerSock_.store(~uintptr_t(0));
+                    abortHandshake();
                     return false;
                 }
             }
 
-            // 4. Receive AUTH_WAITING and/or AUTH_RESULT
+            // 4. Receive AUTH_WAITING and/or AUTH_RESULT (encrypted)
             while (viewerActive_.load()) {
-                if (!recvFrame(vSock, hdr, payload)) {
+                if (!recvFrame(vSock, hdr, payload, &viewerCipher_, &viewerRecvSeq)) {
                     if (!isReconnecting) {
                         setStatus(ViewerConnectionState::Error, "Connection closed during authorization.");
                     }
-                    closeWinSock(vSock);
-                    viewerSock_.store(~uintptr_t(0));
+                    abortHandshake();
                     return false;
                 }
                 PacketType pt = static_cast<PacketType>(hdr.type);
                 if (pt == PacketType::AUTH_WAITING) {
+                    setSocketTimeoutMs(toWinSock(vSock), 50000);
                     setStatus(ViewerConnectionState::WaitingApproval,
                               "Waiting for " + remoteHost + " (" + CryptoUtils::formatDeskId(remoteId) + ") to click Accept...");
                     continue;
@@ -3767,6 +3867,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                     std::string msg = r.readString();
 
                     if (code == AuthResultCode::TotpRequired || code == AuthResultCode::TotpInvalid) {
+                        setSocketTimeoutMs(toWinSock(vSock), 50000);
                         while (viewerActive_.load()) {
                             setStatus(ViewerConnectionState::WaitingTotp,
                                       (code == AuthResultCode::TotpInvalid)
@@ -3785,28 +3886,25 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                 });
                                 if (!signaled || viewerTotpCancelled_ || !viewerActive_.load()) {
                                     setStatus(ViewerConnectionState::Error, "2FA verification cancelled or timed out.");
-                                    closeWinSock(vSock);
-                                    viewerSock_.store(~uintptr_t(0));
+                                    abortHandshake();
                                     return false;
                                 }
                                 codeToSend = viewerTotpCode_;
                             }
 
-                            // Send PacketType::TOTP_VERIFY
+                            // Send PacketType::TOTP_VERIFY (encrypted over active AES-GCM session)
                             ByteWriter tw;
                             tw.writeString(codeToSend);
-                            if (!sendFrame(vSock, PacketType::TOTP_VERIFY, 0, tw.buffer().data(), tw.buffer().size(), viewerSendMutex_)) {
+                            if (!sendViewerEncryptedPacket(PacketType::TOTP_VERIFY, 0, tw.buffer().data(), tw.buffer().size())) {
                                 setStatus(ViewerConnectionState::Error, "Failed to send 2FA verification code.");
-                                closeWinSock(vSock);
-                                viewerSock_.store(~uintptr_t(0));
+                                abortHandshake();
                                 return false;
                             }
 
-                            // Receive next result packet
-                            if (!recvFrame(vSock, hdr, payload)) {
+                            // Receive next result packet (encrypted)
+                            if (!recvFrame(vSock, hdr, payload, &viewerCipher_, &viewerRecvSeq)) {
                                 setStatus(ViewerConnectionState::Error, "Connection closed during 2FA verification.");
-                                closeWinSock(vSock);
-                                viewerSock_.store(~uintptr_t(0));
+                                abortHandshake();
                                 return false;
                             }
 
@@ -3817,7 +3915,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                 msg = r2.readString();
 
                                 if (code == AuthResultCode::Accepted) {
-                                    // Successfully verified! Break out and proceed to session cipher setup
+                                    // Successfully verified! Break out and proceed to connected state
                                     break;
                                 } else if (code == AuthResultCode::TotpInvalid) {
                                     // Code was wrong, loop again to prompt user with error caption
@@ -3825,8 +3923,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                 } else {
                                     // Locked out, rate-limited, or host error
                                     setStatus(ViewerConnectionState::Error, msg.empty() ? "2FA verification failed." : msg);
-                                    closeWinSock(vSock);
-                                    viewerSock_.store(~uintptr_t(0));
+                                    abortHandshake();
                                     return false;
                                 }
                             }
@@ -3837,33 +3934,12 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         if (!isReconnecting) {
                             setStatus(ViewerConnectionState::Error, msg.empty() ? "Authentication rejected." : msg);
                         }
-                        closeWinSock(vSock);
-                        viewerSock_.store(~uintptr_t(0));
+                        abortHandshake();
                         return false;
                     }
 
-                    // Activate mandatory end-to-end stream encryption
-                    if (hostPubBlob.empty() ||
-                        !viewerEcdh.computeSharedSessionKey(
-                            hostPubBlob.data(), hostPubBlob.size(),
-                            remoteId, identity_.deskId(), nonce, viewerSessionKey_) ||
-                        !CryptoUtils::isUsableKey(viewerSessionKey_)) {
-                        if (!isReconnecting) {
-                            setStatus(ViewerConnectionState::Error, "Failed to establish secure session.");
-                        }
-                        closeWinSock(vSock);
-                        viewerSock_.store(~uintptr_t(0));
-                        return false;
-                    }
-
-                    std::string sasFingerprint;
-                    {
-                        std::lock_guard<std::mutex> lock(viewerCipherMutex_);
-                        viewerCipher_.initialize(viewerSessionKey_, /*isHost=*/false);
-                        viewerSendSeq_ = 0;
-                        viewerEncrypted_.store(true);
-                        sasFingerprint = CryptoUtils::sessionFingerprintHex(viewerSessionKey_);
-                    }
+                    // Clear handshake timeout once connected; AES-256-GCM cipher is already active.
+                    setSocketTimeoutMs(toWinSock(vSock), 0);
 
                     {
                         std::lock_guard<std::mutex> lock(viewerStatsMutex_);
@@ -3930,8 +4006,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
             }
         } catch (...) {}
 
-        closeWinSock(vSock);
-        viewerSock_.store(~uintptr_t(0));
+        abortHandshake();
         return false;
     };
 
@@ -6551,7 +6626,7 @@ namespace {
 std::string macSysctlString(const char* name) {
     size_t len = 0;
     if (sysctlbyname(name, nullptr, &len, nullptr, 0) != 0 || len == 0) return {};
-    std::string out(len, ' ');
+    std::string out(len, '\0');
     if (sysctlbyname(name, out.data(), &len, nullptr, 0) != 0) return {};
     out.resize(strnlen(out.c_str(), len));
     return out;
