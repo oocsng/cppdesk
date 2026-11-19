@@ -258,7 +258,7 @@ public:
     // Local IP & listening status
     std::string localIpAddress() const { return localIp_; }
     uint16_t hostListenPort() const { return identity_.listenPort(); }
-    bool hostListening() const { return hostListenSock_ != ~uintptr_t(0); }
+    bool hostListening() const { return hostListenSock_.load() != ~uintptr_t(0); }
 
     // Discovery
     std::vector<DiscoveredPeer> discoveredPeers() const;
@@ -551,6 +551,7 @@ private:
     void discoveryLoop();
     void relayRegistrationLoop();
     void hostAcceptLoop();
+    bool tryStartHostSession(uintptr_t clientSock, std::string clientIp);
     void runHostSession(uintptr_t clientSock, std::string clientIp);
     void runViewerSession(std::string targetInput, std::string password, uint64_t requirePairedDeskId);
 
@@ -570,7 +571,7 @@ private:
     std::function<void(uint16_t, bool)> hostKeySink_;   // test-only, see setHostKeySinkForTest
 
     // Discovery
-    uintptr_t                   udpSock_ = ~uintptr_t(0);
+    std::atomic<uintptr_t>      udpSock_{~uintptr_t(0)};
     std::thread                 discoveryThread_;
     mutable std::mutex          peersMutex_;
     std::vector<DiscoveredPeer> peers_;
@@ -578,10 +579,11 @@ private:
     // Relay registration & built-in server
     RelayServer                 localRelay_;
     std::thread                 relayRegThread_;
-    uintptr_t                   relayControlSock_ = ~uintptr_t(0);
+    std::atomic<uintptr_t>      relayControlSock_{~uintptr_t(0)};
+    std::atomic<bool>           relayReconnectRequested_{false};
 
     // Host server & session
-    uintptr_t                   hostListenSock_ = ~uintptr_t(0);
+    std::atomic<uintptr_t>      hostListenSock_{~uintptr_t(0)};
     std::thread                 hostAcceptThread_;
     mutable std::mutex          hostSessionThreadMutex_;
     std::thread                 hostSessionThread_;
@@ -589,6 +591,7 @@ private:
     std::mutex                  hostSendMutex_;
     mutable std::mutex          hostCipherMutex_;
     AesGcmSessionCipher         hostCipher_;
+    AesGcmSessionCipher         hostRecvCipher_;
     std::array<uint8_t, 32>     hostSessionKey_{};
     uint64_t                    hostSendSeq_ = 0;
     std::atomic<bool>           hostEncrypted_{false};
@@ -623,6 +626,7 @@ private:
     std::mutex                  viewerSendMutex_;
     mutable std::mutex          viewerCipherMutex_;
     AesGcmSessionCipher         viewerCipher_;
+    AesGcmSessionCipher         viewerRecvCipher_;
     std::array<uint8_t, 32>     viewerSessionKey_{};
     PairingKey::PublicKey       viewerHostPairingKey_{};         // the key the host advertised in this handshake
     bool                        viewerHostKeyVerified_ = false;  // ...and it signed this session's transcript with it
@@ -674,8 +678,7 @@ private:
 
     // Audio Capture & Playback state
     std::thread             hostAudioThread_;
-    std::mutex              hostWorkerThreadMutex_;   // guards hostAudioThread_, hostTerminalThread_, hostTunnelThread_
-    void joinHostWorker(std::thread& worker);
+    std::mutex              hostAudioLifecycleMutex_;
     std::atomic<bool>       hostAudioActive_{false};
 #if defined(_WIN32)
     HWAVEOUT                hWaveOut_ = nullptr;
@@ -725,6 +728,7 @@ private:
     int                 childStdoutFd_ = -1;
     int                 childPid_ = -1;
 #endif
+    std::mutex          hostTerminalMutex_;
     std::thread         hostTerminalThread_;
     std::atomic<bool>   hostTerminalActive_{false};
 
@@ -763,9 +767,10 @@ private:
     std::unordered_map<uint32_t, ActiveTunnel> viewerTunnels_;
     std::unordered_map<uint32_t, ActiveTunnel> hostTunnels_;
     std::thread                                viewerTunnelThread_;
-    std::mutex                                 viewerTunnelThreadMutex_;
+    std::mutex                                 viewerTunnelLifecycleMutex_;
     std::atomic<bool>                          viewerTunnelActive_{false};
     std::thread                                hostTunnelThread_;
+    std::mutex                                 hostTunnelLifecycleMutex_;
     std::atomic<bool>                          hostTunnelActive_{false};
 
     // Whiteboard Manager (v2.1.0)
