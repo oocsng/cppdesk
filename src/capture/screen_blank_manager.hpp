@@ -1,12 +1,10 @@
 #pragma once
 
 #if defined(_WIN32)
-#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#endif
 #endif
 
 #include "../core/protocol.hpp"
@@ -33,12 +31,10 @@ public:
     static void wakeDisplays();
 
 #if defined(_WIN32)
-#if defined(_WIN32)
     // Input Filtering Helpers for Low-Level Windows Hooks
     static bool isPhysicalEvent(DWORD flags, bool isMouse);
     static bool isPhysicalMouseInput(const MSLLHOOKSTRUCT& hookStruct);
     static bool isPhysicalKeyboardInput(const KBDLLHOOKSTRUCT& hookStruct);
-#endif
 #endif
 
     // Lifecycle
@@ -53,10 +49,14 @@ public:
 
     bool isBlankActive() const;
     ScreenBlankMode currentBlankMode() const;
+#if defined(_WIN32)
+    HWND curtainHwnd() const { return curtainHwnd_.load(); }
+#endif
 
     // Emergency physical interrupt callback
     void setEmergencyWakeCallback(std::function<void()> cb);
     void triggerEmergencyWake();
+    void requestAsyncEmergencyWake();
 
     // Internal thread message loop
     void blankingThreadFunc();
@@ -66,6 +66,8 @@ private:
     ScreenBlankManager(const ScreenBlankManager&) = delete;
     ScreenBlankManager& operator=(const ScreenBlankManager&) = delete;
 
+    void disengageBlankingLocked();
+    void wakeWorkerFunc();
     void createCurtainWindow();
     void destroyCurtainWindow();
 
@@ -77,9 +79,16 @@ private:
     std::atomic<uint32_t> blankThreadId_{0};
 #endif
 
+    std::mutex lifecycleMutex_;
     std::mutex stateMutex_;
     std::thread blankThread_;
     std::function<void()> emergencyWakeCallback_;
+
+    std::mutex wakeMutex_;
+    std::condition_variable wakeCv_;
+    std::thread wakeThread_;
+    bool wakePending_{false};
+    bool wakeStop_{false};
 
     std::mutex initMutex_;
     std::condition_variable initCv_;
@@ -92,6 +101,7 @@ private:
 
 #if defined(_WIN32)
     HWND hwndCurtain_{nullptr};
+    std::atomic<HWND> curtainHwnd_{nullptr};
     HHOOK hMouseHook_{nullptr};
     HHOOK hKbdHook_{nullptr};
 #else
