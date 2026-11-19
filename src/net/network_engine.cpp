@@ -4404,6 +4404,8 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                     if (decodeTasks.capacity() < tileCount) {
                                         decodeTasks.reserve(tileCount);
                                     }
+                                    const size_t maxFramePixels = static_cast<size_t>(fw) * fh;
+                                    size_t totalTilePixels = 0;
                                     int minX = fw, minY = fh, maxX = 0, maxY = 0;
                                     for (uint16_t i = 0; i < tileCount; ++i) {
                                         if (!r.hasRemaining(sizeof(TileHeader))) break;
@@ -4412,6 +4414,18 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                         if (!r.hasRemaining(th.dataSize)) break;
                                         const uint8_t* tileDataPtr = r.currentPtr();
                                         r.skip(th.dataSize);
+
+                                        if (th.width == 0 || th.height == 0 ||
+                                            th.width > 1024 || th.height > 1024 ||
+                                            static_cast<int>(th.x) + th.width > fw ||
+                                            static_cast<int>(th.y) + th.height > fh) {
+                                            continue;
+                                        }
+                                        const size_t tilePixels = static_cast<size_t>(th.width) * th.height;
+                                        if (tilePixels > maxFramePixels - totalTilePixels) {
+                                            continue;
+                                        }
+                                        totalTilePixels += tilePixels;
 
                                         TileThreadPool::DecodeTask dt;
                                         dt.rx = th.x;
@@ -4431,7 +4445,42 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                         maxX = std::max(maxX, static_cast<int>(th.x + th.width));
                                         maxY = std::max(maxY, static_cast<int>(th.y + th.height));
                                     }
-                                    TileThreadPool::instance().parallelDecode(decodeTasks);
+
+                                    // Detect overlapping tiles via sorted-X sweep; decode sequentially if any overlap
+                                    // to prevent concurrent writes to the same viewerCanvasBgra_ pixels.
+                                    bool hasOverlap = false;
+                                    if (decodeTasks.size() > 1) {
+                                        thread_local std::vector<size_t> order;
+                                        order.resize(decodeTasks.size());
+                                        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+                                        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                                            return decodeTasks[a].rx < decodeTasks[b].rx;
+                                        });
+                                        for (size_t i = 0; i < order.size() && !hasOverlap; ++i) {
+                                            const auto& a = decodeTasks[order[i]];
+                                            int aRight = static_cast<int>(a.rx) + a.rw;
+                                            int aBottom = static_cast<int>(a.ry) + a.rh;
+                                            for (size_t j = i + 1; j < order.size(); ++j) {
+                                                const auto& b = decodeTasks[order[j]];
+                                                if (static_cast<int>(b.rx) >= aRight) break;
+                                                int bBottom = static_cast<int>(b.ry) + b.rh;
+                                                if (static_cast<int>(a.ry) < bBottom && static_cast<int>(b.ry) < aBottom) {
+                                                    hasOverlap = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (hasOverlap) {
+                                        for (const auto& t : decodeTasks) {
+                                            TileCodec::decodeTileIntoCanvas(
+                                                t.rx, t.ry, t.rw, t.rh,
+                                                t.encoding, t.data, t.dataSize,
+                                                t.canvasBgra, t.canvasW, t.canvasH);
+                                        }
+                                    } else {
+                                        TileThreadPool::instance().parallelDecode(decodeTasks);
+                                    }
                                     if (!resChanged) {
                                         if (viewerFullCanvasDirty_) {
                                             viewerDirtyBounds_ = RECT{0, 0, static_cast<LONG>(fw), static_cast<LONG>(fh)};
