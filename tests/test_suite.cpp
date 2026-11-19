@@ -13178,6 +13178,14 @@ void testOsAssignedPorts() {
     setOsAssignedPortsForTest(true);                    // main() runs the suite with it on
 }
 
+#include "fix_tests_a.inc"
+#include "fix_tests_b.inc"
+#include "fix_tests_c.inc"
+#include "fix_tests_d.inc"
+#include "fix_tests_e.inc"
+#include "fix_tests_f.inc"
+#include "fix_tests_g.inc"
+
 int main(int argc, char** argv) {
     try {
         setOsAssignedPortsForTest(true);   // every listener binds an OS-assigned port; tests dial the port that was bound
@@ -13345,6 +13353,13 @@ int main(int argc, char** argv) {
 #endif
         testOsAssignedPorts(); std::cout << "Test 120 done\n" << std::flush;
         testRecentCardButtonsClickable(); std::cout << "Test 121 done\n" << std::flush;
+        testFixesA(); std::cout << "Fix tests A done\n" << std::flush;
+        testFixesB(); std::cout << "Fix tests B done\n" << std::flush;
+        testFixesC(); std::cout << "Fix tests C done\n" << std::flush;
+        testFixesD(); std::cout << "Fix tests D done\n" << std::flush;
+        testFixesE(); std::cout << "Fix tests E done\n" << std::flush;
+        testFixesF(); std::cout << "Fix tests F done\n" << std::flush;
+        testFixesG(); std::cout << "Fix tests G done\n" << std::flush;
 
         std::cout << "---------------------------------------------------------\n";
         std::cout << "Assertions Passed: " << g_passed << " | Failed: " << g_failed << "\n";
