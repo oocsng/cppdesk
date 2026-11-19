@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <functional>
 #include <memory>
+#include <mutex>
 
 #include "canvas.hpp"
 #include "app_ui.hpp"
@@ -48,6 +49,9 @@ static constexpr UINT WM_APP_FRAME_READY        = WM_APP + 101;
 static constexpr UINT WM_APP_SCRATCHPAD_UPDATE  = WM_APP + 102;
 static constexpr UINT WM_APP_COMMAND_PALETTE    = WM_APP + 103;
 static constexpr UINT WM_APP_UPDATE_PROGRESS    = WM_APP + 104;
+static constexpr UINT WM_APP_VERSION_MISMATCH   = WM_APP + 105;
+static constexpr UINT WM_APP_VERSION_UPGRADE    = WM_APP + 106;
+static constexpr UINT WM_APP_FORCE_QUIT         = WM_APP + 107;
 
 inline D2D1_COLOR_F toD2D(const ui::Color& c) {
     return D2D1::ColorF(c.r, c.g, c.b, c.a);
@@ -68,11 +72,18 @@ public:
     static int runUiSnapshots(IdentityManager& identity, NetworkEngine& network, const std::wstring& outDir,
                               bool record = false);
     int messageLoop();
+    bool relaunchRequested() const { return relaunchRequested_; }
 
 private:
+    struct LiveToken {
+        std::mutex m;
+        CppDeskWindow* w = nullptr;
+    };
     friend class WinShell;
     static LRESULT CALLBACK WndProcStatic(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     LRESULT handleMessage(UINT msg, WPARAM wParam, LPARAM lParam);
+    void requestClose();
+    void unregisterNetworkCallbacks();
 
     // Direct2D / DirectWrite lifecycle
     bool initGraphics();
@@ -109,6 +120,8 @@ private:
     std::unique_ptr<ui::D2DCanvas> d2dCanvas_;         // the window's Direct2D canvas
     std::unique_ptr<ui::PlatformShell> shell_;         // WinShell for this window
     std::unique_ptr<AppUi>  app_;                      // every screen
+    std::shared_ptr<LiveToken> liveToken_ = std::make_shared<LiveToken>();
+    bool                    relaunchRequested_ = false;
 };
 
 #elif defined(__APPLE__)

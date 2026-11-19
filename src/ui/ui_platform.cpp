@@ -298,6 +298,9 @@ bool UiPlatform::stepSpring(float& pos, float& vel, float target, float omega, f
         return false;
     }
 
+    if (!std::isfinite(dt) || dt <= 0.0f) return false;
+    dt = std::clamp(dt, 0.0f, 0.048f);
+
     int steps = (dt > 0.008f) ? static_cast<int>(std::ceil(dt / 0.008f)) : 1;
     steps = std::clamp(steps, 1, 6);
     float subDt = dt / static_cast<float>(steps);
@@ -330,8 +333,31 @@ float UiPlatform::dpiScaleFromXftDpi(const char* value) {
     if (!value) return 1.0f;
     char* end = nullptr;
     const double dpi = std::strtod(value, &end);
-    if (end == value || dpi <= 0.0) return 1.0f;
+    if (end == value || !std::isfinite(dpi) || dpi <= 0.0) return 1.0f;
     return static_cast<float>(std::clamp(dpi / 96.0, 1.0, 4.0));
+}
+
+bool UiPlatform::isSafeExternalUrl(const std::string& url) {
+    size_t schemeLen = 0;
+    auto startsWithIgnoreCase = [&](const char* prefix, size_t len) {
+        if (url.size() <= len) return false;
+        for (size_t i = 0; i < len; ++i) {
+            if (std::tolower(static_cast<unsigned char>(url[i])) != static_cast<unsigned char>(prefix[i])) return false;
+        }
+        return true;
+    };
+    if (startsWithIgnoreCase("https://", 8)) {
+        schemeLen = 8;
+    } else if (startsWithIgnoreCase("http://", 7)) {
+        schemeLen = 7;
+    } else {
+        return false;
+    }
+    if (url.size() <= schemeLen) return false;
+    for (unsigned char c : url) {
+        if (c <= 0x1F || c == 0x7F || std::isspace(c)) return false;
+    }
+    return true;
 }
 
 std::vector<std::string> UiPlatform::parseFileUriList(const std::string& uriList) {
@@ -347,16 +373,26 @@ std::vector<std::string> UiPlatform::parseFileUriList(const std::string& uriList
         const size_t pathStart = line.find('/', 7);       // after file://host
         if (pathStart == std::string::npos) continue;
         std::string path;
+        bool hasNul = false;
         for (size_t i = pathStart; i < line.size(); ++i) {
+            if (line[i] == '\0') {
+                hasNul = true;
+                break;
+            }
             if (line[i] == '%' && i + 2 < line.size() && std::isxdigit(static_cast<unsigned char>(line[i + 1])) &&
                 std::isxdigit(static_cast<unsigned char>(line[i + 2]))) {
-                path.push_back(static_cast<char>(std::stoi(line.substr(i + 1, 2), nullptr, 16)));
+                const int decoded = std::stoi(line.substr(i + 1, 2), nullptr, 16);
+                if (decoded == 0) {
+                    hasNul = true;
+                    break;
+                }
+                path.push_back(static_cast<char>(decoded));
                 i += 2;
             } else {
                 path.push_back(line[i]);
             }
         }
-        paths.push_back(std::move(path));
+        if (!hasNul) paths.push_back(std::move(path));
     }
     return paths;
 }

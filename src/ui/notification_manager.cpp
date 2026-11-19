@@ -1,9 +1,56 @@
 #include "notification_manager.hpp"
 #include "../core/spawn.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <vector>
 
 namespace cppdesk {
+
+std::string NotificationManager::truncateForNotification(const std::string& text, size_t maxBytes) {
+    if (text.size() <= maxBytes) return text;
+    size_t cut = maxBytes;
+    // Step back past any UTF-8 continuation bytes so we never split a multibyte code point.
+    while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) {
+        --cut;
+    }
+    return text.substr(0, cut);
+}
+
+std::string NotificationManager::escapePangoMarkup(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (char c : text) {
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            default: out.push_back(c); break;
+        }
+    }
+    return out;
+}
+
+bool NotificationManager::allowExternalSpawn(uint64_t nowMs) {
+    static constexpr uint32_t kBurst = 3;
+    static constexpr uint64_t kRefillMs = 1000;
+    std::lock_guard<std::mutex> lock(spawnMutex_);
+    if (!hasExternalSpawn_) {
+        hasExternalSpawn_ = true;
+        lastExternalRefillMs_ = nowMs;
+        externalSpawnTokens_ = kBurst;
+    } else if (nowMs > lastExternalRefillMs_) {
+        const uint64_t gained = (nowMs - lastExternalRefillMs_) / kRefillMs;
+        if (gained > 0) {
+            externalSpawnTokens_ = static_cast<uint32_t>(
+                std::min<uint64_t>(kBurst, static_cast<uint64_t>(externalSpawnTokens_) + gained));
+            lastExternalRefillMs_ += gained * kRefillMs;
+        }
+    }
+    if (externalSpawnTokens_ == 0) return false;
+    --externalSpawnTokens_;
+    return true;
+}
 
 #if defined(_WIN32)
 
@@ -177,15 +224,29 @@ void NotificationManager::notify(
 #if defined(__linux__)
     // The desktop's notification service, through its standard command-line client (silently absent if missing).
     if (settings.enablePushNotifications) {
-        // "--": a title or message from a peer that starts with '-' is text, not an option.
-        spawn::detached({ "notify-send", "-a", "CppDesk", "--", title.empty() ? appTitle_ : title, message });
+        const auto nowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        if (allowExternalSpawn(nowMs)) {
+            const std::string safeTitle = truncateForNotification(title.empty() ? appTitle_ : title, 128);
+            const std::string safeMsg = escapePangoMarkup(truncateForNotification(message, 512));
+            // "--": a title or message from a peer that starts with '-' is text, not an option.
+            spawn::detached({ "notify-send", "-a", "CppDesk", "--", safeTitle, safeMsg });
+        }
     }
 #elif defined(__APPLE__)
     // The title and text travel as script arguments (argv), never spliced into the script: they come from peers.
     if (settings.enablePushNotifications) {
-        spawn::detached({ "osascript", "-e", "on run argv", "-e",
-                          "display notification (item 2 of argv) with title (item 1 of argv)", "-e", "end run", "--",
-                          title.empty() ? appTitle_ : title, message });
+        const auto nowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        if (allowExternalSpawn(nowMs)) {
+            const std::string safeTitle = truncateForNotification(title.empty() ? appTitle_ : title, 128);
+            const std::string safeMsg = truncateForNotification(message, 512);
+            spawn::detached({ "osascript", "-e", "on run argv", "-e",
+                              "display notification (item 2 of argv) with title (item 1 of argv)", "-e", "end run", "--",
+                              safeTitle, safeMsg });
+        }
     }
 #else
     (void)title;

@@ -9,7 +9,6 @@
 #include <fstream>
 
 #if defined(_WIN32)
-#include "control/windows_service_manager.hpp"
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -21,6 +20,7 @@
 #include <csignal>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <climits>
@@ -71,31 +71,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
     if (argv) {
         for (int i = 1; i < argc; ++i) {
             std::wstring arg = argv[i];
-            if (arg == L"--service-install") {
-                bool ok = cppdesk::WindowsServiceManager::installService();
+            if (arg == L"--service-install" || arg == L"--service-uninstall" ||
+                arg == L"--service-start" || arg == L"--service-stop" || arg == L"--service-run") {
+                // Windows background service mode is not supported (ServiceMain stub disabled).
                 LocalFree(argv);
                 OleUninitialize();
-                return ok ? 0 : 1;
-            } else if (arg == L"--service-uninstall") {
-                bool ok = cppdesk::WindowsServiceManager::uninstallService();
-                LocalFree(argv);
-                OleUninitialize();
-                return ok ? 0 : 1;
-            } else if (arg == L"--service-start") {
-                bool ok = cppdesk::WindowsServiceManager::startService();
-                LocalFree(argv);
-                OleUninitialize();
-                return ok ? 0 : 1;
-            } else if (arg == L"--service-stop") {
-                bool ok = cppdesk::WindowsServiceManager::stopService();
-                LocalFree(argv);
-                OleUninitialize();
-                return ok ? 0 : 1;
-            } else if (arg == L"--service-run") {
-                int res = cppdesk::WindowsServiceManager::runServiceDispatcher();
-                LocalFree(argv);
-                OleUninitialize();
-                return res;
+                return 1;
             } else if (arg == L"--update-target" && i + 1 < argc) {
                 std::wstring targetExe = argv[++i];
                 DWORD waitPid = 0;
@@ -199,9 +180,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
     }
 
     int exitCode = window.messageLoop();
+    const bool shouldRelaunch = window.relaunchRequested();
     network.stop();
     if (hMutex) CloseHandle(hMutex);
     OleUninitialize();
+
+    // Restart after releasing the single-instance mutex so the new copy does not exit on ERROR_ALREADY_EXISTS.
+    if (shouldRelaunch) {
+        std::wstring exePath(1024, L'\0');
+        DWORD len = GetModuleFileNameW(nullptr, exePath.data(), static_cast<DWORD>(exePath.size()));
+        if (len > 0 && len < exePath.size()) {
+            exePath.resize(len);
+            std::wstring cmdLine = GetCommandLineW();
+            std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+            cmdBuf.push_back(L'\0');
+            STARTUPINFOW si{};
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi{};
+            if (CreateProcessW(exePath.c_str(), cmdBuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+        }
+    }
 
     return exitCode;
 }
@@ -256,20 +257,27 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // One parser for every way of naming the desk to connect to, as on Windows: --connect, -c, --connect=, and
-    // the cppdesk:// links the desktop file hands over ("cppdesk %u").
-    {
-        std::wstring cmdLine;
-        for (int i = 0; i < argc; ++i) {
-            const std::string a = argv[i];
-            const bool quote = a.find(' ') != std::string::npos;
-            if (i > 0) cmdLine += L' ';
-            if (quote) cmdLine += L'"';
-            cmdLine.append(a.begin(), a.end());
-            if (quote) cmdLine += L'"';
+    // Parse startup connect target directly from argv (avoiding UTF-8 sign-extension and quote-splitting issues).
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        std::string candidate;
+        if ((arg == "--connect" || arg == "-c") && i + 1 < argc) {
+            candidate = argv[++i];
+        } else if (arg.rfind("--connect=", 0) == 0) {
+            candidate = arg.substr(10);
+        } else if (arg.rfind("cppdesk://", 0) == 0) {
+            candidate = arg.substr(10);
+            while (!candidate.empty() && (candidate.back() == '/' || candidate.back() == '\\')) {
+                candidate.pop_back();
+            }
         }
-        const std::string parsed = cppdesk::ShortcutManager::parseStartupConnectTarget(cmdLine);
-        if (!parsed.empty()) connectTarget = parsed;
+        if (!candidate.empty()) {
+            const std::string clean = cppdesk::ShortcutManager::sanitizeDeskId(candidate);
+            if (clean.size() == 9) {
+                connectTarget = clean;
+                break;
+            }
+        }
     }
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -299,13 +307,26 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Single-instance protection via POSIX advisory file locking
-    std::string lockPath = "/tmp/cppdesk_single_instance_" + std::to_string(instanceId) + ".lock";
-    int lockFd = open(lockPath.c_str(), O_CREAT | O_RDWR, 0666);
-    if (lockFd < 0 || flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
-        std::cout << "Another instance of CppDesk (instance " << instanceId << ") is already running.\n";
-        if (lockFd >= 0) close(lockFd);
-        return 0;
+    // Single-instance protection via POSIX advisory file locking in a user-private directory (never unlinked).
+    std::string lockDir;
+    if (const char* xdg = std::getenv("XDG_RUNTIME_DIR"); xdg && xdg[0] == '/') {
+        lockDir = std::string(xdg) + "/cppdesk";
+    } else if (const char* home = std::getenv("HOME"); home && home[0] == '/') {
+        lockDir = std::string(home) + "/.cppdesk";
+    }
+    int lockFd = -1;
+    if (!lockDir.empty()) {
+        ::mkdir(lockDir.c_str(), 0700);
+        ::chmod(lockDir.c_str(), 0700);
+        std::string lockPath = lockDir + "/single_instance_" + std::to_string(instanceId) + ".lock";
+        lockFd = open(lockPath.c_str(), O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
+        struct stat st{};
+        if (lockFd < 0 || fstat(lockFd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+            flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+            std::cout << "Another instance of CppDesk (instance " << instanceId << ") is already running.\n";
+            if (lockFd >= 0) close(lockFd);
+            return 0;
+        }
     }
 
     cppdesk::IdentityManager identity(instanceId);
@@ -326,9 +347,10 @@ int main(int argc, char* argv[]) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
         network.stop();
-        flock(lockFd, LOCK_UN);
-        close(lockFd);
-        unlink(lockPath.c_str());
+        if (lockFd >= 0) {
+            flock(lockFd, LOCK_UN);
+            close(lockFd);
+        }
         return 0;
     }
 
@@ -336,9 +358,10 @@ int main(int argc, char* argv[]) {
     if (!window.create()) {
         std::cerr << "Failed to create CppDesk window.\n";
         network.stop();
-        flock(lockFd, LOCK_UN);
-        close(lockFd);
-        unlink(lockPath.c_str());
+        if (lockFd >= 0) {
+            flock(lockFd, LOCK_UN);
+            close(lockFd);
+        }
         return 1;
     }
 
@@ -359,9 +382,10 @@ int main(int argc, char* argv[]) {
 #endif
     network.stop();
 
-    flock(lockFd, LOCK_UN);
-    close(lockFd);
-    unlink(lockPath.c_str());
+    if (lockFd >= 0) {
+        flock(lockFd, LOCK_UN);
+        close(lockFd);
+    }
 
 #if defined(__linux__)
     // Restart in place once the single-instance lock is released (a copy started earlier would see it held).
