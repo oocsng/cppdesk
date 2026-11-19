@@ -812,14 +812,14 @@ void AppUi::drawFrame(float width, float height) {
         drawFileTransferDrawer(drawerBounds, drawerAnimT_);
     }
 
-    // macOS Sheet Modal with spring overshoot
-    if (modalAnimT_ > 0.004f) {
-        drawIncomingApprovalModal(width, height, modalAnimT_);
-    }
-
     // Fullscreen Dynamic Island Floating Toolbar
     if (isFullscreen_ && activeTab_ == ActiveTab::RemoteSession) {
         drawDynamicIslandToolbar(width, height);
+    }
+
+    // macOS Sheet Modal with spring overshoot (drawn above Dynamic Island)
+    if (modalAnimT_ > 0.004f) {
+        drawIncomingApprovalModal(width, height, modalAnimT_);
     }
 
     // Dynamic Island Clipboard File Transfer Progress Pill
@@ -1605,6 +1605,7 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
             std::string targetStr = (peerId > 0) ? CryptoUtils::formatDeskId(peerId) : peerEp;
             clickRegions_.push_back({ cardR, cardItemId, [this, targetStr]() {
                 remoteIdInput_ = targetStr;
+                remotePasswordInput_.clear();
                 initiateConnection();
             }, false });
 
@@ -1685,6 +1686,7 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
             drawButton(cardBtnId, quickConnBtn, "Connect",
                        COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this, targetStr]() {
                            remoteIdInput_ = targetStr;
+                           remotePasswordInput_.clear();
                            initiateConnection();
                        }, ui::FontRole::Small);
         }
@@ -4307,6 +4309,9 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
     UiRect r = bounds.offset(slideOffsetX, 0.0f);
 
     drawCardSurface(r, 16.0f, std::clamp(slideProgress, 0.0f, 1.0f));
+    if (showFileDrawer_) {
+        clickRegions_.push_back({ r, "drawer_panel_bg", []() {}, false });
+    }
 
     float x = r.left + 20.0f;
     float rx = r.right - 20.0f;
@@ -5367,6 +5372,11 @@ void AppUi::drawIncomingApprovalModal(float width, float height, float modalProg
     float alpha = std::clamp(modalProgress, 0.0f, 1.0f);
     fillRoundRect({ 0.0f, 0.0f, width, height }, 0.0f, rgba(28, 24, 20, 0.44f * alpha));
 
+    const size_t modalClickStart = clickRegions_.size();
+    if (req.active) {
+        clickRegions_.push_back({ { 0.0f, 0.0f, width, height }, "modal_incoming_scrim", []() {}, false });
+    }
+
     // A host whose macOS permissions are off says so before it accepts: the other person would see nothing.
     const ui::HostPermissionCard permCard = hostPermissionsActive() ? hostPermissionCard() : ui::HostPermissionCard{};
     float mw = 440.0f;
@@ -5377,6 +5387,9 @@ void AppUi::drawIncomingApprovalModal(float width, float height, float modalProg
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 20.0f, alpha);
+    if (req.active) {
+        clickRegions_.push_back({ modal, "modal_incoming_body", []() {}, false });
+    }
 
     float mx = modal.left + 26.0f;
     float mrx = modal.right - 26.0f;
@@ -5431,6 +5444,10 @@ void AppUi::drawIncomingApprovalModal(float width, float height, float modalProg
                    network_.respondToIncomingRequest(true, modalPermissions_);
                    showToast("Connection accepted");
                });
+
+    if (!req.active) {
+        clickRegions_.resize(modalClickStart);
+    }
 
     canvas_->setTransform(ui::Transform2D::identity());
 }
@@ -8799,6 +8816,9 @@ void AppUi::onMouseWheel(int delta) {
 }
 
 void AppUi::onCharInput(char16_t ch) {
+    if (showUpdateRequiredModal_) {
+        return;
+    }
     if (activeTab_ == ActiveTab::RemoteSession && focusedField_ == FocusedField::RemoteCanvas) {
         return;
     }
@@ -8829,12 +8849,18 @@ void AppUi::onCharInput(char16_t ch) {
         maxLen = 6;
     }
 
+    bool bufferModified = false;
     if (ch == L'\b') {
         textinput::popLastCodePoint(*target);
+        bufferModified = true;
     } else if (ch == 1) {
         target->clear();
+        bufferModified = true;
     } else if (ch == 3) {
-        if (!target->empty() && focusedField_ != FocusedField::RemotePassword && focusedField_ != FocusedField::LocalPassword) {
+        if (!target->empty() &&
+            focusedField_ != FocusedField::RemotePassword &&
+            focusedField_ != FocusedField::LocalPassword &&
+            focusedField_ != FocusedField::RelayAuthKey) {
             ClipboardManager::setClipboardUtf8(*target);
             showToast("Copied to clipboard");
         }
@@ -8852,15 +8878,13 @@ void AppUi::onCharInput(char16_t ch) {
         } else if (focusedField_ == FocusedField::TerminalInput) {
             sendTerminalFromInput();
         } else if (focusedField_ == FocusedField::ScratchpadText) {
-            target->push_back('\n');
-            network_.sendScratchpadText(*target);
-        } else if (focusedField_ == FocusedField::OmnibarInput) {
-            if (!omnibarFiltered_.empty() && omnibarSelectedIndex_ >= 0 && omnibarSelectedIndex_ < (int)omnibarFiltered_.size()) {
-                const auto& cmd = omnibarFiltered_[omnibarSelectedIndex_];
-                network_.sendCommandPaletteExec(cmd.commandLine);
-                omnibarLastOutput_ = "Executing: " + cmd.commandLine + "...";
-                omnibarHasOutput_ = true;
+            if (target->size() < maxLen) {
+                target->push_back('\n');
+                bufferModified = true;
             }
+        } else if (focusedField_ == FocusedField::OmnibarInput) {
+            // Executed once in onKeyEvent(VK_RETURN); skip duplicate execution and selection reset.
+            return;
         } else if (focusedField_ == FocusedField::FileBrowserLocalPath) {
             navigateFilePane(0, fileBrowserInputLocalPath_);
         } else if (focusedField_ == FocusedField::FileBrowserRemotePath) {
@@ -8936,18 +8960,20 @@ void AppUi::onCharInput(char16_t ch) {
         } else {
             textinput::appendUtf8Text(*target, clip, maxLen, true);
         }
+        bufferModified = true;
     } else {
         char32_t cp = 0;
         if (charAssembler_.push(static_cast<char16_t>(ch), cp)) {
             if (!isTotp || (cp >= U'0' && cp <= U'9')) {
                 textinput::appendCodePoint(*target, cp, maxLen);
+                bufferModified = true;
             }
         }
     }
 
-    if (focusedField_ == FocusedField::ScratchpadText) {
+    if (focusedField_ == FocusedField::ScratchpadText && bufferModified) {
         network_.sendScratchpadText(*target);
-    } else if (focusedField_ == FocusedField::OmnibarInput) {
+    } else if (focusedField_ == FocusedField::OmnibarInput && bufferModified) {
         omnibarFiltered_ = network_.commandPaletteManager().search(omnibarQuery_);
         omnibarSelectedIndex_ = 0;
     }
@@ -8956,6 +8982,14 @@ void AppUi::onCharInput(char16_t ch) {
 }
 
 void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended) {
+    if (showUpdateRequiredModal_) {
+        if (isDown && vk == VK_ESCAPE && showPeerMismatchModal_) {
+            showUpdateRequiredModal_ = false;
+            showPeerMismatchModal_ = false;
+            shell_->invalidate();
+        }
+        return;
+    }
     if (isDown) {
         if (activeTab_ == ActiveTab::Settings && settingsMaxScroll_ > 0.5f && !showFileDrawer_) {
             float scrollDelta = (vk == VK_NEXT) ? 320.0f : (vk == VK_PRIOR) ? -320.0f : 0.0f;
@@ -9009,7 +9043,9 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
             }
         }
 
-        if (vk == VK_F1 || (vk == 0xBF /* VK_OEM_2 /? */ && shell_->isKeyDown(VK_SHIFT) && activeTab_ != ActiveTab::Fleet)) {
+        if (vk == VK_F1 || (vk == 0xBF /* VK_OEM_2 /? */ && shell_->isKeyDown(VK_SHIFT) &&
+            focusedField_ == FocusedField::None && !anyModalActive() &&
+            activeTab_ != ActiveTab::RemoteSession && activeTab_ != ActiveTab::Fleet)) {
             toggleShortcutsModal();
             return;
         }
@@ -9382,6 +9418,7 @@ void AppUi::initiateConnection() {
         existing->password = remotePasswordInput_;
         existing->state = ViewerConnectionState::ConnectingTcp;
     }
+    remotePasswordInput_.clear();
 
     switchToSessionTab(targetTabId, true);
 }
@@ -10411,6 +10448,7 @@ void AppUi::onUpdateCheckDone(const UpdateInfo& info, bool manual) {
             cleanVer = cleanVer.substr(1);
         }
         updateStatusText_ = "Mandatory Update: v" + cleanVer;
+        showPeerMismatchModal_ = false;
         showUpdateRequiredModal_ = true;
         if (manual) showToast("Mandatory update v" + cleanVer + " available!", true);
     } else {
@@ -10761,6 +10799,9 @@ void AppUi::applySnapshotState(const std::string& name) {
 }
 
 void AppUi::onFilesDropped(const std::vector<std::string>& paths, float dropX, float dropY) {
+    if (showUpdateRequiredModal_) {
+        return;
+    }
     if (activeTab_ == ActiveTab::Fleet) {   // onto a tile: that PC only; anywhere else in the grid: every PC
         const int i = fleetTileAt(fleetTileRects_, dropX, dropY);
         size_t sent = 0;
