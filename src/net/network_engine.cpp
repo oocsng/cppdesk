@@ -537,6 +537,44 @@ bool NetworkEngine::sendViewerEncryptedPacket(PacketType type, uint8_t flags, co
                      &viewerCipher_, &viewerSendSeq_);
 }
 
+bool NetworkEngine::sendToSessionTarget(SessionTarget target, PacketType type, uint8_t flags, const void* payload, size_t payloadLen) {
+    if (target == SessionTarget::Viewer) {
+        return sendViewerEncryptedPacket(type, flags, payload, payloadLen);
+    }
+    if (target == SessionTarget::Host) {
+        return sendHostEncryptedPacket(type, flags, payload, payloadLen);
+    }
+    if (viewerActive_.load() || viewerSock_.load() != ~uintptr_t(0)) {
+        return sendViewerEncryptedPacket(type, flags, payload, payloadLen);
+    }
+    if (activeHostClientSock_.load() != ~uintptr_t(0)) {
+        return sendHostEncryptedPacket(type, flags, payload, payloadLen);
+    }
+    return false;
+}
+
+void NetworkEngine::appendChatMessageLocked(ChatMessageEntry&& entry) {
+    constexpr size_t kMaxChatEntries = 100;
+    constexpr size_t kMaxTotalChatMediaBytes = 20 * 1024 * 1024;
+    chatHistory_.push_back(std::move(entry));
+    while (chatHistory_.size() > kMaxChatEntries) {
+        chatHistory_.erase(chatHistory_.begin());
+    }
+    size_t totalMediaBytes = 0;
+    for (const auto& m : chatHistory_) {
+        totalMediaBytes += m.imageJpegData.size();
+    }
+    for (auto& m : chatHistory_) {
+        if (totalMediaBytes <= kMaxTotalChatMediaBytes) break;
+        if (!m.imageJpegData.empty()) {
+            totalMediaBytes -= m.imageJpegData.size();
+            m.imageJpegData.clear();
+            m.imageJpegData.shrink_to_fit();
+            m.hasImage = false;
+        }
+    }
+}
+
 // ---------------- Brute-Force IP Protection ----------------
 
 bool NetworkEngine::isIpRateLimited(const std::string& ip) {
@@ -1351,26 +1389,34 @@ void NetworkEngine::discoveryLoop() {
                     pkt.hostname[sizeof(pkt.hostname) - 1] = '\0';
 
                     {
+                        constexpr size_t kMaxDiscoveredPeers = 256;
+                        const uint64_t seenAt = nowTickMs();
                         std::lock_guard<std::mutex> lock(peersMutex_);
+                        peers_.erase(
+                            std::remove_if(peers_.begin(), peers_.end(), [&](const DiscoveredPeer& p) {
+                                return seenAt - p.lastSeenTickMs > 12000;
+                            }),
+                            peers_.end()
+                        );
                         bool updated = false;
                         for (auto& p : peers_) {
                             if (p.deskId == pkt.deskId) {
                                 p.hostname = pkt.hostname;
                                 p.ip = senderIp;
                                 p.port = pkt.tcpPort;
-                                p.lastSeenTickMs = nowTickMs();
+                                p.lastSeenTickMs = seenAt;
                                 p.viaRelay = false;
                                 updated = true;
                                 break;
                             }
                         }
-                        if (!updated) {
+                        if (!updated && peers_.size() < kMaxDiscoveredPeers) {
                             DiscoveredPeer np;
                             np.deskId = pkt.deskId;
                             np.hostname = pkt.hostname;
                             np.ip = senderIp;
                             np.port = pkt.tcpPort;
-                            np.lastSeenTickMs = nowTickMs();
+                            np.lastSeenTickMs = seenAt;
                             np.viaRelay = false;
                             peers_.push_back(np);
                         }
@@ -1574,7 +1620,7 @@ void NetworkEngine::updateHostSessionPermissions(uint8_t newPermissions) {
 }
 
 void NetworkEngine::disconnectHostClient() {
-    stopVoiceIntercom();
+    stopVoiceIntercom(SessionTarget::Host);
     displayManager_.restoreResolution();
     clipFileMgr_.reset();
     uintptr_t cs = activeHostClientSock_.exchange(~uintptr_t(0));
@@ -2168,19 +2214,44 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         std::mutex outboxMutex;
         std::condition_variable outboxCv;
         std::deque<HostOutboxItem> outbox;
+        size_t outboxBytes = 0;
         std::vector<std::vector<uint8_t>> outboxBufferPool; // Recycled payload buffers
         uint64_t totalBytesSent = 0;
+        constexpr size_t MAX_OUTBOX_ITEMS = 256;
+        constexpr size_t MAX_OUTBOX_BYTES = 16 * 1024 * 1024;
 
         auto enqueueHostPacketMove = [&](PacketType pt, uint8_t flags, std::vector<uint8_t>&& payload, bool isVideo) {
             std::lock_guard<std::mutex> lk(outboxMutex);
+            if (!sessionAlive.load()) return;
+            const bool coalescableTelemetry =
+                (pt == PacketType::PERFORMANCE_HUD_METRICS || pt == PacketType::CURSOR_UPDATE);
             if (isVideo) {
                 for (auto it = outbox.begin(); it != outbox.end(); ++it) {
                     if (it->isVideoTile) {
+                        outboxBytes -= it->payload.size();
+                        outbox.erase(it);
+                        break;
+                    }
+                }
+            } else if (coalescableTelemetry) {
+                for (auto it = outbox.begin(); it != outbox.end(); ++it) {
+                    if (it->type == pt) {
+                        outboxBytes -= it->payload.size();
                         outbox.erase(it);
                         break;
                     }
                 }
             }
+            if (outbox.size() >= MAX_OUTBOX_ITEMS || outboxBytes + payload.size() > MAX_OUTBOX_BYTES) {
+                if (isVideo || coalescableTelemetry) {
+                    return;
+                }
+                // Non-droppable packets cannot queue further; peer is stalled, tear down the session.
+                sessionAlive.store(false);
+                outboxCv.notify_all();
+                return;
+            }
+            outboxBytes += payload.size();
             outbox.push_back({ pt, flags, std::move(payload), isVideo });
             outboxCv.notify_one();
         };
@@ -2221,6 +2292,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                     });
                     if (!sessionAlive.load() || !running_.load()) break;
                     item = std::move(outbox.front());
+                    outboxBytes -= item.payload.size();
                     outbox.pop_front();
                 }
 
@@ -2595,8 +2667,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             if (!msg.empty()) {
                                 {
                                     std::lock_guard<std::mutex> cl(chatMutex_);
-                                    chatHistory_.push_back({ sender, msg, false, nowTickMs() });
-                                    if (chatHistory_.size() > 100) chatHistory_.erase(chatHistory_.begin());
+                                    appendChatMessageLocked({ sender, msg, false, nowTickMs() });
                                 }
                                 unreadChatCount_.fetch_add(1);
                             }
@@ -2604,11 +2675,11 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                         }
                         case PacketType::CHAT_MEDIA_MESSAGE: {
                             ChatMediaPayload p{};
-                            if (deserializeChatMedia(rpay.data(), rpay.size(), p)) {
+                            if (deserializeChatMedia(rpay.data(), rpay.size(), p) &&
+                                p.jpegData.size() <= 2 * 1024 * 1024) {
                                 {
                                     std::lock_guard<std::mutex> cl(chatMutex_);
-                                    chatHistory_.push_back({ p.senderName, p.captionText, false, p.timestampMs, true, std::move(p.jpegData), p.imgWidth, p.imgHeight });
-                                    if (chatHistory_.size() > 100) chatHistory_.erase(chatHistory_.begin());
+                                    appendChatMessageLocked({ p.senderName, p.captionText, false, p.timestampMs, true, std::move(p.jpegData), p.imgWidth, p.imgHeight });
                                 }
                                 unreadChatCount_.fetch_add(1);
                             }
@@ -2660,7 +2731,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                         }
                         case PacketType::VOICE_INTERCOM_CHUNK: {
                             if (perms & PERM_INPUT) {
-                                handleIncomingVoiceChunk(rpay.data(), rpay.size());
+                                handleIncomingVoiceChunk(rpay.data(), rpay.size(), SessionTarget::Host);
                             }
                             break;
                         }
@@ -3345,7 +3416,7 @@ bool NetworkEngine::connectToRemote(const std::string& targetIdOrAddr, const std
 void NetworkEngine::disconnectViewer() {
     viewerActive_.store(false);
     viewerTunnelActive_.store(false);
-    stopVoiceIntercom();
+    stopVoiceIntercom(SessionTarget::Viewer);
     viewerPrivacyModeActive_.store(false);
     whiteboardMgr_.clearAllStrokes();
     clipFileMgr_.reset();
@@ -3397,6 +3468,7 @@ void NetworkEngine::disconnectViewer() {
         viewerCanvasW_ = 0;
         viewerCanvasH_ = 0;
         viewerFrameSeq_ = 0;
+        viewerLastConsumedSeq_ = 0;
         viewerFullCanvasDirty_ = true;
         viewerDirtyBounds_ = RECT{0, 0, 0, 0};
     }
@@ -3484,7 +3556,7 @@ bool NetworkEngine::copyLatestViewerFrame(
         return false;
     }
 
-    bool missedFrames = (inOutSeq > 0 && viewerFrameSeq_ > inOutSeq + 1);
+    bool missedFrames = (inOutSeq > 0 && inOutSeq != viewerLastConsumedSeq_);
     bool resChanged = (outW != viewerCanvasW_ || outH != viewerCanvasH_ || outBgra.size() != viewerCanvasBgra_.size());
     inOutSeq = viewerFrameSeq_;
     outW = viewerCanvasW_;
@@ -3496,6 +3568,7 @@ bool NetworkEngine::copyLatestViewerFrame(
             *outDirtyBounds = RECT{0, 0, static_cast<LONG>(outW), static_cast<LONG>(outH)};
         }
         viewerFullCanvasDirty_ = false;
+        viewerDirtyBounds_ = RECT{0, 0, 0, 0};
     } else {
         RECT r = viewerDirtyBounds_;
         r.left = std::clamp<LONG>(r.left, 0, static_cast<LONG>(outW));
@@ -3514,7 +3587,9 @@ bool NetworkEngine::copyLatestViewerFrame(
         if (outDirtyBounds) {
             *outDirtyBounds = r;
         }
+        viewerDirtyBounds_ = RECT{0, 0, 0, 0};
     }
+    viewerLastConsumedSeq_ = viewerFrameSeq_;
     return true;
 }
 
@@ -3565,6 +3640,8 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
             }
 
             if (connectedSock == INVALID_SOCKET) {
+                resolvedIp.clear();
+                resolvedPort = DEFAULT_HOST_PORT;
                 if (targetDeskId == identity_.deskId()) {
                     resolvedIp = "127.0.0.1";
                     resolvedPort = identity_.listenPort();
@@ -3573,12 +3650,15 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
             }
 
             if (connectedSock == INVALID_SOCKET) {
+                resolvedIp.clear();
+                resolvedPort = DEFAULT_HOST_PORT;
                 sendDiscoveryQuery(targetDeskId);
                 for (int waitStep = 0; waitStep < (isReconnecting ? 4 : 6) && viewerActive_.load(); ++waitStep) {
+                    const uint64_t now = nowTickMs();
                     {
                         std::lock_guard<std::mutex> lock(peersMutex_);
                         for (const auto& p : peers_) {
-                            if (p.deskId == targetDeskId) {
+                            if (p.deskId == targetDeskId && (now - p.lastSeenTickMs <= 12000)) {
                                 resolvedIp = p.ip;
                                 resolvedPort = p.port;
                                 break;
@@ -3598,12 +3678,15 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
             }
 
             if (connectedSock == INVALID_SOCKET && viewerActive_.load()) {
+                resolvedIp.clear();
+                resolvedPort = DEFAULT_HOST_PORT;
                 std::string rHost;
                 uint16_t rPort = DEFAULT_RELAY_PORT;
                 if (parseHostPort(identity_.relayServerAddress(), rHost, rPort, DEFAULT_RELAY_PORT)) {
                     if (!isReconnecting) {
                         setStatus(ViewerConnectionState::ResolvingId, "Querying Relay Server (" + rHost + ":" + std::to_string(rPort) + ")...");
                     }
+                    bool relayLookupFound = false;
                     SOCKET ls = connectTcpWithTimeout(rHost, rPort, 1500);
                     if (ls != INVALID_SOCKET) {
                         uintptr_t lSock = fromWinSock(ls);
@@ -3622,6 +3705,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                     if (found && !peerIp.empty()) {
                                         resolvedIp = peerIp;
                                         resolvedPort = peerPort;
+                                        relayLookupFound = true;
                                     }
                                 } catch (...) {}
                             }
@@ -3629,7 +3713,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         closeWinSock(lSock);
                     }
 
-                    if (!resolvedIp.empty()) {
+                    if (relayLookupFound && !resolvedIp.empty()) {
                         if (!isReconnecting) {
                             setStatus(ViewerConnectionState::ConnectingTcp, "Connecting to " + resolvedIp + ":" + std::to_string(resolvedPort) + "...");
                         }
@@ -4605,8 +4689,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             if (!msg.empty()) {
                                 {
                                     std::lock_guard<std::mutex> cl(chatMutex_);
-                                    chatHistory_.push_back({ sender, msg, false, nowTickMs() });
-                                    if (chatHistory_.size() > 100) chatHistory_.erase(chatHistory_.begin());
+                                    appendChatMessageLocked({ sender, msg, false, nowTickMs() });
                                 }
                                 unreadChatCount_.fetch_add(1);
                             }
@@ -4614,11 +4697,11 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                         }
                         case PacketType::CHAT_MEDIA_MESSAGE: {
                             ChatMediaPayload p{};
-                            if (deserializeChatMedia(payload.data(), payload.size(), p)) {
+                            if (deserializeChatMedia(payload.data(), payload.size(), p) &&
+                                p.jpegData.size() <= 2 * 1024 * 1024) {
                                 {
                                     std::lock_guard<std::mutex> cl(chatMutex_);
-                                    chatHistory_.push_back({ p.senderName, p.captionText, false, p.timestampMs, true, std::move(p.jpegData), p.imgWidth, p.imgHeight });
-                                    if (chatHistory_.size() > 100) chatHistory_.erase(chatHistory_.begin());
+                                    appendChatMessageLocked({ p.senderName, p.captionText, false, p.timestampMs, true, std::move(p.jpegData), p.imgWidth, p.imgHeight });
                                 }
                                 unreadChatCount_.fetch_add(1);
                             }
@@ -4629,7 +4712,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             break;
                         }
                         case PacketType::VOICE_INTERCOM_CHUNK: {
-                            handleIncomingVoiceChunk(payload.data(), payload.size());
+                            handleIncomingVoiceChunk(payload.data(), payload.size(), SessionTarget::Viewer);
                             break;
                         }
                         case PacketType::PRIVACY_MODE_TOGGLE: {
@@ -4702,6 +4785,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                     if (terminalLines_.empty()) {
                                         terminalLines_.push_back("");
                                     }
+                                    constexpr size_t kMaxTerminalLineBytes = 4096;
                                     for (size_t i = 0; i < tlen; ++i) {
                                         char ch = ttext[i];
                                         if (ch == '\r') {
@@ -4713,6 +4797,12 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                                 terminalLines_.erase(terminalLines_.begin());
                                             }
                                         } else {
+                                            if (terminalLines_.back().size() >= kMaxTerminalLineBytes) {
+                                                terminalLines_.push_back("");
+                                                if (terminalLines_.size() > 500) {
+                                                    terminalLines_.erase(terminalLines_.begin());
+                                                }
+                                            }
                                             terminalLines_.back() += ch;
                                         }
                                     }
@@ -5120,19 +5210,22 @@ void NetworkEngine::applyConnectionProfile(ConnectionProfile profile) {
     }
 }
 
-uint32_t NetworkEngine::sendFile(const std::string& filePath, FileOfferTarget targetHint, float dropNx, float dropNy) {
-    return sendFilePath(std::filesystem::path(filePath), targetHint, dropNx, dropNy);
+uint32_t NetworkEngine::sendFile(const std::string& filePath, FileOfferTarget targetHint, float dropNx, float dropNy, SessionTarget target) {
+    return sendFilePath(std::filesystem::path(filePath), targetHint, dropNx, dropNy, target);
 }
 
-uint32_t NetworkEngine::sendFilePath(const std::filesystem::path& filePath, FileOfferTarget targetHint, float dropNx, float dropNy) {
-    uintptr_t vSock = viewerSock_.load();
-    uintptr_t hSock = activeHostClientSock_.load();
-
-    if (vSock != ~uintptr_t(0)) {
+uint32_t NetworkEngine::sendFilePath(const std::filesystem::path& filePath, FileOfferTarget targetHint, float dropNx, float dropNy, SessionTarget target) {
+    SessionTarget resolved = target;
+    if (resolved == SessionTarget::Auto) {
+        if (viewerSock_.load() != ~uintptr_t(0)) resolved = SessionTarget::Viewer;
+        else if (activeHostClientSock_.load() != ~uintptr_t(0)) resolved = SessionTarget::Host;
+        else return 0;
+    }
+    if (resolved == SessionTarget::Viewer && viewerSock_.load() != ~uintptr_t(0)) {
         return fileManager_.startOutgoingFile(filePath, [this](PacketType pt, const std::vector<uint8_t>& buf) {
             return sendViewerEncryptedPacket(pt, 0, buf.data(), buf.size());
         }, targetHint, dropNx, dropNy);
-    } else if (hSock != ~uintptr_t(0)) {
+    } else if (resolved == SessionTarget::Host && activeHostClientSock_.load() != ~uintptr_t(0)) {
         return fileManager_.startOutgoingFile(filePath, [this](PacketType pt, const std::vector<uint8_t>& buf) {
             return sendHostEncryptedPacket(pt, 0, buf.data(), buf.size());
         }, targetHint, dropNx, dropNy);
@@ -5140,15 +5233,18 @@ uint32_t NetworkEngine::sendFilePath(const std::filesystem::path& filePath, File
     return 0;
 }
 
-int NetworkEngine::sendDropPath(const std::string& path, FileOfferTarget targetHint, float dropNx, float dropNy) {
-    uintptr_t vSock = viewerSock_.load();
-    uintptr_t hSock = activeHostClientSock_.load();
-
-    if (vSock != ~uintptr_t(0)) {
+int NetworkEngine::sendDropPath(const std::string& path, FileOfferTarget targetHint, float dropNx, float dropNy, SessionTarget target) {
+    SessionTarget resolved = target;
+    if (resolved == SessionTarget::Auto) {
+        if (viewerSock_.load() != ~uintptr_t(0)) resolved = SessionTarget::Viewer;
+        else if (activeHostClientSock_.load() != ~uintptr_t(0)) resolved = SessionTarget::Host;
+        else return 0;
+    }
+    if (resolved == SessionTarget::Viewer && viewerSock_.load() != ~uintptr_t(0)) {
         return fileManager_.startOutgoingPath(path, [this](PacketType pt, const std::vector<uint8_t>& buf) {
             return sendViewerEncryptedPacket(pt, 0, buf.data(), buf.size());
         }, targetHint, dropNx, dropNy);
-    } else if (hSock != ~uintptr_t(0)) {
+    } else if (resolved == SessionTarget::Host && activeHostClientSock_.load() != ~uintptr_t(0)) {
         return fileManager_.startOutgoingPath(path, [this](PacketType pt, const std::vector<uint8_t>& buf) {
             return sendHostEncryptedPacket(pt, 0, buf.data(), buf.size());
         }, targetHint, dropNx, dropNy);
@@ -5156,15 +5252,17 @@ int NetworkEngine::sendDropPath(const std::string& path, FileOfferTarget targetH
     return 0;
 }
 
-bool NetworkEngine::cancelFileTransfer(uint32_t transferId) {
-    uintptr_t vSock = viewerSock_.load();
-    uintptr_t hSock = activeHostClientSock_.load();
-
-    if (vSock != ~uintptr_t(0)) {
+bool NetworkEngine::cancelFileTransfer(uint32_t transferId, SessionTarget target) {
+    SessionTarget resolved = target;
+    if (resolved == SessionTarget::Auto) {
+        if (viewerSock_.load() != ~uintptr_t(0)) resolved = SessionTarget::Viewer;
+        else if (activeHostClientSock_.load() != ~uintptr_t(0)) resolved = SessionTarget::Host;
+    }
+    if (resolved == SessionTarget::Viewer && viewerSock_.load() != ~uintptr_t(0)) {
         return fileManager_.cancelTransfer(transferId, [this](PacketType pt, const std::vector<uint8_t>& buf) {
             return sendViewerEncryptedPacket(pt, 0, buf.data(), buf.size());
         });
-    } else if (hSock != ~uintptr_t(0)) {
+    } else if (resolved == SessionTarget::Host && activeHostClientSock_.load() != ~uintptr_t(0)) {
         return fileManager_.cancelTransfer(transferId, [this](PacketType pt, const std::vector<uint8_t>& buf) {
             return sendHostEncryptedPacket(pt, 0, buf.data(), buf.size());
         });
@@ -5187,7 +5285,7 @@ void NetworkEngine::pushLocalClipboardNow() {
     }
 }
 
-bool NetworkEngine::requestRemoteScan(const std::string& remotePath) {
+bool NetworkEngine::requestRemoteScan(const std::string& remotePath, SessionTarget target) {
     fileSyncMgr_.setRemoteRoot(remotePath);
     SyncScanReqPayload req;
     req.scanId = static_cast<uint32_t>(GetTickCount64());
@@ -5195,27 +5293,17 @@ bool NetworkEngine::requestRemoteScan(const std::string& remotePath) {
     req.flags = 0x01; // Recursive
     std::vector<uint8_t> buf;
     serializeSyncScanReq(req, buf);
-    if (viewerSock_.load() != ~uintptr_t(0)) {
-        return sendViewerEncryptedPacket(PacketType::SYNC_SCAN_REQ, 0, buf.data(), buf.size());
-    } else if (activeHostClientSock_.load() != ~uintptr_t(0)) {
-        return sendHostEncryptedPacket(PacketType::SYNC_SCAN_REQ, 0, buf.data(), buf.size());
-    }
-    return false;
+    return sendToSessionTarget(target, PacketType::SYNC_SCAN_REQ, 0, buf.data(), buf.size());
 }
 
-bool NetworkEngine::requestRemoteBlockHashes(const std::string& relativePath) {
+bool NetworkEngine::requestRemoteBlockHashes(const std::string& relativePath, SessionTarget target) {
     SyncHashReqPayload req;
     req.syncId = 1;
     req.fileId = 1;
     req.relativePath = relativePath;
     std::vector<uint8_t> buf;
     serializeSyncHashReq(req, buf);
-    if (viewerSock_.load() != ~uintptr_t(0)) {
-        return sendViewerEncryptedPacket(PacketType::SYNC_HASH_REQ, 0, buf.data(), buf.size());
-    } else if (activeHostClientSock_.load() != ~uintptr_t(0)) {
-        return sendHostEncryptedPacket(PacketType::SYNC_HASH_REQ, 0, buf.data(), buf.size());
-    }
-    return false;
+    return sendToSessionTarget(target, PacketType::SYNC_HASH_REQ, 0, buf.data(), buf.size());
 }
 
 bool NetworkEngine::startFolderSync(const std::string& localPath, const std::string& remotePath, SyncMode mode, bool purge) {
@@ -5226,18 +5314,14 @@ bool NetworkEngine::startFolderSync(const std::string& localPath, const std::str
     return fileSyncMgr_.startSync();
 }
 
-void NetworkEngine::cancelFolderSync() {
+void NetworkEngine::cancelFolderSync(SessionTarget target) {
     fileSyncMgr_.cancelSync();
     SyncActionReqPayload req;
     req.actionId = static_cast<uint32_t>(GetTickCount64());
     req.actionType = static_cast<uint8_t>(SyncActionType::AbortSync);
     std::vector<uint8_t> buf;
     serializeSyncActionReq(req, buf);
-    if (viewerSock_.load() != ~uintptr_t(0)) {
-        sendViewerEncryptedPacket(PacketType::SYNC_ACTION_REQ, 0, buf.data(), buf.size());
-    } else if (activeHostClientSock_.load() != ~uintptr_t(0)) {
-        sendHostEncryptedPacket(PacketType::SYNC_ACTION_REQ, 0, buf.data(), buf.size());
-    }
+    sendToSessionTarget(target, PacketType::SYNC_ACTION_REQ, 0, buf.data(), buf.size());
 }
 
 bool NetworkEngine::sendChatMessage(const std::string& text) {
@@ -5261,8 +5345,7 @@ bool NetworkEngine::sendChatMessage(const std::string& text) {
 
     if (sent) {
         std::lock_guard<std::mutex> lock(chatMutex_);
-        chatHistory_.push_back({ "You (" + identity_.hostname() + ")", text, true, nowTickMs() });
-        if (chatHistory_.size() > 100) chatHistory_.erase(chatHistory_.begin());
+        appendChatMessageLocked({ "You (" + identity_.hostname() + ")", text, true, nowTickMs() });
     }
     return sent;
 }
@@ -5295,8 +5378,7 @@ bool NetworkEngine::sendChatImage(const std::vector<uint8_t>& jpegData, uint32_t
 
     if (sent) {
         std::lock_guard<std::mutex> lock(chatMutex_);
-        chatHistory_.push_back({ "You (" + identity_.hostname() + ")", caption, true, p.timestampMs, true, jpegData, w, h });
-        if (chatHistory_.size() > 100) chatHistory_.erase(chatHistory_.begin());
+        appendChatMessageLocked({ "You (" + identity_.hostname() + ")", caption, true, p.timestampMs, true, jpegData, w, h });
     }
     return sent;
 }
@@ -5532,7 +5614,8 @@ void NetworkEngine::hostAudioCaptureLoop() {
                 hdr.sampleFrames = numFramesRead;
 
                 sendHostEncryptedPacket(PacketType::AUDIO_STREAM_CHUNK, 0, &hdr, sizeof(hdr));
-            } else if (pData) {
+            } else if (pData && srcChannels > 0) {
+                bool convertedOk = false;
                 convertedPcm.resize(numFramesRead * 2);
                 if (isFloat) {
                     const float* fData = reinterpret_cast<const float*>(pData);
@@ -5542,6 +5625,7 @@ void NetworkEngine::hostAudioCaptureLoop() {
                         convertedPcm[f * 2 + 0] = static_cast<int16_t>(std::clamp(left, -1.0f, 1.0f) * 32767.0f);
                         convertedPcm[f * 2 + 1] = static_cast<int16_t>(std::clamp(right, -1.0f, 1.0f) * 32767.0f);
                     }
+                    convertedOk = true;
                 } else if (pwfx->wBitsPerSample == 16) {
                     const int16_t* sData = reinterpret_cast<const int16_t*>(pData);
                     for (UINT32 f = 0; f < numFramesRead; ++f) {
@@ -5550,6 +5634,21 @@ void NetworkEngine::hostAudioCaptureLoop() {
                         convertedPcm[f * 2 + 0] = left;
                         convertedPcm[f * 2 + 1] = right;
                     }
+                    convertedOk = true;
+                } else if (pwfx->wBitsPerSample == 32) {
+                    const int32_t* iData = reinterpret_cast<const int32_t*>(pData);
+                    for (UINT32 f = 0; f < numFramesRead; ++f) {
+                        int32_t left = iData[f * srcChannels] >> 16;
+                        int32_t right = ((srcChannels > 1) ? iData[f * srcChannels + 1] : iData[f * srcChannels]) >> 16;
+                        convertedPcm[f * 2 + 0] = static_cast<int16_t>(std::clamp<int32_t>(left, -32768, 32767));
+                        convertedPcm[f * 2 + 1] = static_cast<int16_t>(std::clamp<int32_t>(right, -32768, 32767));
+                    }
+                    convertedOk = true;
+                }
+
+                if (!convertedOk) {
+                    pCaptureClient->ReleaseBuffer(numFramesRead);
+                    continue;
                 }
 
                 const int16_t* pcmToSend = convertedPcm.data();
@@ -5689,20 +5788,26 @@ void NetworkEngine::shutdownViewerAudioPlayback() {
 
 void NetworkEngine::enqueueViewerAudioChunk(const uint8_t* payload, size_t len) {
 #if defined(_WIN32)
-    if (!hWaveOut_ || len < sizeof(AudioChunkHeader)) return;
+    if (!payload || len < sizeof(AudioChunkHeader)) return;
     if (audioMuted_.load()) return;
     int volPercent = audioVolumePercent_.load();
     if (volPercent <= 0) return;
 
     AudioChunkHeader hdr{};
     std::memcpy(&hdr, payload, sizeof(hdr));
-    if (hdr.isSilent || hdr.sampleFrames == 0) return;
+    if (hdr.isSilent || hdr.sampleFrames == 0 || hdr.bitsPerSample != 16 || hdr.channels == 0) return;
+    if (hdr.sampleRate < 8000 || hdr.sampleRate > 192000 || hdr.channels > 8) return;
+    // waveOut is opened for 48 kHz 16-bit stereo (4 bytes per frame); drop unsupported wire formats and cap frame count.
+    if (hdr.sampleRate != 48000 || hdr.channels != 2) return;
 
-    size_t pcmBytes = len - sizeof(AudioChunkHeader);
-    if (pcmBytes == 0) return;
+    constexpr size_t kMaxAudioFrames = 96000;
+    const size_t availFrames = (len - sizeof(AudioChunkHeader)) / (2 * sizeof(int16_t));
+    const size_t frames = std::min<size_t>({ static_cast<size_t>(hdr.sampleFrames), availFrames, kMaxAudioFrames });
+    if (frames == 0) return;
+    const size_t pcmBytes = frames * 2 * sizeof(int16_t);
 
     const int16_t* inSamples = reinterpret_cast<const int16_t*>(payload + sizeof(AudioChunkHeader));
-    size_t sampleCount = pcmBytes / sizeof(int16_t);
+    const size_t sampleCount = frames * 2;
 
     std::lock_guard<std::mutex> lk(audioPlaybackMutex_);
     if (!hWaveOut_) return;
@@ -5777,10 +5882,16 @@ void NetworkEngine::enqueueViewerAudioChunk(const uint8_t* payload, size_t len) 
 
 // ---------------- Bidirectional Voice Intercom (Feature 4) ----------------
 
-bool NetworkEngine::startVoiceIntercom() {
+bool NetworkEngine::startVoiceIntercom(SessionTarget target) {
+    SessionTarget resolved = target;
+    if (resolved == SessionTarget::Auto) {
+        if (viewerActive_.load() || viewerSock_.load() != ~uintptr_t(0)) resolved = SessionTarget::Viewer;
+        else if (activeHostClientSock_.load() != ~uintptr_t(0)) resolved = SessionTarget::Host;
+    }
+    voiceIntercomTarget_.store(resolved);
     voiceIntercom_.startPlayback(48000, 1);
 
-    return voiceIntercom_.startCapture([this](const uint8_t* pcm, size_t bytes, uint32_t sampleRate, uint8_t channels) {
+    return voiceIntercom_.startCapture([this, resolved](const uint8_t* pcm, size_t bytes, uint32_t sampleRate, uint8_t channels) {
         uint8_t safeCh = std::max<uint8_t>(1, channels);
         VoiceChunkHeader hdr{};
         hdr.sampleRate = sampleRate;
@@ -5796,15 +5907,17 @@ bool NetworkEngine::startVoiceIntercom() {
             std::memcpy(tl_voicePacketScratch.data() + sizeof(hdr), pcm, bytes);
         }
 
-        if (viewerActive_.load()) {
-            sendViewerEncryptedPacket(PacketType::VOICE_INTERCOM_CHUNK, 0, tl_voicePacketScratch.data(), tl_voicePacketScratch.size());
-        } else if (activeHostClientSock_.load() != ~uintptr_t(0)) {
-            sendHostEncryptedPacket(PacketType::VOICE_INTERCOM_CHUNK, 0, tl_voicePacketScratch.data(), tl_voicePacketScratch.size());
-        }
+        sendToSessionTarget(resolved, PacketType::VOICE_INTERCOM_CHUNK, 0, tl_voicePacketScratch.data(), tl_voicePacketScratch.size());
     }, 48000, 1);
 }
 
-void NetworkEngine::stopVoiceIntercom() {
+void NetworkEngine::stopVoiceIntercom(SessionTarget target) {
+    SessionTarget currentTarget = voiceIntercomTarget_.load();
+    if (target != SessionTarget::Auto && currentTarget != SessionTarget::Auto && currentTarget != target) {
+        return;
+    }
+    SessionTarget sendTarget = (target != SessionTarget::Auto) ? target : currentTarget;
+
     VoiceChunkHeader hdr{};
     hdr.sampleRate = 48000;
     hdr.channels = 1;
@@ -5812,14 +5925,11 @@ void NetworkEngine::stopVoiceIntercom() {
     hdr.flags = 0x04;
     hdr.sampleFrames = 0;
 
-    if (viewerActive_.load()) {
-        sendViewerEncryptedPacket(PacketType::VOICE_INTERCOM_CHUNK, 0, &hdr, sizeof(hdr));
-    } else if (activeHostClientSock_.load() != ~uintptr_t(0)) {
-        sendHostEncryptedPacket(PacketType::VOICE_INTERCOM_CHUNK, 0, &hdr, sizeof(hdr));
-    }
+    sendToSessionTarget(sendTarget, PacketType::VOICE_INTERCOM_CHUNK, 0, &hdr, sizeof(hdr));
 
     voiceIntercom_.stopCapture();
     voiceIntercom_.stopPlayback();
+    voiceIntercomTarget_.store(SessionTarget::Auto);
     hostMicLive_.store(false);
     voiceOpenFailed_.store(false);
 }
@@ -5870,15 +5980,19 @@ bool NetworkEngine::isVoiceMonitoring() const {
     return voiceIntercom_.isCapturing();
 }
 
-void NetworkEngine::handleIncomingVoiceChunk(const uint8_t* payload, size_t len) {
+void NetworkEngine::handleIncomingVoiceChunk(const uint8_t* payload, size_t len, SessionTarget source) {
     if (!payload || len < sizeof(VoiceChunkHeader)) return;
     const auto* hdr = reinterpret_cast<const VoiceChunkHeader*>(payload);
 
     if (hdr->flags & 0x04) {
-        voiceIntercom_.stopCapture();
-        voiceIntercom_.stopPlayback();
-        hostMicLive_.store(false);
-        voiceOpenFailed_.store(false);
+        SessionTarget activeTarget = voiceIntercomTarget_.load();
+        if (source == SessionTarget::Auto || activeTarget == SessionTarget::Auto || activeTarget == source) {
+            voiceIntercom_.stopCapture();
+            voiceIntercom_.stopPlayback();
+            voiceIntercomTarget_.store(SessionTarget::Auto);
+            hostMicLive_.store(false);
+            voiceOpenFailed_.store(false);
+        }
         return;
     }
 
@@ -5894,8 +6008,11 @@ void NetworkEngine::handleIncomingVoiceChunk(const uint8_t* payload, size_t len)
     }
     voiceIntercom_.enqueuePlaybackChunk(pcm, pcmBytes, ch);
 
-    if (!voiceOpenFailed_.load() && !voiceIntercom_.isCapturing() && activeHostClientSock_.load() != ~uintptr_t(0)) {
-        if (startVoiceIntercom()) hostMicLive_.store(true);
+    const bool fromHostSession = (source == SessionTarget::Host) ||
+                                 (source == SessionTarget::Auto && !viewerActive_.load());
+    if (fromHostSession && !voiceOpenFailed_.load() && !voiceIntercom_.isCapturing() &&
+        activeHostClientSock_.load() != ~uintptr_t(0)) {
+        if (startVoiceIntercom(SessionTarget::Host)) hostMicLive_.store(true);
         else voiceOpenFailed_.store(true);
     }
 }
@@ -5938,34 +6055,22 @@ void NetworkEngine::clearTerminalScrollback() {
     terminalLines_.clear();
 }
 
-void NetworkEngine::sendWhiteboardStroke(const AnnotationStroke& stroke) {
+void NetworkEngine::sendWhiteboardStroke(const AnnotationStroke& stroke, SessionTarget target) {
     auto payload = WhiteboardManager::serializeStroke(stroke);
-    if (viewerSock_.load() != ~uintptr_t(0)) {
-        sendViewerEncryptedPacket(PacketType::WHITEBOARD_PACKET, 0, payload.data(), payload.size());
-    } else if (activeHostClientSock_.load() != ~uintptr_t(0)) {
-        sendHostEncryptedPacket(PacketType::WHITEBOARD_PACKET, 0, payload.data(), payload.size());
-    }
+    sendToSessionTarget(target, PacketType::WHITEBOARD_PACKET, 0, payload.data(), payload.size());
 }
 
-void NetworkEngine::sendWhiteboardClear() {
+void NetworkEngine::sendWhiteboardClear(SessionTarget target) {
     auto payload = WhiteboardManager::serializeClearPacket();
-    if (viewerSock_.load() != ~uintptr_t(0)) {
-        sendViewerEncryptedPacket(PacketType::WHITEBOARD_PACKET, 0, payload.data(), payload.size());
-    } else if (activeHostClientSock_.load() != ~uintptr_t(0)) {
-        sendHostEncryptedPacket(PacketType::WHITEBOARD_PACKET, 0, payload.data(), payload.size());
-    }
+    sendToSessionTarget(target, PacketType::WHITEBOARD_PACKET, 0, payload.data(), payload.size());
 }
 
-void NetworkEngine::sendWhiteboardLaser(float normX, float normY) {
+void NetworkEngine::sendWhiteboardLaser(float normX, float normY, SessionTarget target) {
     AnnotationStroke stroke{};
     stroke.tool = WhiteboardTool::LaserPointer;
     stroke.points.push_back({ normX, normY });
     auto payload = WhiteboardManager::serializeStroke(stroke);
-    if (viewerSock_.load() != ~uintptr_t(0)) {
-        sendViewerEncryptedPacket(PacketType::WHITEBOARD_PACKET, 0, payload.data(), payload.size());
-    } else if (activeHostClientSock_.load() != ~uintptr_t(0)) {
-        sendHostEncryptedPacket(PacketType::WHITEBOARD_PACKET, 0, payload.data(), payload.size());
-    }
+    sendToSessionTarget(target, PacketType::WHITEBOARD_PACKET, 0, payload.data(), payload.size());
 }
 
 #if defined(_WIN32)
@@ -7814,17 +7919,12 @@ void NetworkEngine::setOnScratchpadUpdateCallback(std::function<void(const Scrat
     onScratchpadUpdate_ = std::move(cb);
 }
 
-bool NetworkEngine::sendScratchpadText(const std::string& text, uint32_t cursorPos) {
+bool NetworkEngine::sendScratchpadText(const std::string& text, uint32_t cursorPos, SessionTarget target) {
     uint32_t myId = static_cast<uint32_t>(identity_.deskId());
     ScratchpadUpdatePayload payload = scratchpadMgr_.updateLocalText(text, myId, cursorPos);
     std::vector<uint8_t> buf;
     serializeScratchpadUpdate(payload, buf);
-    if (viewerActive_.load()) {
-        return sendViewerEncryptedPacket(PacketType::SCRATCHPAD_UPDATE, FLAG_ENCRYPTED, buf.data(), buf.size());
-    } else if (activeHostClientSock_.load() != ~uintptr_t(0)) {
-        return sendHostEncryptedPacket(PacketType::SCRATCHPAD_UPDATE, FLAG_ENCRYPTED, buf.data(), buf.size());
-    }
-    return false;
+    return sendToSessionTarget(target, PacketType::SCRATCHPAD_UPDATE, FLAG_ENCRYPTED, buf.data(), buf.size());
 }
 
 void NetworkEngine::setOnCommandPaletteOutputCallback(std::function<void(const CommandPaletteOutputPayload&)> cb) {

@@ -137,6 +137,8 @@ struct ViewerSessionStats {
 
 enum class PairingRequestState { Idle, Pending, Paired, Refused };
 
+enum class SessionTarget : uint8_t { Auto = 0, Viewer = 1, Host = 2 };
+
 enum class ViewerPairingDecision { Legacy, UsePaired, RefuseIdentityChanged, RefuseNoPairingSupport };
 
 // A pinned host must prove it holds the pinned key; it is never silently re-paired or downgraded to a password.
@@ -360,15 +362,18 @@ public:
     // File transfer, clipboard & live encrypted chat
     uint32_t sendFile(const std::string& filePath,
                       FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads,
-                      float dropNx = 0.0f, float dropNy = 0.0f);
+                      float dropNx = 0.0f, float dropNy = 0.0f,
+                      SessionTarget target = SessionTarget::Auto);
     // Same as sendFile for a path already decoded from UTF-8 (a std::string path is read as the ANSI code page).
     uint32_t sendFilePath(const std::filesystem::path& filePath,
                           FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads,
-                          float dropNx = 0.0f, float dropNy = 0.0f);
+                          float dropNx = 0.0f, float dropNy = 0.0f,
+                          SessionTarget target = SessionTarget::Auto);
     int sendDropPath(const std::string& path,
                      FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads,
-                     float dropNx = 0.0f, float dropNy = 0.0f);
-    bool cancelFileTransfer(uint32_t transferId);
+                     float dropNx = 0.0f, float dropNy = 0.0f,
+                     SessionTarget target = SessionTarget::Auto);
+    bool cancelFileTransfer(uint32_t transferId, SessionTarget target = SessionTarget::Auto);
     void pushLocalClipboardNow();
     bool sendChatMessage(const std::string& text);
     bool sendChatImage(const std::vector<uint8_t>& jpegData, uint32_t w, uint32_t h, const std::string& caption = "");
@@ -389,7 +394,7 @@ public:
     ScratchpadManager& scratchpadManager() { return scratchpadMgr_; }
     const ScratchpadManager& scratchpadManager() const { return scratchpadMgr_; }
     void setOnScratchpadUpdateCallback(std::function<void(const ScratchpadUpdatePayload&)> cb);
-    bool sendScratchpadText(const std::string& text, uint32_t cursorPos = 0);
+    bool sendScratchpadText(const std::string& text, uint32_t cursorPos = 0, SessionTarget target = SessionTarget::Auto);
 
     // Spotlight Omnibar Command Palette
     CommandPaletteManager& commandPaletteManager() { return commandPaletteMgr_; }
@@ -397,10 +402,10 @@ public:
     void setOnCommandPaletteOutputCallback(std::function<void(const CommandPaletteOutputPayload&)> cb);
     bool sendCommandPaletteExec(const std::string& commandLine, uint32_t execId = 0);
 
-    bool requestRemoteScan(const std::string& remotePath);
-    bool requestRemoteBlockHashes(const std::string& relativePath);
+    bool requestRemoteScan(const std::string& remotePath, SessionTarget target = SessionTarget::Auto);
+    bool requestRemoteBlockHashes(const std::string& relativePath, SessionTarget target = SessionTarget::Auto);
     bool startFolderSync(const std::string& localPath, const std::string& remotePath, SyncMode mode, bool purge = false);
-    void cancelFolderSync();
+    void cancelFolderSync(SessionTarget target = SessionTarget::Auto);
 
     // Audio streaming controls (v2.1.0)
     void setAudioVolume(int percent);
@@ -419,6 +424,8 @@ public:
     void setHostMicLiveForTest(bool live) { hostMicLive_.store(live); }
     void injectVoiceChunkForTest(const uint8_t* payload, size_t len) { handleIncomingVoiceChunk(payload, len); }
     bool voiceOpenFailedForTest() const { return voiceOpenFailed_.load(); }
+    // Hands the viewer a received AUDIO_STREAM_CHUNK payload as if the host had sent it (malformed ones included).
+    void injectViewerAudioChunkForTest(const uint8_t* payload, size_t len) { enqueueViewerAudioChunk(payload, len); }
 #if !defined(_WIN32)
     // Tests stand in for the sound hardware: what the host captures and what the viewer plays through. A null factory
     // keeps the real one. Set before a session starts.
@@ -428,8 +435,6 @@ public:
         sourceFactory_ = std::move(source);
         playerFactory_ = std::move(player);
     }
-    // Hands the viewer a received AUDIO_STREAM_CHUNK payload as if the host had sent it (malformed ones included).
-    void injectViewerAudioChunkForTest(const uint8_t* payload, size_t len) { enqueueViewerAudioChunk(payload, len); }
 #endif
 
     // Privacy screen controls (v2.1.0, v3.2.0 & DPMS power management)
@@ -456,9 +461,9 @@ public:
     // Whiteboard & Screen Annotation (v2.1.0)
     WhiteboardManager& whiteboardManager() { return whiteboardMgr_; }
     const WhiteboardManager& whiteboardManager() const { return whiteboardMgr_; }
-    void sendWhiteboardStroke(const AnnotationStroke& stroke);
-    void sendWhiteboardClear();
-    void sendWhiteboardLaser(float normX, float normY);
+    void sendWhiteboardStroke(const AnnotationStroke& stroke, SessionTarget target = SessionTarget::Auto);
+    void sendWhiteboardClear(SessionTarget target = SessionTarget::Auto);
+    void sendWhiteboardLaser(float normX, float normY, SessionTarget target = SessionTarget::Auto);
 
     // Remote Hardware Diagnostics & Live Process Telemetry (Feature 1)
     static SystemDiagnosticsPayload sampleHostDiagnostics();
@@ -484,15 +489,15 @@ public:
     bool hasNewRemoteFileAction();
 
     // Bidirectional Voice Intercom (VoIP Microphone & Playback - Feature 4)
-    bool startVoiceIntercom();
-    void stopVoiceIntercom();
+    bool startVoiceIntercom(SessionTarget target = SessionTarget::Auto);
+    void stopVoiceIntercom(SessionTarget target = SessionTarget::Auto);
     bool isVoiceIntercomActive() const;
     void setVoiceIntercomMicMuted(bool muted);
     bool isVoiceIntercomMicMuted() const;
     float voiceIntercomInputLevel() const;
     void setVoiceInputDevice(int id);
     void setVoiceOutputDevice(int id);
-    void handleIncomingVoiceChunk(const uint8_t* payload, size_t len);
+    void handleIncomingVoiceChunk(const uint8_t* payload, size_t len, SessionTarget source = SessionTarget::Auto);
     bool startVoiceMonitor();
     void stopVoiceMonitor();
     bool isVoiceMonitoring() const;
@@ -562,6 +567,8 @@ private:
     // Encrypted send helpers for active sessions
     bool sendHostEncryptedPacket(PacketType type, uint8_t flags, const void* payload, size_t payloadLen);
     bool sendViewerEncryptedPacket(PacketType type, uint8_t flags, const void* payload, size_t payloadLen);
+    bool sendToSessionTarget(SessionTarget target, PacketType type, uint8_t flags, const void* payload, size_t payloadLen);
+    void appendChatMessageLocked(ChatMessageEntry&& entry);
 
     IdentityManager&            identity_;
     std::string                 localIp_ = "127.0.0.1";
@@ -649,6 +656,7 @@ private:
     int                         viewerCanvasW_ = 0;
     int                         viewerCanvasH_ = 0;
     uint64_t                    viewerFrameSeq_ = 0;
+    mutable uint64_t            viewerLastConsumedSeq_ = 0;
     CursorState                 viewerCursor_;
     mutable RECT                viewerDirtyBounds_{0, 0, 0, 0};
     mutable bool                viewerFullCanvasDirty_ = true;
@@ -807,6 +815,7 @@ private:
 
     // Voice Intercom State (Feature 4)
     VoiceIntercom                              voiceIntercom_;
+    std::atomic<SessionTarget>                 voiceIntercomTarget_{SessionTarget::Auto};
 
     // Virtual Display & Dynamic Resolution Manager (Feature 5)
     DisplayResolutionManager                   displayManager_;
