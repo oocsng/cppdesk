@@ -7,7 +7,7 @@
       type="win32"/>
   <description>CppDesk Ultra-Low-Latency Remote Desktop</description>
 
-  <!-- UAC Execution Level: requireAdministrator ensures full UIPI access for Task Manager, UAC, and system administration -->
+  <!-- UAC Execution Level: asInvoker launches unprivileged; explicit elevation is requested only when needed -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">

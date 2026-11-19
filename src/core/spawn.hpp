@@ -6,6 +6,7 @@
 #if !defined(_WIN32)
 
 #include <spawn.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -104,7 +105,11 @@ inline bool onPath(const std::string& program) {
     while (start <= p.size()) {
         const size_t end = p.find(':', start);
         const std::string dir = p.substr(start, end == std::string::npos ? std::string::npos : end - start);
-        if (!dir.empty() && access((dir + "/" + program).c_str(), X_OK) == 0) return true;
+        if (!dir.empty()) {
+            const std::string full = dir + "/" + program;
+            struct stat st{};
+            if (stat(full.c_str(), &st) == 0 && S_ISREG(st.st_mode) && access(full.c_str(), X_OK) == 0) return true;
+        }
         if (end == std::string::npos) break;
         start = end + 1;
     }
