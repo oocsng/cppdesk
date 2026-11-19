@@ -9459,11 +9459,11 @@ void testLinuxInputHelpers() {
     TEST_ASSERT(UiPlatform::dpiScaleFromXftDpi("48") == 1.0f);
 
     auto paths = UiPlatform::parseFileUriList("file:///home/a/b%20c.txt\r\n# comment\r\nhttps://example.com/x\r\n"
-                                              "file://host/tmp/x\r\nfile:///tmp/%E2%82%AC\n");
-    TEST_ASSERT(paths.size() == 3);
+                                              "file://host/tmp/x\r\nfile://LocalHost/tmp/y\r\nfile:///tmp/%E2%82%AC\n");
+    TEST_ASSERT(paths.size() == 3);   // file://host/... names a remote file and is skipped
     if (paths.size() == 3) {
         TEST_ASSERT(paths[0] == "/home/a/b c.txt");
-        TEST_ASSERT(paths[1] == "/tmp/x");
+        TEST_ASSERT(paths[1] == "/tmp/y");
         TEST_ASSERT(paths[2] == "/tmp/\xE2\x82\xAC");
     }
     TEST_ASSERT(UiPlatform::parseFileUriList("").empty());

@@ -372,6 +372,9 @@ std::vector<std::string> UiPlatform::parseFileUriList(const std::string& uriList
         if (line.rfind("file://", 0) != 0) continue;   // also skips '#' comments and other schemes
         const size_t pathStart = line.find('/', 7);       // after file://host
         if (pathStart == std::string::npos) continue;
+        std::string host = line.substr(7, pathStart - 7);
+        for (char& ch : host) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (!host.empty() && host != "localhost") continue;   // a remote host's path is not a local file
         std::string path;
         bool hasNul = false;
         for (size_t i = pathStart; i < line.size(); ++i) {
