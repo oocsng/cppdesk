@@ -2016,6 +2016,8 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         ScreenCapturer capturer;
         capturer.setAutoHeadless(identity_.settings().autoVirtualDisplay);
         capturer.setRestoreToken(shareHub_.restoreToken());
+        uint64_t appliedCloakGen = privacyCloakGen_.load(std::memory_order_acquire);
+        applyPrivacyCloakConfig(capturer.privacyCloak());
 #if defined(__APPLE__)
         // The screen stream carries the Mac's sound; a source supplied by a test replaces it.
         if (!sourceFactory_) capturer.setSoundSink([this](const int16_t* pcm, size_t frames) { sendHostSoundChunk(pcm, frames); });
@@ -3015,6 +3017,11 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
             bool isKf = false;
             CursorState curState{};
 
+            const uint64_t curCloakGen = privacyCloakGen_.load(std::memory_order_acquire);
+            if (curCloakGen != appliedCloakGen) {
+                appliedCloakGen = curCloakGen;
+                applyPrivacyCloakConfig(capturer.privacyCloak());
+            }
             const bool gotFrame = capturer.captureDirtyTiles(wantKf, preset, dirtyTiles, isKf, curState);
             shareHub_.setNotice(capturer.shareNotice());
             if (std::string shareToken; capturer.takeRestoreTokenChange(shareToken)) shareHub_.pushToken(shareToken);
@@ -5178,6 +5185,38 @@ void NetworkEngine::configurePrivacyCurtain(const std::string& notice, const std
     privacyCurtainNotice_ = notice;
     privacyCurtainBrand_ = brand;
     privacyCurtainShowId_ = showId;
+}
+
+void NetworkEngine::configurePrivacyCloak(bool enabled, uint8_t style, const std::string& keywords) {
+    {
+        std::lock_guard<std::mutex> lk(privacyCloakMutex_);
+        privacyCloakEnabled_ = enabled;
+        privacyCloakStyle_ = style;
+        privacyCloakKeywords_ = keywords;
+    }
+    privacyCloakGen_.fetch_add(1, std::memory_order_release);
+}
+
+void NetworkEngine::applyPrivacyCloakConfig(PrivacyCloakManager& cloak) const {
+    bool enabled = false;
+    uint8_t style = 0;
+    std::string keywords;
+    {
+        std::lock_guard<std::mutex> lk(privacyCloakMutex_);
+        if (privacyCloakGen_.load(std::memory_order_acquire) == 0) {
+            const auto& s = identity_.settings();
+            enabled = s.privacyCloakEnabled;
+            style = s.privacyCloakStyle;
+            keywords = s.privacyCloakKeywords;
+        } else {
+            enabled = privacyCloakEnabled_;
+            style = privacyCloakStyle_;
+            keywords = privacyCloakKeywords_;
+        }
+    }
+    cloak.setEnabled(enabled);
+    cloak.setRedactionStyle(style);
+    cloak.setCustomKeywords(keywords);
 }
 
 void NetworkEngine::requestTogglePrivacyMode(ScreenBlankMode blankMode) {

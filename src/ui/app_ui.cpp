@@ -2767,7 +2767,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         case SettingsSection::Permissions:    sectionContentH = 308.0f + 92.0f + 28.0f * (std::max<size_t>(1, pairedViewers.size()) + std::max<size_t>(1, pairedHosts.size())); break;
         case SettingsSection::TwoFactorAuth:  sectionContentH = 360.0f; break;
         case SettingsSection::NetworkRelay:   sectionContentH = 320.0f; break;
-        case SettingsSection::CurtainPrivacy: sectionContentH = 270.0f; break;
+        case SettingsSection::CurtainPrivacy: sectionContentH = 440.0f; break;
         case SettingsSection::SystemService:  sectionContentH = 360.0f; break;
         case SettingsSection::About:          sectionContentH = 350.0f; break;
         case SettingsSection::Glide:          sectionContentH = 330.0f + 38.0f * identity_.pairedHosts().size(); break;
@@ -3690,6 +3690,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                              AppSettings ns = identity_.settings();
                              ns.privacyCloakEnabled = !ns.privacyCloakEnabled;
                              identity_.updateSettings(ns);
+                             network_.configurePrivacyCloak(ns.privacyCloakEnabled, ns.privacyCloakStyle, ns.privacyCloakKeywords);
                              showToast(ns.privacyCloakEnabled ? "Privacy Cloak Enabled" : "Privacy Cloak Disabled");
                          }, "Black out or pixelate designated sensitive windows prior to frame encoding.");
 
@@ -3708,6 +3709,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                        AppSettings ns = identity_.settings();
                        ns.privacyCloakStyle = 0;
                        identity_.updateSettings(ns);
+                       network_.configurePrivacyCloak(ns.privacyCloakEnabled, ns.privacyCloakStyle, ns.privacyCloakKeywords);
                        showToast("Redaction style: Solid Charcoal");
                    }, ui::FontRole::Small, !isCharcoal, COL_BORDER);
 
@@ -3719,6 +3721,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                        AppSettings ns = identity_.settings();
                        ns.privacyCloakStyle = 1;
                        identity_.updateSettings(ns);
+                       network_.configurePrivacyCloak(ns.privacyCloakEnabled, ns.privacyCloakStyle, ns.privacyCloakKeywords);
                        showToast("Redaction style: Mosaic Blurring");
                    }, ui::FontRole::Small, isCharcoal, COL_BORDER);
 
@@ -3736,6 +3739,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                        AppSettings ns = identity_.settings();
                        ns.privacyCloakKeywords = privacyKeywordsEdit_;
                        identity_.updateSettings(ns);
+                       network_.configurePrivacyCloak(ns.privacyCloakEnabled, ns.privacyCloakStyle, ns.privacyCloakKeywords);
                        showToast("Privacy Cloak keywords saved");
                    }, ui::FontRole::Small);
 
@@ -4071,10 +4075,29 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         drawButton("sett_reset_defaults", resetBtn, "Reset Settings",
                    COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_PRIMARY, 8.0f, [this]() {
                        identity_.resetSettingsToDefault();
+                       const auto& ds = identity_.settings();
+                       relayServerEdit_ = ds.relayServer.empty() ? identity_.relayServerAddress() : ds.relayServer;
+                       relayAuthKeyEdit_ = ds.relayAuthKey;
+                       stunServerEdit_ = ds.stunServer;
+                       relayModeEdit_ = ds.relayMode;
+                       privacyBrandEdit_ = ds.privacyBrandName;
+                       privacyNoticeEdit_ = ds.privacyCustomNotice;
+                       privacyKeywordsEdit_ = ds.privacyCloakKeywords;
+                       totpEnrollCodeEdit_.clear();
+                       totpEnrollFeedback_.clear();
+                       totpEnrollSuccess_ = false;
                        applyWindowThemeAttribute();
-                       scaleMode_ = ScaleMode::FitAspect;
-                       network_.setAutoAcceptIncoming(false, PERM_ALL);
-                       network_.setSessionFpsConfig(30, true);
+                       scaleMode_ = static_cast<ScaleMode>(std::clamp<int>(ds.defaultScaleMode, 0, 3));
+                       network_.setAudioVolume(ds.defaultAudioVolume);
+                       network_.setAudioMuted(ds.audioMutedDefault);
+                       network_.setVoiceInputDevice(ds.audioInputDeviceId);
+                       network_.setVoiceOutputDevice(ds.audioOutputDeviceId);
+                       network_.setAutoAcceptIncoming(ds.autoAcceptIncoming, PERM_ALL);
+                       network_.setSessionFpsConfig(ds.targetFps, ds.adaptiveFps);
+                       network_.configurePrivacyCurtain(ds.privacyCustomNotice, ds.privacyBrandName, ds.privacyShowDeskId);
+                       network_.configurePrivacyCloak(ds.privacyCloakEnabled, ds.privacyCloakStyle, ds.privacyCloakKeywords);
+                       network_.setRelayAddressAndReconnect(relayServerEdit_);
+                       updateTotpQrMatrix();
                        showToast("Settings restored to defaults");
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ON_ACCENT);
 
@@ -10400,6 +10423,7 @@ AppUi::AppUi(IdentityManager& identity, NetworkEngine& network, ui::PlatformShel
     network_.setVoiceOutputDevice(s.audioOutputDeviceId);
     network_.setWaylandRestoreToken(s.waylandRestoreToken);
     network_.configurePrivacyCurtain(s.privacyCustomNotice, s.privacyBrandName, s.privacyShowDeskId);
+    network_.configurePrivacyCloak(s.privacyCloakEnabled, s.privacyCloakStyle, s.privacyCloakKeywords);
     updateActivePalette(themeAnimT_);
     updateTotpQrMatrix();
     privacyKeywordsEdit_ = s.privacyCloakKeywords;
