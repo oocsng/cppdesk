@@ -162,18 +162,15 @@ fillRoundRect 344.00 296.00 936.00 330.00 r6.00 c0.85,0.47,0.34,0.22
 strokeRoundRect 344.00 296.00 936.00 330.00 r6.00 c0.85,0.47,0.34,1.00 w1.00
 fillRoundRect 352.00 302.00 418.00 324.00 r4.00 c0.85,0.47,0.34,0.15
 drawText 352.00 302.00 418.00 324.00 Small CC c0.63,0.27,0.15,1.00 |Network
-drawText 428.00 302.00 876.00 324.00 Small LC c0.15,0.14,0.13,1.00 |Display IP Network Configuration  (cmd.exe /c ipconfig /all)
+drawText 428.00 302.00 876.00 324.00 Small LC c0.15,0.14,0.13,1.00 |Display IP Network Configuration  (ipconfig /all)
 fillRoundRect 352.00 338.00 418.00 360.00 r4.00 c0.85,0.47,0.34,0.15
 drawText 352.00 338.00 418.00 360.00 Small CC c0.63,0.27,0.15,1.00 |Network
-drawText 428.00 338.00 876.00 360.00 Small LC c0.33,0.31,0.27,1.00 |Flush DNS Resolver Cache  (cmd.exe /c ipconfig /flushdns)
+drawText 428.00 338.00 876.00 360.00 Small LC c0.33,0.31,0.27,1.00 |Ping Public DNS (8.8.8.8)  (ping 8.8.8.8)
 fillRoundRect 352.00 374.00 418.00 396.00 r4.00 c0.85,0.47,0.34,0.15
-drawText 352.00 374.00 418.00 396.00 Small CC c0.63,0.27,0.15,1.00 |Network
-drawText 428.00 374.00 876.00 396.00 Small LC c0.33,0.31,0.27,1.00 |Ping Public DNS (8.8.8.8)  (cmd.exe /c ping -n 4 8.8.8.8)
+drawText 352.00 374.00 418.00 396.00 Small CC c0.63,0.27,0.15,1.00 |System
+drawText 428.00 374.00 876.00 396.00 Small LC c0.33,0.31,0.27,1.00 |List Running Processes  (tasklist)
 fillRoundRect 352.00 410.00 418.00 432.00 r4.00 c0.85,0.47,0.34,0.15
-drawText 352.00 410.00 418.00 432.00 Small CC c0.63,0.27,0.15,1.00 |Network
-drawText 428.00 410.00 876.00 432.00 Small LC c0.33,0.31,0.27,1.00 |Active Network Connections  (cmd.exe /c netstat -ano)
-fillRoundRect 352.00 446.00 418.00 468.00 r4.00 c0.85,0.47,0.34,0.15
-drawText 352.00 446.00 418.00 468.00 Small CC c0.63,0.27,0.15,1.00 |Network
-drawText 428.00 446.00 876.00 468.00 Small LC c0.33,0.31,0.27,1.00 |Display IP Routing Table  (cmd.exe /c route print)
+drawText 352.00 410.00 418.00 432.00 Small CC c0.63,0.27,0.15,1.00 |Actions
+drawText 428.00 410.00 876.00 432.00 Small LC c0.33,0.31,0.27,1.00 |Restart Host  (shutdown /r /t 0)
 setTransform 1.00 0.00 0.00 1.00 0.00 0.00
 endFrame

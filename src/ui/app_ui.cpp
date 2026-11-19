@@ -3422,7 +3422,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                 tmOk = (gmtime_r(&when, &tmUtc) != nullptr);
 #endif
                 char date[16] = {};
-                if (!tmOk || std::strftime(date, sizeof(date), "%Y-%m-%d", &tmUtc) == 0) {
+                if (when <= 0 || !tmOk || std::strftime(date, sizeof(date), "%Y-%m-%d", &tmUtc) == 0) {
                     std::snprintf(date, sizeof(date), "unknown");
                 }
                 drawText(p.hostname + " \xC2\xB7 " + CryptoUtils::formatDeskId(p.deskId) + " \xC2\xB7 paired " + date,
@@ -11024,7 +11024,13 @@ void AppUi::applySnapshotState(const std::string& name) {
         showRecordingPlayer_ = true;
     } else if (name == "modal_omnibar") {
         showOmnibarModal_ = true;
-        omnibarFiltered_ = network_.commandPaletteManager().getCatalog();
+        // Fixed list: the real catalog differs per OS, and goldens are shared across platforms.
+        omnibarFiltered_ = {
+            { "net.ipconfig", "Display IP Network Configuration", "Network", "ipconfig /all", false },
+            { "net.ping", "Ping Public DNS (8.8.8.8)", "Network", "ping 8.8.8.8", false },
+            { "sys.tasks", "List Running Processes", "System", "tasklist", false },
+            { "act.reboot", "Restart Host", "Actions", "shutdown /r /t 0", true },
+        };
     } else if (name == "toast") {
         showToast("Saved desk details");
         toastExpireTick_ = UINT64_MAX;
