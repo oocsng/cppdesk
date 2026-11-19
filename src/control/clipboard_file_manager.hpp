@@ -179,6 +179,8 @@ private:
         std::unique_ptr<IncrementalSha256> hasher;
     };
 
+    void pushItemLocked(FileTransferItem item);
+
     mutable std::mutex                             mutex_;
     std::string                                    receiveDir_;
     uint32_t                                       nextTransferId_ = 1;
@@ -258,22 +260,30 @@ private:
         uint32_t             fileIndex = 0;
         uint64_t             offset = 0;
         uint32_t             length = 0;
+        bool                 active = false;
         bool                 completed = false;
         bool                 failed = false;
         std::vector<uint8_t> data;
     };
 
-    mutable std::mutex       mutex_;
-    std::condition_variable  chunkCv_;
+    struct SharedState {
+        mutable std::mutex       mutex;
+        std::condition_variable  chunkCv;
+        SendPacketFn             activeSendFn;
+        OutgoingState            outgoing;
+        IncomingState            incoming;
+        PendingChunkRequest      pendingReq;
+        bool                     destroyed = false;
+    };
+
+    static bool fetchChunkFromState(SharedState& st, uint32_t fileIndex, uint64_t offset, uint32_t length, std::vector<uint8_t>& outData);
+
+    std::shared_ptr<SharedState> state_;
     uint32_t                 lastSequenceNumber_ = 0;
     uint32_t                 nextTransferId_ = 1001;
     std::wstring             stagingDir_;   // this manager's own folder: engines in one process must not purge each other's
     std::atomic<uint64_t>    offerGeneration_{0};   // macOS/Linux: the clipboard offer this manager made
-    SendPacketFn             activeSendFn_;
-
-    OutgoingState            outgoing_;
-    IncomingState            incoming_;
-    PendingChunkRequest      pendingReq_;
+    std::atomic<bool>        hasActiveOffer_{false};
 };
 
 } // namespace cppdesk
