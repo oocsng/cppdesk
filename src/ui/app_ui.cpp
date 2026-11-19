@@ -85,6 +85,11 @@ void AppUi::hardResetViewerUiState() {
     showRewindScrubber_ = false;
     remoteCanvasPressedMask_ = 0;
     whiteboardStrokeActive_ = false;
+
+    // Drain any stale remote file/process responses so they never bleed into the next session
+    if (network_.hasNewRemoteFileList()) (void)network_.latestRemoteFileList();
+    if (network_.hasNewRemoteFileAction()) (void)network_.latestRemoteFileAction();
+    if (network_.hasNewProcessLaunchResp()) (void)network_.latestProcessLaunchResp();
 }
 
 void AppUi::switchTab(ActiveTab newTab) {
@@ -1140,7 +1145,13 @@ void AppUi::drawTopNavBar(float width, float& outTopOffset) {
                (showFileDrawer_ || unreadChat > 0) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                (showFileDrawer_ || unreadChat > 0) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
                9.0f, [this, unreadChat]() {
+                   if (showFileDrawer_ && drawerTab_ == DrawerTab::Diagnostics) {
+                       network_.setDiagnosticsActive(false);
+                   }
                    if (!showFileDrawer_ && unreadChat > 0) {
+                       if (drawerTab_ == DrawerTab::Diagnostics) {
+                           network_.setDiagnosticsActive(false);
+                       }
                        drawerTab_ = DrawerTab::LiveChat;
                        network_.markChatRead();
                    }
@@ -2121,6 +2132,9 @@ void AppUi::drawRemoteSessionView(const UiRect& bounds, float alpha) {
                 if (chatOpen) {
                     showFileDrawer_ = false;
                 } else {
+                    if (drawerTab_ == DrawerTab::Diagnostics) {
+                        network_.setDiagnosticsActive(false);
+                    }
                     showFileDrawer_ = true;
                     drawerTab_ = DrawerTab::LiveChat;
                     network_.markChatRead();
@@ -4294,34 +4308,6 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
 }
 
 void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
-    if (network_.hasNewRemoteFileList()) {
-        auto resp = network_.latestRemoteFileList();
-        remoteFilePane_.isLoading = false;
-        if (resp.statusCode == 0) {
-            // A new listing invalidates the selection; keeping the old index would point a Delete at the wrong item.
-            if (resp.currentPath != remoteFilePane_.currentPath) remoteFilePane_.scrollOffset = 0.0f;
-            remoteFilePane_.selectedIndex = -1;
-            remoteFilePane_.lastClickIndex = -1;
-            remoteFilePane_.currentPath = resp.currentPath;
-            remoteFilePane_.entries = std::move(resp.entries);
-            fileBrowserInputRemotePath_ = (resp.currentPath == "$DRIVES$") ? std::string() : resp.currentPath;
-            remoteFilePane_.statusMessage.clear();
-        } else {
-            remoteFilePane_.statusMessage = resp.errorMessage;
-            showToast("Remote file error: " + resp.errorMessage, true);
-        }
-    }
-    if (network_.hasNewRemoteFileAction()) {
-        auto resp = network_.latestRemoteFileAction();
-        showToast(resp.message, resp.statusCode != 0);
-        network_.requestRemoteFileList(remoteFilePane_.currentPath.empty() ? "$DRIVES$" : remoteFilePane_.currentPath);
-    }
-    if (network_.hasNewProcessLaunchResp()) {
-        auto resp = network_.latestProcessLaunchResp();
-        showToast(resp.statusMessage, resp.success == 0);
-        network_.setDiagnosticsActive(true);
-    }
-
     float slideOffsetX = (bounds.width() + 24.0f) * (1.0f - slideProgress);
     UiRect r = bounds.offset(slideOffsetX, 0.0f);
 
@@ -4408,7 +4394,10 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
             totalTabsW += drawerTabsList[i].width;
         }
 
-        drawerTabsMaxScroll_ = std::max(0.0f, totalTabsW - tabsViewport.width());
+        float tabsAvailW = (totalTabsW > tabsViewport.width())
+            ? std::max(40.0f, tabsViewport.width() - 22.0f)
+            : tabsViewport.width();
+        drawerTabsMaxScroll_ = std::max(0.0f, totalTabsW - tabsAvailW);
         drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_, 0.0f, drawerTabsMaxScroll_);
 
         // Auto-scroll to ensure active tab is visible
@@ -4417,8 +4406,8 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
             if (t.isActive) {
                 if (activeTabStart < drawerTabsScrollTarget_) {
                     drawerTabsScrollTarget_ = activeTabStart;
-                } else if (activeTabStart + t.width > drawerTabsScrollTarget_ + tabsViewport.width()) {
-                    drawerTabsScrollTarget_ = activeTabStart + t.width - tabsViewport.width();
+                } else if (activeTabStart + t.width > drawerTabsScrollTarget_ + tabsAvailW) {
+                    drawerTabsScrollTarget_ = activeTabStart + t.width - tabsAvailW;
                 }
                 break;
             }
@@ -4456,6 +4445,12 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
                            t.isActive ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                            t.isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
                            8.0f, t.onClick, ui::FontRole::Small);
+                auto& cr = clickRegions_.back();
+                cr.rect.left = std::max(cr.rect.left, tabsViewport.left);
+                cr.rect.right = std::min(cr.rect.right, tabsViewport.right);
+                if (cr.rect.right <= cr.rect.left) {
+                    cr.rect = { -10000.0f, -10000.0f, -10000.0f, -10000.0f };
+                }
             }
             curTabX += t.width + 5.0f;
         }
@@ -4568,16 +4563,24 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
                      { chatBox.left + 14.0f, chatBox.centerY() - 14.0f, chatBox.right - 14.0f, chatBox.centerY() + 14.0f },
                      ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
         } else {
-            float rowBaseH = 46.0f;
             int totalMsgs = static_cast<int>(msgs.size());
-            int maxVisible = std::max(1, static_cast<int>((chatBox.height() - 16.0f) / (rowBaseH + 6.0f)));
-            int maxOffset = std::max(0, totalMsgs - maxVisible);
+            int maxOffset = std::max(0, totalMsgs - 1);
             chatScrollOffset_ = std::clamp(chatScrollOffset_, 0, maxOffset);
-            size_t startIdx = static_cast<size_t>(std::max(0, totalMsgs - maxVisible - chatScrollOffset_));
-            size_t endIdx = std::min(msgs.size(), startIdx + static_cast<size_t>(maxVisible));
+            size_t endIdx = static_cast<size_t>(std::max(1, totalMsgs - chatScrollOffset_));
+            float availH = std::max(0.0f, chatBox.height() - 16.0f);
+            float usedH = 0.0f;
+            size_t startIdx = endIdx;
+            while (startIdx > 0) {
+                float h = (msgs[startIdx - 1].hasImage ? 86.0f : 46.0f) + 6.0f;
+                if (startIdx < endIdx && usedH + h > availH) break;
+                usedH += h;
+                --startIdx;
+            }
             float my = chatBox.top + 8.0f;
+            canvas_->pushClip(ui::Rect{chatBox.left, chatBox.top, chatBox.right, chatBox.bottom});
 
             for (size_t i = startIdx; i < endIdx; ++i) {
+                if (my >= chatBox.bottom) break;
                 const auto& m = msgs[i];
                 float msgH = m.hasImage ? 86.0f : 46.0f;
                 UiRect bubble = m.fromLocal
@@ -4609,6 +4612,7 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
                 }
                 my += msgH + 6.0f;
             }
+            canvas_->popClip();
         }
 
         UiRect chatField = { x, r.bottom - 52.0f, rx - 114.0f, r.bottom - 14.0f };
@@ -4681,9 +4685,9 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
             float lineH = 18.0f;
             int maxVisible = std::max(1, static_cast<int>((termBox.height() - 16.0f) / lineH));
             int totalLines = static_cast<int>(lines.size());
-            int scroll = static_cast<int>(terminalScrollOffset_);
             int maxOffset = std::max(0, totalLines - maxVisible);
-            scroll = std::clamp(scroll, 0, maxOffset);
+            terminalScrollOffset_ = std::clamp(terminalScrollOffset_, 0.0f, static_cast<float>(maxOffset));
+            int scroll = static_cast<int>(terminalScrollOffset_);
             size_t startIdx = static_cast<size_t>(std::max(0, totalLines - maxVisible - scroll));
             size_t endIdx = std::min(lines.size(), startIdx + static_cast<size_t>(maxVisible));
             float ly = termBox.top + 8.0f;
@@ -4909,7 +4913,8 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
             int maxVisible = std::max(1, static_cast<int>((tableBox.bottom - listTop - 8.0f) / rowH));
             int totalProcs = static_cast<int>(filteredProcs.size());
             int maxScroll = std::max(0, totalProcs - maxVisible);
-            int scroll = std::clamp(static_cast<int>(diagnosticsScrollOffset_), 0, maxScroll);
+            diagnosticsScrollOffset_ = std::clamp(diagnosticsScrollOffset_, 0.0f, static_cast<float>(maxScroll));
+            int scroll = static_cast<int>(diagnosticsScrollOffset_);
 
             float py = listTop;
             for (int i = scroll; i < totalProcs && (i - scroll) < maxVisible; ++i) {
@@ -6768,6 +6773,8 @@ void AppUi::openFileBrowserModal(int pane, int action) {
             showToast("Open a folder first", true);
             return;
         }
+        fileBrowserModalTargetPath_ = st.currentPath;
+        fileBrowserModalTargetName_.clear();
     } else {
         const FileBrowserItemEntry* sel = st.selectedEntry();
         if (!sel || sel->name == ".." || st.currentPath.empty() || st.currentPath == "$DRIVES$") {
@@ -6817,11 +6824,12 @@ void AppUi::submitFileBrowserModal() {
     }
 
     if (showFileBrowserNewDirModal_) {
-        const std::string path = RemoteFileBrowserManager::joinPath(dir, fileBrowserNewDirName_);
+        const std::string& targetDir = fileBrowserModalTargetPath_.empty() ? dir : fileBrowserModalTargetPath_;
+        const std::string path = RemoteFileBrowserManager::joinPath(targetDir, fileBrowserNewDirName_);
         if (local) {
             if (RemoteFileBrowserManager::createLocalDirectory(path, err)) showToast("Folder created");
             else showToast(err, true);
-            navigateFilePane(0, dir);
+            navigateFilePane(0, targetDir);
         } else {
             network_.sendRemoteFileAction(static_cast<uint8_t>(FileBrowserActionType::CreateDir), path, "");
         }
@@ -6964,7 +6972,8 @@ void AppUi::drawFileManagerDrawer(const UiRect& contentRect) {
             footer = sel->isDirectory ? sel->name : sel->name + "  " + RFB::formatFileSize(sel->sizeBytes);
             if (sel->mtimeSec != 0) footer += "  " + RFB::formatFileTimestamp(sel->mtimeSec);
         } else if (total > 0) {
-            footer = std::to_string(total - 1) + " items";
+            const int count = (!st.entries.empty() && st.entries[0].name == "..") ? (total - 1) : total;
+            footer = std::to_string(count) + " items";
         }
         drawText(footer, { px, listBox.bottom + 2.0f, prx, area.bottom - 2.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
     };
@@ -10232,6 +10241,38 @@ void AppUi::onTick() {
         showToast(remoteFilePane_.statusMessage, true);
         shell_->invalidate();
     }
+    // Poll remote file/process responses regardless of drawer visibility
+    if (network_.hasNewRemoteFileList()) {
+        auto resp = network_.latestRemoteFileList();
+        remoteFilePane_.isLoading = false;
+        if (resp.statusCode == 0) {
+            if (resp.currentPath != remoteFilePane_.currentPath) remoteFilePane_.scrollOffset = 0.0f;
+            remoteFilePane_.selectedIndex = -1;
+            remoteFilePane_.lastClickIndex = -1;
+            remoteFilePane_.currentPath = resp.currentPath;
+            remoteFilePane_.entries = std::move(resp.entries);
+            fileBrowserInputRemotePath_ = (resp.currentPath == "$DRIVES$") ? std::string() : resp.currentPath;
+            remoteFilePane_.statusMessage.clear();
+        } else {
+            remoteFilePane_.statusMessage = resp.errorMessage;
+            showToast("Remote file error: " + resp.errorMessage, true);
+        }
+        shell_->invalidate();
+    }
+    if (network_.hasNewRemoteFileAction()) {
+        auto resp = network_.latestRemoteFileAction();
+        showToast(resp.message, resp.statusCode != 0);
+        network_.requestRemoteFileList(remoteFilePane_.currentPath.empty() ? "$DRIVES$" : remoteFilePane_.currentPath);
+        shell_->invalidate();
+    }
+    if (network_.hasNewProcessLaunchResp()) {
+        auto resp = network_.latestProcessLaunchResp();
+        showToast(resp.statusMessage, resp.success == 0);
+        if (showFileDrawer_ && drawerTab_ == DrawerTab::Diagnostics) {
+            network_.setDiagnosticsActive(true);
+        }
+        shell_->invalidate();
+    }
     auto vStats = network_.viewerStats();
     if (vStats.state == ViewerConnectionState::Connected &&
         prevViewerState_ != ViewerConnectionState::Connected) {
@@ -10377,29 +10418,21 @@ void AppUi::onTick() {
     }
     lastSeenUnreadChat_ = unreadChat;
 
-    // Completed file transfer notifications
+    // Completed file transfer notifications (tracked by transfer ID so newest-first order works)
     auto transfers = network_.fileTransferManager().snapshotTransfers();
-    size_t completedCount = 0;
-    std::string newlyCompletedName;
     for (const auto& item : transfers) {
-        if (item.status == TransferStatus::Completed) {
-            completedCount++;
-            if (!item.isOutgoing && completedCount > prevCompletedTransfersCount_) {
-                newlyCompletedName = item.fileName;
+        if (item.status == TransferStatus::Completed &&
+            notifiedCompletedTransferIds_.insert(item.transferId).second) {
+            if (!item.isOutgoing && notificationMgr_) {
+                notificationMgr_->notify(
+                    NotificationType::FileTransferDone,
+                    "File Transfer Complete",
+                    "File '" + item.fileName + "' received successfully.",
+                    identity_.settings()
+                );
             }
         }
     }
-    if (completedCount > prevCompletedTransfersCount_) {
-        if (!newlyCompletedName.empty() && notificationMgr_) {
-            notificationMgr_->notify(
-                NotificationType::FileTransferDone,
-                "File Transfer Complete",
-                "File '" + newlyCompletedName + "' received successfully.",
-                identity_.settings()
-            );
-        }
-    }
-    prevCompletedTransfersCount_ = completedCount;
 
     // Incoming connection request notification
     auto pending = network_.pendingIncomingRequest();

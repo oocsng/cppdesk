@@ -708,7 +708,7 @@ private:
     bool                    prevHostActive_ = false;
     std::string             prevViewerHostname_;
     std::string             prevHostClientName_;
-    size_t                  prevCompletedTransfersCount_ = 0;
+    std::unordered_set<uint32_t> notifiedCompletedTransferIds_;
     bool                    prevHasPendingIncoming_ = false;
 
     // Mandatory Auto-Updater state (v3.0.0)
