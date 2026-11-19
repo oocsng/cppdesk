@@ -112,9 +112,6 @@ public:
     // Validates PE binary integrity (DOS and NT headers)
     static bool validatePeBinary(const std::wstring& filePath);
 
-    // Builds helper command for detached replacement
-    static std::wstring buildSelfUpdateCommand(const std::wstring& newExePath, const std::wstring& currentExePath);
-
     // Applies self-update: waits for previous instance PID, replaces target binary, and optionally launches updated app
     static int applySelfUpdateAndRestart(
         const std::wstring& sourceExePath,

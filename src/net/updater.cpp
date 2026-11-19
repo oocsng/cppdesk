@@ -922,7 +922,6 @@ bool AutoUpdater::validatePeBinary(const std::wstring&) { return false; }
 bool AutoUpdater::fileMatchesSha256(const std::wstring&, const std::string&) { return false; }
 int AutoUpdater::applySelfUpdateAndRestart(const std::wstring&, const std::wstring&, uint32_t, bool) { return 1; }
 int AutoUpdater::applySelfUpdateAndRestart(const std::wstring&, uint32_t) { return 1; }
-std::wstring AutoUpdater::buildSelfUpdateCommand(const std::wstring&, const std::wstring&) { return L""; }
 bool AutoUpdater::launchSelfUpdate(const std::wstring&, const std::wstring&) { return false; }
 #else
 bool AutoUpdater::fileMatchesSha256(const std::wstring& filePath, const std::string& expectedHex) {
@@ -1087,24 +1086,6 @@ int AutoUpdater::applySelfUpdateAndRestart(const std::wstring& targetExePath, ui
         myPath.resize(myPath.size() * 2);
     }
     return applySelfUpdateAndRestart(myPath, targetExePath, waitPid, true);
-}
-
-std::wstring AutoUpdater::buildSelfUpdateCommand(const std::wstring& newExePath, const std::wstring& currentExePath) {
-    auto hasUnsafeShellChar = [](const std::wstring& s) {
-        if (s.empty()) return true;
-        for (wchar_t c : s) {
-            if (c < 0x20 || c == L'&' || c == L'|' || c == L'"' || c == L'%' ||
-                c == L'<' || c == L'>' || c == L'^' || c == L';' || c == L'!') {
-                return true;
-            }
-        }
-        return false;
-    };
-    if (hasUnsafeShellChar(newExePath) || hasUnsafeShellChar(currentExePath)) {
-        return L"";
-    }
-    std::wstring cmd = L"cmd.exe /c \"timeout /t 1 /nobreak >nul & move /y \"" + newExePath + L"\" \"" + currentExePath + L"\" & start \"\" \"" + currentExePath + L"\"\"";
-    return cmd;
 }
 
 bool AutoUpdater::launchSelfUpdate(const std::wstring& newExePath, const std::wstring& currentExePath) {

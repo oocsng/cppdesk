@@ -301,15 +301,6 @@ static void testFixesC_UpdaterAndSimd() {
         DeleteFileW(src.c_str());
         DeleteFileW(dst.c_str());
     }
-
-    // #249: buildSelfUpdateCommand rejects shell metacharacters.
-    {
-        TEST_ASSERT(AutoUpdater::buildSelfUpdateCommand(L"C:\\Temp\\a&calc.exe", L"C:\\Temp\\b.exe").empty());
-        TEST_ASSERT(AutoUpdater::buildSelfUpdateCommand(L"C:\\Temp\\a.exe", L"C:\\Temp\\b|calc.exe").empty());
-        TEST_ASSERT(AutoUpdater::buildSelfUpdateCommand(L"C:\\Temp\\%TEMP%\\a.exe", L"C:\\Temp\\b.exe").empty());
-        TEST_ASSERT(AutoUpdater::buildSelfUpdateCommand(L"C:\\Temp\\a\"b.exe", L"C:\\Temp\\b.exe").empty());
-        TEST_ASSERT(AutoUpdater::buildSelfUpdateCommand(L"", L"C:\\Temp\\b.exe").empty());
-    }
 #endif
 
     // #167: blitRowBgraOpaque produces identical output to scalarBlitRowBgraOpaque across widths without global -mavx2.

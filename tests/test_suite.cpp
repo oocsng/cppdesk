@@ -5741,17 +5741,6 @@ void testPeerVersionHandshakeAndSelfUpdater() {
         // Clean up mock file
         DeleteFileW(testExePath.c_str());
 
-        // 5c. Test buildSelfUpdateCommand formatting
-        std::wstring newExe = L"C:\\Temp\\CppDesk_new.exe";
-        std::wstring curExe = L"C:\\Program Files\\CppDesk\\CppDesk.exe";
-        std::wstring cmd = AutoUpdater::buildSelfUpdateCommand(newExe, curExe);
-        TEST_ASSERT(cmd.find(L"cmd.exe /c") != std::wstring::npos);
-        TEST_ASSERT(cmd.find(L"timeout /t 1 /nobreak") != std::wstring::npos);
-        TEST_ASSERT(cmd.find(L"move /y") != std::wstring::npos);
-        TEST_ASSERT(cmd.find(L"start \"\"") != std::wstring::npos);
-        TEST_ASSERT(cmd.find(newExe) != std::wstring::npos);
-        TEST_ASSERT(cmd.find(curExe) != std::wstring::npos);
-
         // 5d. Test silent applySelfUpdateAndRestart file replacement
         std::wstring testSrc = std::wstring(tempPath) + L"test_update_src.bin";
         std::wstring testDest = std::wstring(tempPath) + L"test_update_dest.bin";
