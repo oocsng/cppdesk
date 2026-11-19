@@ -105,6 +105,8 @@ void AppUi::switchTab(ActiveTab newTab) {
     }
     if (activeTab_ == ActiveTab::Settings && newTab != ActiveTab::Settings) {
         network_.stopVoiceMonitor();
+        voiceMonitorAttempted_ = false;
+        systemServiceCacheValid_ = false;
         showAudioInputMenu_ = false;
         showAudioOutputMenu_ = false;
     }
@@ -2782,6 +2784,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                            network_.stopVoiceMonitor();
                            voiceMonitorAttempted_ = false;
                        }
+                       if (sec == SettingsSection::SystemService || settingsSection_ == SettingsSection::SystemService) {
+                           systemServiceCacheValid_ = false;
+                       }
                        showAudioInputMenu_ = false;
                        showAudioOutputMenu_ = false;
                        settingsSection_ = sec;
@@ -3399,13 +3404,16 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             for (const auto& p : peers) {
                 std::time_t when = static_cast<std::time_t>(p.pairedAtUnix);
                 std::tm tmUtc{};
+                bool tmOk = false;
 #ifdef _WIN32
-                gmtime_s(&tmUtc, &when);
+                tmOk = (gmtime_s(&tmUtc, &when) == 0);
 #else
-                gmtime_r(&when, &tmUtc);
+                tmOk = (gmtime_r(&when, &tmUtc) != nullptr);
 #endif
-                char date[16];
-                std::strftime(date, sizeof(date), "%Y-%m-%d", &tmUtc);
+                char date[16] = {};
+                if (!tmOk || std::strftime(date, sizeof(date), "%Y-%m-%d", &tmUtc) == 0) {
+                    std::snprintf(date, sizeof(date), "unknown");
+                }
                 drawText(p.hostname + " \xC2\xB7 " + CryptoUtils::formatDeskId(p.deskId) + " \xC2\xB7 paired " + date,
                          { box.left + 16.0f, ry, box.right - 96.0f, ry + 28.0f },
                          ui::FontRole::Small, COL_TEXT_PRIMARY, ui::HAlign::Leading, ui::VAlign::Center);
@@ -3852,11 +3860,15 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                      { svcBox.left + 16.0f, svcBox.top + 8.0f, svcBox.left + 240.0f, svcBox.top + 22.0f },
                      ui::FontRole::Small, COL_TEXT_ACCENT);
 
-            ui::ServiceState svcState = shell_->serviceState();
+            if (!systemServiceCacheValid_) {
+                refreshSystemServiceCache();
+            }
+            ui::ServiceState svcState = cachedServiceState_;
             std::string svcStateLabel = (svcState == ui::ServiceState::Running) ? "Running" :
-                                        (svcState == ui::ServiceState::Stopped) ? "Stopped" : "Not Installed";
+                                        (svcState == ui::ServiceState::Stopped) ? "Stopped" :
+                                        (svcState == ui::ServiceState::Pending) ? "Pending..." : "Not Installed";
             ui::Color svcStateCol = (svcState == ui::ServiceState::Running) ? COL_SUCCESS :
-                                       (svcState == ui::ServiceState::Stopped) ? COL_WARNING : COL_TEXT_MUTED;
+                                       (svcState == ui::ServiceState::Stopped || svcState == ui::ServiceState::Pending) ? COL_WARNING : COL_TEXT_MUTED;
 
             drawPulseDot(svcBox.right - 100.0f, svcBox.top + 15.0f, 3.8f, svcStateCol, alpha);
             drawText(svcStateLabel, { svcBox.right - 90.0f, svcBox.top + 7.0f, svcBox.right - 16.0f, svcBox.top + 23.0f },
@@ -3885,6 +3897,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                                } else {
                                    showToast("Failed to install service (Admin required)", true);
                                }
+                               refreshSystemServiceCache();
                            } else {
                                showToast("Service already installed");
                            }
@@ -3899,6 +3912,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                                } else {
                                    showToast("Failed to uninstall service (Admin required)", true);
                                }
+                               refreshSystemServiceCache();
                            } else {
                                showToast("Service not installed");
                            }
@@ -3915,6 +3929,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                                } else {
                                    showToast("Failed to start service (Admin required)", true);
                                }
+                               refreshSystemServiceCache();
                            } else if (!isInstalled) {
                                showToast("Install service first", true);
                            }
@@ -3932,6 +3947,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                                } else {
                                    showToast("Failed to stop service", true);
                                }
+                               refreshSystemServiceCache();
                            }
                        }, ui::FontRole::Small, !isRunning, COL_BORDER, isRunning ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
@@ -3986,13 +4002,22 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             ny += 25.0f;
         }
 
-        bool isUriReg = ShortcutManager::isUriProtocolRegistered();
-        drawToggleSwitch("sett_reg_uri", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
-                         isUriReg, "Register cppdesk:// URL Protocol Handler", [this, isUriReg]() {
-                             ShortcutManager::setUriProtocolRegistered(!isUriReg);
-                             showToast(!isUriReg ? "Registered cppdesk:// URL protocol" : "Unregistered cppdesk:// URL protocol");
-                         }, onWindowsShell() ? "Register custom cppdesk:// URL scheme in Windows Registry for one-click browser links."
-                                             : "Register the custom cppdesk:// URL scheme for one-click browser links.");
+        if (onWindowsShell()) {
+            if (!systemServiceCacheValid_) {
+                refreshSystemServiceCache();
+            }
+            bool isUriReg = cachedUriProtocolReg_;
+            drawToggleSwitch("sett_reg_uri", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
+                             isUriReg, "Register cppdesk:// URL Protocol Handler", [this, isUriReg]() {
+                                 if (ShortcutManager::setUriProtocolRegistered(!isUriReg)) {
+                                     cachedUriProtocolReg_ = !isUriReg;
+                                     showToast(!isUriReg ? "Registered cppdesk:// URL protocol" : "Unregistered cppdesk:// URL protocol");
+                                 } else {
+                                     showToast("Failed to update cppdesk:// URL protocol", true);
+                                 }
+                                 refreshSystemServiceCache();
+                             }, "Register custom cppdesk:// URL scheme in Windows Registry for one-click browser links.");
+        }
 
         cy = notifBox.bottom + 12.0f;
     }
@@ -7690,8 +7715,10 @@ void AppUi::drawRecordingPlayerModal(float width, float height, float modalProgr
         char timeBuf[128];
         std::snprintf(timeBuf, sizeof(timeBuf),
                       "%02llu:%02llu / %02llu:%02llu   •   Frame %u / %u",
-                      curSec / 60, curSec % 60,
-                      durSec / 60, durSec % 60,
+                      static_cast<unsigned long long>(curSec / 60),
+                      static_cast<unsigned long long>(curSec % 60),
+                      static_cast<unsigned long long>(durSec / 60),
+                      static_cast<unsigned long long>(durSec % 60),
                       curFrame + 1, totFrames);
         drawText(timeBuf, { mx, timeY, mrx, timeY + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     } else {
@@ -7830,7 +7857,12 @@ void AppUi::drawRecordingPlayerModal(float width, float height, float modalProgr
                        return;
                    }
                    std::string dir = network_.fileTransferManager().receiveDirectory();
-                   std::string outPath = (std::filesystem::path(dir) / ("Snapshot_" + std::to_string(shell_->nowMs()) + ".png")).string();
+#if defined(_WIN32)
+                   const char* snapExt = ".png";
+#else
+                   const char* snapExt = ".bmp";
+#endif
+                   std::string outPath = (std::filesystem::path(dir) / ("Snapshot_" + std::to_string(shell_->nowMs()) + snapExt)).string();
                    if (recordingPlayer_->exportSnapshot(outPath)) {
                        std::string fname = std::filesystem::path(outPath).filename().string();
                        showToast("Snapshot saved: " + fname);
@@ -9550,21 +9582,21 @@ void AppUi::openPickFolderDialog(std::string& outPath) {
     });
 }
 
-void AppUi::saveRemoteScreenshot() {
-    if (frameBufferBgra_.empty() || frameBufferW_ <= 0 || frameBufferH_ <= 0) {
-        showToast("No video frame available yet", true);
-        return;
-    }
+bool AppUi::saveBgraSnapshotToBmp(const uint8_t* bgra, size_t bgraSize, int w, int h,
+                                  const std::string& prefix, std::string& outFileName) {
+    if (!bgra || w <= 0 || h <= 0) return false;
+    const uint64_t rowStride = static_cast<uint64_t>(w) * 4ULL;
+    const uint64_t imgSize64 = rowStride * static_cast<uint64_t>(h);
+    if (imgSize64 == 0 || imgSize64 > UINT32_MAX - (sizeof(BmpFileHeader) + sizeof(BmpInfoHeader))) return false;
+    if (bgraSize < imgSize64) return false;
+    const uint32_t imgSize = static_cast<uint32_t>(imgSize64);
 
     std::string dir = network_.fileTransferManager().receiveDirectory();
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
 
-    std::string fileName = "Screenshot_" + std::to_string(shell_->nowMs()) + ".bmp";
-    std::filesystem::path fullPath = std::filesystem::path(dir) / fileName;
-
-    uint32_t rowStride = static_cast<uint32_t>(frameBufferW_ * 4);
-    uint32_t imgSize = rowStride * static_cast<uint32_t>(frameBufferH_);
+    outFileName = prefix + "_" + std::to_string(shell_->nowMs()) + ".bmp";
+    std::filesystem::path fullPath = std::filesystem::path(dir) / outFileName;
 
     BmpFileHeader bfh{};
     bfh.bfType = 0x4D42;
@@ -9573,23 +9605,47 @@ void AppUi::saveRemoteScreenshot() {
 
     BmpInfoHeader bih{};
     bih.biSize = sizeof(BmpInfoHeader);
-    bih.biWidth = frameBufferW_;
-    bih.biHeight = -frameBufferH_;
+    bih.biWidth = w;
+    bih.biHeight = -h;
     bih.biPlanes = 1;
     bih.biBitCount = 32;
     bih.biCompression = 0;
     bih.biSizeImage = imgSize;
 
     std::ofstream out(fullPath, std::ios::binary);
-    if (out.is_open()) {
-        out.write(reinterpret_cast<const char*>(&bfh), sizeof(bfh));
-        out.write(reinterpret_cast<const char*>(&bih), sizeof(bih));
-        out.write(reinterpret_cast<const char*>(frameBufferBgra_.data()), imgSize);
-        out.close();
+    if (!out.is_open()) return false;
+    out.write(reinterpret_cast<const char*>(&bfh), sizeof(bfh));
+    out.write(reinterpret_cast<const char*>(&bih), sizeof(bih));
+    out.write(reinterpret_cast<const char*>(bgra), static_cast<std::streamsize>(imgSize));
+    out.flush();
+    const bool ok = out.good();
+    out.close();
+    return ok && !out.fail();
+}
+
+void AppUi::saveRemoteScreenshot() {
+    if (frameBufferBgra_.empty() || frameBufferW_ <= 0 || frameBufferH_ <= 0) {
+        showToast("No video frame available yet", true);
+        return;
+    }
+
+    std::string fileName;
+    if (saveBgraSnapshotToBmp(frameBufferBgra_.data(), frameBufferBgra_.size(), frameBufferW_, frameBufferH_, "Screenshot", fileName)) {
         showToast("Saved " + fileName);
     } else {
         showToast("Failed to save screenshot", true);
     }
+}
+
+void AppUi::refreshSystemServiceCache() {
+    if (shell_->has(ui::Capability::WindowsService)) {
+        cachedServiceState_ = shell_->serviceState();
+    } else {
+        cachedServiceState_ = ui::ServiceState::NotInstalled;
+    }
+    cachedUriProtocolReg_ = onWindowsShell() ? ShortcutManager::isUriProtocolRegistered() : false;
+    systemServiceCacheValid_ = true;
+    lastSystemServicePollMs_ = shell_->nowMs();
 }
 
 void AppUi::toggleScreenRecording() {
@@ -9599,15 +9655,18 @@ void AppUi::toggleScreenRecording() {
 
         std::error_code ec;
         uint64_t fsz = std::filesystem::file_size(path, ec);
-        char szBuf[64];
-        if (fsz > 1024 * 1024) {
-            std::snprintf(szBuf, sizeof(szBuf), "%.1f MB", static_cast<double>(fsz) / (1024.0 * 1024.0));
-        } else {
-            std::snprintf(szBuf, sizeof(szBuf), "%.1f KB", static_cast<double>(fsz) / 1024.0);
-        }
-
         std::string fname = std::filesystem::path(path).filename().string();
-        showToast("Recording saved: " + fname + " (" + szBuf + ") • Review in Player");
+        if (!ec) {
+            char szBuf[64];
+            if (fsz > 1024 * 1024) {
+                std::snprintf(szBuf, sizeof(szBuf), "%.1f MB", static_cast<double>(fsz) / (1024.0 * 1024.0));
+            } else {
+                std::snprintf(szBuf, sizeof(szBuf), "%.1f KB", static_cast<double>(fsz) / 1024.0);
+            }
+            showToast("Recording saved: " + fname + " (" + szBuf + ") • Review in Player");
+        } else {
+            showToast("Recording saved: " + fname + " • Review in Player");
+        }
         shell_->invalidate();
     } else {
         if (frameBufferBgra_.empty() || frameBufferW_ <= 0 || frameBufferH_ <= 0) {
@@ -9621,10 +9680,21 @@ void AppUi::toggleScreenRecording() {
         std::filesystem::create_directories(recDir, ec);
 
         std::time_t nowT = std::time(nullptr);
-        std::tm st = *std::localtime(&nowT);
+        std::tm st{};
+        bool tmOk = false;
+#if defined(_WIN32)
+        tmOk = (localtime_s(&st, &nowT) == 0);
+#else
+        tmOk = (localtime_r(&nowT, &st) != nullptr);
+#endif
         char nameBuf[128];
-        std::snprintf(nameBuf, sizeof(nameBuf), "Recording_%04d-%02d-%02d_%02d-%02d-%02d.avi",
-                      st.tm_year + 1900, st.tm_mon + 1, st.tm_mday, st.tm_hour, st.tm_min, st.tm_sec);
+        if (tmOk) {
+            std::snprintf(nameBuf, sizeof(nameBuf), "Recording_%04d-%02d-%02d_%02d-%02d-%02d.avi",
+                          st.tm_year + 1900, st.tm_mon + 1, st.tm_mday, st.tm_hour, st.tm_min, st.tm_sec);
+        } else {
+            std::snprintf(nameBuf, sizeof(nameBuf), "Recording_%llu.avi",
+                          static_cast<unsigned long long>(shell_->nowMs()));
+        }
 
         std::filesystem::path fullPath = recDir / nameBuf;
         if (sessionRecorder_.startRecording(fullPath.string(), frameBufferW_, frameBufferH_, 30)) {
@@ -9765,11 +9835,14 @@ void AppUi::drawRewindScrubberBar(const UiRect& stage) {
     drawButton("btn_rewind_copy", copyBtn, "Snapshot",
                withAlpha(COL_SEC_BTN_BG, animAlpha), withAlpha(COL_SEC_BTN_HV, animAlpha), withAlpha(COL_TEXT_PRIMARY, animAlpha),
                5.0f, [this]() {
-                   const uint8_t* pData = rewindFrozen_ ? rewindCachedFrameBgra_.data() : frameBufferBgra_.data();
+                   const auto& buf = rewindFrozen_ ? rewindCachedFrameBgra_ : frameBufferBgra_;
                    int sw = rewindFrozen_ ? rewindCachedW_ : frameBufferW_;
                    int sh = rewindFrozen_ ? rewindCachedH_ : frameBufferH_;
-                   if (pData && sw > 0 && sh > 0) {
-                       showToast("Snapshot saved (" + std::to_string(sw) + "x" + std::to_string(sh) + ")");
+                   std::string fileName;
+                   if (saveBgraSnapshotToBmp(buf.data(), buf.size(), sw, sh, "RewindSnapshot", fileName)) {
+                       showToast("Snapshot saved: " + fileName);
+                   } else {
+                       showToast("Failed to save snapshot", true);
                    }
                }, ui::FontRole::Small, true, withAlpha(COL_BORDER, animAlpha), withAlpha(COL_TEXT_ACCENT, animAlpha));
 
@@ -10271,6 +10344,15 @@ void AppUi::onTick() {
         const ui::HostPermissionStatus before = hostPerms_;
         refreshHostPermissions();
         if (before.screenRecording != hostPerms_.screenRecording || before.accessibility != hostPerms_.accessibility) {
+            shell_->invalidate();
+        }
+    }
+    if (activeTab_ == ActiveTab::Settings && settingsSection_ == SettingsSection::SystemService &&
+        tickNow - lastSystemServicePollMs_ >= 1000) {
+        const ui::ServiceState prevSvc = cachedServiceState_;
+        const bool prevUri = cachedUriProtocolReg_;
+        refreshSystemServiceCache();
+        if (prevSvc != cachedServiceState_ || prevUri != cachedUriProtocolReg_) {
             shell_->invalidate();
         }
     }

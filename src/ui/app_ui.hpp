@@ -361,7 +361,9 @@ private:
     void initiateConnection();
     void openSendFileDialog();
     void openPickFolderDialog(std::string& outPath);
+    bool saveBgraSnapshotToBmp(const uint8_t* bgra, size_t bgraSize, int w, int h, const std::string& prefix, std::string& outFileName);
     void saveRemoteScreenshot();
+    void refreshSystemServiceCache();
     void toggleScreenRecording();
     void sendChatFromInput();
     void sendTerminalFromInput();
@@ -841,6 +843,12 @@ private:
     UiRect                  activeTooltipTargetRect_{};
     float                   tooltipAnimT_ = 0.0f;
     float                   tooltipAnimVel_ = 0.0f;
+
+    // Cached SystemService section state (avoid per-frame SCM RPC / Registry queries)
+    bool                    systemServiceCacheValid_ = false;
+    ui::ServiceState        cachedServiceState_ = ui::ServiceState::NotInstalled;
+    bool                    cachedUriProtocolReg_ = false;
+    uint64_t                lastSystemServicePollMs_ = 0;
 };
 
 } // namespace cppdesk
