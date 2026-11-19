@@ -313,6 +313,20 @@ void executeRemoteSystemAction(SystemActionType action) {
     InputInjector::executeSystemAction(action);
 }
 
+std::array<uint8_t, 32> pairPopDigest(
+    const std::array<uint8_t, 32>& sessionKey,
+    uint64_t viewerDeskId,
+    const PairingKey::PublicKey& viewerKey)
+{
+    ByteWriter w;
+    static constexpr char kTag[] = "CppDesk-PairPoP-v1";
+    w.writeBytes(kTag, sizeof(kTag) - 1);
+    w.writeBytes(sessionKey.data(), sessionKey.size());
+    w.writeU64(viewerDeskId);
+    w.writeBytes(viewerKey.data(), viewerKey.size());
+    return CryptoUtils::sha256(w.buffer().data(), w.buffer().size());
+}
+
 } // namespace
 
 // ---------------- Frame IO ----------------
@@ -2257,9 +2271,11 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             break;
                         }
                         case PacketType::INPUT_RELEASE_ALL: {
-                            std::lock_guard<std::mutex> sinkLock(hostKeySinkMutex_);
-                            if (hostKeySink_) hostKeySink_(0, false);
-                            else InputInjector::releaseAllModifiers();
+                            if (perms & PERM_INPUT) {
+                                std::lock_guard<std::mutex> sinkLock(hostKeySinkMutex_);
+                                if (hostKeySink_) hostKeySink_(0, false);
+                                else InputInjector::releaseAllModifiers();
+                            }
                             break;
                         }
                         case PacketType::SYSTEM_ACTION: {
@@ -2316,6 +2332,15 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                 status.isVirtual = 1;
                                 status.isHeadlessFallback = 0;
                                 status.driverBackend = 0;
+
+                                if ((perms & PERM_INPUT) == 0) {
+                                    status.statusCode = static_cast<uint8_t>(VirtualDisplayStatusCode::PermissionDenied);
+                                    status.message = "Input permission required for virtual display control";
+                                    std::vector<uint8_t> stBytes;
+                                    serializeVirtualDisplayStatus(status, stBytes);
+                                    sendHostEncryptedPacket(PacketType::VIRTUAL_DISPLAY_STATUS, 0, stBytes.data(), stBytes.size());
+                                    break;
+                                }
 
                                 if (cmd.cmd == static_cast<uint8_t>(VirtualDisplayCmdType::Create)) {
                                     uint32_t newId = 0;
@@ -2460,10 +2485,12 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             break;
                         }
                         case PacketType::CLIPBOARD_FILE_CANCEL: {
-                            if (r.hasRemaining(sizeof(ClipboardFileCancelHeader))) {
-                                ClipboardFileCancelHeader cnlHdr{};
-                                r.readBytes(&cnlHdr, sizeof(cnlHdr));
-                                clipFileMgr_.handleFileCancel(cnlHdr.transferId, cnlHdr.reasonCode);
+                            if (perms & PERM_CLIPBOARD) {
+                                if (r.hasRemaining(sizeof(ClipboardFileCancelHeader))) {
+                                    ClipboardFileCancelHeader cnlHdr{};
+                                    r.readBytes(&cnlHdr, sizeof(cnlHdr));
+                                    clipFileMgr_.handleFileCancel(cnlHdr.transferId, cnlHdr.reasonCode);
+                                }
                             }
                             break;
                         }
@@ -2505,8 +2532,10 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             break;
                         }
                         case PacketType::FILE_CANCEL: {
-                            uint32_t tid = r.readU32();
-                            fileManager_.handleFileCancel(tid);
+                            if (perms & PERM_FILE_TRANSFER) {
+                                uint32_t tid = r.readU32();
+                                fileManager_.handleFileCancel(tid);
+                            }
                             break;
                         }
                         case PacketType::CHAT_MESSAGE: {
@@ -2676,10 +2705,12 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             break;
                         }
                         case PacketType::WHITEBOARD_PACKET: {
-                            AnnotationStroke stroke{};
-                            if (WhiteboardManager::deserializeStroke(r.currentPtr(), r.remaining(), stroke)) {
-                                whiteboardMgr_.showHostOverlay();
-                                whiteboardMgr_.applyRemoteStroke(stroke);
+                            if (perms & PERM_INPUT) {
+                                AnnotationStroke stroke{};
+                                if (WhiteboardManager::deserializeStroke(r.currentPtr(), r.remaining(), stroke)) {
+                                    whiteboardMgr_.showHostOverlay();
+                                    whiteboardMgr_.applyRemoteStroke(stroke);
+                                }
                             }
                             break;
                         }
@@ -2873,9 +2904,11 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             break;
                         }
                         case PacketType::SYNC_STATUS_UPDATE: {
-                            SyncStatusUpdatePayload status;
-                            if (deserializeSyncStatusUpdate(rpay.data(), rpay.size(), status)) {
-                                fileSyncMgr_.handleStatusUpdate(status);
+                            if (perms & PERM_FILE_TRANSFER) {
+                                SyncStatusUpdatePayload status;
+                                if (deserializeSyncStatusUpdate(rpay.data(), rpay.size(), status)) {
+                                    fileSyncMgr_.handleStatusUpdate(status);
+                                }
                             }
                             break;
                         }
@@ -2932,8 +2965,10 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             break;
                         }
                         case PacketType::PAIR_REQUEST: {
-                            // Reached only after login. The viewer offers its key; the ID it is filed under is the authenticated one.
+                            // Reached only after login. The viewer offers its key + proof of possession;
+                            // view-only or reduced-permission viewers cannot escalate via pairing.
                             PairingKey::PublicKey viewerKey{};
+                            PairingKey::Signature popSig{};
                             std::string viewerName;
                             bool wellFormed = false;
                             try {
@@ -2941,14 +2976,32 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                 if (wellFormed) {
                                     r.readBytes(viewerKey.data(), viewerKey.size());
                                     viewerName = r.readString();
-                                    wellFormed = viewerName.size() <= 255;
+                                    wellFormed = viewerName.size() <= 255 &&
+                                                 r.hasRemaining(2) &&
+                                                 r.readU16() == popSig.size() &&
+                                                 r.hasRemaining(popSig.size());
+                                    if (wellFormed) {
+                                        r.readBytes(popSig.data(), popSig.size());
+                                    }
                                 }
                             } catch (...) { wellFormed = false; }
+                            std::array<uint8_t, 32> sessionKeyCopy{};
+                            {
+                                std::lock_guard<std::mutex> lock(hostCipherMutex_);
+                                sessionKeyCopy = hostSessionKey_;
+                            }
+                            const bool popValid = wellFormed &&
+                                CryptoUtils::isUsableKey(sessionKeyCopy) &&
+                                PairingKey::verify(viewerKey, pairPopDigest(sessionKeyCopy, viewerId, viewerKey), popSig);
+                            CryptoUtils::secureZero(sessionKeyCopy.data(), sessionKeyCopy.size());
+
                             const bool allowed = identity_.settings().allowPairing;   // checked now, not at login
+                            const uint8_t requiredPerms = static_cast<uint8_t>(identity_.settings().defaultPermissions | PERM_INPUT);
+                            const bool hasPerms = (perms & requiredPerms) == requiredPerms;
                             // viewerId is only a claim in a password login: it must not overwrite another PC's pinned key.
                             const auto existing = identity_.findPairedViewer(viewerId);
-                            const bool replacesOtherKey = wellFormed && !pairedLogin && existing && existing->publicKey != viewerKey;
-                            const bool accept = wellFormed && allowed && !replacesOtherKey;
+                            const bool replacesOtherKey = popValid && !pairedLogin && existing && existing->publicKey != viewerKey;
+                            const bool accept = popValid && hasPerms && allowed && !replacesOtherKey;
                             if (accept) {
                                 identity_.addPairedViewer({viewerId, viewerName, viewerKey, static_cast<uint64_t>(std::time(nullptr))});
                             }
@@ -2962,6 +3015,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                 pw.writeU16(0);
                             }
                             pw.writeString(accept ? "Paired" : (!allowed ? "This PC is not accepting new pairings."
+                                : !hasPerms ? "Insufficient session permissions to pair."
                                 : replacesOtherKey ? "Already paired; forget it on the host first." : "Invalid pairing request."));
                             enqueueHostPacket(PacketType::PAIR_RESULT, 0, pw.buffer(), false);
                             break;
@@ -3302,10 +3356,25 @@ bool NetworkEngine::requestPairing() {
     if (!key.isValid()) return false;
     PairingRequestState idleOrDone = pairingState_.load();
     if (idleOrDone == PairingRequestState::Pending || idleOrDone == PairingRequestState::Paired) return false;
+
+    std::array<uint8_t, 32> sessionKeyCopy{};
+    {
+        std::lock_guard<std::mutex> lock(viewerCipherMutex_);
+        if (!viewerEncrypted_.load()) return false;
+        sessionKeyCopy = viewerSessionKey_;
+    }
+    PairingKey::Signature popSig{};
+    const bool signedOk = CryptoUtils::isUsableKey(sessionKeyCopy) &&
+        key.sign(pairPopDigest(sessionKeyCopy, identity_.deskId(), key.publicKey()), popSig);
+    CryptoUtils::secureZero(sessionKeyCopy.data(), sessionKeyCopy.size());
+    if (!signedOk) return false;
+
     ByteWriter w;
     w.writeU16(static_cast<uint16_t>(key.publicKey().size()));
     w.writeBytes(key.publicKey().data(), key.publicKey().size());
     w.writeString(identity_.hostname());
+    w.writeU16(static_cast<uint16_t>(popSig.size()));
+    w.writeBytes(popSig.data(), popSig.size());
     pairingState_.store(PairingRequestState::Pending);   // before the send: the answer may beat us back
     if (!sendViewerEncryptedPacket(PacketType::PAIR_REQUEST, 0, w.buffer().data(), w.buffer().size())) {
         pairingState_.store(PairingRequestState::Idle);
