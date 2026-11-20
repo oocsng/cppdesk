@@ -25,7 +25,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Test
 ```
 
 Results:
-- [ ] All 51 test suites pass with zero failures
+- [ ] The whole test suite passes with zero failures
 - [ ] Manual host and viewer verification completed
 
 ## Checklist
