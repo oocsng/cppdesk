@@ -6,8 +6,8 @@ We provide security updates and patches for the following versions:
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 3.5.x   | Yes                |
-| < 3.5.0 | No                 |
+| 3.12.x  | Yes                |
+| < 3.12.0 | No                |
 
 We strongly recommend always running the latest stable release to receive security enhancements, crypto hardening, and critical protocol updates.
 
@@ -24,13 +24,9 @@ Use GitHub Private Vulnerability Reporting:
 2. Select **Advisories** and click **Report a vulnerability**.
 3. Provide details on the vulnerability, affected components, reproduction steps, and potential impact.
 
-### Alternative Channel
+If you cannot use GitHub Security Advisories, open a public issue asking for a private contact and put no details in it. Do not describe the vulnerability publicly.
 
-If you cannot use GitHub Security Advisories, send an encrypted or plaintext email to:
-
-`security@cppdesk.io`
-
-Include:
+Include in your report:
 - Type of vulnerability (e.g., buffer overflow, crypto bypass, authentication flaw)
 - Affected platforms and versions
 - Step-by-step reproduction instructions or a minimal proof of concept

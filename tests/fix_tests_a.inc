@@ -7,7 +7,7 @@
 static void testFixesA_ProtocolAndQr() {
     // #180: version constants agree
     TEST_ASSERT(PROTOCOL_VERSION == 4);
-    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030B02);
+    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030C00);
 
     // #217: ByteWriter is non-copyable
     static_assert(!std::is_copy_constructible_v<ByteWriter>, "ByteWriter must not be copy-constructible");

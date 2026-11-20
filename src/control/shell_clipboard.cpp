@@ -3,7 +3,14 @@
 
 #include <cstring>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <deque>
 #include <filesystem>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <thread>
 #include <limits>
 #include <type_traits>
 
@@ -24,6 +31,75 @@
 namespace cppdesk {
 
 #if defined(_WIN32)
+
+namespace {
+
+// OleSetClipboard needs a thread that has called OleInitialize and pumps messages, and the data object has to be
+// served from that same thread. The network threads that offer a peer's files are neither, so one dedicated
+// thread owns the OLE clipboard and every call is marshalled onto it. It lives for the whole process.
+class ClipboardStaThread {
+public:
+    static ClipboardStaThread& get() {
+        static ClipboardStaThread* t = new ClipboardStaThread;   // never destroyed: the thread outlives static teardown
+        return *t;
+    }
+
+    // Runs fn on the STA thread and returns its result. False when the thread is unavailable or fn does not
+    // finish in time (a paste in progress can keep the thread busy; the task still runs afterwards).
+    bool call(std::function<bool()> fn) {
+        if (GetCurrentThreadId() == tid_.load()) return fn();   // already there (e.g. called from a data-object callback)
+        std::packaged_task<bool()> task(std::move(fn));
+        std::future<bool> result = task.get_future();
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            if (!ready_) return false;
+            tasks_.push_back(std::move(task));
+        }
+        PostThreadMessageW(tid_.load(), WM_APP, 0, 0);
+        if (result.wait_for(std::chrono::seconds(3)) != std::future_status::ready) return false;
+        return result.get();
+    }
+
+private:
+    ClipboardStaThread() {
+        std::promise<void> started;
+        std::future<void> startedF = started.get_future();
+        std::thread([this, &started]() {
+            const bool inited = SUCCEEDED(OleInitialize(nullptr));
+            MSG msg;
+            PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);   // creates this thread's message queue
+            {
+                std::lock_guard<std::mutex> lk(m_);
+                tid_.store(GetCurrentThreadId());
+                ready_ = inited;
+            }
+            started.set_value();
+            if (!inited) return;
+            while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+                if (msg.hwnd == nullptr && msg.message == WM_APP) {
+                    std::deque<std::packaged_task<bool()>> batch;
+                    {
+                        std::lock_guard<std::mutex> lk(m_);
+                        batch.swap(tasks_);
+                    }
+                    for (auto& t : batch) t();
+                } else {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            OleUninitialize();
+        }).detach();
+        startedF.wait();
+    }
+
+    std::mutex m_;
+    bool ready_ = false;
+    std::atomic<DWORD> tid_{0};
+    std::deque<std::packaged_task<bool()>> tasks_;
+};
+
+} // namespace
 
 bool ShellClipboard::initializeOle() {
     HRESULT hr = OleInitialize(nullptr);
@@ -93,13 +169,13 @@ bool ShellClipboard::getLocalClipboardFiles(std::vector<VirtualFileEntry>& outFi
 bool ShellClipboard::setVirtualClipboardFiles(const std::vector<VirtualFileEntry>& files, VirtualChunkReadFn chunkReader) {
     if (files.empty()) return false;
     ShellDataObject* obj = new ShellDataObject(files, std::move(chunkReader));
-    HRESULT hr = OleSetClipboard(obj);
+    const bool ok = ClipboardStaThread::get().call([obj]() { return SUCCEEDED(OleSetClipboard(obj)); });
     obj->Release();
-    return SUCCEEDED(hr);
+    return ok;
 }
 
 void ShellClipboard::clearClipboard() {
-    OleSetClipboard(nullptr);
+    ClipboardStaThread::get().call([]() { return SUCCEEDED(OleSetClipboard(nullptr)); });
 }
 
 #else

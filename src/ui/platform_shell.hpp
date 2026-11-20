@@ -16,6 +16,7 @@ namespace cppdesk::ui {
 // Features that only some platforms have. Screens hide the controls for anything the shell lacks.
 enum class Capability {
     WindowsService,      // install/start/stop the background service from settings
+    UrlProtocol,         // register the cppdesk:// URL scheme with the OS (Windows registry)
     Elevation,           // relaunch with administrator rights
     DesktopShortcut,     // create a desktop shortcut for a desk
     ActionCenterToasts,  // Windows Action Center notifications toggle

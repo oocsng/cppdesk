@@ -457,7 +457,7 @@ void ScreenBlankManager::createCurtainWindow() {
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         activeBrand = brandName_.empty() ? "CppDesk Enterprise Security" : brandName_;
-        activeNotice = customNotice_.empty() ? "Screen output hidden and local physical inputs secured for authorized administration." : customNotice_;
+        activeNotice = customNotice_.empty() ? "Privacy screen is on. Move the mouse or press a key on this PC to end it." : customNotice_;
         showId = showDeskId_;
         deskId = deskId_;
     }

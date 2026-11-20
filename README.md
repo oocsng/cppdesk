@@ -34,19 +34,19 @@
   </sub>
 </p>
 
-CppDesk is a portable remote desktop application built with modern C++ and hardware-accelerated rendering (Direct2D on Windows, Cocoa and Metal on macOS, X11 and MIT-SHM on Linux). It runs standalone with no installer, registry clutter, or external runtime requirements. Sessions authenticate via ephemeral or permanent keys and run end-to-end encrypted. CppDesk is built for devices on the same network: two machines on one LAN connect directly, with no server and no account. NAT hole punching (STUN) and a self-hosted relay server exist for connecting across networks, but they are optional and not the focus.
+CppDesk is a portable remote desktop application built with modern C++ and native rendering (Direct2D on Windows, CoreGraphics on macOS, Cairo/Pango on X11 on Linux). It runs standalone with no installer, registry clutter, or external runtime requirements. Sessions authenticate via ephemeral or permanent keys and run end-to-end encrypted. CppDesk is built for devices on the same network: two machines on one LAN connect directly, with no server and no account. NAT hole punching (STUN) and a self-hosted relay server exist for connecting across networks, but they are optional and not the focus.
 
 Hosts and clients identify each other with a 9-digit desk ID (`XXX XXX XXX`). Access can be granted with a password or through interactive on-screen approval.
 
 ## Features
 
-- Screen streaming: Low-latency desktop capture using DXGI Desktop Duplication with GDI fallback on Windows, AVFoundation / CoreGraphics on macOS, and MIT-SHM / X11 on Linux; multi-monitor selection, dynamic resolution matching, and 4-tier quality presets (Low Bandwidth 15 FPS, Balanced 30 FPS, High Bandwidth 45 FPS, Ultra LAN 60 FPS).
+- Screen streaming: Low-latency desktop capture using DXGI Desktop Duplication with GDI fallback on Windows, ScreenCaptureKit / CoreGraphics on macOS, and MIT-SHM / X11 on Linux; multi-monitor selection, dynamic resolution matching, and 4-tier quality presets (Low Bandwidth 15 FPS, Balanced 30 FPS, High Bandwidth 45 FPS, Ultra LAN 60 FPS).
 - Multi-session management: Tabbed interface for controlling multiple remote machines at once, with live ping indicators and unread chat counters.
 - File transfer and directory sync: Drag-and-drop file delivery with chunked progress tracking, SHA-256 integrity checks, and background bidirectional folder mirroring.
 - Audio and voice intercom: Full-duplex microphone chat with live VU meters, device selection dropdowns, and remote system loopback sound streaming.
 - Session recording and instant rewind: Record sessions directly into self-contained video files with an integrated in-app player, or scrub backwards through a rolling frame cache without interrupting the connection.
-- Terminal, process control, and command palette: Built-in remote command prompt, PowerShell / bash execution, live task manager with process killing, and an omnibar command palette (`Ctrl+K`).
-- Security and privacy: ECDH (NIST P-256) key exchange, AES-256-GCM AEAD authenticated encryption, optional TOTP 2FA (RFC 6238) with QR setup, brute-force rate limiting, curtain screen privacy mode, and real-time privacy cloak redaction zones.
+- Terminal, process control, and command palette: Built-in remote command prompt, PowerShell / bash execution, live task manager with process killing, and an omnibar command palette (`Ctrl+Shift+P`).
+- Security and privacy: ECDH (NIST P-256) key exchange, AES-256-GCM AEAD authenticated encryption, optional TOTP 2FA (RFC 6238) with QR setup, brute-force rate limiting, and, on Windows hosts only, curtain screen privacy mode and privacy cloak redaction zones.
 - Collaboration tools: In-session screen drawing tools (pens, highlighters, pointers), shared clipboard sync (text, and files: copy them on one computer and paste them on the other, where they are fetched when you paste), and a real-time collaborative scratchpad.
 - Built-in networking tools: Port forwarding presets (RDP, SSH, VNC, HTTP), STUN and relay diagnostics (for connecting across networks), and address book with quick tags.
 
@@ -180,7 +180,7 @@ cmake --build build --config Release
 ├── build.ps1                     # Windows build and test automation script
 ├── CMakeLists.txt                # Cross-platform CMake build configuration
 ├── src/
-│   ├── capture/                  # Screen capture (DXGI, GDI, AVFoundation, X11 SHM), display management, rewind buffer
+│   ├── capture/                  # Screen capture (DXGI, GDI, ScreenCaptureKit, X11 SHM), display management, rewind buffer
 │   ├── control/                  # Input injection (SendInput, CGEvent, XTest), session tabs, whiteboard, scratchpad
 │   ├── core/                     # Protocol definitions, crypto identity, and TOTP 2FA
 │   ├── media/                    # Voice intercom, session recorder, and player

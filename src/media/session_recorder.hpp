@@ -91,6 +91,8 @@ public:
     void stopRecording();
 
     bool isRecording() const { return recording_.load(); }
+    // True once the recording ended on its own because the file reached the 4 GiB AVI limit.
+    bool stoppedAtSizeLimit() const { return sizeLimitHit_.load(); }
     uint64_t recordedFrames() const { return frameCount_.load(); }
     uint64_t droppedFrames() const { return droppedFrames_.load(); }
     uint64_t recordedBytes() const { return bytesWritten_.load(); }
@@ -105,6 +107,7 @@ private:
 
     std::atomic<bool>               recording_{false};
     std::atomic<bool>               workerStopping_{false};
+    std::atomic<bool>               sizeLimitHit_{false};
     std::atomic<uint64_t>           frameCount_{0};
     std::atomic<uint64_t>           droppedFrames_{0};
     std::atomic<uint64_t>           bytesWritten_{0};
