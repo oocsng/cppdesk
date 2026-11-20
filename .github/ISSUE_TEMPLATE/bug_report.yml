@@ -16,6 +16,9 @@ body:
       options:
         - Windows 11 (x64)
         - Windows 10 (x64)
+        - Linux (X11)
+        - Linux (Wayland)
+        - macOS Sequoia (15.x) or later
         - macOS Sonoma (14.x)
         - macOS Ventura (13.x)
         - macOS Monterey (12.x)
@@ -27,8 +30,8 @@ body:
     id: version
     attributes:
       label: CppDesk Version
-      description: Exact version number shown in Settings > About (e.g., v3.5.3)
-      placeholder: "v3.5.3"
+      description: Exact version number shown in Settings > About & Data (e.g., v1.0.0)
+      placeholder: "v1.0.0"
     validations:
       required: true
 

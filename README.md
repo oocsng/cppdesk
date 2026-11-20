@@ -40,15 +40,15 @@ Hosts and clients identify each other with a 9-digit desk ID (`XXX XXX XXX`). Ac
 
 ## Features
 
-- Screen streaming: Low-latency desktop capture using DXGI Desktop Duplication with GDI fallback on Windows, ScreenCaptureKit / CoreGraphics on macOS, and MIT-SHM / X11 on Linux; multi-monitor selection, dynamic resolution matching, and 4-tier quality presets (Low Bandwidth 15 FPS, Balanced 30 FPS, High Bandwidth 45 FPS, Ultra LAN 60 FPS).
+- Screen streaming: Low-latency desktop capture using DXGI Desktop Duplication with GDI fallback on Windows, ScreenCaptureKit / CoreGraphics on macOS, and MIT-SHM / X11 on Linux; multi-monitor selection, dynamic resolution matching, and 4 quality presets (Low Bandwidth 15 FPS, Balanced 30 FPS, High Bandwidth 45 FPS, Very High 60 FPS).
 - Multi-session management: Tabbed interface for controlling multiple remote machines at once, with live ping indicators and unread chat counters.
 - File transfer and directory sync: Drag-and-drop file delivery with chunked progress tracking, SHA-256 integrity checks, and background bidirectional folder mirroring.
 - Audio and voice intercom: Full-duplex microphone chat with live VU meters, device selection dropdowns, and remote system loopback sound streaming.
-- Session recording and instant rewind: Record sessions directly into self-contained video files with an integrated in-app player, or scrub backwards through a rolling frame cache without interrupting the connection.
+- Session recording and instant rewind: Record a session to an uncompressed AVI file with an integrated in-app player (the files grow fast and recording stops at 4 GiB, so it suits short clips), or scrub backwards through a rolling frame cache without interrupting the connection.
 - Terminal, process control, and command palette: Built-in remote command prompt, PowerShell / bash execution, live task manager with process killing, and an omnibar command palette (`Ctrl+Shift+P`).
 - Security and privacy: ECDH (NIST P-256) key exchange, AES-256-GCM AEAD authenticated encryption, optional TOTP 2FA (RFC 6238) with QR setup, brute-force rate limiting, and, on Windows hosts only, curtain screen privacy mode and privacy cloak redaction zones.
 - Collaboration tools: In-session screen drawing tools (pens, highlighters, pointers), shared clipboard sync (text, and files: copy them on one computer and paste them on the other, where they are fetched when you paste), and a real-time collaborative scratchpad.
-- Built-in networking tools: Port forwarding presets (RDP, SSH, VNC, HTTP), STUN and relay diagnostics (for connecting across networks), and address book with quick tags.
+- Built-in networking tools: Port forwarding presets (RDP, SSH, VNC, web), STUN and relay diagnostics (for connecting across networks), and address book with quick tags.
 
 ## Quick start
 
@@ -85,6 +85,15 @@ Headless Linux host / service mode:
 1. On the host: Note your 9-digit ID and one-time session password (or set a permanent password in settings).
 2. On the viewer: Enter the host's 9-digit ID, type the password (or leave blank to prompt the host user for approval), and click Connect.
 
+### 3. Across networks (optional)
+Two machines on one LAN need nothing more. To connect across networks you can run your own relay server (needs the .NET 10 SDK):
+
+```bash
+dotnet run --project relay-dotnet -c Release -- --port 50999 --auth-key <secret>
+```
+
+The key can also come from the `CPPDESK_RELAY_AUTH_KEY` environment variable. On each machine, open Settings > Network & Relay and enter the relay's address and the same key. There is no public relay.
+
 ## Building from source
 
 ### Requirements
@@ -94,7 +103,7 @@ Headless Linux host / service mode:
 
 On Linux (Debian / Ubuntu / derivatives):
 ```bash
-sudo apt install build-essential cmake libx11-dev libxext-dev libxtst-dev libxrandr-dev libzstd-dev libjpeg-turbo8-dev libssl-dev libcairo2-dev libpango1.0-dev pkg-config
+sudo apt install build-essential cmake libx11-dev libxext-dev libxtst-dev libxrandr-dev libzstd-dev libjpeg-dev libssl-dev libcairo2-dev libpango1.0-dev pkg-config
 ```
 
 On macOS (Homebrew):
@@ -169,7 +178,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Test
 cmake -B build
 cmake --build build --config Release
 
-# Run automated tests (52 test suites)
+# Run the automated tests
 ./build/CppDeskTests
 ```
 
@@ -189,7 +198,10 @@ cmake --build build --config Release
 │   └── ui/                       # Shared screens with Direct2D (Windows) and Cairo/X11 (Linux) backends; Cocoa (macOS)
 ├── relay-dotnet/                 # Optional self-hosted relay server (.NET 10)
 ├── scripts/                      # Verification and benchmark utilities
-└── tests/                        # Automated unit and integration test suite (52 suites)
+├── platform/                     # Linux desktop entry and packaging files, macOS Info.plist
+├── docs/                         # Hand-test checklists for sound, Mac and Wayland hosts
+├── site/                         # The landing page published to GitHub Pages
+└── tests/                        # Automated unit and integration tests, and the UI golden files
 ```
 
 ## Issues and support
@@ -201,7 +213,7 @@ If you hit a bug, connection failure, or want to suggest an improvement:
 
 Include the following in your report to help diagnose the issue:
 - Operating system and version (for example, Windows 11 23H2 x64, macOS 14.5, Ubuntu 24.04 X11)
-- CppDesk version (for example, v3.10.0)
+- CppDesk version (for example, v1.0.0; it is shown in Settings > About & Data)
 - Connection type (Direct LAN, STUN NAT traversal, or Relay)
 - Steps to reproduce, along with relevant log lines or status messages
 
