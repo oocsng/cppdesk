@@ -110,6 +110,8 @@ Headless Linux host / service mode:
 1. On the host: Note your 9-digit ID and one-time session password (or set a permanent password in settings).
 2. On the viewer: Enter the host's 9-digit ID, type the password (or leave blank to prompt the host user for approval), and click Connect.
 
+Run the same CppDesk release on both machines. A host drops a viewer that speaks a different protocol version, and the viewer only sees that the connection failed.
+
 ### 3. Across networks (optional)
 Two machines on one LAN need nothing more. To connect across networks you can run your own relay server (needs the .NET 10 SDK):
 
