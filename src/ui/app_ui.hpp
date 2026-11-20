@@ -268,7 +268,7 @@ private:
 private:
 
     // Windows-specific wording only where the Windows-only service capability exists.
-    bool onWindowsShell() const { return shell_->has(ui::Capability::WindowsService); }
+    bool onWindowsShell() const { return shell_->has(ui::Capability::UrlProtocol); }
     void applyWindowThemeAttribute();
     void switchTab(ActiveTab newTab);
 
@@ -701,6 +701,7 @@ private:
     float                   updateModalAnimT_ = 0.0f;
     float                   updateModalAnimVel_ = 0.0f;
     bool                    isCheckingUpdates_ = false;
+    bool                    recordingLimitReported_ = false;
     std::string             updateStatusText_ = std::string("Version v") + CPP_DESK_VERSION + " (Up to date)";
     UpdateInfo              latestUpdateInfo_{};
     float                   startupUpdateCheckTimer_ = 2.0f;

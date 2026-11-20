@@ -66,6 +66,7 @@ bool SessionRecorder::startRecording(const std::string& outputPath, int width, i
         workerStopping_.store(false);
     }
 
+    sizeLimitHit_.store(false);
     frameCount_.store(0);
     droppedFrames_.store(0);
     bytesWritten_.store(0);
@@ -308,10 +309,15 @@ void SessionRecorder::workerLoop() {
             const uint64_t projectedIdxBytes = 8ULL + (static_cast<uint64_t>(indexEntries_.size()) + 1ULL) * sizeof(AviIndexEntry);
             if (pos64 + 8ULL + expectedBytes + projectedIdxBytes > kMaxAviFileBytes) {
                 // Stop cleanly before the 4 GiB RIFF/AVI 1.0 offset limit so headers stay valid.
-                std::lock_guard<std::mutex> lock(queueMutex_);
-                recording_.store(false);
-                workerStopping_.store(true);
-                while (!frameQueue_.empty()) frameQueue_.pop();
+                {
+                    std::lock_guard<std::mutex> lock(queueMutex_);
+                    recording_.store(false);
+                    workerStopping_.store(true);
+                    sizeLimitHit_.store(true);
+                    while (!frameQueue_.empty()) frameQueue_.pop();
+                }
+                // The UI sees recording_ go false and never calls stopRecording(), so close the file here.
+                updateAviHeadersOnClose();
                 break;
             }
 

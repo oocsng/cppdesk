@@ -1311,6 +1311,10 @@ bool ScreenCapturer::initDxgiForMonitor(int monitorIndex) {
     IDXGIOutput* matchedOutput = nullptr;
     (void)monitorIndex;
 
+    // Take the attached output whose top-left corner is nearest the cached one. The size is not compared: a
+    // viewer-requested resolution change alters it (and moves the origin of a monitor left of or above the
+    // primary), and an exact match would then fail forever and leave capture on GDI.
+    long long bestScore = -1;
     for (UINT a = 0; ; ++a) {
         IDXGIAdapter1* adapter = nullptr;
         if (factory->EnumAdapters1(a, &adapter) == DXGI_ERROR_NOT_FOUND) break;
@@ -1319,19 +1323,22 @@ bool ScreenCapturer::initDxgiForMonitor(int monitorIndex) {
             IDXGIOutput* output = nullptr;
             if (adapter->EnumOutputs(o, &output) == DXGI_ERROR_NOT_FOUND) break;
             DXGI_OUTPUT_DESC outDesc{};
-            if (SUCCEEDED(output->GetDesc(&outDesc)) &&
-                outDesc.AttachedToDesktop &&
-                outDesc.DesktopCoordinates.left == activeMonitor_.x &&
-                outDesc.DesktopCoordinates.top == activeMonitor_.y &&
-                (outDesc.DesktopCoordinates.right - outDesc.DesktopCoordinates.left) == activeMonitor_.width &&
-                (outDesc.DesktopCoordinates.bottom - outDesc.DesktopCoordinates.top) == activeMonitor_.height) {
-                matchedAdapter = adapter;
-                matchedOutput = output;
-                break;
+            if (SUCCEEDED(output->GetDesc(&outDesc)) && outDesc.AttachedToDesktop) {
+                const long long score =
+                    std::llabs(static_cast<long long>(outDesc.DesktopCoordinates.left) - activeMonitor_.x) +
+                    std::llabs(static_cast<long long>(outDesc.DesktopCoordinates.top) - activeMonitor_.y);
+                if (bestScore < 0 || score < bestScore) {
+                    if (matchedOutput) matchedOutput->Release();
+                    if (matchedAdapter) matchedAdapter->Release();
+                    adapter->AddRef();
+                    matchedAdapter = adapter;
+                    matchedOutput = output;   // keeps the reference taken by EnumOutputs
+                    bestScore = score;
+                    continue;
+                }
             }
             output->Release();
         }
-        if (matchedOutput) break;
         adapter->Release();
     }
     factory->Release();

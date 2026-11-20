@@ -1279,6 +1279,7 @@ bool NetworkEngine::start() {
     }
 
     if (identity_.instanceId() == 1) {
+        localRelay_.setAuthKey(identity_.settings().relayAuthKey);
         localRelay_.start(DEFAULT_RELAY_PORT);
     }
 
@@ -1981,8 +1982,9 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         std::array<uint8_t, 32> clientDigest{};
         authReader.readBytes(clientDigest.data(), clientDigest.size());
 
-        // Relayed sessions share clientIp == "Relay-Bridge"; scope rate limits per viewerId to prevent cross-viewer DoS.
-        const std::string rateKey = (clientIp == "Relay-Bridge") ? ("Relay:" + std::to_string(viewerId)) : clientIp;
+        // Relayed sessions share clientIp == "Relay-Bridge", so they share one lockout. viewerId is chosen by the
+        // peer, so keying on it would let an attacker dodge the lockout with a fresh id per guess.
+        const std::string& rateKey = clientIp;
 
         bool accepted = false;
         bool pairedLogin = false;
@@ -5722,8 +5724,8 @@ void NetworkEngine::setHostPrivacyMode(bool enable, const std::string& notice, c
             VirtualDisplayManager::instance().ensureHeadlessDisplay(1920, 1080, 60);
         }
 
-        ScreenBlankManager::instance().engageBlanking(blankMode, activeNotice, activeBrand, activeShowId, identity_.deskId());
-        hostPrivacyModeActive_.store(true);
+        // Report privacy mode as active only if the curtain really came up (it is Windows-only).
+        hostPrivacyModeActive_.store(ScreenBlankManager::instance().engageBlanking(blankMode, activeNotice, activeBrand, activeShowId, identity_.deskId()));
     } else {
         ScreenBlankManager::instance().disengageBlanking();
         hostPrivacyModeActive_.store(false);

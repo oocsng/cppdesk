@@ -80,7 +80,7 @@ void testFixesG() {
             std::string frame = rc.serialize();
             TEST_ASSERT(frame.find("Dismiss") != std::string::npos);
 
-            // #94: Mandatory update check overrides peer mismatch Dismiss with Exit CppDesk
+            // A newer release is advice: it must not turn the dismissible peer-mismatch modal into a hard lock
             UpdateInfo reqInfo{};
             reqInfo.success = true;
             reqInfo.updateRequired = true;
@@ -90,14 +90,8 @@ void testFixesG() {
             ui::RecordingCanvas rc2;
             for (int i = 0; i < 10; ++i) app.render(rc2, 1280, 800, 1.0 / 60.0);
             std::string frame2 = rc2.serialize();
-            TEST_ASSERT(frame2.find("Exit CppDesk") != std::string::npos);
-            TEST_ASSERT(frame2.find("Dismiss") == std::string::npos);
-
-            // #94: Esc must not dismiss mandatory update modal
-            app.onKey(KeyEvent{VK_ESCAPE, 0, true, false});
-            ui::RecordingCanvas rc3;
-            app.render(rc3, 1280, 800, 1.0 / 60.0);
-            TEST_ASSERT(rc3.serialize().find("Exit CppDesk") != std::string::npos);
+            TEST_ASSERT(frame2.find("Dismiss") != std::string::npos);
+            TEST_ASSERT(frame2.find("Exit CppDesk") == std::string::npos);
         }
 
         std::error_code ec;
@@ -167,7 +161,7 @@ void testFixesG() {
         std::filesystem::remove(id.configFilePath(), ec);
     }
 
-    // #245: About section uses CPP_DESK_VERSION rather than hardcoded v3.11.2
+    // #245: About section uses CPP_DESK_VERSION rather than hardcoded v3.12.0
     {
         IdentityManager id(4906);
         id.loadOrCreate();

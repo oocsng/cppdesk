@@ -61,10 +61,10 @@ struct AppSettings {
     // Virtual Multi-Display Driver & Headless Emulation
     // Remembered answer to the Wayland desktop's screen sharing question (a restore token), kept with the other settings
     std::string   waylandRestoreToken = "";
-    bool          autoVirtualDisplay = true;             // Auto-provision virtual display for headless host
+    bool          autoVirtualDisplay = false;            // Auto-provision virtual display for headless host
 
     // Privacy Mode Curtain Screen Custom Branding & Notice
-    std::string   privacyCustomNotice = "Screen output hidden and local physical inputs secured for authorized administration.";
+    std::string   privacyCustomNotice = "Privacy screen is on. Move the mouse or press a key on this PC to end it.";
     std::string   privacyBrandName = "CppDesk Enterprise Security";
     bool          privacyShowDeskId = true;
     bool          hardwareDpmsBlanking = true;           // Hardware DPMS monitor standby coupled with curtain mode (default true)

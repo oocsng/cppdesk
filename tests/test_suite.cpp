@@ -1301,8 +1301,8 @@ void testAutoUpdaterAndProtocolV3() {
     TEST_ASSERT(PROTOCOL_MAGIC == 0x43505044); // "CPPD"
     TEST_ASSERT(RELAY_MAGIC == 0x4344534B);    // "CDSK"
     TEST_ASSERT(PROTOCOL_VERSION == 4);
-    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.11.2");
-    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030B02);
+    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "3.12.0");
+    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x030C00);
 
     // 2. Semantic Version Triad Parsing
     int maj = 0, min = 0, pat = 0;
@@ -4463,7 +4463,7 @@ void testVirtualDisplayManagerAndHeadlessEmulation() {
     {
         IdentityManager idMgr(77);
         AppSettings s = idMgr.settings();
-        TEST_ASSERT(s.autoVirtualDisplay); // Default is true
+        TEST_ASSERT(!s.autoVirtualDisplay); // Default is off: no virtual display driver is included
 
         s.autoVirtualDisplay = false;
         idMgr.updateSettings(s);
@@ -4650,7 +4650,11 @@ void testHardwareDpmsAndScreenBlanking() {
 
         // Host privacy mode engage and disengage
         host.setHostPrivacyMode(true, "Sec Notice", "Sec Brand", false, ScreenBlankMode::CurtainOnly);
-        TEST_ASSERT(host.isHostPrivacyModeActive());
+#if defined(_WIN32)
+        TEST_ASSERT(host.isHostPrivacyModeActive());   // the curtain only exists on Windows
+#else
+        TEST_ASSERT(!host.isHostPrivacyModeActive());  // no curtain here, so privacy mode must not claim to be active
+#endif
         host.setHostPrivacyMode(false);
         TEST_ASSERT(!host.isHostPrivacyModeActive());
     }
@@ -9083,6 +9087,7 @@ public:
     bool has(ui::Capability c) const override {
         switch (c) {
             case ui::Capability::WindowsService: return service;
+            case ui::Capability::UrlProtocol: return service;
             case ui::Capability::Elevation: return elevation;
             case ui::Capability::DesktopShortcut: return shortcut;
             case ui::Capability::ActionCenterToasts: return actionCenter;

@@ -2783,6 +2783,8 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
     };
 
     for (const auto& item : navItems) {
+        // The curtain and privacy cloak only exist in the Windows host.
+        if (item.section == SettingsSection::CurtainPrivacy && !onWindowsShell()) continue;
         UiRect itemRect = { navCard.left + navPad, navY, navCard.right - navPad, navY + 38.0f };
         bool isActive = (settingsSection_ == item.section);
 
@@ -3162,11 +3164,11 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                          }, "Use Direct3D 11 hardware acceleration instead of software rasterization.");
 
         drawToggleSwitch("sett_auto_virtual_display", { ovBox.left + 16.0f, ovBox.top + 54.0f, ovBox.right - 16.0f, ovBox.top + 80.0f },
-                         s.autoVirtualDisplay, "Auto Virtual Display for Headless Host", [this]() {
+                         s.autoVirtualDisplay, "Placeholder screen for headless host", [this]() {
                              AppSettings ns = identity_.settings();
                              ns.autoVirtualDisplay = !ns.autoVirtualDisplay;
                              identity_.updateSettings(ns);
-                         }, "Automatically spawn a virtual display driver when hosting on a headless machine.");
+                         }, "Shows a placeholder picture when the host has no monitor. No virtual display driver is included.");
 
         cy = ovBox.bottom + 12.0f;
     }
@@ -3573,17 +3575,6 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         float prX = netBox.right - 16.0f;
         UiRect lanPreset = { prX - presetW, netBox.top + 5.0f, prX, netBox.top + 5.0f + presetH };
         UiRect localPreset = { lanPreset.left - 4.0f - 64.0f, netBox.top + 5.0f, lanPreset.left - 4.0f, netBox.top + 5.0f + presetH };
-        UiRect pubPreset = { localPreset.left - 4.0f - 54.0f, netBox.top + 5.0f, localPreset.left - 4.0f, netBox.top + 5.0f + presetH };
-
-        drawButton("sett_pre_pub", pubPreset, "Public",
-                   (relayModeEdit_ == 0) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (relayModeEdit_ == 0) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (relayModeEdit_ == 0) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   5.0f, [this]() {
-                       relayServerEdit_ = "relay.cppdesk.io:50999";
-                       stunServerEdit_ = "stun.l.google.com:19302";
-                       relayModeEdit_ = 0;
-                   }, ui::FontRole::Small, relayModeEdit_ != 0, COL_BORDER);
 
         drawButton("sett_pre_loc", localPreset, "Localhost",
                    (relayModeEdit_ == 1) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
@@ -3717,7 +3708,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 6.0f, [this]() {
                        AppSettings ns = identity_.settings();
                        ns.privacyBrandName = privacyBrandEdit_.empty() ? "CppDesk Enterprise Security" : privacyBrandEdit_;
-                       ns.privacyCustomNotice = privacyNoticeEdit_.empty() ? "Screen output hidden and local physical inputs secured for authorized administration." : privacyNoticeEdit_;
+                       ns.privacyCustomNotice = privacyNoticeEdit_.empty() ? "Privacy screen is on. Move the mouse or press a key on this PC to end it." : privacyNoticeEdit_;
                        identity_.updateSettings(ns);
                        network_.configurePrivacyCurtain(ns.privacyCustomNotice, ns.privacyBrandName, ns.privacyShowDeskId);
                        showToast("Privacy screen branding updated");
@@ -5931,7 +5922,7 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
     if (adminMenuAnimT_ > 0.005f) {
         float menuAlpha = std::clamp(adminMenuAnimT_, 0.0f, 1.0f);
         float itemH = 32.0f;
-        float dropH = 5 * itemH + 16.0f;
+        float dropH = 4 * itemH + 16.0f;
         UiRect baseDropRect = { adminBtn.left - 20.0f, pillBottom + 6.0f, adminBtn.left + 210.0f, pillBottom + 6.0f + dropH };
         UiRect dropRect = UiPlatform::computeSpringRect(baseDropRect, adminMenuAnimT_, 0.0f);
         drawCardShadow(dropRect, 14.0f, 0.95f * menuAlpha);
@@ -5966,15 +5957,8 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
                    }, ui::FontRole::Small, true, COL_BORDER);
         dy += itemH;
 
-        UiRect r4 = { dropRect.left + 8.0f, dy, dropRect.right - 8.0f, dy + 28.0f };
-        drawButton("drop_adm_reboot_rec", r4, "Reboot & Reconnect...",
-                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
-                       showAdminMenu_ = false;
-                       rebootIsEmergency_ = false;
-                       showRebootConfirmModal_ = true;
-                   }, ui::FontRole::Small, true, COL_BORDER);
-        dy += itemH;
-
+        // No "Reboot & Reconnect" here: nothing restarts CppDesk after the reboot (no service, no autostart),
+        // so the host would stay unreachable.
         UiRect r5 = { dropRect.left + 8.0f, dy, dropRect.right - 8.0f, dy + 28.0f };
         drawButton("drop_adm_reboot", r5, "Emergency Reboot...",
                    COL_DANGER, COL_DANGER_HV, COL_TEXT_ON_ACCENT, 6.0f, [this]() {
@@ -9039,7 +9023,7 @@ void AppUi::onCharInput(char16_t ch) {
         } else if (focusedField_ == FocusedField::PrivacyBrand || focusedField_ == FocusedField::PrivacyNotice) {
             AppSettings ns = identity_.settings();
             ns.privacyBrandName = privacyBrandEdit_.empty() ? "CppDesk Enterprise Security" : privacyBrandEdit_;
-            ns.privacyCustomNotice = privacyNoticeEdit_.empty() ? "Screen output hidden and local physical inputs secured for authorized administration." : privacyNoticeEdit_;
+            ns.privacyCustomNotice = privacyNoticeEdit_.empty() ? "Privacy screen is on. Move the mouse or press a key on this PC to end it." : privacyNoticeEdit_;
             identity_.updateSettings(ns);
             network_.configurePrivacyCurtain(ns.privacyCustomNotice, ns.privacyBrandName, ns.privacyShowDeskId);
             showToast("Privacy screen branding updated");
@@ -9538,8 +9522,7 @@ void AppUi::closeSessionTab(uint32_t tabId, bool quiet) {
 }
 
 void AppUi::initiateConnection() {
-    if (showUpdateRequiredModal_ || latestUpdateInfo_.updateRequired) {
-        showUpdateRequiredModal_ = true;
+    if (showUpdateRequiredModal_) {
         showToast("Update required to connect to remote sessions!", true);
         return;
     }
@@ -10280,6 +10263,14 @@ void AppUi::onResized() {
 
 void AppUi::onTick() {
     uint64_t tickNow = shell_->nowMs();
+    if (sessionRecorder_.stoppedAtSizeLimit()) {
+        if (!recordingLimitReported_) {
+            recordingLimitReported_ = true;
+            showToast("Recording stopped and saved: the AVI file reached its 4 GB limit", true);
+        }
+    } else {
+        recordingLimitReported_ = false;
+    }
     {
         bool doneReady = false;
         bool doneOk = false;
@@ -10699,10 +10690,9 @@ void AppUi::onUpdateCheckDone(const UpdateInfo& info, bool manual) {
         if (!cleanVer.empty() && (cleanVer[0] == 'v' || cleanVer[0] == 'V')) {
             cleanVer = cleanVer.substr(1);
         }
-        updateStatusText_ = "Mandatory Update: v" + cleanVer;
-        showPeerMismatchModal_ = false;
-        showUpdateRequiredModal_ = true;
-        if (manual) showToast("Mandatory update v" + cleanVer + " available!", true);
+        // A newer release is advice, not a lock: LAN-only and offline users must still be able to connect.
+        updateStatusText_ = "Update available: v" + cleanVer;
+        if (manual) showToast("Update v" + cleanVer + " available");
     } else {
         updateStatusText_ = "CppDesk is up to date (v" + std::string(CPP_DESK_VERSION) + ")";
         if (manual) showToast("You have the latest version (v" + std::string(CPP_DESK_VERSION) + ")");
