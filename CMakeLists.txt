@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # ScreenCaptureKit (macOS host capture) needs 12.3; must be set before project().
 set(CMAKE_OSX_DEPLOYMENT_TARGET "12.3" CACHE STRING "")
-project(CppDesk VERSION 3.12.0 LANGUAGES C CXX)
+project(CppDesk VERSION 1.0.0 LANGUAGES C CXX)
 if(NOT MSVC)
     enable_language(ASM)
 endif()

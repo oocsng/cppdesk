@@ -6,8 +6,7 @@ We provide security updates and patches for the following versions:
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 3.12.x  | Yes                |
-| < 3.12.0 | No                |
+| 1.0.x   | Yes                |
 
 We strongly recommend always running the latest stable release to receive security enhancements, crypto hardening, and critical protocol updates.
 

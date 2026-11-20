@@ -161,7 +161,7 @@ void testFixesG() {
         std::filesystem::remove(id.configFilePath(), ec);
     }
 
-    // #245: About section uses CPP_DESK_VERSION rather than hardcoded v3.12.0
+    // #245: About section uses CPP_DESK_VERSION rather than hardcoded v1.0.0
     {
         IdentityManager id(4906);
         id.loadOrCreate();
