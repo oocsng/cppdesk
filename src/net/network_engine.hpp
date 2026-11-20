@@ -420,6 +420,9 @@ public:
     // True while the host's microphone is open because a viewer's voice arrived: the dashboard says so.
     bool isHostMicLive() const { return hostMicLive_.load(); }
     // Test-only, host side: key events go to the sink instead of InputInjector; INPUT_RELEASE_ALL arrives as (0, false).
+    // True once no session holds the host: the status flag clears first, but a viewer that leaves mid-handshake keeps the
+    // slot until its session thread has unwound, and a dial in that gap is answered "host busy".
+    bool hostSessionSlotFreeForTest() const { return activeHostClientSock_.load() == ~uintptr_t(0); }
     void setHostKeySinkForTest(std::function<void(uint16_t vk, bool isDown)> sink) {
         std::lock_guard<std::mutex> lk(hostKeySinkMutex_);
         hostKeySink_ = std::move(sink);

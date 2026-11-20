@@ -10762,6 +10762,8 @@ void testGlideHome() {
             for (int i = 0; i < ms / 50 && !cond(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
             return cond();
         };
+        // Ready for the next dial: not just "no session shown", the host must also have let go of its one session slot.
+        auto hostIdle = [](NetworkEngine& h) { return !h.hostSessionStatus().active && h.hostSessionSlotFreeForTest(); };
 
         struct Run { FakeShell shell; std::unique_ptr<AppUi> app; };   // app goes first, then its shell
         auto fresh = [&] {
@@ -10859,7 +10861,7 @@ void testGlideHome() {
             TEST_ASSERT(tabs(*r) == 1);
             tick(*r, 8300 + 60000);
             TEST_ASSERT(tabs(*r) == 0);
-            TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active; }, 4000));
+            TEST_ASSERT(waitFor([&] { return hostIdle(hostP); }, 4000));
 
             // Switch edge: Q on the left; going there drops P's glide session first.
             push(*r, right, 70000);
@@ -10881,7 +10883,7 @@ void testGlideHome() {
             TEST_ASSERT(!r->app->sessionTabsForTest().getTab(tabQ) && frontTab(*r).requirePairedDeskId == 0);
             net.disconnectViewer();
         }
-        TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active && !hostQ.hostSessionStatus().active; }, 4000));
+        TEST_ASSERT(waitFor([&] { return hostIdle(hostP) && hostIdle(hostQ); }, 4000));
         {   // glideFailureGoesHome: nothing listens. Closing the window mid-glide also goes home first.
             auto r = fresh();
             push(*r, top, 0);
@@ -10913,7 +10915,7 @@ void testGlideHome() {
             TEST_ASSERT(toastShown(*r, "Reception is in use by someone else"));
             other.disconnectViewer();
         }
-        TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active; }, 4000));
+        TEST_ASSERT(waitFor([&] { return hostIdle(hostP); }, 4000));
         {   // Two monitors: the glide window fills the right one, so going home means crossing the seam into the left one.
             auto r = fresh();
             r->shell.desktop = ui::Rect{0, 0, 3840, 1080};
@@ -10930,7 +10932,7 @@ void testGlideHome() {
             TEST_ASSERT(atHome(*r, ui::Point{3837, 540}));
             net.disconnectViewer();
         }
-        TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active; }, 4000));
+        TEST_ASSERT(waitFor([&] { return hostIdle(hostP); }, 4000));
         {   // Sent home before the connection finished: it must not pull the window back to the live session.
             auto r = fresh();
             push(*r, right, 0);
@@ -10943,7 +10945,7 @@ void testGlideHome() {
             TEST_ASSERT(!toastShown(*r, "Connected on same PC") && !toastShown(*r, "Connected to"));
             net.disconnectViewer();
         }
-        TEST_ASSERT(waitFor([&] { return !hostP.hostSessionStatus().active; }, 4000));
+        TEST_ASSERT(waitFor([&] { return hostIdle(hostP); }, 4000));
         {   // Idle close: watching the live session counts as use, and closing never throws someone out of Settings.
             auto r = fresh();
             push(*r, right, 0);
