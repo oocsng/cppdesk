@@ -46,8 +46,10 @@ std::optional<std::vector<uint8_t>> normaliseJpeg(const std::vector<uint8_t>& fi
 
 bool validateWireJpeg(const std::vector<uint8_t>& jpeg) {
     if (jpeg.empty() || jpeg.size() > kMaxWireBytes) return false;
-    std::vector<uint8_t> px;
     int w = 0, h = 0;
+    // Header first: decodeJpeg would allocate whatever the peer claims (up to 64M pixels) before we could refuse it.
+    if (!TileCodec::jpegDimensions(jpeg.data(), jpeg.size(), w, h) || w > 256 || h > 256) return false;
+    std::vector<uint8_t> px;
     return TileCodec::decodeJpeg(jpeg.data(), jpeg.size(), px, w, h) && w >= 1 && w <= 256 && h >= 1 && h <= 256;
 }
 

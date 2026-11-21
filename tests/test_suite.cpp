@@ -13147,6 +13147,17 @@ void testAvatarImage() {
     auto bigJpg = TileCodec::encodeJpeg(big.data(), 400, 400, 30);
     TEST_ASSERT(!bigJpg.empty() && bigJpg.size() <= av::kMaxWireBytes);   // size alone must not be what rejects it
     TEST_ASSERT(!av::validateWireJpeg(bigJpg));
+    if (norm) {   // header claims 8000x8000: refused from the header, before any 256 MB decode
+        auto lying = *norm;
+        for (size_t i = 2; i + 8 < lying.size(); ++i)
+            if (lying[i] == 0xFF && lying[i + 1] == 0xC0) {   // baseline SOF0: len(2) precision(1) height(2) width(2)
+                lying[i + 5] = lying[i + 7] = 8000 >> 8; lying[i + 6] = lying[i + 8] = 8000 & 0xFF;
+                break;
+            }
+        int lw = 0, lh = 0;
+        TEST_ASSERT(TileCodec::jpegDimensions(lying.data(), lying.size(), lw, lh) && lw == 8000 && lh == 8000);
+        TEST_ASSERT(!av::validateWireJpeg(lying));
+    }
 
     TEST_ASSERT(!av::normaliseJpeg(std::vector<uint8_t>(11u << 20, 0xFF)).has_value());
     TEST_ASSERT(!av::normaliseJpeg(noise).has_value());

@@ -73,6 +73,8 @@ public:
     static bool decompressZstd(const void* src, size_t srcLen, void* dst, size_t dstCapacity);
     static std::vector<uint8_t> encodeJpeg(const uint8_t* bgra, int width, int height, int quality);
     static bool decodeJpeg(const uint8_t* jpegData, size_t jpegLen, std::vector<uint8_t>& outBgra, int& outW, int& outH);
+    // Reads the SOF dimensions from the header only, so untrusted size claims can be refused before decodeJpeg allocates.
+    static bool jpegDimensions(const uint8_t* jpegData, size_t jpegLen, int& outW, int& outH);
     static bool decodeJpegIntoCanvas(
         const uint8_t* jpegData, size_t jpegLen,
         uint8_t* canvasBgra, int canvasW, int canvasH,
