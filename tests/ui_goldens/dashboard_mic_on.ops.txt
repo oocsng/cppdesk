@@ -85,7 +85,7 @@ fillEllipse 965.00 346.00 9.11 9.11 c0.85,0.47,0.34,0.07
 fillEllipse 965.00 346.00 7.11 7.11 c0.85,0.47,0.34,0.14
 fillEllipse 965.00 346.00 4.00 4.00 c0.85,0.47,0.34,1.00
 drawText 976.00 336.00 1224.00 356.00 Small LC c0.63,0.27,0.15,1.00 |ACTIVE SESSION
-drawText 960.00 358.00 1224.00 382.00 Subheading LC c0.15,0.14,0.13,1.00 |Office (123 456 789)
+drawText 960.00 358.00 1224.00 382.00 Subheading LC c0.15,0.14,0.13,1.00 |Dana (123 456 789)
 drawText 960.00 384.00 1224.00 416.00 Tooltip LC c0.66,0.36,0.07,1.00 |Microphone is on: the viewer can hear this room
 drawText 960.00 424.00 1170.00 448.00 Body LC c0.15,0.14,0.13,1.00 |Mouse & Keyboard
 fillRoundRect 1182.00 425.80 1224.00 449.80 r12.00 c0.85,0.47,0.34,0.24

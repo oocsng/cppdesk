@@ -13418,6 +13418,11 @@ void testAvatarFallbackAndSplitNames() {
     TEST_ASSERT(r - l == 36.0f && b - t == 36.0f);                                  // the 18px avatar rect
     TEST_ASSERT(ops.find("|J\n") == std::string::npos);
 
+    // The host-side ACTIVE SESSION card names the viewer by username, not the whole wire name
+    const std::string card = renderAppState(id, net, shell, "dashboard_mic_on");
+    TEST_ASSERT(card.find("|Dana (123 456 789)") != std::string::npos);
+    TEST_ASSERT(card.find("Dana \xC2\xB7") == std::string::npos);
+
     std::error_code ec;
     std::filesystem::remove(id.configFilePath(), ec);
 }

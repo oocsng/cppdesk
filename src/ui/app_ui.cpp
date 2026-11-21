@@ -18,6 +18,12 @@ namespace cppdesk {
 
 namespace {
 
+// The username part of a peer's wire name ("Jane \xC2\xB7 PC1" -> "Jane"); a plain hostname comes back unchanged.
+std::string peerName(const std::string& wire) {
+    const std::string n = profile::splitWireName(wire).name;
+    return n.empty() ? wire : n;
+}
+
 #pragma pack(push, 2)
 struct BmpFileHeader {
     uint16_t bfType;
@@ -1615,7 +1621,7 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
         for (const auto& p : offline) {
             const UiRect row = { rx0, ry, rx1, ry + rowH };
             strokeRoundRect({ row.left + 14.0f, row.centerY() - 10.0f, row.left + 34.0f, row.centerY() + 10.0f }, 6.0f, COL_BORDER, 1.5f);
-            drawText(p.hostname, { row.left + 50.0f, row.top, row.right - 130.0f, row.bottom }, ui::FontRole::BodyBold, COL_TEXT_MUTED);
+            drawText(peerName(p.hostname), { row.left + 50.0f, row.top, row.right - 130.0f, row.bottom }, ui::FontRole::BodyBold, COL_TEXT_MUTED);
             drawText("Offline", { row.right - 126.0f, row.top, row.right - 14.0f, row.bottom }, ui::FontRole::Small,
                      COL_TEXT_MUTED, ui::HAlign::Trailing);
             ry += rowH + 2.0f;
@@ -1851,7 +1857,7 @@ void AppUi::drawThisDeskPanel(const UiRect& panel, float alpha) {
         drawPulseDot(hx + 5.0f, hy + 10.0f, 4.0f, COL_PRIMARY_ACCENT, alpha);
         drawText("ACTIVE SESSION", { hx + 16.0f, hy, hrx, hy + 20.0f }, ui::FontRole::Small, COL_TEXT_ACCENT);
         hy += 22.0f;
-        std::string who = hStatus.viewerHostname + " (" + CryptoUtils::formatDeskId(hStatus.viewerDeskId) + ")";
+        std::string who = peerName(hStatus.viewerHostname) + " (" + CryptoUtils::formatDeskId(hStatus.viewerDeskId) + ")";
         drawText(who, { hx, hy, hrx, hy + 24.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
         hy += 26.0f;
 
@@ -2835,7 +2841,7 @@ void AppUi::drawGlideSettings(float cx, float crx, float& cy) {
         return std::any_of(eligible.begin(), eligible.end(), [&](const FleetMember& m) { return m.deskId == id; });
     };
     auto nameOf = [&](uint64_t id) {
-        for (const auto& h : hosts) if (h.deskId == id) return h.hostname;
+        for (const auto& h : hosts) if (h.deskId == id) return peerName(h.hostname);
         return std::string();
     };
     const AppSettings s = identity_.settings();
@@ -2882,7 +2888,7 @@ void AppUi::drawGlideSettings(float cx, float crx, float& cy) {
     float ry = list.top + 40.0f;
     for (const auto& h : hosts) {
         const bool picked = h.deskId == glidePickedDesk_;
-        drawButton("glide_pc_" + std::to_string(h.deskId), { list.left + 12.0f, ry, list.right - 12.0f, ry + rowH - 6.0f }, h.hostname,
+        drawButton("glide_pc_" + std::to_string(h.deskId), { list.left + 12.0f, ry, list.right - 12.0f, ry + rowH - 6.0f }, peerName(h.hostname),
                    picked ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG, picked ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    picked ? COL_TEXT_ON_ACCENT : (online(h.deskId) ? COL_TEXT_PRIMARY : COL_TEXT_MUTED),
                    8.0f, [this, id = h.deskId]() { glidePickedDesk_ = (glidePickedDesk_ == id) ? 0 : id; },
@@ -3489,7 +3495,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                 if (when <= 0 || !tmOk || std::strftime(date, sizeof(date), "%Y-%m-%d", &tmUtc) == 0) {
                     std::snprintf(date, sizeof(date), "unknown");
                 }
-                drawText(p.hostname + " \xC2\xB7 " + CryptoUtils::formatDeskId(p.deskId) + " \xC2\xB7 paired " + date,
+                drawText(peerName(p.hostname) + " \xC2\xB7 " + CryptoUtils::formatDeskId(p.deskId) + " \xC2\xB7 paired " + date,
                          { box.left + 16.0f, ry, box.right - 96.0f, ry + 28.0f },
                          ui::FontRole::Small, COL_TEXT_PRIMARY, ui::HAlign::Leading, ui::VAlign::Center);
                 uint64_t deskId = p.deskId;
@@ -9857,7 +9863,7 @@ void AppUi::glideTick(uint64_t nowMs, const ViewerSessionStats& viewer, bool hos
         // Failed or ended (Error can come before any frame): slide home. Reconnecting and connecting are left alone.
         if (!tab || viewer.state == ViewerConnectionState::Error || viewer.state == ViewerConnectionState::Disconnected) {
             const auto host = identity_.findPairedHost(glide_->deskId);
-            const std::string name = host ? host->hostname : CryptoUtils::formatDeskId(glide_->deskId);
+            const std::string name = host ? peerName(host->hostname) : CryptoUtils::formatDeskId(glide_->deskId);
             std::string toast = name + ": " + viewer.statusMessage;
             if (viewer.statusMessage.find("already in an active remote session") != std::string::npos)   // HostBusy
                 toast = name + " is in use by someone else";
@@ -9921,7 +9927,7 @@ void AppUi::glideOut(GlideEdge edge, ui::Point cursor, uint64_t nowMs) {
         if (said != glideOfflineNotifiedMs_.end() && nowMs - said->second < 60000) return;
         glideOfflineNotifiedMs_[deskId] = nowMs;
         const auto host = identity_.findPairedHost(deskId);
-        const std::string name = host ? host->hostname : CryptoUtils::formatDeskId(deskId);
+        const std::string name = host ? peerName(host->hostname) : CryptoUtils::formatDeskId(deskId);
         if (notificationMgr_) notificationMgr_->notify(NotificationType::GeneralInfo, "Glide", name + " is offline", identity_.settings());
         return;
     }
@@ -10334,7 +10340,7 @@ void AppUi::onTick() {
         rewindFrozen_ = false;
         rewindOffsetMs_ = 0;
         if (notificationMgr_) {
-            std::string hName = prevViewerHostname_.empty() ? "Remote Desktop" : prevViewerHostname_;
+            std::string hName = prevViewerHostname_.empty() ? "Remote Desktop" : peerName(prevViewerHostname_);
             notificationMgr_->notify(NotificationType::SessionDropped, "Session Disconnected",
                                      "Remote session with " + hName + " ended.", identity_.settings());
         }
@@ -10374,7 +10380,7 @@ void AppUi::onTick() {
         }
     } else if (vStats.offerPairing && !pairOfferShown_) {
         pairOfferShown_ = showPairOfferModal_ = true;
-        pairOfferName_ = vStats.remoteHostname.empty() ? CryptoUtils::formatDeskId(vStats.remoteDeskId) : vStats.remoteHostname;
+        pairOfferName_ = vStats.remoteHostname.empty() ? CryptoUtils::formatDeskId(vStats.remoteDeskId) : peerName(vStats.remoteHostname);
         shell_->invalidate();
     }
     const PairingRequestState pairState = network_.pairingRequestState();
@@ -10387,7 +10393,7 @@ void AppUi::onTick() {
     // Host session disconnect detection
     auto hostStatus = network_.hostSessionStatus();
     if (hostStatus.active && !prevHostActive_ && hostStatus.paired && notificationMgr_) {
-        std::string caller = hostStatus.viewerHostname.empty() ? "Remote User" : hostStatus.viewerHostname;
+        std::string caller = hostStatus.viewerHostname.empty() ? "Remote User" : peerName(hostStatus.viewerHostname);
         notificationMgr_->notify(NotificationType::IncomingConnection, "Paired PC connected",
                                  caller + " (" + CryptoUtils::formatDeskId(hostStatus.viewerDeskId) + ") connected without a password (paired).",
                                  identity_.settings());
@@ -10400,7 +10406,7 @@ void AppUi::onTick() {
         }
     }
     if (hostStatus.active) {
-        prevHostClientName_ = hostStatus.viewerHostname;
+        prevHostClientName_ = peerName(hostStatus.viewerHostname);
     }
     prevHostActive_ = hostStatus.active;
 
@@ -10554,7 +10560,7 @@ void AppUi::toggleNotificationsMuted() {
 std::string AppUi::trayStatusText() const {
     auto vStats = network_.viewerStats();
     if (vStats.state == ViewerConnectionState::Connected) {
-        return "Controlling " + vStats.remoteHostname;
+        return "Controlling " + peerName(vStats.remoteHostname);
     }
     if (network_.hostSessionStatus().active) {
         return "Host Active";
@@ -10872,7 +10878,7 @@ void AppUi::applySnapshotState(const std::string& name) {
         HostSessionStatus viewer;
         viewer.active = true;
         viewer.viewerDeskId = 123456789;
-        viewer.viewerHostname = "Office";
+        viewer.viewerHostname = "Dana \xC2\xB7 Office";   // the ACTIVE SESSION card shows the username only
         viewer.viewerIp = "192.168.1.20";
         snapshotHostStatus_ = viewer;
         snapshotHostMicLive_ = true;
