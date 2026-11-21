@@ -13378,6 +13378,50 @@ void testProfilePictureRejectsHostile() {
 }
 
 
+// Row names show the username, the hostname goes to the sub line, and a stored picture replaces the initial disc.
+void testAvatarFallbackAndSplitNames() {
+    std::cout << "[TEST 128] Avatar picture or initial, and split names in the home list...\n";
+    IdentityManager id(4253);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    FakeShell shell;
+    constexpr uint64_t kDesk = 555000402;   // seeded by home_desks
+    auto render = [&](const std::vector<uint8_t>& pic = {}) {
+        AppUi app(id, net, shell, "");
+        ui::RecordingCanvas rc;
+        app.applySnapshotState("home_desks");
+        id.addOrUpdateRecentSession(kDesk, "Jane \xC2\xB7 PC1", "");
+        net.injectPeerPictureForTest(kDesk, pic);   // after the state, which clears the seeded desks' pictures
+        for (int i = 0; i < 60; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);
+        return rc.serialize();
+    };
+    auto imageLines = [](const std::string& ops) {
+        std::vector<std::string> out;
+        std::istringstream in(ops);
+        for (std::string line; std::getline(in, line);) if (line.rfind("drawImage", 0) == 0) out.push_back(line);
+        return out;
+    };
+
+    std::string ops = render();
+    TEST_ASSERT(ops.find("|Jane\n") != std::string::npos);
+    TEST_ASSERT(ops.find("\xC2\xB7  PC1\n") != std::string::npos);                  // the computer, not the whole wire name
+    TEST_ASSERT(ops.find("|Jane \xC2\xB7 PC1") == std::string::npos);
+    TEST_ASSERT(imageLines(ops).empty());
+    TEST_ASSERT(ops.find("|J\n") != std::string::npos);                              // the initial of the username
+
+    std::vector<uint8_t> px(96u * 96u * 4u, 0x80);
+    ops = render(TileCodec::encodeJpeg(px.data(), 96, 96, 85));
+    const auto imgs = imageLines(ops);
+    TEST_ASSERT(imgs.size() == 1);
+    float l = 0, t = 0, r = 0, b = 0;
+    TEST_ASSERT(std::sscanf(imgs[0].c_str(), "drawImage %*d %f %f %f %f", &l, &t, &r, &b) == 4);
+    TEST_ASSERT(r - l == 36.0f && b - t == 36.0f);                                  // the 18px avatar rect
+    TEST_ASSERT(ops.find("|J\n") == std::string::npos);
+
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
 int main(int argc, char** argv) {
     try {
         setOsAssignedPortsForTest(true);   // every listener binds an OS-assigned port; tests dial the port that was bound
@@ -13487,6 +13531,7 @@ int main(int argc, char** argv) {
         testAuthResponseTrailingPicture(); std::cout << "Test 125 done\n" << std::flush;
         testPeerPictureCachedOnlyAfterAccept(); std::cout << "Test 126 done\n" << std::flush;
         testProfilePictureRejectsHostile(); std::cout << "Test 127 done\n" << std::flush;
+        testAvatarFallbackAndSplitNames(); std::cout << "Test 128 done\n" << std::flush;
 #if defined(__linux__)
         testCairoCanvas(); std::cout << "Test 73 done\n" << std::flush;
 #endif

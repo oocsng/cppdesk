@@ -294,6 +294,7 @@ public:
 
     // Profile pictures (peers' are cached per desk ID only after a session is accepted)
     std::vector<uint8_t> peerPicture(uint64_t deskId) const;   // memory, else cache file, else empty
+    void storePeerPicture(uint64_t deskId, const std::vector<uint8_t>& jpeg);   // empty = none: deletes the cache file
     uint32_t peerPictureGeneration() const { return peerPictureGeneration_.load(); }   // bumps on every peer or own picture change
     void sendProfilePicture();   // re-reads the own picture file and sends it on any accepted session
 
@@ -327,6 +328,7 @@ public:
     void pushRestoreTokenForTest(const std::string& token) { shareHub_.pushToken(token); }
     // Adds or replaces a peer as if discovery had just heard it (tests).
     void injectDiscoveredPeerForTest(const DiscoveredPeer& p);
+    void injectPeerPictureForTest(uint64_t deskId, const std::vector<uint8_t>& jpeg);   // memory only; empty = remove
 
     // Copy latest decoded remote frame if frameSeq > lastSeenSeq
     bool copyLatestViewerFrame(
@@ -879,7 +881,6 @@ private:
     std::atomic<uint64_t>                                   hostSessionGen_{0};
 
     std::vector<uint8_t> ownPicture() const;
-    void storePeerPicture(uint64_t deskId, const std::vector<uint8_t>& jpeg);   // empty = none: deletes the cache file
     mutable std::mutex                                      peerPictureMutex_;
     std::unordered_map<uint64_t, std::vector<uint8_t>>      peerPictures_;
     std::atomic<uint32_t>                                   peerPictureGeneration_{0};

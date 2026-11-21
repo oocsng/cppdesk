@@ -365,6 +365,14 @@ private:
     void ensureAppIconImage();
     // Destroys the canvas image (if any) and clears the handle.
     void releaseImage(ui::ImageId& id);
+    // A peer's picture in a circle, or its initial on the desk's colour. jpeg overrides the lookup (approval: the caller's
+    // picture is not stored yet). Images are cached per desk and dropped when the engine's picture generation changes.
+    void drawAvatar(float cx, float cy, float r, uint64_t deskId, const std::string& name, float alpha,
+                    const std::vector<uint8_t>* jpeg = nullptr);
+    std::unordered_map<uint64_t, ui::ImageId> avatarImages_;   // invalid id = no picture
+    uint32_t                avatarGen_ = ~0u;
+    std::vector<uint8_t>    avatarApprovalBytes_;              // what avatarImages_[kApprovalKey] was built from
+    std::vector<uint8_t>    snapshotCallerPicture_;            // a snapshot's stand-in for the pending caller's picture
 
     // Two-Factor Authentication (TOTP) rendering
     void renderQrCodeDirect2D(

@@ -3,6 +3,9 @@
 #include "../core/win_compat.hpp"
 #include "vk_codes.hpp"
 #include "glide.hpp"
+#include "../capture/avatar_image.hpp"
+#include "../capture/screen_capture.hpp"
+#include "../core/profile.hpp"
 
 #include <algorithm>
 #include <ctime>
@@ -474,6 +477,58 @@ void AppUi::drawIconTheme(float cx, float cy, float radius, bool isDark, ui::Col
 void AppUi::releaseImage(ui::ImageId& id) {
     if (id.valid() && canvas_) canvas_->destroyImage(id);
     id = {};
+}
+
+void AppUi::drawAvatar(float cx, float cy, float r, uint64_t deskId, const std::string& name, float alpha,
+                       const std::vector<uint8_t>* jpeg) {
+    constexpr uint64_t kApprovalKey = ~0ull;
+    const uint32_t gen = network_.peerPictureGeneration();   // also bumps when our own picture changes
+    if (gen != avatarGen_) {
+        for (auto& [k, img] : avatarImages_) releaseImage(img);
+        avatarImages_.clear();
+        avatarGen_ = gen;
+    }
+    const uint64_t key = jpeg ? kApprovalKey : deskId;
+    auto it = avatarImages_.find(key);
+    if (jpeg && it != avatarImages_.end() && avatarApprovalBytes_ != *jpeg) {
+        releaseImage(it->second);
+        avatarImages_.erase(it);
+        it = avatarImages_.end();
+    }
+    if (it == avatarImages_.end()) {
+        std::vector<uint8_t> bytes;
+        if (jpeg) {
+            bytes = *jpeg;
+            avatarApprovalBytes_ = bytes;
+        } else if (deskId == identity_.deskId()) {
+            std::ifstream f(identity_.ownPicturePath(), std::ios::binary);
+            bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        } else {
+            bytes = network_.peerPicture(deskId);   // already validated; once per generation, not per frame
+        }
+        ui::ImageId img;
+        std::vector<uint8_t> bgra;
+        int w = 0, h = 0;
+        // Own file and the caller's bytes are checked here: decodeCircleBgra has no size cap of its own
+        if (canvas_ && avatar::validateWireJpeg(bytes) && avatar::decodeCircleBgra(bytes, bgra, w, h)) {
+            img = canvas_->createImage(w, h, false);
+            canvas_->updateImage(img, bgra.data(), w * 4, ui::Rect{ 0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h) });
+        }
+        it = avatarImages_.emplace(key, img).first;
+    }
+    if (it->second.valid()) {
+        canvas_->drawImage(it->second, { cx - r, cy - r, cx + r, cy + r }, alpha);
+        return;
+    }
+    // An initial on a colour picked from the desk ID, so a desk keeps its colour
+    static const ui::Color kAvatar[] = { rgba(160, 82, 45), rgba(46, 110, 96), rgba(84, 94, 140),
+                                         rgba(136, 80, 118), rgba(112, 100, 52), rgba(96, 88, 80) };
+    canvas_->fillEllipse(cx, cy, r, r, withAlpha(kAvatar[deskId % 6], alpha));
+    const char first = name.empty() ? '?' : name[0];
+    const std::string initial = (static_cast<unsigned char>(first) < 0x80) ? std::string(1, static_cast<char>(std::toupper(static_cast<unsigned char>(first))))
+                                                                           : name.substr(0, name.size() > 1 ? 2 : 1);
+    drawText(initial, { cx - r, cy - r, cx + r, cy + r }, r < 14.0f ? ui::FontRole::Small : ui::FontRole::BodyBold,
+             withAlpha(rgba(255, 255, 255), alpha), ui::HAlign::Center, ui::VAlign::Center);
 }
 
 void AppUi::fillRoundRect(const UiRect& r, float radius, ui::Color color) {
@@ -1251,9 +1306,11 @@ std::vector<AppUi::HomeRow> AppUi::buildHomeRows(size_t& nearbyStart) const {
         }
         const std::string id = row.deskId > 0 ? CryptoUtils::formatDeskId(row.deskId) : row.endpoint;
         row.target = row.deskId > 0 ? id : row.endpoint;
-        row.name = !row.alias.empty() ? row.alias : !row.hostname.empty() ? row.hostname : id;
+        const profile::WireName wn = profile::splitWireName(row.hostname);
+        row.name = !row.alias.empty() ? row.alias : !wn.name.empty() ? wn.name : id;
         row.sub = id;
-        if (!row.hostname.empty() && row.hostname != row.name && row.hostname != id) row.sub += "  \xC2\xB7  " + row.hostname;
+        const std::string& shown = wn.computer.empty() ? wn.name : wn.computer;   // a 1.0 peer sent only the hostname
+        if (!shown.empty() && shown != row.name && shown != id) row.sub += "  \xC2\xB7  " + shown;
         if (!row.saved && row.endpoint != id) row.sub += "  \xC2\xB7  " + row.endpoint.substr(0, row.endpoint.find(':'));
         row.paired = isPaired(row.deskId);
         return true;
@@ -1301,6 +1358,7 @@ void AppUi::removeHomeDesk(const HomeRow& row) {
         }
     }
     identity_.removeRecentSession(row.deskId);
+    network_.storePeerPicture(row.deskId, {});   // drops the cached file; Undo gets the row back without a picture until the next connect
     homeSel_ = -1;
     showToast("Removed " + row.name, false, 6000);
     undoRemoved_ = removed;   // after showToast, which drops any older undo
@@ -1641,17 +1699,8 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
                 if (twice && i < homeRows_.size()) connectHomeRow(homeRows_[i], false);
             }, false });
 
-            // Avatar: an initial on a colour picked from the desk ID, so a desk keeps its colour
-            static const ui::Color kAvatar[] = { rgba(160, 82, 45), rgba(46, 110, 96), rgba(84, 94, 140),
-                                                 rgba(136, 80, 118), rgba(112, 100, 52), rgba(96, 88, 80) };
-            const size_t ci = static_cast<size_t>((row.deskId != 0 ? row.deskId : std::hash<std::string>{}(row.endpoint)) % 6);
-            const float ax = rr.left + 32.0f, ay = rr.centerY();
-            canvas_->fillEllipse(ax, ay, 18.0f, 18.0f, kAvatar[ci]);
-            const char first = row.name.empty() ? '?' : row.name[0];
-            const std::string initial = (static_cast<unsigned char>(first) < 0x80) ? std::string(1, static_cast<char>(std::toupper(static_cast<unsigned char>(first))))
-                                                                                   : row.name.substr(0, row.name.size() > 1 ? 2 : 1);
-            drawText(initial, { ax - 18.0f, ay - 18.0f, ax + 18.0f, ay + 18.0f }, ui::FontRole::BodyBold, rgba(255, 255, 255),
-                     ui::HAlign::Center, ui::VAlign::Center);
+            drawAvatar(rr.left + 32.0f, rr.centerY(), 18.0f,
+                       row.deskId != 0 ? row.deskId : std::hash<std::string>{}(row.endpoint), row.name, 1.0f);
 
             const bool showActions = hT > 0.5f || sel;
             const float textRight = rr.right - (showActions ? 150.0f : 190.0f);
@@ -1949,8 +1998,9 @@ void AppUi::drawRemoteSessionView(const UiRect& bounds, float alpha) {
         float bx = hudBar.left + 18.0f;
         std::string peerTitle = stats.remoteHostname.empty()
             ? CryptoUtils::formatDeskId(stats.remoteDeskId)
-            : stats.remoteHostname;
-        drawText(peerTitle, { bx, hudBar.top, bx + 170.0f, hudBar.bottom }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
+            : profile::splitWireName(stats.remoteHostname).name;
+        drawAvatar(bx + 12.0f, hudBar.centerY(), 12.0f, stats.remoteDeskId, peerTitle, alpha);
+        drawText(peerTitle, { bx + 30.0f, hudBar.top, bx + 170.0f, hudBar.bottom }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
         bx += 174.0f;
 
         ui::Color stateDotCol = COL_WARNING;
@@ -4540,6 +4590,8 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
         strokeRoundRect(chatBox, 11.0f, COL_BORDER);
 
         auto msgs = network_.chatMessages();
+        const uint64_t chatPeerDesk = network_.viewerStats().state != ViewerConnectionState::Disconnected
+            ? network_.viewerStats().remoteDeskId : network_.hostSessionStatus().viewerDeskId;
         if (msgs.empty()) {
             drawText("No messages yet.",
                      { chatBox.left + 14.0f, chatBox.centerY() - 14.0f, chatBox.right - 14.0f, chatBox.centerY() + 14.0f },
@@ -4571,7 +4623,9 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
                 fillRoundRect(bubble, 9.5f, m.fromLocal ? COL_BG_CARD_ALT : COL_BG_CARD);
                 strokeRoundRect(bubble, 9.5f, m.fromLocal ? COL_BORDER_ALT : COL_BORDER);
 
-                drawText(m.senderName, { bubble.left + 10.0f, bubble.top + 4.0f, bubble.right - 10.0f, bubble.top + 20.0f },
+                const std::string sender = profile::splitWireName(m.senderName).name;
+                drawAvatar(bubble.left + 20.0f, bubble.top + 12.0f, 10.0f, m.fromLocal ? identity_.deskId() : chatPeerDesk, sender, 1.0f);
+                drawText(sender, { bubble.left + 36.0f, bubble.top + 4.0f, bubble.right - 10.0f, bubble.top + 20.0f },
                          ui::FontRole::Small, m.fromLocal ? COL_PRIMARY_ACCENT : COL_TEXT_ACCENT);
 
                 if (m.hasImage) {
@@ -5341,12 +5395,16 @@ void AppUi::drawIncomingApprovalModal(float width, float height, float modalProg
     float mrx = modal.right - 26.0f;
     float my = modal.top + 24.0f;
 
-    drawText("Someone wants to connect", { mx, my, mrx, my + 28.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    const std::string callerName = profile::splitWireName(req.callerHostname).name;
+    // The picture is only the caller's while the request is open; the request keeps it after a decision
+    const std::vector<uint8_t>& callerPic = req.active ? req.callerPicture : snapshotCallerPicture_;
+    drawAvatar(mx + 22.0f, my + 27.0f, 22.0f, req.callerDeskId, callerName, alpha, &callerPic);
+    drawText("Someone wants to connect", { mx + 56.0f, my, mrx, my + 28.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
     my += 30.0f;
 
     const std::string callerId = CryptoUtils::formatDeskId(req.callerDeskId);
-    const std::string callerLine = req.callerHostname.empty() ? "Desk " + callerId : req.callerHostname + " \xC2\xB7 " + callerId;
-    drawText(callerLine, { mx, my, mrx, my + 24.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
+    const std::string callerLine = callerName.empty() ? "Desk " + callerId : callerName + " \xC2\xB7 " + callerId;
+    drawText(callerLine, { mx + 56.0f, my, mrx, my + 24.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
     my += 24.0f;
 
     drawText("They will see your screen. Choose what else they can do.",
@@ -5425,8 +5483,9 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
 
     std::string peerTitle = stats.remoteHostname.empty()
         ? CryptoUtils::formatDeskId(stats.remoteDeskId)
-        : stats.remoteHostname;
-    drawText(peerTitle, { curX, pillTop, curX + 130.0f, pillBottom }, ui::FontRole::Small, COL_TEXT_PRIMARY);
+        : profile::splitWireName(stats.remoteHostname).name;
+    drawAvatar(curX + 9.0f, pillRect.centerY(), 9.0f, stats.remoteDeskId, peerTitle, 1.0f);
+    drawText(peerTitle, { curX + 22.0f, pillTop, curX + 130.0f, pillBottom }, ui::FontRole::Small, COL_TEXT_PRIMARY);
     curX += 136.0f;
 
     // 1. Display Switcher
@@ -6505,7 +6564,10 @@ void AppUi::drawFleetView(const UiRect& bounds, float alpha) {
         // Name, state and the newest send; Open hands the PC to a normal session tab
         const float bx = tr.left + 10.0f, by = tr.bottom - barH;
         UiRect openBtn = { tr.right - 64.0f, by + 8.0f, tr.right - 10.0f, by + 32.0f };
-        drawText(t.name.empty() ? CryptoUtils::formatDeskId(t.deskId) : t.name, { bx, by + 3.0f, openBtn.left - 6.0f, by + 20.0f },
+        const std::string tileName = t.name.empty() ? CryptoUtils::formatDeskId(t.deskId) : profile::splitWireName(t.name).name;
+        const float tx = bx + 22.0f;
+        drawAvatar(bx + 9.0f, by + 20.0f, 9.0f, t.deskId, tileName, alpha);
+        drawText(tileName, { tx, by + 3.0f, openBtn.left - 6.0f, by + 20.0f },
                  ui::FontRole::Small, COL_TEXT_PRIMARY);
         std::string state = "Connecting\xE2\x80\xA6";
         ui::Color stateCol = COL_TEXT_SECONDARY;
@@ -6517,9 +6579,9 @@ void AppUi::drawFleetView(const UiRect& bounds, float alpha) {
             state = busy ? "Busy" : "Failed: " + t.statusMessage;
             stateCol = busy ? COL_WARNING : COL_DANGER;
         }
-        const float stateW = canvas_->measureTextBlock(state, ui::FontRole::Small, openBtn.left - 6.0f - bx).x;
-        drawText(state, { bx, by + 20.0f, openBtn.left - 6.0f, by + 37.0f }, ui::FontRole::Small, stateCol);
-        if (t.lastOutgoing && bx + stateW + 10.0f < openBtn.left - 6.0f) {
+        const float stateW = canvas_->measureTextBlock(state, ui::FontRole::Small, openBtn.left - 6.0f - tx).x;
+        drawText(state, { tx, by + 20.0f, openBtn.left - 6.0f, by + 37.0f }, ui::FontRole::Small, stateCol);
+        if (t.lastOutgoing && tx + stateW + 10.0f < openBtn.left - 6.0f) {
             std::string sent;
             ui::Color sentCol = COL_TEXT_SECONDARY;
             switch (t.lastOutgoing->status) {
@@ -6529,7 +6591,7 @@ void AppUi::drawFleetView(const UiRect& bounds, float alpha) {
                 case TransferStatus::Completed: sent = "\xE2\x9C\x93 Sent"; sentCol = COL_SUCCESS; break;
                 default: sent = "\xE2\x9C\x97 Failed"; sentCol = COL_DANGER; break;
             }
-            drawText(sent, { bx + stateW + 10.0f, by + 20.0f, openBtn.left - 6.0f, by + 37.0f }, ui::FontRole::Small, sentCol);
+            drawText(sent, { tx + stateW + 10.0f, by + 20.0f, openBtn.left - 6.0f, by + 37.0f }, ui::FontRole::Small, sentCol);
         }
         drawButton("fleet_open_" + std::to_string(t.deskId), openBtn, "Open",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this, deskId = t.deskId]() {
@@ -10235,7 +10297,7 @@ void AppUi::onTick() {
             if (!glideHome) showToast("Connected on same PC. View-Only enabled (F8 to toggle).");
         } else {
             remoteInputEnabled_ = true;
-            if (!glideHome) showToast("Connected to " + vStats.remoteHostname);
+            if (!glideHome) showToast("Connected to " + profile::splitWireName(vStats.remoteHostname).name);
         }
 
         SessionTab* activeTab = sessionTabs_.activeTab();
@@ -10244,7 +10306,7 @@ void AppUi::onTick() {
             activeTab->deskId = vStats.remoteDeskId;
             activeTab->remoteHostname = vStats.remoteHostname;
             if (!vStats.remoteHostname.empty()) {
-                activeTab->title = vStats.remoteHostname;
+                activeTab->title = profile::splitWireName(vStats.remoteHostname).name;
             }
             activeTab->connectedSinceTickMs = tickNow;
         }
@@ -10298,7 +10360,7 @@ void AppUi::onTick() {
             curTab->privacyModeEngaged = vStats.privacyModeEngaged;
             if (!vStats.remoteHostname.empty() && curTab->remoteHostname != vStats.remoteHostname) {
                 curTab->remoteHostname = vStats.remoteHostname;
-                curTab->title = vStats.remoteHostname;
+                curTab->title = profile::splitWireName(vStats.remoteHostname).name;
             }
         }
     }
@@ -10351,13 +10413,13 @@ void AppUi::onTick() {
     if (unreadChat > lastSeenUnreadChat_) {
         auto msgs = network_.chatMessages();
         if (!msgs.empty() && !msgs.back().fromLocal) {
-            showToast(msgs.back().senderName + ": " + msgs.back().text);
+            showToast(profile::splitWireName(msgs.back().senderName).name + ": " + msgs.back().text);
             bool isUnfocused = !shell_->isWindowForeground();
             bool drawerClosed = (!showFileDrawer_ || drawerTab_ != DrawerTab::LiveChat);
             if ((isUnfocused || drawerClosed) && notificationMgr_) {
                 notificationMgr_->notify(
                     NotificationType::ChatMessage,
-                    msgs.back().senderName.empty() ? "New Chat Message" : msgs.back().senderName,
+                    msgs.back().senderName.empty() ? "New Chat Message" : profile::splitWireName(msgs.back().senderName).name,
                     msgs.back().text,
                     identity_.settings()
                 );
@@ -10389,7 +10451,7 @@ void AppUi::onTick() {
         shell_->bringToFront();
         if (notificationMgr_) {
             std::string title = "Incoming Connection Request";
-            std::string caller = pending.callerHostname.empty() ? "Remote User" : pending.callerHostname;
+            std::string caller = pending.callerHostname.empty() ? "Remote User" : profile::splitWireName(pending.callerHostname).name;
             std::string msg = caller + " (" + CryptoUtils::formatDeskId(pending.callerDeskId) + ") is requesting remote control.";
             notificationMgr_->notify(NotificationType::IncomingConnection, title, msg, identity_.settings());
         }
@@ -10661,10 +10723,10 @@ std::vector<std::string> AppUi::snapshotStateNames() {
     return { "dashboard_light", "dashboard_dark", "theme_mid_blend", "settings_appearance", "settings_display",
              "settings_audio", "settings_permissions", "settings_2fa", "settings_network", "settings_privacy",
              "settings_system", "settings_about", "settings_glide", "session_view", "session_more_menu", "session_tabs_3", "drawer_file_transfer", "drawer_terminal", "drawer_notes",
-             "drawer_file_manager", "drawer_sync", "chat_long_text", "modal_approval", "modal_totp", "modal_run_task",
+             "drawer_file_manager", "drawer_sync", "chat_long_text", "modal_approval", "modal_approval_picture", "modal_totp", "modal_run_task",
              "modal_address_book", "modal_recording_player", "modal_omnibar", "toast", "tooltip",
              "modal_pair_offer", "settings_permissions_paired", "home_grid_select", "fleet_grid",
-             "home_desks", "home_menu", "sessions_empty",
+             "home_desks", "home_desks_pictures", "home_menu", "sessions_empty",
              // Dark twins of the screens the redesign touched (light and dark are both first-class)
              "settings_appearance_dark", "settings_display_dark", "settings_privacy_dark", "drawer_file_transfer_dark", "drawer_terminal_dark", "drawer_sync_dark", "chat_long_text_dark", "modal_approval_dark", "modal_address_book_dark", "modal_omnibar_dark", "session_more_menu_dark", "home_menu_dark",
              "dashboard_mac_permissions", "dashboard_mac_restart", "dashboard_wayland_denied", "dashboard_wayland_view_only",
@@ -10733,6 +10795,22 @@ void AppUi::applySnapshotState(const std::string& name) {
     fleetPicked_.clear();
     constexpr uint64_t kSeedDesks[] = { 555000401, 555000402, 555000403 };   // home_desks and home_menu seed these
     for (uint64_t d : kSeedDesks) identity_.removeRecentSession(d);
+    for (uint64_t d : kSeedDesks) network_.injectPeerPictureForTest(d, {});
+    snapshotCallerPicture_.clear();
+    // A 96x96 gradient stands in for a profile picture
+    auto syntheticPicture = [](uint8_t tint) {
+        std::vector<uint8_t> px(96u * 96u * 4u);
+        for (int y = 0; y < 96; ++y) {
+            for (int x = 0; x < 96; ++x) {
+                uint8_t* p = &px[(static_cast<size_t>(y) * 96 + x) * 4];
+                p[0] = static_cast<uint8_t>(x * 255 / 95);
+                p[1] = static_cast<uint8_t>(y * 255 / 95);
+                p[2] = tint;
+                p[3] = 255;
+            }
+        }
+        return TileCodec::encodeJpeg(px.data(), 96, 96, 85);
+    };
     fleet_.closeAll();
     snapshotFleetTiles_ = nullptr;
 
@@ -10798,8 +10876,9 @@ void AppUi::applySnapshotState(const std::string& name) {
         viewer.viewerIp = "192.168.1.20";
         snapshotHostStatus_ = viewer;
         snapshotHostMicLive_ = true;
-    } else if (name == "modal_approval") {
+    } else if (name == "modal_approval" || name == "modal_approval_picture") {
         activeTab_ = ActiveTab::Dashboard;
+        if (name == "modal_approval_picture") snapshotCallerPicture_ = syntheticPicture(60);
         snapshotPerFrame_ = [](AppUi& a) { a.modalAnimT_ = 1.0f; a.modalAnimVel_ = 0.0f; };
     } else if (name == "modal_totp") {
         showTotpModal_ = true;
@@ -10823,11 +10902,16 @@ void AppUi::applySnapshotState(const std::string& name) {
         p.hostname = "Build Server";
         p.deskId = kSeedHost;
         identity_.addPairedHost(p);
-    } else if (name == "home_desks" || name == "home_menu") {
+    } else if (name == "home_desks" || name == "home_desks_pictures" || name == "home_menu") {
         activeTab_ = ActiveTab::Dashboard;
+        const bool pics = name == "home_desks_pictures";
         identity_.addOrUpdateRecentSession(kSeedDesks[2], "mums-laptop", "", "Mum's laptop");
-        identity_.addOrUpdateRecentSession(kSeedDesks[1], "build-01", "", "", "Servers");
+        identity_.addOrUpdateRecentSession(kSeedDesks[1], pics ? "Sam \xC2\xB7 build-01" : "build-01", "", "", "Servers");
         identity_.addOrUpdateRecentSession(kSeedDesks[0], "OFFICE-PC", "", "Office", "Work");
+        if (pics) {   // the middle row keeps its initial
+            network_.injectPeerPictureForTest(kSeedDesks[0], syntheticPicture(200));
+            network_.injectPeerPictureForTest(kSeedDesks[2], syntheticPicture(120));
+        }
         identity_.toggleFavoriteSession(kSeedDesks[0]);
         if (name == "home_menu") {
             snapshotPerFrame_ = [](AppUi& a) {

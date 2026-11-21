@@ -5633,6 +5633,14 @@ void NetworkEngine::storePeerPicture(uint64_t deskId, const std::vector<uint8_t>
     peerPictureGeneration_.fetch_add(1);
 }
 
+void NetworkEngine::injectPeerPictureForTest(uint64_t deskId, const std::vector<uint8_t>& jpeg) {
+    {
+        std::lock_guard<std::mutex> lk(peerPictureMutex_);
+        if (jpeg.empty()) peerPictures_.erase(deskId); else peerPictures_[deskId] = jpeg;
+    }
+    peerPictureGeneration_.fetch_add(1);
+}
+
 void NetworkEngine::sendProfilePicture() {
     ByteWriter w;
     writeWirePicture(w, ownPicture());

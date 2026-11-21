@@ -121,8 +121,10 @@ fillRoundRect 420.00 263.00 860.00 539.00 r20.00 c0.15,0.12,0.08,0.10
 fillRoundRect 420.00 262.00 860.00 538.00 r20.00 c0.15,0.15,0.13,1.00
 strokeRoundRect 420.00 262.00 860.00 538.00 r20.00 c0.23,0.22,0.20,1.00 w1.00
 fillRoundRect 434.00 262.80 846.00 263.80 r0.50 c1.00,1.00,1.00,0.05
-drawText 446.00 286.00 834.00 314.00 Heading LC c0.98,0.97,0.95,1.00 |Someone wants to connect
-drawText 446.00 316.00 834.00 340.00 Subheading LC c0.98,0.97,0.95,1.00 |Desk 0
+fillEllipse 468.00 313.00 22.00 22.00 c0.63,0.32,0.18,1.00
+drawText 446.00 291.00 490.00 335.00 BodyBold CC c1.00,1.00,1.00,1.00 |?
+drawText 502.00 286.00 834.00 314.00 Heading LC c0.98,0.97,0.95,1.00 |Someone wants to connect
+drawText 502.00 316.00 834.00 340.00 Subheading LC c0.98,0.97,0.95,1.00 |Desk 0
 drawText 446.00 340.00 834.00 360.00 Small LC c0.72,0.69,0.65,1.00 |They will see your screen. Choose what else they can do.
 drawText 446.00 368.00 780.00 394.00 Body LC c0.98,0.97,0.95,1.00 |Allow mouse and keyboard control
 fillRoundRect 792.00 370.80 834.00 394.80 r12.00 c0.85,0.47,0.34,0.24
