@@ -1,5 +1,6 @@
 #include "../src/core/protocol.hpp"
 #include "../src/core/crypto_identity.hpp"
+#include "../src/core/profile.hpp"
 #include "../src/simd/simd_kernels.hpp"
 #include "../src/capture/screen_capture.hpp"
 #include "../src/control/input_injector.hpp"
@@ -13037,6 +13038,72 @@ void testOsAssignedPorts() {
 #include "fix_tests_f.inc"
 #include "fix_tests_g.inc"
 
+// Username helpers: normalising, the "Name \xC2\xB7 HOST" wire form, and the setting's round trip through the config file.
+void testProfileNames() {
+    std::cout << "[TEST 122] Username normalising, wire name compose/split, setting round trip...\n";
+    using namespace cppdesk::profile;
+    auto isValidUtf8 = [](const std::string& s) {
+        size_t i = 0;
+        while (i < s.size()) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+            if (n == 0 || i + n > s.size()) return false;
+            for (size_t k = 1; k < n; ++k) if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) return false;
+            i += n;
+        }
+        return true;
+    };
+
+    TEST_ASSERT(composeWireName("", "DESKTOP-4F2") == "DESKTOP-4F2");
+    TEST_ASSERT(composeWireName("Jane", "DESKTOP-4F2") == "Jane \xC2\xB7 DESKTOP-4F2");
+    WireName w = splitWireName("Jane \xC2\xB7 DESKTOP-4F2");
+    TEST_ASSERT(w.name == "Jane" && w.computer == "DESKTOP-4F2");
+    w = splitWireName("A \xC2\xB7 B \xC2\xB7 PC");
+    TEST_ASSERT(w.name == "A \xC2\xB7 B" && w.computer == "PC");
+    w = splitWireName("PC");
+    TEST_ASSERT(w.name == "PC" && w.computer.empty());
+
+    TEST_ASSERT(normaliseName("  Jane  ") == "Jane");
+    TEST_ASSERT(normaliseName(" Ja\tne\n\x01 ") == "Jane");
+    std::string longName;
+    for (int i = 0; i < 40; ++i) longName += "\xE6\x97\xA5";
+    TEST_ASSERT(normaliseName(longName).size() == 96);
+
+    std::string emoji;
+    for (int i = 0; i < 32; ++i) emoji += "\xF0\x9F\x98\x80";
+    std::string tight = composeWireName(emoji, "VERY-LONG-HOSTNAME", 63);
+    TEST_ASSERT(tight.size() <= 63 && isValidUtf8(tight));
+    std::string wideHost;
+    for (int i = 0; i < 10; ++i) wideHost += "\xE6\x97\xA5";
+    std::string cutHost = composeWireName("Jane", wideHost, 14);   // 4 + 3 separator bytes leave 7: two 3-byte characters
+    TEST_ASSERT(cutHost.size() <= 14 && isValidUtf8(cutHost) && splitWireName(cutHost).computer == "\xE6\x97\xA5\xE6\x97\xA5");
+
+    std::filesystem::path cfg;
+    { IdentityManager probe(4410); cfg = probe.configFilePath(); }
+    std::error_code ec;
+    std::filesystem::remove(cfg, ec);
+    {
+        IdentityManager id(4410);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(id.displayName().empty() && id.wireName() == id.hostname());
+        AppSettings s = id.settings();
+        s.displayName = "Jane";
+        id.updateSettings(s);
+        TEST_ASSERT(id.save());
+    }
+    {
+        IdentityManager id(4410);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(id.settings().displayName == "Jane" && id.displayName() == "Jane");
+        TEST_ASSERT(id.wireName() == "Jane \xC2\xB7 " + id.hostname());
+        TEST_ASSERT(id.peerPicturePath(42) == peerPicturePath(cfg, 4410, 42));
+        TEST_ASSERT(id.ownPicturePath() == ownPicturePath(cfg, 4410));
+    }
+    std::filesystem::remove(cfg, ec);
+    TEST_ASSERT(peerPicturePath("cfg/config_3.ini", 3, 42).generic_string().ends_with("avatars_3/42.jpg"));
+    TEST_ASSERT(ownPicturePath("cfg/config_3.ini", 3).generic_string().ends_with("profile_3.jpg"));
+}
+
 int main(int argc, char** argv) {
     try {
         setOsAssignedPortsForTest(true);   // every listener binds an OS-assigned port; tests dial the port that was bound
@@ -13140,6 +13207,7 @@ int main(int argc, char** argv) {
         testAppUiRendersEveryScreenHeadless(); std::cout << "Test 70 done\n" << std::flush;
         testAppUiPublicInputApi(); std::cout << "Test 71 done\n" << std::flush;
         testUiGoldens(); std::cout << "Test 72 done\n" << std::flush;
+        testProfileNames(); std::cout << "Test 122 done\n" << std::flush;
 #if defined(__linux__)
         testCairoCanvas(); std::cout << "Test 73 done\n" << std::flush;
 #endif

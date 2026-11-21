@@ -85,6 +85,9 @@ struct AppSettings {
 
     // Glide: desk ID of the paired PC placed past each screen edge (config keys glide_left/right/top/bottom); 0 = nothing placed
     uint64_t      glideLeft = 0, glideRight = 0, glideTop = 0, glideBottom = 0;
+
+    // Profile: the username shown to peers (config key display_name); empty = peers see only the hostname
+    std::string   displayName = "";
 };
 
 class CryptoUtils {
@@ -390,6 +393,12 @@ public:
     const TotpManager& totpManager() const { return totpManager_; }
 
     std::string configFilePath() const;
+
+    // Profile: the normalised username, and what peers are sent in place of the hostname ("Name \xC2\xB7 HOST", or just HOST)
+    std::string displayName() const;
+    std::string wireName(size_t maxBytes = 255) const;
+    std::filesystem::path ownPicturePath() const;
+    std::filesystem::path peerPicturePath(uint64_t deskId) const;
     void setConfigPathForTest(const std::filesystem::path& path);
 
     // Pairing (thread-safe; getters return copies). The add/remove calls save the config.

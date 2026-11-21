@@ -1,5 +1,6 @@
 #include "crypto_identity.hpp"
 #include "protocol.hpp"
+#include "profile.hpp"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -584,6 +585,26 @@ IdentityManager::IdentityManager(int instanceId)
 #endif
 }
 
+std::string IdentityManager::displayName() const {
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    return profile::normaliseName(settings_.displayName);
+}
+
+std::string IdentityManager::wireName(size_t maxBytes) const {
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    return profile::composeWireName(profile::normaliseName(settings_.displayName), hostname_, maxBytes);
+}
+
+std::filesystem::path IdentityManager::ownPicturePath() const {
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    return profile::ownPicturePath(configPath_, instanceId_);
+}
+
+std::filesystem::path IdentityManager::peerPicturePath(uint64_t deskId) const {
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    return profile::peerPicturePath(configPath_, instanceId_, deskId);
+}
+
 std::string IdentityManager::configFilePath() const {
     std::lock_guard<std::mutex> lk(stateMutex_);
     auto u8 = configPath_.u8string();
@@ -642,6 +663,8 @@ bool IdentityManager::loadOrCreate() {
                 }
             } else if (key == "relay_auth_key") {
                 settings_.relayAuthKey = val;
+            } else if (key == "display_name") {
+                settings_.displayName = val;
             } else if (key == "stun_server") {
                 if (!val.empty()) settings_.stunServer = val;
             } else if (key == "relay_mode") {
@@ -884,6 +907,7 @@ bool IdentityManager::save() const {
         out << "relay_server=" << sanitizeIniLine(settings_.relayServer.empty() ? relayServerAddr_ : settings_.relayServer) << "\n";
         out << "relay_auth_key=" << sanitizeIniLine(settings_.relayAuthKey) << "\n";
         out << "stun_server=" << sanitizeIniLine(settings_.stunServer) << "\n";
+        out << "display_name=" << sanitizeIniLine(settings_.displayName) << "\n";
         out << "relay_mode=" << static_cast<int>(settings_.relayMode) << "\n";
         out << "dark_theme=" << (settings_.darkTheme ? "1" : "0") << "\n";
         out << "reduce_motion=" << static_cast<int>(settings_.reduceMotion) << "\n";

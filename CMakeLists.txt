@@ -13,6 +13,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Common core sources
 set(CORE_SOURCES
     src/core/crypto_identity.cpp
+    src/core/profile.cpp
     src/core/totp_manager.cpp
     src/core/qr_matrix.cpp
     src/net/network_engine.cpp
