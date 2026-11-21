@@ -26,6 +26,7 @@ struct RecentSessionEntry {
 
 struct AppSettings {
     bool          darkTheme = false;                     // false = Light (White & Blue), true = Dark (Black & Blue)
+    uint8_t       reduceMotion = 0;                      // 0 = follow the OS, 1 = on, 2 = off
     uint8_t       targetFps = 30;                        // 15, 30, 45, or 60 FPS
     bool          adaptiveFps = true;                    // Auto-drop FPS when network connection is poor
     QualityPreset defaultQuality = QualityPreset::Balanced;

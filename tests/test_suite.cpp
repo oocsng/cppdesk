@@ -622,6 +622,7 @@ void testAppSettingsAndAdaptiveFps() {
         idSave.loadOrCreate();
         AppSettings s = idSave.settings();
         s.darkTheme = true;
+        s.reduceMotion = 1;
         s.targetFps = 60;
         s.adaptiveFps = false;
         s.defaultQuality = QualityPreset::LowBandwidth;
@@ -643,6 +644,7 @@ void testAppSettingsAndAdaptiveFps() {
         idLoad.loadOrCreate();
         AppSettings loaded = idLoad.settings();
         TEST_ASSERT(loaded.darkTheme == true);
+        TEST_ASSERT(loaded.reduceMotion == 1);
         TEST_ASSERT(loaded.targetFps == 60);
         TEST_ASSERT(loaded.adaptiveFps == false);
         TEST_ASSERT(loaded.defaultQuality == QualityPreset::LowBandwidth);
@@ -662,6 +664,7 @@ void testAppSettingsAndAdaptiveFps() {
         idLoad.resetSettingsToDefault();
         AppSettings def = idLoad.settings();
         TEST_ASSERT(def.darkTheme == false);
+        TEST_ASSERT(def.reduceMotion == 0);
         TEST_ASSERT(def.targetFps == 30);
         TEST_ASSERT(def.adaptiveFps == true);
         TEST_ASSERT(def.defaultQuality == QualityPreset::Balanced);
@@ -6661,34 +6664,39 @@ void testCrossPlatformUiWindowingAndMacOsViewer() {
         TEST_ASSERT(std::abs(vel) < 0.01f);
         TEST_ASSERT(maxOvershoot > 0.005f);
 
-        // 4.2: Tactile transformed rect geometry (UiPlatform::computeSpringRect)
+        // 4.2: Press shrinks to 97% around the centre; at rest the rect is unchanged
         UiPlatformRect baseBtn = { 100.0f, 200.0f, 200.0f, 240.0f };
+        UiPlatformRect restRect = UiPlatform::computeSpringRect(baseBtn, 0.0f);
+        TEST_ASSERT(std::abs(restRect.left - baseBtn.left) < 0.001f && std::abs(restRect.bottom - baseBtn.bottom) < 0.001f);
+        UiPlatformRect pressRect = UiPlatform::computeSpringRect(baseBtn, 1.0f);
+        TEST_ASSERT(std::abs(pressRect.width() - 97.0f) < 0.01f && std::abs(pressRect.height() - 38.8f) < 0.01f);
+        TEST_ASSERT(std::abs(pressRect.centerX() - baseBtn.centerX()) < 0.001f && std::abs(pressRect.centerY() - baseBtn.centerY()) < 0.001f);
 
-        // Resting state: hoverT = 0, pressT = 0
-        UiPlatformRect restRect = UiPlatform::computeSpringRect(baseBtn, 0.0f, 0.0f);
-        TEST_ASSERT(std::abs(restRect.left - baseBtn.left) < 0.001f);
-        TEST_ASSERT(std::abs(restRect.top - baseBtn.top) < 0.001f);
-        TEST_ASSERT(std::abs(restRect.width() - baseBtn.width()) < 0.001f);
-        TEST_ASSERT(std::abs(restRect.height() - baseBtn.height()) < 0.001f);
+        // 4.3: Popovers grow from 95% around their trigger point
+        UiPlatformRect menu = { 100.0f, 50.0f, 300.0f, 250.0f };
+        UiPlatformRect start = UiPlatform::popoverRect(menu, 0.0f, 200.0f, 50.0f);
+        TEST_ASSERT(std::abs(start.top - 50.0f) < 0.001f && std::abs(start.width() - 190.0f) < 0.01f);
+        UiPlatformRect end = UiPlatform::popoverRect(menu, 1.0f, 200.0f, 50.0f);
+        TEST_ASSERT(std::abs(end.left - menu.left) < 0.001f && std::abs(end.bottom - menu.bottom) < 0.001f);
 
-        // Hover state (hoverT = 1.0, pressT = 0): expands bounds, lifts upward
-        UiPlatformRect hoverRect = UiPlatform::computeSpringRect(baseBtn, 1.0f, 0.0f);
-        TEST_ASSERT(hoverRect.width() > baseBtn.width());
-        TEST_ASSERT(hoverRect.height() > baseBtn.height());
-        TEST_ASSERT(hoverRect.top < baseBtn.top);
-        TEST_ASSERT(std::abs(hoverRect.centerY() - (baseBtn.centerY() - 1.8f)) < 0.05f);
-
-        // Pressed state (hoverT = 1.0, pressT = 1.0): squishes down, depresses downward
-        UiPlatformRect pressRect = UiPlatform::computeSpringRect(baseBtn, 1.0f, 1.0f);
-        TEST_ASSERT(pressRect.width() < hoverRect.width());
-        TEST_ASSERT(pressRect.height() < hoverRect.height());
-        TEST_ASSERT(pressRect.top > hoverRect.top);
-
-        // Standalone press from rest (hoverT = 0, pressT = 1.0)
-        UiPlatformRect pressFromRest = UiPlatform::computeSpringRect(baseBtn, 0.0f, 1.0f);
-        TEST_ASSERT(pressFromRest.width() < baseBtn.width());
-        TEST_ASSERT(pressFromRest.height() < baseBtn.height());
-        TEST_ASSERT(pressFromRest.top > baseBtn.top);
+        // 4.4: App motion never overshoots, exits finish sooner, and reduced motion jumps to the target
+        auto framesToSettle = [](float from, float to, bool reduced, float& maxOvershoot) {
+            float p = from, v = 0.0f;
+            maxOvershoot = 0.0f;
+            for (int f = 1; f <= 120; ++f) {
+                UiPlatform::stepMotion(p, v, to, 32.0f, 0.72f, 0.016f, 0.0012f, reduced);
+                maxOvershoot = std::max(maxOvershoot, (to > from) ? p - to : to - p);
+                if (std::fabs(p - to) < 0.01f) return f;
+            }
+            return 999;
+        };
+        float over = 0.0f;
+        const int enterFrames = framesToSettle(0.0f, 1.0f, false, over);
+        TEST_ASSERT(over <= 0.0f);
+        const int exitFrames = framesToSettle(1.0f, 0.0f, false, over);
+        TEST_ASSERT(over <= 0.0f);
+        TEST_ASSERT(exitFrames < enterFrames);
+        TEST_ASSERT(framesToSettle(0.0f, 1.0f, true, over) == 1);
     }
 }
 
@@ -6837,6 +6845,10 @@ void testThemePaletteContrast() {
         // Exemption: white label on the terracotta fill is about 3.1:1; the Connect-screen sub-project owns the button design.
         CONTRAST_CHECK(COL_TEXT_ON_ACCENT, COL_PRIMARY_ACCENT, 3.0);
 
+        // The espresso rail stays dark in both modes.
+        CONTRAST_CHECK(COL_RAIL_TEXT, COL_RAIL_BG, 4.5);
+        CONTRAST_CHECK(COL_RAIL_TEXT_ACTIVE, COL_RAIL_BG, 4.5);
+
         // Not covered: COL_STAGE_BG (sits behind the remote canvas, no text) and the rewind-bar label (drawn over video).
         TEST_ASSERT(std::fabs(COL_HUD_BG.a - 0.94f) < 1e-5f);
 
@@ -6866,19 +6878,11 @@ void testThemeScales() {
     TEST_ASSERT(theme::type::mono.size == 14.0f && theme::type::mono.weight == 700);
     TEST_ASSERT(theme::type::tooltip.size == 11.5f && theme::type::tooltip.weight == 400);
 
-    // Motion scale equals the spring parameters the update loop used before the scale existed.
-    TEST_ASSERT(theme::motion::themeBlend.omega == 20.0f && theme::motion::themeBlend.zeta == 0.92f);
-    TEST_ASSERT(theme::motion::hover.omega == 32.0f && theme::motion::hover.zeta == 0.72f);
-    TEST_ASSERT(theme::motion::press.omega == 38.0f && theme::motion::press.zeta == 0.68f);
-    TEST_ASSERT(theme::motion::standard.omega == 28.0f && theme::motion::standard.zeta == 0.74f);
-    TEST_ASSERT(theme::motion::menu.omega == 32.0f && theme::motion::menu.zeta == 0.76f);
-    TEST_ASSERT(theme::motion::panel.omega == 26.0f && theme::motion::panel.zeta == 0.78f);
-    TEST_ASSERT(theme::motion::drawer.omega == 26.0f && theme::motion::drawer.zeta == 0.80f);
-    TEST_ASSERT(theme::motion::scroll.omega == 32.0f && theme::motion::scroll.zeta == 0.88f);
+    // Everyday UI never bounces: every motion spring is critically damped.
     for (const auto& s : { theme::motion::themeBlend, theme::motion::hover, theme::motion::press,
                            theme::motion::standard, theme::motion::menu, theme::motion::panel,
                            theme::motion::drawer, theme::motion::scroll }) {
-        TEST_ASSERT(s.omega > 0.0f && s.zeta > 0.0f && s.zeta < 1.0f);
+        TEST_ASSERT(s.omega > 0.0f && s.zeta >= 1.0f);
     }
 }
 
@@ -8174,7 +8178,7 @@ void testLinuxWindow() {
         }
 
         // Click the desk search box and type into it.
-        auto field = findTextRect(w.app(), wDip, hDip, "Search desks...");
+        auto field = findTextRect(w.app(), wDip, hDip, "Desk ID or name");
         TEST_ASSERT(field.has_value());
         if (field) {
             sendButton(peer, win, static_cast<int>((field->left + field->right) / 2),
@@ -8264,7 +8268,7 @@ void testLinuxWindow() {
         }));
         TEST_ASSERT(attrs.width >= 2 * 900);   // at least the 900-DIP minimum, doubled
         const float wd = attrs.width / 2.0f, hd = attrs.height / 2.0f;
-        auto field = findTextRect(w.app(), wd, hd, "Search desks...");
+        auto field = findTextRect(w.app(), wd, hd, "Desk ID or name");
         TEST_ASSERT(field.has_value());
         if (field) {
             sendButton(peer, win, static_cast<int>(field->left + field->right), static_cast<int>(field->top + field->bottom));
@@ -8302,7 +8306,7 @@ void testMacWindow() {
         TEST_ASSERT(macWindowDrewVariedPixels(w.nativeWindow()));
 
         // Click the desk search box and type into it: once each, not twice (keyDown and the text input client).
-        auto field = findTextRect(w.app(), wDip, hDip, "Search desks...");
+        auto field = findTextRect(w.app(), wDip, hDip, "Desk ID or name");
         TEST_ASSERT(field.has_value());
         if (field) {
             macClick(w.nativeWindow(), (field->left + field->right) / 2, (field->top + field->bottom) / 2);
@@ -8852,7 +8856,7 @@ void testLinuxTray() {
         w.app().applySnapshotState("settings_system");
         ui::RecordingCanvas rc;
         for (int i = 0; i < 30; ++i) w.app().render(rc, 1220, 760, 1.0 / 60.0);
-        return rc.serialize().find("Minimize window to system tray") != std::string::npos;
+        return rc.serialize().find("Minimize to the tray") != std::string::npos;
     };
 
     // No tray: the toggle is hidden and closing quits instead of hiding the window for good.
@@ -9117,17 +9121,17 @@ void testShellCapabilityGating() {
     std::string sysAll = renderAppState(id, net, all, "settings_system");
     std::string dashAll = renderAppState(id, net, all, "dashboard_light");
     TEST_ASSERT(sysAll.find("|Uninstall") != std::string::npos);
-    TEST_ASSERT(sysAll.find("WINDOWS SYSTEM SERVICE") != std::string::npos);
-    TEST_ASSERT(sysAll.find("Windows Action Center push toasts") != std::string::npos);
+    TEST_ASSERT(sysAll.find("Windows service") != std::string::npos);
+    TEST_ASSERT(sysAll.find("Windows notifications") != std::string::npos);
 
     FakeShell none;
     none.service = none.elevation = none.shortcut = none.actionCenter = none.tray = false;
     std::string sysNone = renderAppState(id, net, none, "settings_system");
     std::string dashNone = renderAppState(id, net, none, "dashboard_light");
     TEST_ASSERT(sysNone.find("|Uninstall") == std::string::npos);
-    TEST_ASSERT(sysNone.find("WINDOWS SYSTEM SERVICE") == std::string::npos);
-    TEST_ASSERT(sysNone.find("Windows Action Center push toasts") == std::string::npos);
-    TEST_ASSERT(sysNone.find("Minimize window to system tray") == std::string::npos);
+    TEST_ASSERT(sysNone.find("Windows service") == std::string::npos);
+    TEST_ASSERT(sysNone.find("Windows notifications") == std::string::npos);
+    TEST_ASSERT(sysNone.find("Minimize to the tray") == std::string::npos);
     TEST_ASSERT(dashNone.find("|Elevate Admin") == std::string::npos);
     // No Windows wording where the platform is not Windows.
     TEST_ASSERT(sysNone.find("Windows") == std::string::npos);
@@ -9155,7 +9159,7 @@ void testAppUiRendersEveryScreenHeadless() {
         TEST_ASSERT(rc.ops().size() > 20);
     }
     std::string approval = renderAppState(id, net, shell, "modal_approval");
-    TEST_ASSERT(approval.find("|Connection Request") != std::string::npos);
+    TEST_ASSERT(approval.find("|Someone wants to connect") != std::string::npos);
     std::string dash = renderAppState(id, net, shell, "dashboard_light");
     TEST_ASSERT(dash.find("|" + CryptoUtils::formatDeskId(id.deskId())) != std::string::npos);
 
@@ -9163,13 +9167,13 @@ void testAppUiRendersEveryScreenHeadless() {
     TEST_ASSERT(std::find(names.begin(), names.end(), "modal_pair_offer") != names.end());
     TEST_ASSERT(std::find(names.begin(), names.end(), "settings_permissions_paired") != names.end());
     std::string offer = renderAppState(id, net, shell, "modal_pair_offer");
-    TEST_ASSERT(offer.find("|Pair with this PC?") != std::string::npos);
+    TEST_ASSERT(offer.find("|Pair with this desk?") != std::string::npos);
     TEST_ASSERT(offer.find("|Not now") != std::string::npos);
     TEST_ASSERT(offer.find("|Pair\n") != std::string::npos);
     std::string paired = renderAppState(id, net, shell, "settings_permissions_paired");
     TEST_ASSERT(paired.find("|Allow pairing") != std::string::npos);
-    TEST_ASSERT(paired.find("|PAIRED PCS") != std::string::npos);
-    TEST_ASSERT(paired.find("|PCS THIS ONE CAN ENTER") != std::string::npos);
+    TEST_ASSERT(paired.find("|Paired desks") != std::string::npos);
+    TEST_ASSERT(paired.find("|Desks this one can enter") != std::string::npos);
     TEST_ASSERT(paired.find("|Forget") != std::string::npos);
     TEST_ASSERT(paired.find("|Office \xC2\xB7 555 000 111 \xC2\xB7 paired 2023-11-14") != std::string::npos);
     TEST_ASSERT(paired.find("None yet") == std::string::npos);
@@ -9556,7 +9560,7 @@ void testWaylandShareNoticeUi() {
     {   // Settings: the same words, labelled experimental; gone again when there is nothing to say
         net.setShareNoticeForTest({ShareState::Denied, ""});
         const std::string settings = renderAppState(id, net, shell, "settings_system");
-        TEST_ASSERT(settings.find("|WAYLAND SCREEN SHARING (EXPERIMENTAL)") != npos && settings.find("|Screen sharing is off") != npos);
+        TEST_ASSERT(settings.find("|Wayland screen sharing (experimental)") != npos && settings.find("|Screen sharing is off") != npos);
         net.setShareNoticeForTest({ShareState::Running, ""});
         TEST_ASSERT(renderAppState(id, net, shell, "settings_system").find("WAYLAND SCREEN SHARING") == npos);
         net.setShareNoticeForTest({});
@@ -10285,11 +10289,10 @@ void testFleetUi() {
     NetworkEngine net(id);
     FakeShell shell;
     const auto names = AppUi::snapshotStateNames();
-    TEST_ASSERT(std::find(names.begin(), names.end(), "fleet_picker") != names.end());
+    TEST_ASSERT(std::find(names.begin(), names.end(), "home_grid_select") != names.end());
     TEST_ASSERT(std::find(names.begin(), names.end(), "fleet_grid") != names.end());
-    const std::string picker = renderAppState(id, net, shell, "fleet_picker");
-    TEST_ASSERT(picker.find("|Do it on all") != std::string::npos);
-    TEST_ASSERT(picker.find("|Paired PCs on this network") != std::string::npos);
+    const std::string picker = renderAppState(id, net, shell, "home_grid_select");
+    TEST_ASSERT(picker.find("|Build Server") != std::string::npos);
     TEST_ASSERT(picker.find("|Offline") != std::string::npos);      // a paired PC discovery does not see
     TEST_ASSERT(picker.find("|Open grid (0)") != std::string::npos);
     const std::string grid = renderAppState(id, net, shell, "fleet_grid");
@@ -10351,7 +10354,7 @@ void testFleetUi() {
             app.onKey({0xBF, 0x35, false, false});
             app.onKey({VK_F1, 0x3B, true, false});  // the help sheet opens while Shift is still held
             for (int i = 0; i < 10; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);
-            TEST_ASSERT(rc.serialize().find("|Keyboard Shortcuts") != std::string::npos);   // a modal is up
+            TEST_ASSERT(rc.serialize().find("|Keyboard shortcuts") != std::string::npos);   // a modal is up
             app.onKey({VK_F1, 0x3B, false, false});
             app.onKey({VK_SHIFT, 0x2A, false, false});
             TEST_ASSERT(waitFor([&] { return saw(VK_SHIFT, true) && saw(0xBF, true) && saw(0xBF, false) && saw(VK_SHIFT, false); }, 2000));
@@ -10408,7 +10411,7 @@ void testFleetUi() {
             app.onTick();   // dials Alpha in a session tab; leaving the grid keeps Bravo
             TEST_ASSERT(count(frame(), "Type into all") == 0);   // off the grid
             TEST_ASSERT(hostB.hostSessionStatus().active);
-            TEST_ASSERT(clickText(app, frame(), "Dashboard"));
+            TEST_ASSERT(clickText(app, frame(), "Home"));
             ops = frame();
             TEST_ASSERT(count(ops, "Back to grid (1)") == 1 && count(ops, "Do it on all") == 0);
             TEST_ASSERT(clickText(app, ops, "Back to grid (1)"));
@@ -10421,7 +10424,7 @@ void testFleetUi() {
             plainShell.clock += 301;
             app.onTick();
             frame();
-            TEST_ASSERT(clickText(app, frame(), "Dashboard"));
+            TEST_ASSERT(clickText(app, frame(), "Home"));
             ops = frame();
             TEST_ASSERT(count(ops, "Do it on all") == 1 && ops.find("|Back to grid") == std::string::npos);
         }
@@ -10576,7 +10579,7 @@ void testGlideSettingsUi() {
             app.onMouseButton(MouseButtonId::Left, false, x, y);
             settle();
         };
-        const float rowX = 990.0f, officeY = 198.0f, receptionY = 237.0f, leftX = 350.0f, slotY = 267.0f;
+        const float rowX = 990.0f, officeY = 140.0f, receptionY = 179.0f, leftX = 422.0f, slotY = 209.0f;   // below no top bar, right of the 72-DIP rail
         click(rowX, officeY);
         click(leftX, slotY);
         TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Left) == 555000401);
@@ -10995,7 +10998,7 @@ void testPairingOfferEveryConnection() {
             for (int i = 0; i < 60; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);   // long enough for a modal to settle
             return rc.serialize();
         };
-        auto offered = [&] { return frame().find("|Pair with this PC?") != std::string::npos; };
+        auto offered = [&] { return frame().find("|Pair with this desk?") != std::string::npos; };
         auto connected = [&] { return viewerNet.viewerStats().state == ViewerConnectionState::Connected; };
         auto waitFor = [](const std::function<bool()>& cond, int ms) {
             for (int i = 0; i < ms / 50 && !cond(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -11023,7 +11026,7 @@ void testPairingOfferEveryConnection() {
 
         // Back on the dashboard with A still connected, dial B. The UI does not tick until B is up, as when a quick
         // LAN handshake (or a busy message queue) beats the next timer tick: B still gets its own offer.
-        TEST_ASSERT(clickText("Dashboard") && connected());
+        TEST_ASSERT(clickText("Home") && connected());
         app.onText(std::string(40, '\b') + "127.0.0.1:" + std::to_string(hostB.hostListenPort()));
         TEST_ASSERT(clickText("Connect"));
         TEST_ASSERT(waitFor([&] { return connected() && viewerNet.viewerStats().remoteDeskId == hostBId.deskId(); }, 4000));
@@ -11049,7 +11052,7 @@ void testIdleFocusedFieldDoesNotSpin() {
         ui::RecordingCanvas rc;
         for (int i = 0; i < 240; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);   // past the 2 s startup timer
         TEST_ASSERT(!app.wantsAnimationFrame());   // the idle tick repaints for the caret; no 60 fps loop
-        TEST_ASSERT(rc.serialize().find("Remote Desk") != std::string::npos);
+        TEST_ASSERT(rc.serialize().find("|Connect to a desk") != std::string::npos);
     }
     std::filesystem::remove(probe.configFilePath(), ec);
 }
@@ -12919,7 +12922,7 @@ void testMacAudioPaths() {
 } // namespace
 
 void testRecentCardButtonsClickable() {
-    std::cout << "[TEST 121] Dashboard: the remove button on a recent-desk card removes it instead of connecting..." << std::endl;
+    std::cout << "[TEST 121] Home: a desk's menu removes it, Undo puts it back, the connect box finds desks; the session bar's More menu..." << std::endl;
     std::error_code ec;
     IdentityManager id(4371);
     std::filesystem::remove(id.configFilePath(), ec);
@@ -12930,24 +12933,73 @@ void testRecentCardButtonsClickable() {
     AppUi app(id, net, shell);
     ui::RecordingCanvas rc;
     auto frame = [&] { for (int i = 0; i < 30; ++i) app.render(rc, 1280, 800, 1.0 / 60.0); return rc.serialize(); };
-    float t = 0, r = 0;
-    std::istringstream in(frame());
-    for (std::string line; std::getline(in, line);) {   // the card's own Connect button is 86 wide, unlike the Remote Desk one
-        const std::string tail = "|Connect";
-        if (line.rfind("drawText ", 0) != 0 || line.size() < tail.size() ||
-            line.compare(line.size() - tail.size(), std::string::npos, tail) != 0) continue;
-        float l = 0, tt = 0, rr = 0, b = 0;
-        std::istringstream(line.substr(9)) >> l >> tt >> rr >> b;
-        if (std::fabs((rr - l) - 86.0f) < 1.0f) { t = tt; r = rr; }
+    auto centre = [](const std::string& ops, const std::string& text) -> std::optional<std::pair<float, float>> {
+        std::istringstream in(ops);
+        for (std::string line; std::getline(in, line);) {
+            if (line.rfind("drawText ", 0) != 0 || !line.ends_with("|" + text)) continue;
+            float l = 0, t = 0, r = 0, b = 0;
+            std::istringstream(line.substr(9)) >> l >> t >> r >> b;
+            return std::make_pair((l + r) / 2, (t + b) / 2);
+        }
+        return std::nullopt;
+    };
+    auto click = [&](MouseButtonId btn, std::pair<float, float> p) {
+        app.onMouseMove(p.first, p.second);
+        frame();
+        app.onMouseButton(btn, true, p.first, p.second);
+        app.onMouseButton(btn, false, p.first, p.second);
+        return frame();
+    };
+
+    std::string ops = frame();
+    const auto row = centre(ops, "Office");
+    TEST_ASSERT(row.has_value());
+    if (row) {
+        ops = click(MouseButtonId::Right, *row);   // right-click opens the row's menu; nothing dials
+        const auto remove = centre(ops, "Remove");
+        TEST_ASSERT(remove.has_value() && centre(ops, "Rename & tags\xE2\x80\xA6").has_value());
+        if (remove) ops = click(MouseButtonId::Left, *remove);
+        TEST_ASSERT(id.recentSessions().empty());
+        const auto undo = centre(ops, "Undo");
+        TEST_ASSERT(undo.has_value());
+        if (undo) click(MouseButtonId::Left, *undo);
+        const auto back = id.recentSessions();
+        TEST_ASSERT(back.size() == 1 && back[0].deskId == 987654321ull && back[0].address == "127.0.0.1:1");
     }
-    TEST_ASSERT(r > 0.0f);
-    const float x = r - 10.0f, y = t - 21.0f;   // centre of the card's X button
-    app.onMouseMove(x, y);
-    frame();
-    app.onMouseButton(MouseButtonId::Left, true, x, y);
-    app.onMouseButton(MouseButtonId::Left, false, x, y);
-    frame();
-    TEST_ASSERT(id.recentSessions().empty());
+
+    // The connect box is also the search: an ID in any spacing finds its desk, other text matches by name.
+    if (const auto box = centre(frame(), "Desk ID or name")) click(MouseButtonId::Left, *box);
+    app.onText("987-654 321");
+    TEST_ASSERT(frame().find("|Office") != std::string::npos);
+    app.onText("\x01zzz");   // Ctrl+A clears the box first
+    ops = frame();
+    TEST_ASSERT(ops.find("|Office") == std::string::npos && ops.find("|No desks match") != std::string::npos);
+
+    {   // The session bar keeps the everyday controls; the rest sit under More, and a narrow window folds the bar's leftmost into More
+        AppUi s(id, net, shell, "");
+        ui::RecordingCanvas src;
+        s.applySnapshotState("session_more_menu");
+        auto draw = [&](int w) { for (int i = 0; i < 30; ++i) s.render(src, w, 800, 1.0 / 60.0); return src.serialize(); };
+        auto lineOf = [](const std::string& o, const std::string& text) {
+            std::istringstream in(o);
+            for (std::string line; std::getline(in, line);) if (line.rfind("drawText ", 0) == 0 && line.ends_with("|" + text)) return line;
+            return std::string();
+        };
+        std::string wide = draw(1280);
+        TEST_ASSERT(lineOf(wide, "Vol: 100%").find(" Small ") != std::string::npos);   // in the bar
+        TEST_ASSERT(lineOf(wide, "Record").find(" Body ") != std::string::npos);        // in the menu
+        std::string narrow = draw(900);
+        TEST_ASSERT(lineOf(narrow, "Vol: 100%").find(" Body ") != std::string::npos);
+        TEST_ASSERT(lineOf(narrow, "Fullscreen").find(" Small ") != std::string::npos);
+        if (const auto board = centre(narrow, "Board")) {
+            s.onMouseMove(board->first, board->second);
+            draw(900);
+            s.onMouseButton(MouseButtonId::Left, true, board->first, board->second);
+            s.onMouseButton(MouseButtonId::Left, false, board->first, board->second);
+        }
+        narrow = draw(900);
+        TEST_ASSERT(narrow.find("|Whiteboard active") != std::string::npos && narrow.find("|Record") == std::string::npos);
+    }
     std::filesystem::remove(id.configFilePath(), ec);
 }
 

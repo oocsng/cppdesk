@@ -32,6 +32,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -542,6 +543,15 @@ public:
         if (live()) XBell(w_->dpy, 0);
     }
     bool isWindowForeground() const override { return live() && w_->focused && w_->mapped; }
+    // GNOME's setting; other desktops have no common one, so they read as "animate".
+    bool systemPrefersReducedMotion() const override {
+        FILE* p = popen("gsettings get org.gnome.desktop.interface enable-animations 2>/dev/null", "r");
+        if (!p) return false;
+        char buf[16] = {};
+        const bool got = fgets(buf, sizeof buf, p) != nullptr;
+        pclose(p);
+        return got && std::strncmp(buf, "false", 5) == 0;
+    }
     void bringToFront() override {
         if (!live()) return;
         XMapRaised(w_->dpy, w_->win);

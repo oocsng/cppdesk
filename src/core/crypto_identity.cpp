@@ -648,6 +648,8 @@ bool IdentityManager::loadOrCreate() {
                 try { settings_.relayMode = static_cast<uint8_t>(std::clamp(std::stoi(val), 0, 2)); } catch (...) {}
             } else if (key == "dark_theme") {
                 settings_.darkTheme = (val == "1" || val == "true");
+            } else if (key == "reduce_motion") {
+                try { settings_.reduceMotion = static_cast<uint8_t>(std::clamp(std::stoi(val), 0, 2)); } catch (...) {}
             } else if (key == "target_fps") {
                 try { settings_.targetFps = clampTargetFps(static_cast<uint8_t>(std::stoi(val))); } catch (...) {}
             } else if (key == "adaptive_fps") {
@@ -884,6 +886,7 @@ bool IdentityManager::save() const {
         out << "stun_server=" << sanitizeIniLine(settings_.stunServer) << "\n";
         out << "relay_mode=" << static_cast<int>(settings_.relayMode) << "\n";
         out << "dark_theme=" << (settings_.darkTheme ? "1" : "0") << "\n";
+        out << "reduce_motion=" << static_cast<int>(settings_.reduceMotion) << "\n";
         out << "target_fps=" << static_cast<int>(clampTargetFps(settings_.targetFps)) << "\n";
         out << "adaptive_fps=" << (settings_.adaptiveFps ? "1" : "0") << "\n";
         out << "default_quality=" << static_cast<int>(settings_.defaultQuality) << "\n";

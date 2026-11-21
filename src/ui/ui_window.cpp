@@ -167,6 +167,10 @@ public:
     bool isWindowForeground() const override {
         return w_.hwnd_ && GetForegroundWindow() == w_.hwnd_ && !IsIconic(w_.hwnd_);
     }
+    bool systemPrefersReducedMotion() const override {
+        BOOL animate = TRUE;
+        return SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animate, 0) && !animate;
+    }
     void bringToFront() override {
         if (!w_.hwnd_ || SetForegroundWindow(w_.hwnd_)) return;
         // Windows refuses focus to a background process; sharing the foreground thread's input queue lifts that.

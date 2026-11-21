@@ -59,8 +59,14 @@ public:
     // Second-order damped harmonic oscillator (macOS CoreAnimation CASpringAnimation physics)
     static bool stepSpring(float& pos, float& vel, float target, float omega, float zeta, float dt, float eps = 0.0012f);
 
-    // Compute MacBook-style tactile spring transformed rect (hover expands 2.8%, lifts -1.8px; press squishes 4.8%, depresses +1.6px)
-    static UiPlatformRect computeSpringRect(const UiPlatformRect& base, float hoverT, float pressT);
+    // stepSpring under the app's motion rules: never overshoots (damping raised to critical), a spring heading to 0
+    // (an exit) runs 25% faster, and with reduced motion the value jumps straight to the target.
+    static bool stepMotion(float& pos, float& vel, float target, float omega, float zeta, float dt, float eps, bool reduced);
+
+    // A pressed control shrinks to 97% around its centre; hover changes colour only, never size.
+    static UiPlatformRect computeSpringRect(const UiPlatformRect& base, float pressT);
+    // A popover at progress t (0..1) scaled from 95% around the point it opens from (its trigger).
+    static UiPlatformRect popoverRect(const UiPlatformRect& base, float t, float originX, float originY);
 
     // The X resource Xft.dpi as a UI scale ("192" -> 2.0); 1.0 when missing or invalid.
     static float dpiScaleFromXftDpi(const char* value);

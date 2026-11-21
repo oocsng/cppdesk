@@ -75,6 +75,8 @@ public:
     virtual void playAlertSound() = 0;
     // True when the app window is the active, non-minimized window.
     virtual bool isWindowForeground() const = 0;
+    // The OS asks apps to cut animation (Windows "Animation effects" off, macOS Reduce motion, GNOME animations off).
+    virtual bool systemPrefersReducedMotion() const { return false; }
     // Raise the app window and give it focus.
     virtual void bringToFront() = 0;
 

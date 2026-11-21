@@ -10,6 +10,7 @@ ui::Color COL_BG_NAV{};
 ui::Color COL_BG_CARD{};
 ui::Color COL_BG_SUBTLE{};
 ui::Color COL_BG_CARD_ALT{};
+ui::Color COL_BG_RAISED{};
 ui::Color COL_BG_INPUT{};
 ui::Color COL_BG_INPUT_FOCUS{};
 ui::Color COL_BORDER{};
@@ -34,6 +35,9 @@ ui::Color COL_HUD_TEXT{};
 ui::Color COL_HUD_TEXT_SECONDARY{};
 ui::Color COL_HUD_TEXT_MUTED{};
 ui::Color COL_HUD_TEXT_ACCENT{};
+ui::Color COL_RAIL_BG{};
+ui::Color COL_RAIL_TEXT{};
+ui::Color COL_RAIL_TEXT_ACTIVE{};
 
 namespace {
 
@@ -45,6 +49,7 @@ const PaletteToken kTokens[] = {
     { "COL_BG_CARD",           &COL_BG_CARD,           rgba(255, 255, 255), rgba(38, 37, 34) },
     { "COL_BG_SUBTLE",         &COL_BG_SUBTLE,         rgba(243, 238, 230), rgba(46, 44, 40) },
     { "COL_BG_CARD_ALT",       &COL_BG_CARD_ALT,       rgba(249, 243, 236), rgba(51, 44, 38) },
+    { "COL_BG_RAISED",         &COL_BG_RAISED,         rgba(255, 255, 255), rgba(68, 64, 58) },
     { "COL_BG_INPUT",          &COL_BG_INPUT,          rgba(243, 238, 230), rgba(34, 32, 29) },
     { "COL_BG_INPUT_FOCUS",    &COL_BG_INPUT_FOCUS,    rgba(255, 255, 255), rgba(42, 40, 36) },
     { "COL_BORDER",            &COL_BORDER,            rgba(228, 222, 212), rgba(59, 56, 51) },
@@ -69,6 +74,9 @@ const PaletteToken kTokens[] = {
     { "COL_HUD_TEXT_SECONDARY", &COL_HUD_TEXT_SECONDARY, rgba(184, 177, 166), rgba(184, 177, 166) },
     { "COL_HUD_TEXT_MUTED",     &COL_HUD_TEXT_MUTED,     rgba(168, 161, 150), rgba(168, 161, 150) },
     { "COL_HUD_TEXT_ACCENT",    &COL_HUD_TEXT_ACCENT,    rgba(228, 138, 108), rgba(228, 138, 108) },
+    { "COL_RAIL_BG",            &COL_RAIL_BG,            rgba(43, 36, 31),    rgba(20, 18, 16) },
+    { "COL_RAIL_TEXT",          &COL_RAIL_TEXT,          rgba(201, 190, 177), rgba(184, 176, 165) },
+    { "COL_RAIL_TEXT_ACTIVE",   &COL_RAIL_TEXT_ACTIVE,   rgba(255, 250, 244), rgba(255, 250, 244) },
 };
 
 // Live tokens hold light values from startup, before any window calls updateActivePalette.
