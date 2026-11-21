@@ -71,7 +71,8 @@ enum class SettingsSection : uint8_t {
     CurtainPrivacy  = 6,
     SystemService   = 7,
     About           = 8,
-    Glide           = 9
+    Glide           = 9,
+    Profile         = 10
 };
 
 enum class FocusedField : uint8_t {
@@ -107,7 +108,8 @@ enum class FocusedField : uint8_t {
     FileBrowserLocalPath = 30,
     FileBrowserRemotePath = 31,
     FileBrowserNewDir  = 32,
-    FileBrowserRename  = 33
+    FileBrowserRename  = 33,
+    DisplayName        = 34
 };
 
 enum class DrawerTab : uint8_t {
@@ -305,6 +307,10 @@ private:
     void drawRemoteSessionView(const UiRect& bounds, float alpha = 1.0f);
     void drawSettingsView(const UiRect& bounds, float alpha = 1.0f);
     void drawGlideSettings(float cx, float crx, float& cy);
+    void drawSettingsProfile(float cx, float crx, float& cy);
+    void commitDisplayName();                       // normalises displayNameEdit_ and saves it when it changed
+    void setOwnPicture(const std::string& path);    // picks, normalises and stores the own picture, then tells peers
+    std::string ownAvatarName() const;              // the username, else the computer name
     void drawFileTransferDrawer(const UiRect& bounds, float slideProgress);
     void drawFileManagerDrawer(const UiRect& contentRect);
     void drawSyncDrawer(const UiRect& contentRect);
@@ -371,6 +377,11 @@ private:
                     const std::vector<uint8_t>* jpeg = nullptr);
     std::unordered_map<uint64_t, ui::ImageId> avatarImages_;   // invalid id = no picture
     uint32_t                avatarGen_ = ~0u;
+    // Own-picture swap: the old image stays under the new one for 150 ms
+    ui::ImageId             ownPrevImg_;
+    float                   ownFadeT_ = 1.0f;                  // 0..1; 1 = settled
+    std::vector<uint8_t>    ownBytes_;                         // what the own avatar was last built from
+    bool                    ownBytesKnown_ = false;
     std::vector<uint8_t>    avatarApprovalBytes_;              // what avatarImages_[kApprovalKey] was built from
     std::vector<uint8_t>    snapshotCallerPicture_;            // a snapshot's stand-in for the pending caller's picture
 
@@ -443,6 +454,8 @@ private:
     std::string             relayAuthKeyEdit_;
     std::string             stunServerEdit_;
     uint8_t                 relayModeEdit_ = 0;
+    std::string             displayNameEdit_;
+    bool                    displayNameWasFocused_ = false;   // blur detector: commit when focus leaves the field
     std::string             privacyBrandEdit_;
     std::string             privacyNoticeEdit_;
     std::string             chatInput_;

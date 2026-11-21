@@ -186,6 +186,11 @@ bool AppUi::stepAnimations(float dt) {
     if (railIndInit_ && stepSpring(railIndY_, railIndVel_, railIndTarget_, theme::motion::standard.omega, theme::motion::standard.zeta, dt, 0.15f)) active = true;
     if (stepSpring(homeMenuAnimT_, homeMenuAnimVel_, homeMenu_ ? 1.0f : 0.0f, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
     if (stepSpring(sessMoreAnimT_, sessMoreAnimVel_, sessMore_ ? 1.0f : 0.0f, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
+    if (ownFadeT_ < 1.0f) {
+        ownFadeT_ = std::min(1.0f, ownFadeT_ + dt / 0.15f);
+        if (ownFadeT_ >= 1.0f) releaseImage(ownPrevImg_);
+        active = true;
+    }
     if (homeIntroT_ < 1.0f) {
         homeIntroT_ = g_reduceMotion ? 1.0f : std::min(1.0f, homeIntroT_ + dt);
         active = true;
@@ -489,8 +494,14 @@ void AppUi::drawAvatar(float cx, float cy, float r, uint64_t deskId, const std::
                        const std::vector<uint8_t>* jpeg) {
     constexpr uint64_t kApprovalKey = ~0ull;
     const uint32_t gen = network_.peerPictureGeneration();   // also bumps when our own picture changes
+    const bool own = !jpeg && deskId == identity_.deskId();
     if (gen != avatarGen_) {
-        for (auto& [k, img] : avatarImages_) releaseImage(img);
+        releaseImage(ownPrevImg_);
+        ownFadeT_ = 1.0f;
+        for (auto& [k, img] : avatarImages_) {
+            if (k == identity_.deskId()) ownPrevImg_ = img;   // kept until the rebuilt own avatar is compared with it
+            else releaseImage(img);
+        }
         avatarImages_.clear();
         avatarGen_ = gen;
     }
@@ -521,20 +532,40 @@ void AppUi::drawAvatar(float cx, float cy, float r, uint64_t deskId, const std::
             canvas_->updateImage(img, bgra.data(), w * 4, ui::Rect{ 0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h) });
         }
         it = avatarImages_.emplace(key, img).first;
+        if (own) {   // a changed picture crossfades from the old one (instant with reduced motion)
+            if (ownBytesKnown_ && bytes != ownBytes_ && !g_reduceMotion) ownFadeT_ = 0.0f;
+            else releaseImage(ownPrevImg_);
+            ownBytes_ = bytes;
+            ownBytesKnown_ = true;
+        }
+    }
+    const bool fading = own && ownFadeT_ < 1.0f;
+    const float inT = fading ? 1.0f - std::pow(1.0f - ownFadeT_, 3.0f) : 1.0f;   // ease-out
+    // An initial on a colour picked from the desk ID, so a desk keeps its colour
+    auto drawInitial = [&](float a) {
+        static const ui::Color kAvatar[] = { rgba(160, 82, 45), rgba(46, 110, 96), rgba(84, 94, 140),
+                                             rgba(136, 80, 118), rgba(112, 100, 52), rgba(96, 88, 80) };
+        canvas_->fillEllipse(cx, cy, r, r, withAlpha(kAvatar[deskId % 6], a));
+        const char first = name.empty() ? '?' : name[0];
+        const std::string initial = (static_cast<unsigned char>(first) < 0x80) ? std::string(1, static_cast<char>(std::toupper(static_cast<unsigned char>(first))))
+                                                                               : name.substr(0, name.size() > 1 ? 2 : 1);
+        drawText(initial, { cx - r, cy - r, cx + r, cy + r }, r < 14.0f ? ui::FontRole::Small : ui::FontRole::BodyBold,
+                 withAlpha(rgba(255, 255, 255), a), ui::HAlign::Center, ui::VAlign::Center);
+    };
+    if (fading) {   // what the new look fades in over
+        if (ownPrevImg_.valid()) canvas_->drawImage(ownPrevImg_, { cx - r, cy - r, cx + r, cy + r }, alpha);
+        else if (it->second.valid()) drawInitial(alpha);
     }
     if (it->second.valid()) {
-        canvas_->drawImage(it->second, { cx - r, cy - r, cx + r, cy + r }, alpha);
+        canvas_->drawImage(it->second, { cx - r, cy - r, cx + r, cy + r }, alpha * inT);
         return;
     }
-    // An initial on a colour picked from the desk ID, so a desk keeps its colour
-    static const ui::Color kAvatar[] = { rgba(160, 82, 45), rgba(46, 110, 96), rgba(84, 94, 140),
-                                         rgba(136, 80, 118), rgba(112, 100, 52), rgba(96, 88, 80) };
-    canvas_->fillEllipse(cx, cy, r, r, withAlpha(kAvatar[deskId % 6], alpha));
-    const char first = name.empty() ? '?' : name[0];
-    const std::string initial = (static_cast<unsigned char>(first) < 0x80) ? std::string(1, static_cast<char>(std::toupper(static_cast<unsigned char>(first))))
-                                                                           : name.substr(0, name.size() > 1 ? 2 : 1);
-    drawText(initial, { cx - r, cy - r, cx + r, cy + r }, r < 14.0f ? ui::FontRole::Small : ui::FontRole::BodyBold,
-             withAlpha(rgba(255, 255, 255), alpha), ui::HAlign::Center, ui::VAlign::Center);
+    drawInitial(alpha * inT);
+}
+
+std::string AppUi::ownAvatarName() const {
+    const std::string n = identity_.displayName();
+    return n.empty() ? identity_.hostname() : n;
 }
 
 void AppUi::fillRoundRect(const UiRect& r, float radius, ui::Color color) {
@@ -815,6 +846,14 @@ void AppUi::drawToggleSwitch(
 
 void AppUi::drawFrame(float width, float height) {
     clickRegions_.clear();
+    // Blur saves the name: focus moved on, or the Profile page was left with the field still focused
+    const bool nameFocused = focusedField_ == FocusedField::DisplayName && activeTab_ == ActiveTab::Settings &&
+                             settingsSection_ == SettingsSection::Profile;
+    if (displayNameWasFocused_ && !nameFocused) {
+        commitDisplayName();
+        if (focusedField_ == FocusedField::DisplayName) focusedField_ = FocusedField::None;
+    }
+    displayNameWasFocused_ = nameFocused;
     canvas_->beginFrame(width, height, COL_BG_MAIN);
 
     const float topOffset = 0.0f;
@@ -1180,6 +1219,7 @@ void AppUi::drawNavRail(float height) {
     const float itemH = 58.0f;
     const float homeTop = 12.0f, sessTop = homeTop + itemH + 4.0f, filesTop = sessTop + itemH + 4.0f;
     const float settTop = height - 12.0f - itemH, themeTop = settTop - 4.0f - itemH;
+    const float profTop = themeTop - 4.0f - 44.0f;   // the own avatar slot, 32 px circle in 44 px
 
     // The page indicator slides between Home, Sessions and Settings; Files opens a drawer, so it lights on its own.
     const bool onSessions = activeTab_ == ActiveTab::RemoteSession || activeTab_ == ActiveTab::Fleet;
@@ -1225,6 +1265,18 @@ void AppUi::drawNavRail(float height) {
     if (showFileDrawer_) fillRoundRect({ 6.0f, filesTop, railW - 6.0f, filesTop + itemH }, 12.0f, rgba(255, 255, 255, 0.10f));
     item("btn_drawer", "Files", 2, filesTop, showFileDrawer_, unreadChat > 0 ? unreadChat : transfers,
          [this]() { selectRailItem(2); });
+    {   // Own avatar: opens Settings > Profile
+        const UiRect pr = { 6.0f, profTop, railW - 6.0f, profTop + 44.0f };
+        clickRegions_.push_back({ pr, "rail_profile", [this]() {
+            switchTab(ActiveTab::Settings);
+            settingsSection_ = SettingsSection::Profile;
+            settingsScrollOffset_ = settingsScrollTarget_ = settingsScrollVel_ = 0.0f;
+        }, false });
+        activeTooltips_.push_back({ pr, "Profile" });
+        const float hT = std::clamp(widgetAnims_["rail_profile"].hoverT, 0.0f, 1.0f);
+        if (hT > 0.01f) fillRoundRect(pr, 12.0f, rgba(255, 255, 255, 0.06f * hT));
+        drawAvatar(pr.centerX(), pr.centerY(), 16.0f, identity_.deskId(), ownAvatarName(), 1.0f);
+    }
     item("btn_nav_theme", "Theme", -1, themeTop, false, 0, [this]() {
         AppSettings s = identity_.settings();
         s.darkTheme = !s.darkTheme;
@@ -2898,6 +2950,75 @@ void AppUi::drawGlideSettings(float cx, float crx, float& cy) {
     cy = list.bottom + 14.0f;
 }
 
+void AppUi::commitDisplayName() {
+    const std::string n = profile::normaliseName(displayNameEdit_);
+    displayNameEdit_ = n;
+    AppSettings s = identity_.settings();
+    if (s.displayName == n) return;
+    s.displayName = n;
+    identity_.updateSettings(s);
+}
+
+void AppUi::setOwnPicture(const std::string& path) {
+    namespace fs = std::filesystem;
+    const fs::path src{ std::u8string(path.begin(), path.end()) };
+    std::error_code ec;
+    const uintmax_t size = fs::file_size(src, ec);
+    std::optional<std::vector<uint8_t>> jpeg;
+    if (!ec && size <= avatar::kMaxInputBytes) {
+        std::ifstream in(src, std::ios::binary);
+        const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (!bytes.empty()) jpeg = avatar::normaliseJpeg(bytes);
+    }
+    const fs::path dst = identity_.ownPicturePath();
+    bool saved = false;
+    if (jpeg) {
+        fs::create_directories(dst.parent_path(), ec);
+        std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(jpeg->data()), static_cast<std::streamsize>(jpeg->size()));
+        saved = out.good();
+    }
+    if (!saved) {
+        showToast("That picture couldn't be used. Pick a JPEG image.", true);
+        return;
+    }
+    network_.sendProfilePicture();   // also refreshes the avatars here
+    showToast("Picture updated");
+}
+
+void AppUi::drawSettingsProfile(float cx, float crx, float& cy) {
+    drawText("Profile", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    cy += 25.0f;
+    drawText("Your name and picture, as the people you connect with see them.",
+             { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+    cy += 30.0f;
+
+    drawAvatar(cx + 32.0f, cy + 32.0f, 32.0f, identity_.deskId(), ownAvatarName(), 1.0f);
+    const float by = cy + 16.0f;
+    drawButton("sett_profile_pick", { cx + 84.0f, by, cx + 234.0f, by + 32.0f }, "Change picture...",
+               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
+                   shell_->chooseOpenFile("Choose a picture", "JPEG images", "*.jpg;*.jpeg",
+                                          [this](std::optional<std::string> path) { if (path) setOwnPicture(*path); });
+               }, ui::FontRole::Small);
+    std::error_code ec;
+    if (std::filesystem::exists(identity_.ownPicturePath(), ec)) {
+        drawButton("sett_profile_remove", { cx + 242.0f, by, cx + 322.0f, by + 32.0f }, "Remove",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
+                       std::error_code rec;
+                       std::filesystem::remove(identity_.ownPicturePath(), rec);
+                       network_.sendProfilePicture();
+                   }, ui::FontRole::Small);
+    }
+    cy += 80.0f;
+
+    drawText("Name", { cx, cy, cx + 60.0f, cy + 32.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
+    const UiRect field = { cx + 64.0f, cy, cx + 64.0f + 260.0f, cy + 32.0f };
+    drawTextField("field_display_name", FocusedField::DisplayName, field, displayNameEdit_, identity_.hostname(), false);
+    drawText("Shown to anyone you connect with", { field.right + 14.0f, cy, crx, cy + 32.0f },
+             ui::FontRole::Small, COL_TEXT_SECONDARY);
+    cy += 48.0f;
+}
+
 void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
     if (alpha <= 0.01f) return;
 
@@ -2926,6 +3047,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         const char* label;
     };
     static const NavItem navItems[] = {
+        { SettingsSection::Profile,        "sett_sec_profile", "Profile" },
         { SettingsSection::Appearance,     "sett_sec_app",    "Appearance" },
         { SettingsSection::DisplayQuality, "sett_sec_disp",   "Display & quality" },
         { SettingsSection::AudioVoice,     "sett_sec_audio",  "Audio & voice" },
@@ -2995,6 +3117,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         case SettingsSection::SystemService:  sectionContentH = 360.0f; break;
         case SettingsSection::About:          sectionContentH = 350.0f; break;
         case SettingsSection::Glide:          sectionContentH = 330.0f + 38.0f * identity_.pairedHosts().size(); break;
+        case SettingsSection::Profile:        sectionContentH = 230.0f; break;
     }
 
     float availContentH = navCard.height();
@@ -4206,6 +4329,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                        privacyBrandEdit_ = ds.privacyBrandName;
                        privacyNoticeEdit_ = ds.privacyCustomNotice;
                        privacyKeywordsEdit_ = ds.privacyCloakKeywords;
+                       displayNameEdit_ = ds.displayName;
                        totpEnrollCodeEdit_.clear();
                        totpEnrollFeedback_.clear();
                        totpEnrollSuccess_ = false;
@@ -4228,6 +4352,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
     }
     else if (settingsSection_ == SettingsSection::Glide) {
         drawGlideSettings(cx, crx, cy);
+    }
+    else if (settingsSection_ == SettingsSection::Profile) {
+        drawSettingsProfile(cx, crx, cy);
     }
 
     // Clamp hit-test regions inside contentPane viewport
@@ -8356,6 +8483,7 @@ std::string* AppUi::activeFocusedTextBuffer() {
     if (focusedField_ == FocusedField::EditTag) return &editTagInput_;
     if (focusedField_ == FocusedField::EditNotes) return &editNotesInput_;
     if (focusedField_ == FocusedField::ClipboardSearch) return &clipSearchQuery_;
+    if (focusedField_ == FocusedField::DisplayName) return &displayNameEdit_;
     if (focusedField_ == FocusedField::PrivacyBrand) return &privacyBrandEdit_;
     if (focusedField_ == FocusedField::PrivacyNotice) return &privacyNoticeEdit_;
     if (focusedField_ == FocusedField::TotpEnrollTestCode) return &totpEnrollCodeEdit_;
@@ -8819,6 +8947,8 @@ void AppUi::onCharInput(char16_t ch) {
         maxLen = 512;
     } else if (focusedField_ == FocusedField::FileBrowserNewDir || focusedField_ == FocusedField::FileBrowserRename) {
         maxLen = 128;
+    } else if (focusedField_ == FocusedField::DisplayName) {
+        maxLen = 128;   // commitDisplayName caps at 32 code points
     } else if (focusedField_ == FocusedField::PrivacyBrand) {
         maxLen = 63;
     } else if (isTotp) {
@@ -8851,6 +8981,8 @@ void AppUi::onCharInput(char16_t ch) {
         } else if (focusedField_ == FocusedField::RelayServer && !relayServerEdit_.empty()) {
             identity_.setRelayServerAddress(relayServerEdit_);
             showToast("Relay server saved");
+        } else if (focusedField_ == FocusedField::DisplayName) {
+            commitDisplayName();
         } else if (focusedField_ == FocusedField::ChatInput) {
             sendChatFromInput();
         } else if (focusedField_ == FocusedField::TerminalInput) {
@@ -10645,6 +10777,7 @@ AppUi::AppUi(IdentityManager& identity, NetworkEngine& network, ui::PlatformShel
     relayModeEdit_ = s.relayMode;
     privacyBrandEdit_ = s.privacyBrandName;
     privacyNoticeEdit_ = s.privacyCustomNotice;
+    displayNameEdit_ = identity_.displayName();
     themeAnimT_ = s.darkTheme ? 1.0f : 0.0f;
     scaleMode_ = static_cast<ScaleMode>(std::clamp<int>(s.defaultScaleMode, 0, 3));
     network_.setAudioVolume(s.defaultAudioVolume);
@@ -10728,13 +10861,13 @@ void AppUi::ensureAppIconImage() {
 std::vector<std::string> AppUi::snapshotStateNames() {
     return { "dashboard_light", "dashboard_dark", "theme_mid_blend", "settings_appearance", "settings_display",
              "settings_audio", "settings_permissions", "settings_2fa", "settings_network", "settings_privacy",
-             "settings_system", "settings_about", "settings_glide", "session_view", "session_more_menu", "session_tabs_3", "drawer_file_transfer", "drawer_terminal", "drawer_notes",
+             "settings_system", "settings_about", "settings_glide", "settings_profile", "session_view", "session_more_menu", "session_tabs_3", "drawer_file_transfer", "drawer_terminal", "drawer_notes",
              "drawer_file_manager", "drawer_sync", "chat_long_text", "modal_approval", "modal_approval_picture", "modal_totp", "modal_run_task",
              "modal_address_book", "modal_recording_player", "modal_omnibar", "toast", "tooltip",
              "modal_pair_offer", "settings_permissions_paired", "home_grid_select", "fleet_grid",
              "home_desks", "home_desks_pictures", "home_menu", "sessions_empty",
              // Dark twins of the screens the redesign touched (light and dark are both first-class)
-             "settings_appearance_dark", "settings_display_dark", "settings_privacy_dark", "drawer_file_transfer_dark", "drawer_terminal_dark", "drawer_sync_dark", "chat_long_text_dark", "modal_approval_dark", "modal_address_book_dark", "modal_omnibar_dark", "session_more_menu_dark", "home_menu_dark",
+             "settings_appearance_dark", "settings_display_dark", "settings_profile_dark", "settings_privacy_dark", "drawer_file_transfer_dark", "drawer_terminal_dark", "drawer_sync_dark", "chat_long_text_dark", "modal_approval_dark", "modal_address_book_dark", "modal_omnibar_dark", "session_more_menu_dark", "home_menu_dark",
              "dashboard_mac_permissions", "dashboard_mac_restart", "dashboard_wayland_denied", "dashboard_wayland_view_only",
              "dashboard_mic_on" };
 }
@@ -10784,6 +10917,7 @@ void AppUi::applySnapshotState(const std::string& name) {
         { "settings_2fa", SettingsSection::TwoFactorAuth }, { "settings_network", SettingsSection::NetworkRelay },
         { "settings_privacy", SettingsSection::CurtainPrivacy }, { "settings_system", SettingsSection::SystemService },
         { "settings_about", SettingsSection::About }, { "settings_glide", SettingsSection::Glide },
+        { "settings_profile", SettingsSection::Profile },
     };
 
     // Pairing states seed these two peers; clear them so no other state shows them
@@ -10821,6 +10955,12 @@ void AppUi::applySnapshotState(const std::string& name) {
     snapshotFleetTiles_ = nullptr;
 
     setDark(false);
+    {   // A fixed username: the rail avatar would otherwise show this machine's computer name
+        AppSettings s = identity_.settings();
+        s.displayName = "Jane";
+        identity_.updateSettings(s);
+        displayNameEdit_ = "Jane";
+    }
     network_.injectViewerFrameForTest({}, 0, 0);
     if (name == "dashboard_light") {
         activeTab_ = ActiveTab::Dashboard;
@@ -10993,6 +11133,7 @@ void AppUi::applySnapshotState(const std::string& name) {
             if (name == sec.first) {
                 activeTab_ = ActiveTab::Settings;
                 settingsSection_ = sec.second;
+                if (sec.second == SettingsSection::Profile) focusedField_ = FocusedField::DisplayName;
             }
         }
     }

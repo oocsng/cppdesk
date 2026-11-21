@@ -9050,7 +9050,8 @@ public:
     uint64_t clock = 10000;
     uint64_t nowMs() const override { return clock; }
     void setTextInputActive(bool) override {}
-    void chooseOpenFile(const std::string&, const std::string&, const std::string&, ChosenPath chosen) override { chosen(std::nullopt); }
+    std::optional<std::string> pickPath;   // what chooseOpenFile "chooses"; nullopt = the user cancels
+    void chooseOpenFile(const std::string&, const std::string&, const std::string&, ChosenPath chosen) override { chosen(pickPath); }
     void chooseFolder(const std::string&, ChosenPath chosen) override { chosen(std::nullopt); }
     void openUrl(const std::string&) override {}
     int relaunches = 0;
@@ -13379,6 +13380,71 @@ void testProfilePictureRejectsHostile() {
 
 
 // Row names show the username, the hostname goes to the sub line, and a stored picture replaces the initial disc.
+void testSettingsProfile() {
+    std::cout << "[TEST 129] Settings > Profile saves the name, sets and removes the picture; the rail avatar opens it...\n";
+    IdentityManager id(4254);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    FakeShell shell;
+    AppUi app(id, net, shell, "");
+    ui::RecordingCanvas rc;
+    auto settle = [&] { for (int i = 0; i < 150; ++i) app.render(rc, 1280, 800, 1.0 / 60.0); };
+    auto click = [&](float x, float y) {
+        app.onMouseMove(x, y);
+        app.onMouseButton(MouseButtonId::Left, true, x, y);
+        app.onMouseButton(MouseButtonId::Left, false, x, y);
+        settle();
+    };
+    auto shows = [&](const char* text) { return rc.serialize().find(text) != std::string::npos; };
+    const char* kHelper = "Shown to anyone you connect with";
+
+    app.applySnapshotState("settings_profile");   // the name field is focused
+    AppSettings s = id.settings();
+    s.displayName.clear();
+    id.updateSettings(s);
+    settle();
+    app.onText("\x01");
+    app.onText("Jane");
+    app.onText("\r");   // Enter saves
+    TEST_ASSERT(id.settings().displayName == "Jane");
+    app.onText("\x01");
+    app.onText("  Kim  ");
+    TEST_ASSERT(id.settings().displayName == "Jane");   // still typing
+    click(190, 126);                                     // leaving the page (Appearance) saves, trimmed
+    TEST_ASSERT(id.settings().displayName == "Kim");
+
+    app.applySnapshotState("settings_appearance");
+    settle();
+    TEST_ASSERT(!shows(kHelper));
+    click(36, 642);   // the rail avatar, above Theme
+    TEST_ASSERT(shows(kHelper));
+
+    // Change picture (the fake picker returns shell.pickPath), then Remove
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::remove(id.ownPicturePath(), ec);
+    std::vector<uint8_t> px(200u * 120u * 4u, 0x80);
+    const auto jpeg = TileCodec::encodeJpeg(px.data(), 200, 120, 85);
+    const fs::path jpg = fs::temp_directory_path() / "cppdesk_profile_pick.jpg";
+    { std::ofstream(jpg, std::ios::binary).write(reinterpret_cast<const char*>(jpeg.data()), static_cast<std::streamsize>(jpeg.size())); }
+    settle();
+    TEST_ASSERT(!shows("Remove"));
+    shell.pickPath = jpg.string();
+    click(497, 125);
+    TEST_ASSERT(fs::exists(id.ownPicturePath(), ec));
+    TEST_ASSERT(shows("Picture updated") && shows("Remove"));
+    click(620, 125);   // Remove
+    TEST_ASSERT(!fs::exists(id.ownPicturePath(), ec));
+
+    { std::ofstream(jpg, std::ios::binary | std::ios::trunc) << "not a picture"; }
+    click(497, 125);
+    TEST_ASSERT(!fs::exists(id.ownPicturePath(), ec));
+    TEST_ASSERT(shows("couldn't be used"));
+
+    fs::remove(jpg, ec);
+    fs::remove(id.configFilePath(), ec);
+}
+
 void testAvatarFallbackAndSplitNames() {
     std::cout << "[TEST 128] Avatar picture or initial, and split names in the home list...\n";
     IdentityManager id(4253);
@@ -13407,7 +13473,13 @@ void testAvatarFallbackAndSplitNames() {
     TEST_ASSERT(ops.find("\xC2\xB7  PC1\n") != std::string::npos);                  // the computer, not the whole wire name
     TEST_ASSERT(ops.find("|Jane \xC2\xB7 PC1") == std::string::npos);
     TEST_ASSERT(imageLines(ops).empty());
-    TEST_ASSERT(ops.find("|J\n") != std::string::npos);                              // the initial of the username
+    const auto initials = [](const std::string& s) {   // "|J" lines: the row's initial, plus the rail's own avatar (Jane)
+        size_t n = 0;
+        for (size_t p = s.find("|J\n"); p != std::string::npos; p = s.find("|J\n", p + 1)) ++n;
+        return n;
+    };
+    const size_t withInitial = initials(ops);
+    TEST_ASSERT(withInitial == 2);                                                    // the initial of the username
 
     std::vector<uint8_t> px(96u * 96u * 4u, 0x80);
     ops = render(TileCodec::encodeJpeg(px.data(), 96, 96, 85));
@@ -13416,7 +13488,7 @@ void testAvatarFallbackAndSplitNames() {
     float l = 0, t = 0, r = 0, b = 0;
     TEST_ASSERT(std::sscanf(imgs[0].c_str(), "drawImage %*d %f %f %f %f", &l, &t, &r, &b) == 4);
     TEST_ASSERT(r - l == 36.0f && b - t == 36.0f);                                  // the 18px avatar rect
-    TEST_ASSERT(ops.find("|J\n") == std::string::npos);
+    TEST_ASSERT(initials(ops) == withInitial - 1);                                    // the row shows the picture, the rail keeps its initial
 
     // The host-side ACTIVE SESSION card names the viewer by username, not the whole wire name
     const std::string card = renderAppState(id, net, shell, "dashboard_mic_on");
@@ -13537,6 +13609,7 @@ int main(int argc, char** argv) {
         testPeerPictureCachedOnlyAfterAccept(); std::cout << "Test 126 done\n" << std::flush;
         testProfilePictureRejectsHostile(); std::cout << "Test 127 done\n" << std::flush;
         testAvatarFallbackAndSplitNames(); std::cout << "Test 128 done\n" << std::flush;
+        testSettingsProfile(); std::cout << "Test 129 done\n" << std::flush;
 #if defined(__linux__)
         testCairoCanvas(); std::cout << "Test 73 done\n" << std::flush;
 #endif
