@@ -13317,8 +13317,9 @@ void testPeerPictureCachedOnlyAfterAccept() {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     ask(true);
-    TEST_ASSERT(std::filesystem::exists(rig.hostId.peerPicturePath(viewerDesk)));
-    TEST_ASSERT(hostNet.peerPicture(viewerDesk) == rig.viewerPic);
+    // The host stores after sending AUTH_RESULT, so the viewer can be Connected first
+    TEST_ASSERT(waitFor([&] { return std::filesystem::exists(rig.hostId.peerPicturePath(viewerDesk)); }));
+    TEST_ASSERT(waitFor([&] { return hostNet.peerPicture(viewerDesk) == rig.viewerPic; }));
     TEST_ASSERT(waitFor([&] { return viewerNet.peerPicture(hostDesk) == rig.hostPic; }));
     TEST_ASSERT(std::filesystem::exists(rig.viewerId.peerPicturePath(hostDesk)));
 
