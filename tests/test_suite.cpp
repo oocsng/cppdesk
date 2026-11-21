@@ -13205,6 +13205,177 @@ void testWireNameOnTheWire() {
     hangUp();
 }
 
+void testAuthResponseTrailingPicture() {
+    std::cout << "[TEST 125] AUTH_RESPONSE trailing picture: 1.0 parse unchanged, new parse extracts it...\n";
+    std::vector<uint8_t> px(96u * 96u * 4u, 0x80);
+    const auto pic = TileCodec::encodeJpeg(px.data(), 96, 96, 85);
+    TEST_ASSERT(cppdesk::avatar::validateWireJpeg(pic));
+
+    for (uint8_t mode : {AUTH_MODE_NONE, AUTH_MODE_PASSWORD_BOUND, AUTH_MODE_REBOOT_TOKEN, AUTH_MODE_PAIRED}) {
+        for (int withPic = 0; withPic < 2; ++withPic) {
+            std::array<uint8_t, 32> digest{}; digest.fill(0x5A);
+            PairingKey::Signature sig{}; sig.fill(0xC3);
+            ByteWriter w;
+            w.writeU8(mode);
+            w.writeBytes(digest.data(), digest.size());
+            if (mode == AUTH_MODE_PAIRED) { w.writeU16(static_cast<uint16_t>(sig.size())); w.writeBytes(sig.data(), sig.size()); }
+            if (withPic) writeWirePicture(w, pic);
+
+            // The 1.0 host's sequence: mode, 32 bytes, and for PAIRED a guarded u16 + signature
+            ByteReader r(w.buffer());
+            TEST_ASSERT(r.readU8() == mode);
+            std::array<uint8_t, 32> gotDigest{};
+            r.readBytes(gotDigest.data(), gotDigest.size());
+            TEST_ASSERT(gotDigest == digest);
+            if (mode == AUTH_MODE_PAIRED) {
+                PairingKey::Signature gotSig{};
+                const bool present = r.hasRemaining(2 + gotSig.size()) && r.readU16() == gotSig.size();
+                if (present) r.readBytes(gotSig.data(), gotSig.size());
+                TEST_ASSERT(present && gotSig == sig);
+            }
+            // The new host reads on from there
+            const auto got = readWirePicture(r);
+            TEST_ASSERT(withPic ? (got && *got == pic) : !got);
+        }
+    }
+
+    auto parse = [](const std::vector<uint8_t>& bytes) { ByteReader r(bytes); return readWirePicture(r); };
+    { ByteWriter w; writeWirePicture(w, {}); auto p = parse(w.buffer()); TEST_ASSERT(p && p->empty()); }   // explicit none
+    { ByteWriter w; w.writeU16(100); w.writeBytes(pic.data(), 10); TEST_ASSERT(!parse(w.buffer())); }        // truncated
+    { ByteWriter w; writeWirePicture(w, std::vector<uint8_t>(cppdesk::avatar::kMaxWireBytes + 1, 0xFF)); TEST_ASSERT(!parse(w.buffer())); }
+    std::vector<uint8_t> noise(3000);
+    uint32_t s = 777;
+    for (auto& b : noise) { s = s * 1664525u + 1013904223u; b = static_cast<uint8_t>(s >> 24); }
+    { ByteWriter w; writeWirePicture(w, noise); TEST_ASSERT(!parse(w.buffer())); }
+    std::vector<uint8_t> big(400u * 400u * 4u, 0x40);
+    { ByteWriter w; writeWirePicture(w, TileCodec::encodeJpeg(big.data(), 400, 400, 30)); TEST_ASSERT(!parse(w.buffer())); }
+}
+
+namespace {
+// A host and a viewer whose config (and so profile_/avatars_ files) live in a fresh temp dir.
+struct PictureRig {
+    std::filesystem::path dir;
+    IdentityManager hostId, viewerId;
+    std::vector<uint8_t> hostPic, viewerPic;
+    PictureRig(const char* name, int inst) : hostId(inst), viewerId(inst + 1) {
+        dir = std::filesystem::temp_directory_path() / name;
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        std::filesystem::create_directories(dir);
+        hostId.setConfigPathForTest(dir / "host.ini");
+        viewerId.setConfigPathForTest(dir / "viewer.ini");
+        std::vector<uint8_t> a(96u * 96u * 4u, 0x30), b(96u * 96u * 4u, 0xD0);
+        hostPic = TileCodec::encodeJpeg(a.data(), 96, 96, 85);
+        viewerPic = TileCodec::encodeJpeg(b.data(), 96, 96, 85);
+    }
+    ~PictureRig() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
+    static void writeFile(const std::filesystem::path& p, const std::vector<uint8_t>& bytes) {
+        std::ofstream(p, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+};
+
+template <class F> bool waitFor(F cond, int ms = 4000) {
+    for (int i = 0; i < ms / 25; ++i) { if (cond()) return true; std::this_thread::sleep_for(std::chrono::milliseconds(25)); }
+    return cond();
+}
+} // namespace
+
+void testPeerPictureCachedOnlyAfterAccept() {
+    std::cout << "[TEST 126] Peer pictures are cached only after the host accepts...\n";
+    PictureRig rig("cppdesk_pic_accept", 4342);
+    TEST_ASSERT(rig.hostId.loadOrCreate() && rig.viewerId.loadOrCreate());
+    PictureRig::writeFile(rig.hostId.ownPicturePath(), rig.hostPic);
+    PictureRig::writeFile(rig.viewerId.ownPicturePath(), rig.viewerPic);
+    const uint64_t hostDesk = rig.hostId.deskId(), viewerDesk = rig.viewerId.deskId();
+    const auto hostAvatars = rig.hostId.peerPicturePath(viewerDesk).parent_path();
+    const auto viewerAvatars = rig.viewerId.peerPicturePath(hostDesk).parent_path();
+
+    NetworkEngine hostNet(rig.hostId);
+    NetworkEngine viewerNet(rig.viewerId);
+    TEST_ASSERT(hostNet.start() && viewerNet.start());
+    const std::string target = "127.0.0.1:" + std::to_string(hostNet.hostListenPort());
+
+    const uint32_t gen0 = viewerNet.peerPictureGeneration();
+    viewerNet.sendProfilePicture();   // no session: still counts as an own-picture change
+    TEST_ASSERT(viewerNet.peerPictureGeneration() == gen0 + 1);
+
+    auto ask = [&](bool accept) {
+        TEST_ASSERT(viewerNet.connectToRemote(target, ""));
+        PendingIncomingRequest req;
+        TEST_ASSERT(waitFor([&] { req = hostNet.pendingIncomingRequest(); return req.active; }));
+        TEST_ASSERT(req.callerDeskId == viewerDesk && req.callerPicture == rig.viewerPic);   // the modal sees it before any decision
+        hostNet.respondToIncomingRequest(accept, PERM_ALL);
+        const auto want = accept ? ViewerConnectionState::Connected : ViewerConnectionState::Error;
+        TEST_ASSERT(waitFor([&] { return viewerNet.viewerStats().state == want; }));
+    };
+
+    ask(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    TEST_ASSERT(!std::filesystem::exists(hostAvatars) && !std::filesystem::exists(viewerAvatars));
+    TEST_ASSERT(hostNet.peerPicture(viewerDesk).empty() && viewerNet.peerPicture(hostDesk).empty());
+    viewerNet.disconnectViewer();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    ask(true);
+    TEST_ASSERT(std::filesystem::exists(rig.hostId.peerPicturePath(viewerDesk)));
+    TEST_ASSERT(hostNet.peerPicture(viewerDesk) == rig.viewerPic);
+    TEST_ASSERT(waitFor([&] { return viewerNet.peerPicture(hostDesk) == rig.hostPic; }));
+    TEST_ASSERT(std::filesystem::exists(rig.viewerId.peerPicturePath(hostDesk)));
+
+    viewerNet.disconnectViewer();
+    hostNet.disconnectHostClient();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // A fresh engine (no memory copy) reads the cached file
+    NetworkEngine later(rig.hostId);
+    TEST_ASSERT(later.peerPicture(viewerDesk) == rig.viewerPic);
+}
+
+void testProfilePictureRejectsHostile() {
+    std::cout << "[TEST 127] Hostile PROFILE_PICTURE payloads are ignored and the session stays up...\n";
+    PictureRig rig("cppdesk_pic_hostile", 4344);
+    TEST_ASSERT(rig.hostId.loadOrCreate() && rig.viewerId.loadOrCreate());
+    rig.hostId.setUnattendedEnabled(true);
+    rig.hostId.setUnattendedPassword("HostPw1");
+    PictureRig::writeFile(rig.viewerId.ownPicturePath(), rig.viewerPic);
+    const uint64_t viewerDesk = rig.viewerId.deskId();
+
+    NetworkEngine hostNet(rig.hostId);
+    NetworkEngine viewerNet(rig.viewerId);
+    TEST_ASSERT(hostNet.start() && viewerNet.start());
+    TEST_ASSERT(viewerNet.connectToRemote("127.0.0.1:" + std::to_string(hostNet.hostListenPort()), "HostPw1"));
+    TEST_ASSERT(waitFor([&] { return viewerNet.viewerStats().state == ViewerConnectionState::Connected; }));
+    TEST_ASSERT(waitFor([&] { return hostNet.peerPicture(viewerDesk) == rig.viewerPic; }));
+
+    std::vector<uint8_t> noise(3000);
+    uint32_t s = 4242;
+    for (auto& b : noise) { s = s * 1664525u + 1013904223u; b = static_cast<uint8_t>(s >> 24); }
+    std::vector<uint8_t> big(400u * 400u * 4u, 0x40);
+    const std::vector<std::vector<uint8_t>> hostile = {
+        std::vector<uint8_t>(cppdesk::avatar::kMaxWireBytes + 1, 0xFF), noise, TileCodec::encodeJpeg(big.data(), 400, 400, 30)};
+    const uint32_t gen = hostNet.peerPictureGeneration();
+    for (const auto& bad : hostile) {
+        PictureRig::writeFile(rig.viewerId.ownPicturePath(), bad);
+        viewerNet.sendProfilePicture();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    TEST_ASSERT(hostNet.peerPictureGeneration() == gen);
+    TEST_ASSERT(hostNet.peerPicture(viewerDesk) == rig.viewerPic);
+    TEST_ASSERT(viewerNet.viewerStats().state == ViewerConnectionState::Connected && hostNet.hostSessionStatus().active);
+
+    // The same path still carries a good picture, and an explicit none deletes the cache
+    PictureRig::writeFile(rig.viewerId.ownPicturePath(), rig.hostPic);
+    viewerNet.sendProfilePicture();
+    TEST_ASSERT(waitFor([&] { return hostNet.peerPicture(viewerDesk) == rig.hostPic; }));
+    std::filesystem::remove(rig.viewerId.ownPicturePath());
+    viewerNet.sendProfilePicture();
+    TEST_ASSERT(waitFor([&] { return hostNet.peerPicture(viewerDesk).empty(); }));
+    TEST_ASSERT(!std::filesystem::exists(rig.hostId.peerPicturePath(viewerDesk)));
+
+    viewerNet.disconnectViewer();
+    hostNet.disconnectHostClient();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+}
+
 
 int main(int argc, char** argv) {
     try {
@@ -13312,6 +13483,9 @@ int main(int argc, char** argv) {
         testProfileNames(); std::cout << "Test 122 done\n" << std::flush;
         testAvatarImage(); std::cout << "Test 123 done\n" << std::flush;
         testWireNameOnTheWire(); std::cout << "Test 124 done\n" << std::flush;
+        testAuthResponseTrailingPicture(); std::cout << "Test 125 done\n" << std::flush;
+        testPeerPictureCachedOnlyAfterAccept(); std::cout << "Test 126 done\n" << std::flush;
+        testProfilePictureRejectsHostile(); std::cout << "Test 127 done\n" << std::flush;
 #if defined(__linux__)
         testCairoCanvas(); std::cout << "Test 73 done\n" << std::flush;
 #endif

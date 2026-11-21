@@ -174,7 +174,8 @@ enum class PacketType : uint8_t {
 
     // Pairing offer inside an authenticated session
     PAIR_REQUEST        = 0x5C, // Viewer -> Host: u16 64 + viewer pairing key, string viewer hostname
-    PAIR_RESULT         = 0x5D  // Host -> Viewer: u8 accepted, u16 len + host pairing key (0 if refused), string message
+    PAIR_RESULT         = 0x5D, // Host -> Viewer: u8 accepted, u16 len + host pairing key (0 if refused), string message
+    PROFILE_PICTURE     = 0x5E, // Bidirectional (encrypted, after accept): u16 len + 96x96 JPEG, 0 = none
 };
 
 enum class SystemActionType : uint8_t {
