@@ -24,7 +24,7 @@ fillRoundRect 105.20 428.80 284.80 429.80 r0.50 c1.00,1.00,1.00,0.16
 fillRoundRect 102.00 437.00 105.00 455.00 r1.50 c0.85,0.47,0.34,1.00
 drawText 116.00 428.00 280.00 464.00 BodyBold LC c0.15,0.14,0.13,1.00 |About
 drawText 116.00 468.00 280.00 504.00 Body LC c0.33,0.31,0.27,1.00 |Glide
-drawText 102.00 754.00 288.00 772.00 Small CC c0.41,0.38,0.35,1.00 |v1.0.0
+drawText 102.00 754.00 288.00 772.00 Small CC c0.41,0.38,0.35,1.00 |v1.0.1
 fillRoundRect 311.50 19.60 1264.50 788.60 r18.50 c0.15,0.12,0.08,0.01
 fillRoundRect 313.00 18.60 1263.00 784.60 r17.00 c0.15,0.12,0.08,0.01
 fillRoundRect 314.00 18.10 1262.00 782.10 r16.00 c0.15,0.12,0.08,0.01
@@ -48,7 +48,7 @@ strokeRoundRect 338.00 84.10 1238.00 150.10 r12.00 c0.89,0.87,0.83,1.00 w1.00
 fillRoundRect 352.00 84.90 1224.00 85.90 r0.50 c1.00,1.00,1.00,0.75
 fillRoundRect 354.00 97.10 394.00 137.10 r10.00 c0.85,0.47,0.34,1.00
 drawText 354.00 97.10 394.00 137.10 Subheading CC c1.00,1.00,1.00,1.00 |CD
-drawText 408.00 96.10 938.00 118.10 Subheading LC c0.15,0.14,0.13,1.00 |CppDesk v1.0.0  •  Fast, secure remote desktop for Windows
+drawText 408.00 96.10 938.00 118.10 Subheading LC c0.15,0.14,0.13,1.00 |CppDesk v1.0.1  •  Fast, secure remote desktop for Windows
 fillEllipse 413.00 129.10 8.91 8.91 c0.66,0.36,0.07,0.07
 fillEllipse 413.00 129.10 6.91 6.91 c0.66,0.36,0.07,0.14
 fillEllipse 413.00 129.10 3.80 3.80 c0.66,0.36,0.07,1.00
@@ -71,7 +71,7 @@ fillRoundRect 1078.00 180.10 1146.00 206.10 r6.00 c0.94,0.92,0.88,1.00
 fillRoundRect 1080.40 180.90 1143.60 181.90 r0.50 c1.00,1.00,1.00,0.16
 strokeRoundRect 1078.00 180.10 1146.00 206.10 r6.00 c0.89,0.87,0.83,1.00 w1.00
 drawText 1078.00 180.10 1146.00 206.10 Small CC c0.15,0.14,0.13,1.00 |GitHub
-drawText 354.00 192.10 1066.00 212.10 Small LC c0.33,0.31,0.27,1.00 |CppDesk v1.0.0 • Free & Open Source
+drawText 354.00 192.10 1066.00 212.10 Small LC c0.33,0.31,0.27,1.00 |CppDesk v1.0.1 • Free & Open Source
 fillRoundRect 338.00 236.10 1238.00 314.10 r12.00 c0.95,0.93,0.90,1.00
 strokeRoundRect 338.00 236.10 1238.00 314.10 r12.00 c0.89,0.87,0.83,1.00 w1.00
 drawText 354.00 244.10 1222.00 258.10 BodyBold LC c0.15,0.14,0.13,1.00 |Your data
