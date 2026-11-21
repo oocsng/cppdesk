@@ -1,6 +1,7 @@
 #include "../src/core/protocol.hpp"
 #include "../src/core/crypto_identity.hpp"
 #include "../src/core/profile.hpp"
+#include "../src/capture/avatar_image.hpp"
 #include "../src/simd/simd_kernels.hpp"
 #include "../src/capture/screen_capture.hpp"
 #include "../src/control/input_injector.hpp"
@@ -13104,6 +13105,53 @@ void testProfileNames() {
     TEST_ASSERT(ownPicturePath("cfg/config_3.ini", 3).generic_string().ends_with("profile_3.jpg"));
 }
 
+// Profile picture model: centre-crop to 96x96 JPEG, wire validation, circular alpha mask.
+void testAvatarImage() {
+    std::cout << "[TEST 123] Avatar JPEG normalise, validate, circle mask...\n";
+    namespace av = cppdesk::avatar;
+    auto gradient = [](int w, int h) {
+        std::vector<uint8_t> px(static_cast<size_t>(w) * h * 4);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                uint8_t* p = &px[(static_cast<size_t>(y) * w + x) * 4];
+                p[0] = static_cast<uint8_t>(x * 255 / w); p[1] = static_cast<uint8_t>(y * 255 / h); p[2] = 128; p[3] = 255;
+            }
+        return px;
+    };
+    auto src = gradient(300, 200);
+    auto jpg = TileCodec::encodeJpeg(src.data(), 300, 200, 85);
+    TEST_ASSERT(!jpg.empty());
+
+    auto norm = av::normaliseJpeg(jpg);
+    TEST_ASSERT(norm.has_value());
+    if (norm) {
+        TEST_ASSERT(norm->size() <= av::kMaxWireBytes);
+        std::vector<uint8_t> bgra; int w = 0, h = 0;
+        TEST_ASSERT(TileCodec::decodeJpeg(norm->data(), norm->size(), bgra, w, h) && w == 96 && h == 96);
+        TEST_ASSERT(av::validateWireJpeg(*norm));
+
+        std::vector<uint8_t> circ; int cw = 0, ch = 0;
+        TEST_ASSERT(av::decodeCircleBgra(*norm, circ, cw, ch) && cw == 96 && ch == 96);
+        if (circ.size() == 96u * 96u * 4u) {
+            TEST_ASSERT(circ[3] == 0);
+            TEST_ASSERT(circ[(48u * 96u + 48u) * 4 + 3] == 255);
+        }
+    }
+
+    TEST_ASSERT(!av::validateWireJpeg({}));
+    std::vector<uint8_t> noise(20000);
+    uint32_t s = 12345;
+    for (auto& b : noise) { s = s * 1664525u + 1013904223u; b = static_cast<uint8_t>(s >> 24); }
+    TEST_ASSERT(!av::validateWireJpeg(noise));
+    auto big = gradient(400, 400);
+    auto bigJpg = TileCodec::encodeJpeg(big.data(), 400, 400, 30);
+    TEST_ASSERT(!bigJpg.empty() && bigJpg.size() <= av::kMaxWireBytes);   // size alone must not be what rejects it
+    TEST_ASSERT(!av::validateWireJpeg(bigJpg));
+
+    TEST_ASSERT(!av::normaliseJpeg(std::vector<uint8_t>(11u << 20, 0xFF)).has_value());
+    TEST_ASSERT(!av::normaliseJpeg(noise).has_value());
+}
+
 int main(int argc, char** argv) {
     try {
         setOsAssignedPortsForTest(true);   // every listener binds an OS-assigned port; tests dial the port that was bound
@@ -13208,6 +13256,7 @@ int main(int argc, char** argv) {
         testAppUiPublicInputApi(); std::cout << "Test 71 done\n" << std::flush;
         testUiGoldens(); std::cout << "Test 72 done\n" << std::flush;
         testProfileNames(); std::cout << "Test 122 done\n" << std::flush;
+        testAvatarImage(); std::cout << "Test 123 done\n" << std::flush;
 #if defined(__linux__)
         testCairoCanvas(); std::cout << "Test 73 done\n" << std::flush;
 #endif

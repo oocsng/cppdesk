@@ -20,6 +20,7 @@ set(CORE_SOURCES
     src/net/fleet_manager.cpp
     src/net/updater.cpp
     src/capture/screen_capture.cpp
+    src/capture/avatar_image.cpp
     src/capture/display_manager.cpp
     src/capture/virtual_display_manager.cpp
     src/capture/screen_blank_manager.cpp
