@@ -1396,7 +1396,7 @@ void NetworkEngine::sendDiscoveryQuery(uint64_t targetDeskId) {
     pkt.deskId = identity_.deskId();
     pkt.queryId = targetDeskId;
     pkt.tcpPort = identity_.listenPort();
-    std::strncpy(pkt.hostname, identity_.hostname().c_str(), sizeof(pkt.hostname) - 1);
+    std::strncpy(pkt.hostname, identity_.wireName(sizeof(pkt.hostname) - 1).c_str(), sizeof(pkt.hostname) - 1);
 
     for (int slot = 0; slot < 6; ++slot) {
         uint16_t port = static_cast<uint16_t>(DEFAULT_DISCOVERY_PORT - slot);
@@ -1489,7 +1489,7 @@ void NetworkEngine::discoveryLoop() {
                         reply.deskId = identity_.deskId();
                         reply.queryId = 0;
                         reply.tcpPort = identity_.listenPort();
-                        std::strncpy(reply.hostname, identity_.hostname().c_str(), sizeof(reply.hostname) - 1);
+                        std::strncpy(reply.hostname, identity_.wireName(sizeof(reply.hostname) - 1).c_str(), sizeof(reply.hostname) - 1);
                         sendto(us, reinterpret_cast<const char*>(&reply), sizeof(reply), 0,
                                reinterpret_cast<sockaddr*>(&fromAddr), sizeof(fromAddr));
                     }
@@ -1523,7 +1523,7 @@ void NetworkEngine::relayRegistrationLoop() {
 
         ByteWriter w;
         w.writeU64(identity_.deskId());
-        w.writeString(identity_.hostname());
+        w.writeString(identity_.wireName());
         w.writeString(localIp_);
         w.writeU16(identity_.listenPort());
         w.writeU8(relayowner::OWNER_CAP);
@@ -1923,7 +1923,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         {
             ByteWriter w;
             w.writeU64(identity_.deskId());
-            w.writeString(identity_.hostname());
+            w.writeString(identity_.wireName());
             w.writeBytes(nonce.data(), nonce.size());
             w.writeU8(identity_.unattendedEnabled() ? 1 : 0);
             w.writeU16(static_cast<uint16_t>(hostEcdh.localPublicKey().size()));
@@ -3622,7 +3622,7 @@ bool NetworkEngine::requestPairing() {
     ByteWriter w;
     w.writeU16(static_cast<uint16_t>(key.publicKey().size()));
     w.writeBytes(key.publicKey().data(), key.publicKey().size());
-    w.writeString(identity_.hostname());
+    w.writeString(identity_.wireName());
     w.writeU16(static_cast<uint16_t>(popSig.size()));
     w.writeBytes(popSig.data(), popSig.size());
     pairingState_.store(PairingRequestState::Pending);   // before the send: the answer may beat us back
@@ -3926,7 +3926,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                 ByteWriter w;
                 w.writeU16(PROTOCOL_VERSION);
                 w.writeU64(identity_.deskId());
-                w.writeString(identity_.hostname());
+                w.writeString(identity_.wireName());
                 w.writeU16(static_cast<uint16_t>(viewerEcdh.localPublicKey().size()));
                 if (!viewerEcdh.localPublicKey().empty()) {
                     w.writeBytes(viewerEcdh.localPublicKey().data(), viewerEcdh.localPublicKey().size());
@@ -5531,7 +5531,7 @@ bool NetworkEngine::sendChatMessage(const std::string& text) {
     if (text.empty() || text.size() > 2048) return false;
 
     ByteWriter w;
-    w.writeString(identity_.hostname());
+    w.writeString(identity_.wireName());
     w.writeString(text);
 
     bool sent = false;
@@ -5548,7 +5548,7 @@ bool NetworkEngine::sendChatMessage(const std::string& text) {
 
     if (sent) {
         std::lock_guard<std::mutex> lock(chatMutex_);
-        appendChatMessageLocked({ "You (" + identity_.hostname() + ")", text, true, nowTickMs() });
+        appendChatMessageLocked({ "You (" + (identity_.displayName().empty() ? identity_.hostname() : identity_.displayName()) + ")", text, true, nowTickMs() });
     }
     return sent;
 }
@@ -5557,7 +5557,7 @@ bool NetworkEngine::sendChatImage(const std::vector<uint8_t>& jpegData, uint32_t
     if (jpegData.empty() || jpegData.size() > 2 * 1024 * 1024) return false;
 
     ChatMediaPayload p;
-    p.senderName = identity_.hostname();
+    p.senderName = identity_.wireName();
     p.captionText = caption;
     p.imgWidth = w;
     p.imgHeight = h;
@@ -5581,7 +5581,7 @@ bool NetworkEngine::sendChatImage(const std::vector<uint8_t>& jpegData, uint32_t
 
     if (sent) {
         std::lock_guard<std::mutex> lock(chatMutex_);
-        appendChatMessageLocked({ "You (" + identity_.hostname() + ")", caption, true, p.timestampMs, true, jpegData, w, h });
+        appendChatMessageLocked({ "You (" + (identity_.displayName().empty() ? identity_.hostname() : identity_.displayName()) + ")", caption, true, p.timestampMs, true, jpegData, w, h });
     }
     return sent;
 }

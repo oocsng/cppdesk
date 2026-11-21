@@ -13163,6 +13163,49 @@ void testAvatarImage() {
     TEST_ASSERT(!av::normaliseJpeg(noise).has_value());
 }
 
+void testWireNameOnTheWire() {
+    std::cout << "[TEST 124] The viewer sees the host's username with its computer name...\n";
+    IdentityManager hostId(4340), viewerId(4341);
+    for (auto* id : {&hostId, &viewerId}) { std::error_code ec; std::filesystem::remove(id->configFilePath(), ec); }
+    TEST_ASSERT(hostId.loadOrCreate() && viewerId.loadOrCreate());
+    hostId.setUnattendedEnabled(true);
+    hostId.setUnattendedPassword("HostPw1");
+    { AppSettings s = hostId.settings(); s.displayName = "Jane"; hostId.updateSettings(s); }
+
+    NetworkEngine hostNet(hostId);
+    NetworkEngine viewerNet(viewerId);
+    TEST_ASSERT(hostNet.start() && viewerNet.start());
+    const std::string target = "127.0.0.1:" + std::to_string(hostNet.hostListenPort());
+
+    auto dial = [&]() {
+        viewerNet.connectToRemote(target, "HostPw1");
+        ViewerSessionStats st;
+        for (int i = 0; i < 80; ++i) {
+            st = viewerNet.viewerStats();
+            if (st.state == ViewerConnectionState::Connected || st.state == ViewerConnectionState::Error) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return st;
+    };
+    auto hangUp = [&]() {
+        viewerNet.disconnectViewer();
+        hostNet.disconnectHostClient();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    };
+
+    auto st = dial();
+    TEST_ASSERT(st.state == ViewerConnectionState::Connected);
+    TEST_ASSERT(st.remoteHostname == "Jane \xC2\xB7 " + hostId.hostname());
+    hangUp();
+
+    { AppSettings s = hostId.settings(); s.displayName = ""; hostId.updateSettings(s); }
+    st = dial();
+    TEST_ASSERT(st.state == ViewerConnectionState::Connected);
+    TEST_ASSERT(st.remoteHostname == hostId.hostname());
+    hangUp();
+}
+
+
 int main(int argc, char** argv) {
     try {
         setOsAssignedPortsForTest(true);   // every listener binds an OS-assigned port; tests dial the port that was bound
@@ -13268,6 +13311,7 @@ int main(int argc, char** argv) {
         testUiGoldens(); std::cout << "Test 72 done\n" << std::flush;
         testProfileNames(); std::cout << "Test 122 done\n" << std::flush;
         testAvatarImage(); std::cout << "Test 123 done\n" << std::flush;
+        testWireNameOnTheWire(); std::cout << "Test 124 done\n" << std::flush;
 #if defined(__linux__)
         testCairoCanvas(); std::cout << "Test 73 done\n" << std::flush;
 #endif
