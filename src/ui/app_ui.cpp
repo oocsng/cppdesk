@@ -1273,9 +1273,10 @@ void AppUi::drawNavRail(float height) {
             settingsScrollOffset_ = settingsScrollTarget_ = settingsScrollVel_ = 0.0f;
         }, false });
         activeTooltips_.push_back({ pr, "Profile" });
+        const UiRect ar = getWidgetAnimRect("rail_profile", pr);   // press shrinks it to 0.97 like the other rail items
         const float hT = std::clamp(widgetAnims_["rail_profile"].hoverT, 0.0f, 1.0f);
-        if (hT > 0.01f) fillRoundRect(pr, 12.0f, rgba(255, 255, 255, 0.06f * hT));
-        drawAvatar(pr.centerX(), pr.centerY(), 16.0f, identity_.deskId(), ownAvatarName(), 1.0f);
+        if (hT > 0.01f) fillRoundRect(ar, 12.0f, rgba(255, 255, 255, 0.06f * hT));
+        drawAvatar(ar.centerX(), ar.centerY(), 16.0f * ar.height() / pr.height(), identity_.deskId(), ownAvatarName(), 1.0f);
     }
     item("btn_nav_theme", "Theme", -1, themeTop, false, 0, [this]() {
         AppSettings s = identity_.settings();

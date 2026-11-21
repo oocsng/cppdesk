@@ -13433,6 +13433,7 @@ void testSettingsProfile() {
     click(497, 125);
     TEST_ASSERT(fs::exists(id.ownPicturePath(), ec));
     TEST_ASSERT(shows("Picture updated") && shows("Remove"));
+    TEST_ASSERT(shows("drawImage"));   // the picked picture is drawn
     click(620, 125);   // Remove
     TEST_ASSERT(!fs::exists(id.ownPicturePath(), ec));
 
@@ -13442,6 +13443,91 @@ void testSettingsProfile() {
     TEST_ASSERT(shows("couldn't be used"));
 
     fs::remove(jpg, ec);
+    fs::remove(id.configFilePath(), ec);
+}
+
+// The own avatar when its picture changes: crossfade over 150 ms, or instant with reduced motion.
+void testOwnAvatarCrossfade() {
+    std::cout << "[TEST 130] The own avatar crossfades when the picture changes and swaps instantly with reduced motion...\n";
+    IdentityManager id(4255);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    FakeShell shell;
+    AppUi app(id, net, shell, "");
+    ui::RecordingCanvas rc;
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    {
+        AppSettings s = id.settings();
+        s.displayName = "Zq";   // its initial "Z" is the only avatar on the dashboard
+        s.reduceMotion = 2;     // motion forced on
+        id.updateSettings(s);
+    }
+    auto motion = [&](uint8_t mode) { AppSettings s = id.settings(); s.reduceMotion = mode; id.updateSettings(s); };
+    auto frames = [&](int n) { for (int i = 0; i < n; ++i) app.render(rc, 1280, 800, 1.0 / 60.0); return rc.serialize(); };
+    auto opacities = [](const std::string& ops) {   // "drawImage id l t r b o<opacity>" lines of the last frame
+        std::vector<float> out;
+        std::istringstream in(ops);
+        for (std::string line; std::getline(in, line);)
+            if (line.rfind("drawImage", 0) == 0) out.push_back(std::stof(line.substr(line.rfind(" o") + 2)));
+        return out;
+    };
+    auto initials = [](const std::string& ops) {
+        size_t n = 0;
+        for (size_t p = ops.find("|Z\n"); p != std::string::npos; p = ops.find("|Z\n", p + 1)) ++n;
+        return n;
+    };
+    auto jpegOf = [](uint8_t tint) {
+        std::vector<uint8_t> px(96u * 96u * 4u);
+        for (size_t i = 0; i < px.size(); i += 4) { px[i] = tint; px[i + 1] = static_cast<uint8_t>(i / 64); px[i + 2] = 40; px[i + 3] = 255; }
+        return TileCodec::encodeJpeg(px.data(), 96, 96, 85);
+    };
+    auto setPicture = [&](const std::vector<uint8_t>& jpeg) {   // what the Profile page does to the file, then sendProfilePicture
+        if (jpeg.empty()) fs::remove(id.ownPicturePath(), ec);
+        else std::ofstream(id.ownPicturePath(), std::ios::binary | std::ios::trunc).write(reinterpret_cast<const char*>(jpeg.data()), static_cast<std::streamsize>(jpeg.size()));
+        net.sendProfilePicture();
+    };
+    const auto pictA = jpegOf(0x40), pictB = jpegOf(0xC0);
+
+    setPicture({});
+    std::string ops = frames(3);
+    const size_t base = opacities(ops).size();   // pictures on screen that are not ours
+    TEST_ASSERT(initials(ops) == 1);
+
+    setPicture(pictA);   // initial -> picture: fades in over the initial
+    ops = frames(1);
+    TEST_ASSERT(opacities(ops).size() == base + 1 && opacities(ops).back() < 1.0f && initials(ops) == 1);
+    ops = frames(30);
+    TEST_ASSERT(opacities(ops).size() == base + 1 && opacities(ops).back() == 1.0f && initials(ops) == 0);
+
+    setPicture(pictB);   // picture -> picture: the old one stays under the new one
+    ops = frames(1);
+    {
+        const auto o = opacities(ops);
+        TEST_ASSERT(o.size() == base + 2 && o[o.size() - 2] == 1.0f && o.back() < 1.0f);
+    }
+    ops = frames(30);
+    TEST_ASSERT(opacities(ops).size() == base + 1 && opacities(ops).back() == 1.0f);
+
+    net.sendProfilePicture();   // same file again (a generation bump, e.g. a peer's picture): no fade
+    ops = frames(1);
+    TEST_ASSERT(opacities(ops).size() == base + 1 && opacities(ops).back() == 1.0f && initials(ops) == 0);
+
+    setPicture({});   // removed: the initial fades in over the old picture
+    ops = frames(1);
+    TEST_ASSERT(opacities(ops).size() == base + 1 && opacities(ops).back() == 1.0f && initials(ops) == 1);
+    ops = frames(30);
+    TEST_ASSERT(opacities(ops).size() == base && initials(ops) == 1);
+
+    motion(1);   // reduced motion: instant both ways
+    setPicture(pictA);
+    ops = frames(1);
+    TEST_ASSERT(opacities(ops).size() == base + 1 && opacities(ops).back() == 1.0f && initials(ops) == 0);
+    setPicture({});
+    ops = frames(1);
+    TEST_ASSERT(opacities(ops).size() == base && initials(ops) == 1);
+
+    fs::remove(id.ownPicturePath(), ec);
     fs::remove(id.configFilePath(), ec);
 }
 
@@ -13610,6 +13696,7 @@ int main(int argc, char** argv) {
         testProfilePictureRejectsHostile(); std::cout << "Test 127 done\n" << std::flush;
         testAvatarFallbackAndSplitNames(); std::cout << "Test 128 done\n" << std::flush;
         testSettingsProfile(); std::cout << "Test 129 done\n" << std::flush;
+        testOwnAvatarCrossfade(); std::cout << "Test 130 done\n" << std::flush;
 #if defined(__linux__)
         testCairoCanvas(); std::cout << "Test 73 done\n" << std::flush;
 #endif
