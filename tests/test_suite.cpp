@@ -9053,7 +9053,9 @@ public:
     std::optional<std::string> pickPath;   // what chooseOpenFile "chooses"; nullopt = the user cancels
     void chooseOpenFile(const std::string&, const std::string&, const std::string&, ChosenPath chosen) override { chosen(pickPath); }
     void chooseFolder(const std::string&, ChosenPath chosen) override { chosen(std::nullopt); }
-    void openUrl(const std::string&) override {}
+    std::vector<std::string> openedUrls, updateDownloads;
+    bool autoUpdate = true;
+    void openUrl(const std::string& url) override { openedUrls.push_back(url); }
     int relaunches = 0;
     void relaunchApp() override { ++relaunches; }
     void setFrameIntervalMs(unsigned) override {}
@@ -9087,8 +9089,8 @@ public:
     void trackMouseLeave() override {}
     bool loadAppIcon(std::vector<uint8_t>&, int&, int&) override { return false; }
     void checkForUpdates(bool) override {}
-    void startUpdateDownload(const std::string&, uint64_t, const std::string&,
-                             std::function<void(bool, const std::string&)>) override {}
+    void startUpdateDownload(const std::string& url, uint64_t, const std::string&,
+                             std::function<void(bool, const std::string&)>) override { updateDownloads.push_back(url); }
     ui::ServiceState serviceState() const override { return ui::ServiceState::NotInstalled; }
     bool runServiceAction(ui::ServiceAction) override { return false; }
     bool has(ui::Capability c) const override {
@@ -9100,6 +9102,7 @@ public:
             case ui::Capability::ActionCenterToasts: return actionCenter;
             case ui::Capability::TrayIcon: return tray;
             case ui::Capability::HostPermissions: return hostPermsCap;
+            case ui::Capability::AutoUpdate: return autoUpdate;
         }
         return false;
     }
@@ -13446,6 +13449,115 @@ void testSettingsProfile() {
     fs::remove(id.configFilePath(), ec);
 }
 
+// The Home update pill: shown only for a newer release, updates in place or opens the release page, one download at a time.
+void testHomeUpdatePill() {
+    std::cout << "[TEST 131] The Home update pill downloads where the shell can, else opens the release page..." << std::endl;
+    IdentityManager id(4256);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    UpdateInfo info;
+    info.success = info.checkSucceeded = info.updateRequired = true;
+    info.latestVersion = "v1.0.2";
+    info.releaseUrl = "https://github.com/oocsng/cppdesk/releases/tag/v1.0.2";
+    info.directDownloadUrl = "https://github.com/oocsng/cppdesk/releases/download/v1.0.2/CppDesk.exe";
+    auto run = [&](FakeShell& shell, auto body) {
+        AppUi app(id, net, shell, "");
+        ui::RecordingCanvas rc;
+        auto frames = [&](int n) { for (int i = 0; i < n; ++i) app.render(rc, 1280, 800, 1.0 / 60.0); };
+        auto textRect = [&](const std::string& label) -> std::optional<ui::Rect> {
+            std::istringstream in(rc.serialize());
+            for (std::string line; std::getline(in, line);) {
+                if (line.rfind("drawText ", 0) != 0 || !line.ends_with("|" + label)) continue;
+                ui::Rect r{};
+                if (std::sscanf(line.c_str(), "drawText %f %f %f %f", &r.left, &r.top, &r.right, &r.bottom) == 4) return r;
+            }
+            return std::nullopt;
+        };
+        auto click = [&](const std::string& label) {
+            const auto r = textRect(label);
+            TEST_ASSERT(r.has_value());
+            if (!r) return;
+            const float x = (r->left + r->right) / 2, y = (r->top + r->bottom) / 2;
+            app.onMouseMove(x, y);
+            frames(30);
+            app.onMouseButton(MouseButtonId::Left, true, x, y);
+            frames(30);
+            app.onMouseButton(MouseButtonId::Left, false, x, y);
+            frames(30);
+        };
+        frames(2);
+        TEST_ASSERT(textRect("Connect to a desk").has_value());   // the Home screen is up
+        body(app, frames, textRect, click);
+    };
+    const auto noPill = [&](const std::function<std::optional<ui::Rect>(const std::string&)>& textRect) {
+        return !textRect("Update to v1.0.2") && !textRect("Get v1.0.2");
+    };
+
+    {   // No in-app update (Linux, macOS): the pill opens the release page and starts nothing
+        FakeShell shell;
+        shell.autoUpdate = false;
+        run(shell, [&](AppUi& app, auto frames, auto textRect, auto click) {
+            app.onUpdateCheckDone(info, false);
+            frames(30);
+            TEST_ASSERT(textRect("Get v1.0.2").has_value());
+            click("Get v1.0.2");
+        });
+        TEST_ASSERT(shell.openedUrls.size() == 1 && shell.openedUrls[0] == info.releaseUrl);
+        TEST_ASSERT(shell.updateDownloads.empty());
+    }
+    {   // In-app update: one download, then the pill shows progress and ignores clicks
+        FakeShell shell;
+        run(shell, [&](AppUi& app, auto frames, auto textRect, auto click) {
+            app.onUpdateCheckDone(info, false);
+            frames(30);
+            click("Update to v1.0.2");
+            TEST_ASSERT(shell.updateDownloads.size() == 1 && shell.updateDownloads[0] == info.directDownloadUrl);
+            TEST_ASSERT(shell.openedUrls.empty());
+            frames(5);
+            TEST_ASSERT(textRect("Updating 0%").has_value());
+            click("Updating 0%");
+            TEST_ASSERT(shell.updateDownloads.size() == 1 && shell.openedUrls.empty());
+        });
+    }
+    {   // No newer release, or a failed check: no pill
+        FakeShell shell;
+        run(shell, [&](AppUi& app, auto frames, auto textRect, auto) {
+            UpdateInfo none = info;
+            none.updateRequired = false;
+            app.onUpdateCheckDone(none, false);
+            frames(30);
+            TEST_ASSERT(noPill(textRect));
+            UpdateInfo failed = info;
+            failed.success = false;
+            app.onUpdateCheckDone(failed, false);
+            frames(30);
+            TEST_ASSERT(noPill(textRect));
+        });
+    }
+    {   // First show: fade plus a 4 px slide; with reduced motion the fade only
+        for (const uint8_t mode : { uint8_t(2), uint8_t(1) }) {
+            AppSettings s = id.settings();
+            s.reduceMotion = mode;
+            id.updateSettings(s);
+            FakeShell shell;
+            run(shell, [&](AppUi& app, auto frames, auto textRect, auto) {
+                app.onUpdateCheckDone(info, false);
+                frames(1);
+                const auto first = textRect("Update to v1.0.2");
+                frames(30);
+                const auto settled = textRect("Update to v1.0.2");
+                TEST_ASSERT(first && settled);
+                if (first && settled) {
+                    if (mode == 2) TEST_ASSERT(first->top > settled->top + 0.5f && first->top <= settled->top + 4.0f);
+                    else TEST_ASSERT(first->top == settled->top);
+                }
+            });
+        }
+    }
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
 // The own avatar when its picture changes: crossfade over 150 ms, or instant with reduced motion.
 void testOwnAvatarCrossfade() {
     std::cout << "[TEST 130] The own avatar crossfades when the picture changes and swaps instantly with reduced motion...\n";
@@ -13697,6 +13809,7 @@ int main(int argc, char** argv) {
         testAvatarFallbackAndSplitNames(); std::cout << "Test 128 done\n" << std::flush;
         testSettingsProfile(); std::cout << "Test 129 done\n" << std::flush;
         testOwnAvatarCrossfade(); std::cout << "Test 130 done\n" << std::flush;
+        testHomeUpdatePill(); std::cout << "Test 131 done\n" << std::flush;
 #if defined(__linux__)
         testCairoCanvas(); std::cout << "Test 73 done\n" << std::flush;
 #endif

@@ -291,6 +291,7 @@ private:
     void selectRailItem(int index);                                        // 0 Home, 1 Sessions, 2 Files, 3 Settings
     void drawSessionsEmptyView(const UiRect& bounds, float alpha);
     void drawDashboardView(const UiRect& bounds, float alpha = 1.0f);
+    void startUpdate();   // download and install where the shell can, else open the release page
     void drawThisDeskPanel(const UiRect& panel, float alpha);
     std::vector<HomeRow> buildHomeRows(size_t& nearbyStart) const;
     void connectHomeRow(const HomeRow& row, bool keepPassword);
@@ -759,6 +760,7 @@ private:
 
     // In-App Self-Updater Download State
     bool                    isDownloadingUpdate_ = false;
+    float                   updatePillT_ = 0.0f;               // Home update pill fade-in, 0..1
     float                   updateDownloadProgress_ = 0.0f;
     uint64_t                updateDownloadedBytes_ = 0;
     uint64_t                updateTotalBytes_ = 0;

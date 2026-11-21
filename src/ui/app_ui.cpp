@@ -195,6 +195,12 @@ bool AppUi::stepAnimations(float dt) {
         homeIntroT_ = g_reduceMotion ? 1.0f : std::min(1.0f, homeIntroT_ + dt);
         active = true;
     }
+    if (!(latestUpdateInfo_.success && latestUpdateInfo_.updateRequired)) {
+        updatePillT_ = 0.0f;
+    } else if (updatePillT_ < 1.0f && activeTab_ == ActiveTab::Dashboard) {
+        updatePillT_ = std::min(1.0f, updatePillT_ + dt / 0.2f);
+        active = true;
+    }
 
     // 3. Smooth Light <-> Dark Mode Transition
     float wantTheme = identity_.settings().darkTheme ? 1.0f : 0.0f;
@@ -1539,6 +1545,36 @@ void AppUi::drawPopoverMenu(const std::vector<MenuEntry>& items, float anchorX, 
     canvas_->setTransform(prev);
 }
 
+void AppUi::startUpdate() {
+    if (isDownloadingUpdate_) return;
+
+    const std::string dlUrl = latestUpdateInfo_.directDownloadUrl;
+    if (!shell_->has(ui::Capability::AutoUpdate) || dlUrl.empty()) {
+        shell_->openUrl(latestUpdateInfo_.releaseUrl.empty()
+            ? "https://github.com/oocsng/cppdesk/releases/latest"
+            : latestUpdateInfo_.releaseUrl);
+        return;
+    }
+
+    isDownloadingUpdate_ = true;
+    updateDownloadProgress_ = 0.0f;
+    updateDownloadedBytes_ = 0;
+    updateTotalBytes_ = latestUpdateInfo_.assetSizeBytes;
+    updateSpeedBps_ = 0.0;
+    updateStatusMsg_ = "Connecting to download server...";
+    shell_->invalidate();
+
+    auto doneBox = downloadDoneBox_;
+    shell_->startUpdateDownload(dlUrl, latestUpdateInfo_.assetSizeBytes, latestUpdateInfo_.assetSha256,
+        [doneBox](bool ok, const std::string& message) {
+            std::lock_guard<std::mutex> lk(doneBox->mtx);
+            if (!doneBox->alive) return;
+            doneBox->ok = ok;
+            doneBox->message = message;
+            doneBox->ready = true;
+        });
+}
+
 void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
     if (alpha <= 0.01f) return;
 
@@ -1550,6 +1586,27 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
 
     // ========== CONNECT BAR ==========
     drawText("Connect to a desk", { mx, y, mrx, y + 28.0f }, ui::FontRole::Heading, withAlpha(COL_TEXT_PRIMARY, alpha));
+    if (latestUpdateInfo_.success && latestUpdateInfo_.updateRequired) {   // pill on the heading line
+        std::string ver = latestUpdateInfo_.latestVersion;
+        if (!ver.empty() && (ver[0] == 'v' || ver[0] == 'V')) ver.erase(0, 1);
+        const float frac = std::clamp(updateDownloadProgress_, 0.0f, 1.0f);
+        const std::string label = isDownloadingUpdate_ ? "Updating " + std::to_string(static_cast<int>(frac * 100.0f)) + "%"
+                                                       : (shell_->has(ui::Capability::AutoUpdate) ? "Update to v" : "Get v") + ver;
+        const float pillW = canvas_->measureTextWidth(isDownloadingUpdate_ ? "Updating 100%" : label, ui::FontRole::Small) + 28.0f;
+        const float inT = 1.0f - std::pow(1.0f - std::clamp(updatePillT_, 0.0f, 1.0f), 3.0f);   // ease-out; fade, plus a 4 px slide unless motion is reduced
+        const float slide = reduceMotionActive() ? 0.0f : 4.0f * (1.0f - inT);
+        const float a = alpha * inT;
+        const UiRect pill = { mrx - pillW, y - 1.0f + slide, mrx, y + 29.0f + slide };
+        if (isDownloadingUpdate_) {   // the fill is the download progress
+            fillRoundRect(pill, 15.0f, withAlpha(COL_PRIMARY_ACCENT, 0.16f * a));
+            if (frac > 0.0f) fillRoundRect({ pill.left, pill.top, pill.left + pillW * frac, pill.bottom }, 15.0f, withAlpha(COL_PRIMARY_ACCENT, 0.35f * a));
+            drawButton("home_update_pill", pill, label, withAlpha(COL_PRIMARY_ACCENT, 0.0f), withAlpha(COL_PRIMARY_ACCENT, 0.0f),
+                       withAlpha(COL_TEXT_ACCENT, a), 15.0f, [this]() { startUpdate(); }, ui::FontRole::Small);
+        } else {
+            drawButton("home_update_pill", pill, label, withAlpha(COL_PRIMARY_ACCENT, a), withAlpha(COL_PRIMARY_ACCENT_HV, a),
+                       withAlpha(COL_TEXT_ON_ACCENT, a), 15.0f, [this]() { startUpdate(); }, ui::FontRole::Small);
+        }
+    }
     y += 38.0f;
     const float connectW = 112.0f, pwW = std::clamp((mrx - mx) * 0.28f, 150.0f, 200.0f);
     const UiRect idField = { mx, y, mrx - connectW - pwW - 20.0f, y + 44.0f };
@@ -7295,36 +7352,7 @@ void AppUi::drawUpdateRequiredModal(float width, float height, float modalProgre
                isDownloadingUpdate_ ? COL_SEC_BTN_BG : COL_PRIMARY_ACCENT,
                isDownloadingUpdate_ ? COL_SEC_BTN_BG : COL_PRIMARY_ACCENT_HV,
                isDownloadingUpdate_ ? COL_TEXT_MUTED : COL_TEXT_ON_ACCENT,
-               9.0f, [this]() {
-                   if (isDownloadingUpdate_) return;
-
-                   std::string dlUrl = latestUpdateInfo_.directDownloadUrl;
-                   if (dlUrl.empty()) {
-                       std::string targetUrl = latestUpdateInfo_.releaseUrl.empty()
-                           ? "https://github.com/oocsng/cppdesk/releases/latest"
-                           : latestUpdateInfo_.releaseUrl;
-                       shell_->openUrl(targetUrl);
-                       return;
-                   }
-
-                   isDownloadingUpdate_ = true;
-                   updateDownloadProgress_ = 0.0f;
-                   updateDownloadedBytes_ = 0;
-                   updateTotalBytes_ = latestUpdateInfo_.assetSizeBytes;
-                   updateSpeedBps_ = 0.0;
-                   updateStatusMsg_ = "Connecting to download server...";
-                   shell_->invalidate();
-
-                   auto doneBox = downloadDoneBox_;
-                   shell_->startUpdateDownload(dlUrl, latestUpdateInfo_.assetSizeBytes, latestUpdateInfo_.assetSha256,
-                       [doneBox](bool ok, const std::string& message) {
-                           std::lock_guard<std::mutex> lk(doneBox->mtx);
-                           if (!doneBox->alive) return;
-                           doneBox->ok = ok;
-                           doneBox->message = message;
-                           doneBox->ready = true;
-                       });
-               }, ui::FontRole::Small);
+               9.0f, [this]() { startUpdate(); }, ui::FontRole::Small);
 
     canvas_->setTransform(ui::Transform2D::identity());
 }
@@ -10868,7 +10896,7 @@ std::vector<std::string> AppUi::snapshotStateNames() {
              "modal_pair_offer", "settings_permissions_paired", "home_grid_select", "fleet_grid",
              "home_desks", "home_desks_pictures", "home_menu", "sessions_empty",
              // Dark twins of the screens the redesign touched (light and dark are both first-class)
-             "settings_appearance_dark", "settings_display_dark", "settings_profile_dark", "settings_privacy_dark", "drawer_file_transfer_dark", "drawer_terminal_dark", "drawer_sync_dark", "chat_long_text_dark", "modal_approval_dark", "modal_address_book_dark", "modal_omnibar_dark", "session_more_menu_dark", "home_menu_dark",
+             "settings_appearance_dark", "settings_display_dark", "settings_profile_dark", "settings_privacy_dark", "drawer_file_transfer_dark", "drawer_terminal_dark", "drawer_sync_dark", "chat_long_text_dark", "modal_approval_dark", "modal_address_book_dark", "modal_omnibar_dark", "session_more_menu_dark", "home_menu_dark", "home_update_available", "home_update_available_dark", "home_updating",
              "dashboard_mac_permissions", "dashboard_mac_restart", "dashboard_wayland_denied", "dashboard_wayland_view_only",
              "dashboard_mic_on" };
 }
@@ -10933,6 +10961,10 @@ void AppUi::applySnapshotState(const std::string& name) {
     sessMore_ = false;
     sessMoreAnimT_ = 0.0f;
     homeIntroT_ = 1.0f;   // no row cascade in a still
+    latestUpdateInfo_ = {};
+    isDownloadingUpdate_ = false;
+    updateDownloadProgress_ = 0.0f;
+    updatePillT_ = 1.0f;
     fleetPicked_.clear();
     constexpr uint64_t kSeedDesks[] = { 555000401, 555000402, 555000403 };   // home_desks and home_menu seed these
     for (uint64_t d : kSeedDesks) identity_.removeRecentSession(d);
@@ -11069,6 +11101,15 @@ void AppUi::applySnapshotState(const std::string& name) {
                 a.homeMenuAnimT_ = 1.0f;
                 a.homeMenuAnimVel_ = 0.0f;
             };
+        }
+    } else if (name == "home_update_available" || name == "home_updating") {
+        activeTab_ = ActiveTab::Dashboard;
+        latestUpdateInfo_.success = latestUpdateInfo_.checkSucceeded = latestUpdateInfo_.updateRequired = true;
+        latestUpdateInfo_.latestVersion = "1.0.2";
+        latestUpdateInfo_.directDownloadUrl = "https://github.com/oocsng/cppdesk/releases/download/v1.0.2/CppDesk.exe";
+        if (name == "home_updating") {
+            isDownloadingUpdate_ = true;
+            updateDownloadProgress_ = 0.4f;
         }
     } else if (name == "sessions_empty") {
         activeTab_ = ActiveTab::RemoteSession;
