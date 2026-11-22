@@ -30,8 +30,8 @@ body:
     id: version
     attributes:
       label: CppDesk Version
-      description: Exact version number shown in Settings > About & Data (e.g., v1.0.0)
-      placeholder: "v1.0.0"
+      description: Exact version number shown in Settings > About & Data (e.g., v1.0.1)
+      placeholder: "v1.0.1"
     validations:
       required: true
 
