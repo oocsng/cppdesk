@@ -4350,7 +4350,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         cy = aboutBox.bottom + 14.0f;
 
         // 3. Data & Reset Actions
-        UiRect maintBox = { cx, cy, crx, cy + 78.0f };
+        UiRect maintBox = { cx, cy, crx, cy + 114.0f };
         fillRoundRect(maintBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(maintBox, 12.0f, COL_BORDER);
 
@@ -4359,8 +4359,41 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                  ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         float mThirdW = (innerW - 32.0f - 16.0f) / 3.0f;
-        float mBtnTop = maintBox.top + 28.0f;
-        float mBtnBot = maintBox.top + 64.0f;
+        // Received-files folder row: label, current path (tail kept when it is too long), Change button
+        const float rowTop = maintBox.top + 28.0f;
+        UiRect chgBtn = { maintBox.right - 16.0f - 68.0f, rowTop, maintBox.right - 16.0f, rowTop + 26.0f };
+        const float pathLeft = maintBox.left + 16.0f + 140.0f;
+        drawText("Received files folder",
+                 { maintBox.left + 16.0f, rowTop + 6.0f, pathLeft, rowTop + 20.0f },
+                 ui::FontRole::Small, COL_TEXT_SECONDARY);
+        std::string recvShown = network_.fileTransferManager().receiveDirectory();
+        const float recvMaxW = chgBtn.left - 8.0f - pathLeft;
+        if (canvas_->measureTextWidth(recvShown, ui::FontRole::Small) > recvMaxW) {
+            size_t cut = 0;
+            std::string tail;
+            do {
+                cut += 1;
+                while (cut < recvShown.size() && (static_cast<unsigned char>(recvShown[cut]) & 0xC0) == 0x80) ++cut; // whole UTF-8 chars
+                tail = "..." + recvShown.substr(cut);
+            } while (cut < recvShown.size() && canvas_->measureTextWidth(tail, ui::FontRole::Small) > recvMaxW);
+            recvShown = tail;
+        }
+        drawText(recvShown, { pathLeft, rowTop + 6.0f, chgBtn.left - 8.0f, rowTop + 20.0f },
+                 ui::FontRole::Small, COL_TEXT_PRIMARY);
+        drawButton("sett_recv_dir_change", chgBtn, "Change",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
+                       shell_->chooseFolder("Choose where received files go", [this](std::optional<std::string> path) {
+                           if (!path) return;
+                           AppSettings ns = identity_.settings();
+                           ns.receiveDir = *path;
+                           identity_.updateSettings(ns);
+                           network_.applyReceiveDirectory();
+                           showToast("Received files will go to " + std::filesystem::path(*path).filename().string());
+                       });
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+
+        float mBtnTop = maintBox.top + 64.0f;
+        float mBtnBot = maintBox.top + 100.0f;
 
         UiRect openRecvBtn = { maintBox.left + 16.0f, mBtnTop, maintBox.left + 16.0f + mThirdW, mBtnBot };
         UiRect clearRecBtn = { openRecvBtn.right + 8.0f, mBtnTop, openRecvBtn.right + 8.0f + mThirdW, mBtnBot };
@@ -4380,6 +4413,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         drawButton("sett_reset_defaults", resetBtn, "Reset settings",
                    COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_PRIMARY, 8.0f, [this]() {
                        identity_.resetSettingsToDefault();
+                       network_.applyReceiveDirectory();
                        const auto& ds = identity_.settings();
                        relayServerEdit_ = ds.relayServer.empty() ? identity_.relayServerAddress() : ds.relayServer;
                        relayAuthKeyEdit_ = ds.relayAuthKey;

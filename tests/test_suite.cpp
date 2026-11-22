@@ -11200,7 +11200,8 @@ void testUiGoldens() {
     std::filesystem::remove(id.configFilePath(), ec);
     {
         std::ofstream cfg(id.configFilePath(), std::ios::trunc);
-        cfg << "desk_id=482910375\n" << "totp_secret=JBSWY3DPEHPK3PXP\n";
+        // A fixed folder, so the Settings golden does not carry this machine's profile path
+        cfg << "desk_id=482910375\n" << "totp_secret=JBSWY3DPEHPK3PXP\n" << "receive_dir=cppdesk_ui_golden_recv\n";
     }
     id.loadOrCreate();
     id.setSessionCode("k7m2qp");
@@ -11234,6 +11235,7 @@ void testUiGoldens() {
         TEST_ASSERT(got == want);
     }
     std::filesystem::remove(id.configFilePath(), ec);
+    std::filesystem::remove("cppdesk_ui_golden_recv", ec);   // the engine created it empty
 }
 
 void testWaylandHelpers() {
