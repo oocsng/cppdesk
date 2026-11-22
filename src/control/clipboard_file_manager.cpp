@@ -745,10 +745,12 @@ static constexpr const char* kDefaultReceivedFolder = "CppDesk_Received";
 std::string FileTransferManager::defaultReceiveDirectory() {
     std::filesystem::path dl;
 #if defined(_WIN32)
-    char profileDir[MAX_PATH] = {};
-    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_PROFILE, nullptr, 0, profileDir))) {
+    // Wide API: the ANSI one returns bytes std::filesystem (UTF-8 here) cannot decode when the profile name is not ASCII
+    PWSTR profileDir = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Profile, 0, nullptr, &profileDir)) && profileDir) {
         dl = std::filesystem::path(profileDir) / "Downloads" / kDefaultReceivedFolder;
     }
+    CoTaskMemFree(profileDir);
 #else
     const char* home = std::getenv("HOME");
     if (home) {
@@ -795,7 +797,7 @@ void FileTransferManager::openReceiveDirectoryInExplorer() const {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
 #if defined(_WIN32)
-    ShellExecuteA(nullptr, "open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    ShellExecuteW(nullptr, L"open", std::filesystem::path(dir).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #elif defined(__APPLE__)
     cppdesk::spawn::detached({"open", dir});
 #else

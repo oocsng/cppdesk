@@ -357,6 +357,32 @@ void testFixesD() {
             TEST_ASSERT(!resolveDropFolder(-30000, -30000).has_value());
             TEST_ASSERT(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(1500));
         }
+        // Names outside the ANSI code page: a chosen receive folder (UTF-8 string) and a drop folder (wide path) both work
+        {
+            auto toU8 = [](const fs::path& p) {
+                const std::wstring w = p.wstring();
+                const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+                std::string s(static_cast<size_t>(n), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
+                return s;
+            };
+            FileTransferManager uniMgr;
+            const fs::path uniRecv = baseTmp / L"ft_\u00e9_\u6587\u6863";
+            uniMgr.setReceiveDirectory(toU8(uniRecv));
+            TEST_ASSERT(fs::is_directory(uniRecv, ec));
+            TEST_ASSERT(uniMgr.receiveDirectory() == toU8(uniRecv));
+            uniMgr.handleFileOffer(50, 4, "\xE6\x96\x87.txt");   // U+6587
+            uniMgr.handleFileChunk(50, 0, d1, 4);
+            uniMgr.handleFileComplete(50, CryptoUtils::sha256Hex("AAAA"));
+            TEST_ASSERT(fs::exists(uniRecv / L"\u6587.txt", ec));
+
+            const fs::path uniDrop = baseTmp / L"ft_drop_\u6587";
+            fs::create_directories(uniDrop, ec);
+            uniMgr.handleFileOffer(51, 4, "plain.txt", uniDrop);
+            uniMgr.handleFileChunk(51, 0, d1, 4);
+            uniMgr.handleFileComplete(51, CryptoUtils::sha256Hex("AAAA"));
+            TEST_ASSERT(fs::exists(uniDrop / "plain.txt", ec));
+        }
 #endif
 
         // Spamming oversized offers must respect the 150-item cap
