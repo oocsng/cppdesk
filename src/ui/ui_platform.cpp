@@ -134,14 +134,26 @@ bool UiPlatform::stepSpring(float& pos, float& vel, float target, float omega, f
     return true;
 }
 
-UiPlatformRect UiPlatform::computeSpringRect(const UiPlatformRect& base, float hoverT, float pressT) {
-    float hT = std::clamp(hoverT, 0.0f, 1.25f);
-    float pT = std::clamp(pressT, -0.25f, 1.25f);
-    float scaleDelta = (0.028f * hT) - (0.048f * pT);
-    float dx = std::max(base.width() * scaleDelta * 0.5f, 1.2f * hT - 1.8f * pT);
-    float dy = std::max(base.height() * scaleDelta * 0.5f, 0.9f * hT - 1.5f * pT);
-    float liftY = (-1.8f * hT) + (1.6f * pT);
-    return base.inflate(dx, dy).offset(0.0f, liftY);
+bool UiPlatform::stepMotion(float& pos, float& vel, float target, float omega, float zeta, float dt, float eps, bool reduced) {
+    if (reduced) {
+        if (pos == target && vel == 0.0f) return false;
+        pos = target;
+        vel = 0.0f;
+        return true;
+    }
+    if (target == 0.0f) omega *= 1.25f;
+    return stepSpring(pos, vel, target, omega, std::max(zeta, 1.0f), dt, eps);
+}
+
+UiPlatformRect UiPlatform::computeSpringRect(const UiPlatformRect& base, float pressT) {
+    float shrink = 0.03f * std::clamp(pressT, 0.0f, 1.0f) * 0.5f;
+    return base.inflate(-base.width() * shrink, -base.height() * shrink);
+}
+
+UiPlatformRect UiPlatform::popoverRect(const UiPlatformRect& base, float t, float originX, float originY) {
+    float s = 0.95f + 0.05f * std::clamp(t, 0.0f, 1.0f);
+    return { originX + (base.left - originX) * s, originY + (base.top - originY) * s,
+             originX + (base.right - originX) * s, originY + (base.bottom - originY) * s };
 }
 
 float UiPlatform::dpiScaleFromXftDpi(const char* value) {

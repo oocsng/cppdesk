@@ -324,6 +324,67 @@ void testFixesD() {
         TEST_ASSERT(fs::exists(ftDir / "dup.txt"));
         TEST_ASSERT(fs::exists(ftDir / "dup (1).txt"));
 
+        // A drop folder is used when it is a directory; a missing or non-directory one falls back to the receive dir
+        const fs::path dropDir = baseTmp / "ft_drop";
+        fs::create_directories(dropDir, ec);
+        mgr.handleFileOffer(40, 4, "drop.txt", dropDir);
+        mgr.handleFileChunk(40, 0, d1, 4);
+        mgr.handleFileComplete(40, CryptoUtils::sha256Hex("AAAA"));
+        TEST_ASSERT(fs::exists(dropDir / "drop.txt"));
+        mgr.handleFileOffer(41, 4, "gone.txt", baseTmp / "no_such_dir");
+        mgr.handleFileChunk(41, 0, d1, 4);
+        mgr.handleFileComplete(41, CryptoUtils::sha256Hex("AAAA"));
+        TEST_ASSERT(fs::exists(ftDir / "gone.txt"));
+        TEST_ASSERT(!fs::exists(baseTmp / "no_such_dir"));
+        // A drop folder we cannot create a file in falls back too (here the write probe's name is taken by a directory)
+        const fs::path lockedDir = baseTmp / "ft_drop_locked";
+        fs::create_directories(lockedDir / ".cppdesk_write_test", ec);
+        mgr.handleFileOffer(43, 4, "locked.txt", lockedDir);
+        mgr.handleFileChunk(43, 0, d1, 4);
+        mgr.handleFileComplete(43, CryptoUtils::sha256Hex("AAAA"));
+        TEST_ASSERT(fs::exists(ftDir / "locked.txt"));
+        TEST_ASSERT(!fs::exists(lockedDir / "locked.txt"));
+        const fs::path notDir = baseTmp / "ft_not_a_dir.txt";
+        std::ofstream(notDir) << "x";
+        mgr.handleFileOffer(42, 4, "file_as_dir.txt", notDir);
+        mgr.handleFileChunk(42, 0, d1, 4);
+        mgr.handleFileComplete(42, CryptoUtils::sha256Hex("AAAA"));
+        TEST_ASSERT(fs::exists(ftDir / "file_as_dir.txt"));
+#if defined(_WIN32)
+        // No window sits at a far off-screen point: no folder, and the lookup returns well inside its 1 s bound
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            TEST_ASSERT(!resolveDropFolder(-30000, -30000).has_value());
+            TEST_ASSERT(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(1500));
+        }
+        // Names outside the ANSI code page: a chosen receive folder (UTF-8 string) and a drop folder (wide path) both work
+        {
+            auto toU8 = [](const fs::path& p) {
+                const std::wstring w = p.wstring();
+                const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+                std::string s(static_cast<size_t>(n), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
+                return s;
+            };
+            FileTransferManager uniMgr;
+            const fs::path uniRecv = baseTmp / L"ft_\u00e9_\u6587\u6863";
+            uniMgr.setReceiveDirectory(toU8(uniRecv));
+            TEST_ASSERT(fs::is_directory(uniRecv, ec));
+            TEST_ASSERT(uniMgr.receiveDirectory() == toU8(uniRecv));
+            uniMgr.handleFileOffer(50, 4, "\xE6\x96\x87.txt");   // U+6587
+            uniMgr.handleFileChunk(50, 0, d1, 4);
+            uniMgr.handleFileComplete(50, CryptoUtils::sha256Hex("AAAA"));
+            TEST_ASSERT(fs::exists(uniRecv / L"\u6587.txt", ec));
+
+            const fs::path uniDrop = baseTmp / L"ft_drop_\u6587";
+            fs::create_directories(uniDrop, ec);
+            uniMgr.handleFileOffer(51, 4, "plain.txt", uniDrop);
+            uniMgr.handleFileChunk(51, 0, d1, 4);
+            uniMgr.handleFileComplete(51, CryptoUtils::sha256Hex("AAAA"));
+            TEST_ASSERT(fs::exists(uniDrop / "plain.txt", ec));
+        }
+#endif
+
         // Spamming oversized offers must respect the 150-item cap
         for (uint32_t i = 1000; i < 1200; ++i) {
             mgr.handleFileOffer(i, 5ULL * 1024 * 1024 * 1024, "huge.bin");

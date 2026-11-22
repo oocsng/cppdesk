@@ -53,6 +53,7 @@ struct PendingIncomingRequest {
     std::string callerHostname;
     std::string callerIp;
     uint8_t     proposedPermissions = PERM_ALL;
+    std::vector<uint8_t> callerPicture;   // empty = none
 };
 
 struct HostSessionStatus {
@@ -150,6 +151,11 @@ inline ViewerPairingDecision decideViewerPairing(bool hostAdvertisesPairing, boo
     if (advertisedHostKey != pinned->publicKey || !hostSignatureValid) return ViewerPairingDecision::RefuseIdentityChanged;
     return ViewerPairingDecision::UsePaired;
 }
+
+// Profile picture field (AUTH_RESPONSE tail, PROFILE_PICTURE payload): u16 length + JPEG, 0 = none.
+void writeWirePicture(ByteWriter& w, const std::vector<uint8_t>& jpeg);
+// nullopt when absent, truncated or not a valid wire JPEG (hostile data is ignored); empty = an explicit none.
+std::optional<std::vector<uint8_t>> readWirePicture(ByteReader& r);
 
 struct StunNatResult {
     bool        success = false;
@@ -286,6 +292,12 @@ public:
     void disconnectHostClient();
     void clearRateLimitRecords();
 
+    // Profile pictures (peers' are cached per desk ID only after a session is accepted)
+    std::vector<uint8_t> peerPicture(uint64_t deskId) const;   // memory, else cache file, else empty
+    void storePeerPicture(uint64_t deskId, const std::vector<uint8_t>& jpeg);   // empty = none: deletes the cache file
+    uint32_t peerPictureGeneration() const { return peerPictureGeneration_.load(); }   // bumps on every peer or own picture change
+    void sendProfilePicture();   // re-reads the own picture file and sends it on any accepted session
+
     // Viewer: Outgoing connection & remote session control
     // requirePairedDeskId != 0: the host must prove it is that paired PC (pairing keys only, never a password or an
     // unpaired login), else the connection is refused before any credential is sent. Used by the grid.
@@ -316,6 +328,7 @@ public:
     void pushRestoreTokenForTest(const std::string& token) { shareHub_.pushToken(token); }
     // Adds or replaces a peer as if discovery had just heard it (tests).
     void injectDiscoveredPeerForTest(const DiscoveredPeer& p);
+    void injectPeerPictureForTest(uint64_t deskId, const std::vector<uint8_t>& jpeg);   // memory only; empty = remove
 
     // Copy latest decoded remote frame if frameSeq > lastSeenSeq
     bool copyLatestViewerFrame(
@@ -384,6 +397,8 @@ public:
     uint32_t unreadChatCount() const { return unreadChatCount_.load(); }
     void markChatRead() { unreadChatCount_.store(0); }
 
+    // Points the file manager at settings().receiveDir (or the built-in default when empty)
+    void applyReceiveDirectory();
     FileTransferManager& fileTransferManager() { return fileManager_; }
     const FileTransferManager& fileTransferManager() const { return fileManager_; }
     ClipboardFileTransferManager& clipboardFileTransferManager() { return clipFileMgr_; }
@@ -869,6 +884,11 @@ private:
     std::function<void(const CommandPaletteOutputPayload&)> onCommandPaletteOutput_;
     std::atomic<uint32_t>                                   nextExecId_{1};
     std::atomic<uint64_t>                                   hostSessionGen_{0};
+
+    std::vector<uint8_t> ownPicture() const;
+    mutable std::mutex                                      peerPictureMutex_;
+    std::unordered_map<uint64_t, std::vector<uint8_t>>      peerPictures_;
+    std::atomic<uint32_t>                                   peerPictureGeneration_{0};
 };
 
 } // namespace cppdesk

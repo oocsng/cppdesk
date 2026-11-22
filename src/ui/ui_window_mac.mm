@@ -599,6 +599,7 @@ public:
     bool relaunchElevated() override { return false; }
     void playAlertSound() override { NSBeep(); }
     bool isWindowForeground() const override { return live() && w_->window.isKeyWindow && !w_->window.isMiniaturized; }
+    bool systemPrefersReducedMotion() const override { return [[NSWorkspace sharedWorkspace] accessibilityDisplayShouldReduceMotion]; }
     void bringToFront() override {
         if (!live()) return;
         [NSApp activateIgnoringOtherApps:YES];

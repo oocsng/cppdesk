@@ -22,6 +22,7 @@ enum class Capability {
     ActionCenterToasts,  // Windows Action Center notifications toggle
     TrayIcon,            // minimize to the tray / menu bar
     HostPermissions,     // the OS asks the user to allow screen sharing and control (macOS)
+    AutoUpdate,          // download and install a new version from inside the app (Windows)
 };
 
 // Permissions a host needs before it can be seen and controlled. Platforms without them report everything allowed.
@@ -75,6 +76,8 @@ public:
     virtual void playAlertSound() = 0;
     // True when the app window is the active, non-minimized window.
     virtual bool isWindowForeground() const = 0;
+    // The OS asks apps to cut animation (Windows "Animation effects" off, macOS Reduce motion, GNOME animations off).
+    virtual bool systemPrefersReducedMotion() const { return false; }
     // Raise the app window and give it focus.
     virtual void bringToFront() = 0;
 

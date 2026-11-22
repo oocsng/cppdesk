@@ -15,7 +15,9 @@ if (-not (Test-Path $Gpp)) {
 $CoreSources = @(
     "src/simd/simd_kernels.S",
     "src/core/crypto_identity.cpp",
+    "src/core/profile.cpp",
     "src/capture/screen_capture.cpp",
+    "src/capture/avatar_image.cpp",
     "src/control/input_injector.cpp",
     "src/control/shell_clipboard.cpp",
     "src/control/clipboard_file_manager.cpp",

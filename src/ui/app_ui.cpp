@@ -3,6 +3,9 @@
 #include "../core/win_compat.hpp"
 #include "vk_codes.hpp"
 #include "glide.hpp"
+#include "../capture/avatar_image.hpp"
+#include "../capture/screen_capture.hpp"
+#include "../core/profile.hpp"
 
 #include <algorithm>
 #include <ctime>
@@ -14,6 +17,12 @@
 namespace cppdesk {
 
 namespace {
+
+// The username part of a peer's wire name ("Jane \xC2\xB7 PC1" -> "Jane"); a plain hostname comes back unchanged.
+std::string peerName(const std::string& wire) {
+    const std::string n = profile::splitWireName(wire).name;
+    return n.empty() ? profile::stripFormatting(wire) : n;
+}
 
 #pragma pack(push, 2)
 struct BmpFileHeader {
@@ -38,9 +47,12 @@ struct BmpInfoHeader {
     uint32_t biClrImportant;
 };
 
-// Second-order damped harmonic oscillator (macOS CoreAnimation CASpringAnimation physics)
+// Reduced motion for the frame being drawn: the setting, or the OS when the setting follows it.
+bool g_reduceMotion = false;
+
+// Every UI spring runs under the app's motion rules (no overshoot, faster exits, reduced motion).
 bool stepSpring(float& pos, float& vel, float target, float omega, float zeta, float dt, float eps = 0.0012f) {
-    return cppdesk::UiPlatform::stepSpring(pos, vel, target, omega, zeta, dt, eps);
+    return cppdesk::UiPlatform::stepMotion(pos, vel, target, omega, zeta, dt, eps, g_reduceMotion);
 }
 
 bool stepExp(float& current, float target, float speed, float dt) {
@@ -130,12 +142,15 @@ void AppUi::switchTab(ActiveTab newTab) {
         }
     }
     activeTab_ = newTab;
+    homeMenu_ = false;
+    sessMore_ = false;
     tabEnterStaggerT_ = 0.0f;
     tabEnterStaggerVel_ = 0.0f;
     tooltipAnimT_ = 0.0f;
     tooltipAnimVel_ = 0.0f;
     activeTooltipText_.clear();
-    if (newTab == ActiveTab::RemoteSession) {
+    if (newTab == ActiveTab::RemoteSession &&
+        (sessionTabs_.tabCount() > 0 || network_.viewerStats().state != ViewerConnectionState::Disconnected)) {
         focusedField_ = FocusedField::RemoteCanvas;
         displayedFrameSeq_ = 0;
         network_.markViewerCanvasFullDirty();
@@ -153,29 +168,43 @@ void AppUi::switchTab(ActiveTab newTab) {
     shell_->invalidate();
 }
 
+bool AppUi::reduceMotionActive() const {
+    const uint8_t mode = identity_.settings().reduceMotion;
+    return mode == 1 || (mode == 0 && systemReducedMotion_);
+}
+
 bool AppUi::stepAnimations(float dt) {
     bool active = false;
+    g_reduceMotion = reduceMotionActive();
     animTimeSec_ += dt;
 
     // 1. macOS Spring Viewport & Stagger Choreography
-    float targetViewport = (activeTab_ == ActiveTab::Dashboard) ? 0.0f :
-                           (activeTab_ == ActiveTab::RemoteSession) ? 1.0f : 2.0f;
-    if (stepSpring(viewportPos_, viewportVel_, targetViewport, 25.0f, 0.82f, dt)) active = true;
     if (stepSpring(tabEnterStaggerT_, tabEnterStaggerVel_, 1.0f, 22.0f, 0.78f, dt)) active = true;
     if (stepSpring(glideSlideT_, glideSlideVel_, 1.0f, theme::motion::panel.omega, theme::motion::panel.zeta, dt)) active = true;
 
-    // 2. Liquid macOS Segmented Control Pill (leading edge moves faster than trailing edge)
-    if (navPillInit_) {
-        bool movingRight = (targetPillLeft_ >= navPillLeft_);
-        float omegaL = movingRight ? 24.0f : 32.0f;
-        float omegaR = movingRight ? 32.0f : 24.0f;
-        if (stepSpring(navPillLeft_, navPillVelL_, targetPillLeft_, omegaL, 0.78f, dt, 0.15f)) active = true;
-        if (stepSpring(navPillRight_, navPillVelR_, targetPillRight_, omegaR, 0.78f, dt, 0.15f)) active = true;
+    // 2. Rail page indicator, the Home row menu, and Home's one-time row cascade
+    if (railIndInit_ && stepSpring(railIndY_, railIndVel_, railIndTarget_, theme::motion::standard.omega, theme::motion::standard.zeta, dt, 0.15f)) active = true;
+    if (stepSpring(homeMenuAnimT_, homeMenuAnimVel_, homeMenu_ ? 1.0f : 0.0f, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
+    if (stepSpring(sessMoreAnimT_, sessMoreAnimVel_, sessMore_ ? 1.0f : 0.0f, theme::motion::menu.omega, theme::motion::menu.zeta, dt)) active = true;
+    if (ownFadeT_ < 1.0f) {
+        ownFadeT_ = std::min(1.0f, ownFadeT_ + dt / 0.15f);
+        if (ownFadeT_ >= 1.0f) releaseImage(ownPrevImg_);
+        active = true;
+    }
+    if (homeIntroT_ < 1.0f) {
+        homeIntroT_ = g_reduceMotion ? 1.0f : std::min(1.0f, homeIntroT_ + dt);
+        active = true;
+    }
+    if (!(latestUpdateInfo_.success && latestUpdateInfo_.updateRequired)) {
+        updatePillT_ = 0.0f;
+    } else if (updatePillT_ < 1.0f && activeTab_ == ActiveTab::Dashboard) {
+        updatePillT_ = std::min(1.0f, updatePillT_ + dt / 0.2f);
+        active = true;
     }
 
     // 3. Smooth Light <-> Dark Mode Transition
     float wantTheme = identity_.settings().darkTheme ? 1.0f : 0.0f;
-    if (stepSpring(themeAnimT_, themeAnimVel_, wantTheme, theme::motion::themeBlend.omega, theme::motion::themeBlend.zeta, dt)) active = true;
+    if (UiPlatform::stepMotion(themeAnimT_, themeAnimVel_, wantTheme, theme::motion::themeBlend.omega, theme::motion::themeBlend.zeta, dt, 0.0012f, false)) active = true;
 
     // 4. Floating Side Sheet Drawer Spring
     float targetDrawer = showFileDrawer_ ? 1.0f : 0.0f;
@@ -195,7 +224,7 @@ bool AppUi::stepAnimations(float dt) {
     bool toastVisible = (!toastText_.empty() && shell_->nowMs() <= toastExpireTick_);
     float targetToast = toastVisible ? 1.0f : 0.0f;
     if (stepSpring(toastAnimT_, toastAnimVel_, targetToast, 28.0f, 0.72f, dt)) active = true;
-    float estTextW = static_cast<float>(toastText_.size()) * 7.6f + 64.0f;
+    float estTextW = static_cast<float>(toastText_.size()) * 7.6f + 64.0f + (undoRemoved_ ? 76.0f : 0.0f);
     float hiToast = std::max(220.0f, std::min(560.0f, winW - 40.0f));
     float targetToastW = std::min(std::max(estTextW, 220.0f), hiToast);
     if (stepSpring(toastWidth_, toastWidthVel_, targetToastW, 30.0f, 0.75f, dt)) active = true;
@@ -244,7 +273,6 @@ bool AppUi::stepAnimations(float dt) {
 
     float targetPairOfferModal = showPairOfferModal_ ? 1.0f : 0.0f;
     if (stepSpring(pairOfferModalAnimT_, pairOfferModalAnimVel_, targetPairOfferModal, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
-    if (stepSpring(fleetPickerAnimT_, fleetPickerAnimVel_, showFleetPicker_ ? 1.0f : 0.0f, theme::motion::standard.omega, theme::motion::standard.zeta, dt)) active = true;
 
     // 11. Mandatory Update Modal Spring (v3.0.0)
     float targetUpdateModal = showUpdateRequiredModal_ ? 1.0f : 0.0f;
@@ -306,19 +334,7 @@ bool AppUi::stepAnimations(float dt) {
         }
     }
 
-    // Horizontal HUD Smooth Scroll Spring
-    sessionHudScrollTarget_ = std::clamp(sessionHudScrollTarget_, 0.0f, sessionHudMaxScroll_);
-    if (stepSpring(sessionHudScrollOffset_, sessionHudScrollVel_, sessionHudScrollTarget_, theme::motion::scroll.omega, theme::motion::scroll.zeta, dt, 0.15f)) {
-        sessionHudScrollOffset_ = std::clamp(sessionHudScrollOffset_, 0.0f, sessionHudMaxScroll_);
-        active = true;
-    }
 
-    // Drawer Tabs Header Smooth Scroll Spring
-    drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_, 0.0f, drawerTabsMaxScroll_);
-    if (stepSpring(drawerTabsScrollOffset_, drawerTabsScrollVel_, drawerTabsScrollTarget_, theme::motion::scroll.omega, theme::motion::scroll.zeta, dt, 0.15f)) {
-        drawerTabsScrollOffset_ = std::clamp(drawerTabsScrollOffset_, 0.0f, drawerTabsMaxScroll_);
-        active = true;
-    }
 
     // Startup auto-update check timer (queries GitHub 2.0s after launch)
     if (!startupCheckTriggered_) {
@@ -399,7 +415,7 @@ void AppUi::drawCardSurface(const UiRect& r, float radius, float alpha, bool /*a
 
 void AppUi::drawPulseDot(float cx, float cy, float baseRadius, ui::Color color, float alpha) {
     if (!canvas_ || alpha <= 0.01f) return;
-    float wave = 0.5f + 0.5f * std::sin(animTimeSec_ * 2.8f);
+    float wave = g_reduceMotion ? 0.5f : 0.5f + 0.5f * std::sin(animTimeSec_ * 2.8f);
     float haloRadius = baseRadius + 1.2f + 3.0f * wave;
     float haloAlpha = (0.24f - 0.16f * wave) * alpha;
 
@@ -480,6 +496,85 @@ void AppUi::releaseImage(ui::ImageId& id) {
     id = {};
 }
 
+void AppUi::drawAvatar(float cx, float cy, float r, uint64_t deskId, const std::string& name, float alpha,
+                       const std::vector<uint8_t>* jpeg) {
+    constexpr uint64_t kApprovalKey = ~0ull;
+    const uint32_t gen = network_.peerPictureGeneration();   // also bumps when our own picture changes
+    const bool own = !jpeg && deskId == identity_.deskId();
+    if (gen != avatarGen_) {
+        releaseImage(ownPrevImg_);
+        ownFadeT_ = 1.0f;
+        for (auto& [k, img] : avatarImages_) {
+            if (k == identity_.deskId()) ownPrevImg_ = img;   // kept until the rebuilt own avatar is compared with it
+            else releaseImage(img);
+        }
+        avatarImages_.clear();
+        avatarGen_ = gen;
+    }
+    const uint64_t key = jpeg ? kApprovalKey : deskId;
+    auto it = avatarImages_.find(key);
+    if (jpeg && it != avatarImages_.end() && avatarApprovalBytes_ != *jpeg) {
+        releaseImage(it->second);
+        avatarImages_.erase(it);
+        it = avatarImages_.end();
+    }
+    if (it == avatarImages_.end()) {
+        std::vector<uint8_t> bytes;
+        if (jpeg) {
+            bytes = *jpeg;
+            avatarApprovalBytes_ = bytes;
+        } else if (deskId == identity_.deskId()) {
+            std::ifstream f(identity_.ownPicturePath(), std::ios::binary);
+            bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        } else {
+            bytes = network_.peerPicture(deskId);   // already validated; once per generation, not per frame
+        }
+        ui::ImageId img;
+        std::vector<uint8_t> bgra;
+        int w = 0, h = 0;
+        // Own file and the caller's bytes are checked here: decodeCircleBgra has no size cap of its own
+        if (canvas_ && avatar::validateWireJpeg(bytes) && avatar::decodeCircleBgra(bytes, bgra, w, h)) {
+            img = canvas_->createImage(w, h, false);
+            canvas_->updateImage(img, bgra.data(), w * 4, ui::Rect{ 0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h) });
+        }
+        it = avatarImages_.emplace(key, img).first;
+        if (own) {   // a changed picture crossfades from the old one (instant with reduced motion)
+            if (ownBytesKnown_ && bytes != ownBytes_ && !g_reduceMotion) ownFadeT_ = 0.0f;
+            else releaseImage(ownPrevImg_);
+            ownBytes_ = bytes;
+            ownBytesKnown_ = true;
+        }
+    }
+    const bool fading = own && ownFadeT_ < 1.0f;
+    const float inT = fading ? 1.0f - std::pow(1.0f - ownFadeT_, 3.0f) : 1.0f;   // ease-out
+    // An initial on a colour picked from the desk ID, so a desk keeps its colour
+    auto drawInitial = [&](float a) {
+        static const ui::Color kAvatar[] = { rgba(160, 82, 45), rgba(46, 110, 96), rgba(84, 94, 140),
+                                             rgba(136, 80, 118), rgba(112, 100, 52), rgba(96, 88, 80) };
+        canvas_->fillEllipse(cx, cy, r, r, withAlpha(kAvatar[deskId % 6], a));
+        const char first = name.empty() ? '?' : name[0];
+        const unsigned char lead = static_cast<unsigned char>(first);
+        const size_t len = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;   // the whole first UTF-8 character
+        const std::string initial = lead < 0x80 ? std::string(1, static_cast<char>(std::toupper(lead))) : name.substr(0, std::min(len, name.size()));
+        drawText(initial, { cx - r, cy - r, cx + r, cy + r }, r < 14.0f ? ui::FontRole::Small : ui::FontRole::BodyBold,
+                 withAlpha(rgba(255, 255, 255), a), ui::HAlign::Center, ui::VAlign::Center);
+    };
+    if (fading) {   // what the new look fades in over
+        if (ownPrevImg_.valid()) canvas_->drawImage(ownPrevImg_, { cx - r, cy - r, cx + r, cy + r }, alpha);
+        else if (it->second.valid()) drawInitial(alpha);
+    }
+    if (it->second.valid()) {
+        canvas_->drawImage(it->second, { cx - r, cy - r, cx + r, cy + r }, alpha * inT);
+        return;
+    }
+    drawInitial(alpha * inT);
+}
+
+std::string AppUi::ownAvatarName() const {
+    const std::string n = identity_.displayName();
+    return n.empty() ? identity_.hostname() : n;
+}
+
 void AppUi::fillRoundRect(const UiRect& r, float radius, ui::Color color) {
     if (canvas_) canvas_->fillRoundRect(r, radius, color);
 }
@@ -515,20 +610,10 @@ void AppUi::drawButton(
 {
     WidgetAnimState& anim = widgetAnims_[id];
 
-    // MacBook fluid tactile spring scale (hover expands 2.8%, press squishes 4.8%)
-    float hT = std::clamp(anim.hoverT, 0.0f, 1.25f);
-    float pT = std::clamp(anim.pressT, -0.25f, 1.25f);
-    UiRect animRect = cppdesk::UiPlatform::computeSpringRect(r, anim.hoverT, anim.pressT);
-
-    // Floating dynamic ambient drop shadow on hover
-    if (hT > 0.02f) {
-        float shadowAlpha = 0.16f * hT * std::max(0.0f, 1.0f - pT);
-        float shadowSpread = 1.2f * hT;
-        float shadowY = 2.0f + 1.8f * hT;
-        ui::Color shadowCol = (bgColor.a > 0.05f) ? COL_PRIMARY_ACCENT : rgba(38, 30, 20);
-        fillRoundRect(animRect.offset(0.0f, shadowY).inflate(shadowSpread, shadowSpread),
-                      radius + shadowSpread, withAlpha(shadowCol, shadowAlpha));
-    }
+    // Hover changes colour only; a press shrinks to 97%
+    float hT = std::clamp(anim.hoverT, 0.0f, 1.0f);
+    float pT = std::clamp(anim.pressT, 0.0f, 1.0f);
+    UiRect animRect = cppdesk::UiPlatform::computeSpringRect(r, anim.pressT);
 
     ui::Color curBg = lerpColor(bgColor, hoverColor, std::clamp(hT, 0.0f, 1.0f));
     if (pT > 0.01f) {
@@ -582,7 +667,7 @@ void AppUi::drawButton(
 UiRect AppUi::getWidgetAnimRect(const std::string& id, const UiRect& r) const {
     auto it = widgetAnims_.find(id);
     if (it == widgetAnims_.end()) return r;
-    return cppdesk::UiPlatform::computeSpringRect(r, it->second.hoverT, it->second.pressT);
+    return cppdesk::UiPlatform::computeSpringRect(r, it->second.pressT);
 }
 
 void AppUi::drawTextField(
@@ -604,8 +689,7 @@ void AppUi::drawTextField(
     float fT = std::clamp(anim.focusT, 0.0f, 1.2f);
     float hT = std::clamp(anim.hoverT, 0.0f, 1.0f);
 
-    // Subtle tactile hover & focus lift
-    UiRect animField = r.offset(0.0f, -0.8f * std::max(hT, fT));
+    UiRect animField = r;
 
     if (fT > 0.01f) {
         // macOS Monterey / Sonoma dual-ring focus halo
@@ -638,7 +722,12 @@ void AppUi::drawTextField(
                 display.push_back('|');
             }
         }
-        drawText(display, textR, ui::FontRole::Mono, COL_TEXT_PRIMARY, ui::HAlign::Leading);
+        // Text wider than the field scrolls so its end (where typing happens) stays in view
+        const float textW = canvas_->measureTextWidth(display, ui::FontRole::Mono);
+        const UiRect shown = textW > textR.width() ? UiRect{ textR.right - textW - 2.0f, textR.top, textR.right, textR.bottom } : textR;
+        canvas_->pushClip(ui::Rect{ textR.left, textR.top, textR.right, textR.bottom });
+        drawText(display, shown, ui::FontRole::Mono, COL_TEXT_PRIMARY, ui::HAlign::Leading);
+        canvas_->popClip();
     }
 
     clickRegions_.push_back({ r, id, [this, fieldType]() {
@@ -701,16 +790,16 @@ void AppUi::drawToggleSwitch(
         UiRect animBadgeRect = baseBadgeRect.inflate(1.2f * bHoverT, 1.2f * bHoverT);
         float badgeRadius = animBadgeRect.height() * 0.5f;
 
-        ui::Color restBg = lerpColor(rgba(215, 210, 202, 0.45f), rgba(52, 49, 44, 0.50f), themeAnimT_);
+        ui::Color restBg = COL_SEC_BTN_HV;   // opaque, so the badge reads on the subtle boxes in both themes
         ui::Color hoverBg = lerpColor(rgba(240, 235, 228, 0.88f), rgba(68, 64, 58, 0.90f), themeAnimT_);
         hoverBg = lerpColor(hoverBg, withAlpha(COL_PRIMARY_ACCENT, 0.22f), 0.5f);
         ui::Color badgeBg = lerpColor(restBg, hoverBg, bHoverT);
 
-        ui::Color restBorder = withAlpha(COL_BORDER, 0.65f);
+        ui::Color restBorder = COL_BORDER;
         ui::Color hoverBorder = COL_PRIMARY_ACCENT;
         ui::Color badgeBorder = lerpColor(restBorder, hoverBorder, bHoverT);
 
-        ui::Color restGlyph = lerpColor(COL_TEXT_MUTED, COL_TEXT_PRIMARY, 0.35f);
+        ui::Color restGlyph = COL_TEXT_SECONDARY;
         ui::Color hoverGlyph = lerpColor(COL_TEXT_PRIMARY, COL_PRIMARY_ACCENT, 0.55f);
         ui::Color badgeGlyph = lerpColor(restGlyph, hoverGlyph, bHoverT);
 
@@ -764,20 +853,21 @@ void AppUi::drawToggleSwitch(
 
 void AppUi::drawFrame(float width, float height) {
     clickRegions_.clear();
+    // Blur saves the name: focus moved on, or the Profile page was left with the field still focused
+    const bool nameFocused = focusedField_ == FocusedField::DisplayName && activeTab_ == ActiveTab::Settings &&
+                             settingsSection_ == SettingsSection::Profile;
+    if (displayNameWasFocused_ && !nameFocused) {
+        commitDisplayName();
+        if (focusedField_ == FocusedField::DisplayName) focusedField_ = FocusedField::None;
+    }
+    displayNameWasFocused_ = nameFocused;
     canvas_->beginFrame(width, height, COL_BG_MAIN);
 
-    float topOffset = 0.0f;
-    if (!isFullscreen_) {
-        drawTopNavBar(width, topOffset);
-    }
+    const float topOffset = 0.0f;
+    const float railW = isFullscreen_ ? 0.0f : theme::railWidth;
+    UiRect contentBounds = { railW, topOffset, width, height };
 
-    UiRect contentBounds = { 0.0f, topOffset, width, height };
-
-    // macOS Spring Viewport Glide + Scale Choreography
-    float targetIdx = (activeTab_ == ActiveTab::Dashboard) ? 0.0f :
-                      (activeTab_ == ActiveTab::RemoteSession) ? 1.0f : 2.0f;
-    float slideX = (targetIdx - viewportPos_) * 42.0f;
-    float viewScale = 0.982f + 0.018f * std::clamp(tabEnterStaggerT_, 0.0f, 1.08f);
+    // Pages fade in where they stand: no slide, no scale
     float enterAlpha = std::clamp(0.30f + 0.70f * smoothStepEase(tabEnterStaggerT_), 0.0f, 1.0f);
 
     // A glide slides the remote screen in from the edge it was pushed through.
@@ -793,15 +883,17 @@ void AppUi::drawFrame(float width, float height) {
         }
     }
 
-    if (std::fabs(slideX) > 0.15f || std::fabs(viewScale - 1.0f) > 0.001f || glideX != 0.0f || glideY != 0.0f) {
-        ui::Point center = ui::Point{contentBounds.centerX(), contentBounds.centerY()};
-        canvas_->setTransform(ui::Transform2D::scale(viewScale, viewScale, (center).x, (center).y) * ui::Transform2D::translation(slideX + glideX, glideY));
+    canvas_->pushClip(contentBounds);
+    if (glideX != 0.0f || glideY != 0.0f) {
+        canvas_->setTransform(ui::Transform2D::translation(glideX, glideY));
     }
 
+    const bool hasSession = network_.viewerStats().state != ViewerConnectionState::Disconnected || sessionTabs_.tabCount() > 0;
     if (activeTab_ == ActiveTab::Dashboard) {
         drawDashboardView(contentBounds, enterAlpha);
     } else if (activeTab_ == ActiveTab::RemoteSession) {
-        drawRemoteSessionView(contentBounds, enterAlpha);
+        if (hasSession) drawRemoteSessionView(contentBounds, enterAlpha);
+        else drawSessionsEmptyView(contentBounds, enterAlpha);
     } else if (activeTab_ == ActiveTab::Fleet) {
         drawFleetView(contentBounds, enterAlpha);
     } else {
@@ -809,6 +901,12 @@ void AppUi::drawFrame(float width, float height) {
     }
 
     canvas_->setTransform(ui::Transform2D::identity());
+    canvas_->popClip();
+
+    // The rail draws after the page so its buttons win any overlap
+    if (!isFullscreen_) {
+        drawNavRail(height);
+    }
 
     // Floating macOS Side Sheet Drawer
     if (drawerAnimT_ > 0.004f) {
@@ -820,7 +918,7 @@ void AppUi::drawFrame(float width, float height) {
 
         // Interactive scrim dismiss region outside the drawer
         if (drawerAnimT_ > 0.01f) {
-            UiRect scrimRect = { 0.0f, topOffset, std::max(0.0f, width - drawerW - 14.0f), height };
+            UiRect scrimRect = { railW, topOffset, std::max(railW, width - drawerW - 14.0f), height };
             clickRegions_.push_back({ scrimRect, "drawer_scrim_dismiss", [this]() {
                 if (drawerTab_ == DrawerTab::Diagnostics) {
                     network_.setDiagnosticsActive(false);
@@ -830,6 +928,11 @@ void AppUi::drawFrame(float width, float height) {
         }
 
         drawFileTransferDrawer(drawerBounds, drawerAnimT_);
+    }
+
+    if (activeTab_ == ActiveTab::RemoteSession && !isFullscreen_ && (sessMore_ || sessMoreAnimT_ > 0.004f)) {
+        drawPopoverMenu(sessMoreItems_, sessMoreBtnRect_.right, sessMoreBtnRect_.bottom + 4.0f, true,
+                        sessMore_, sessMoreAnimT_, width, height, "sess_more_menu");
     }
 
     // Fullscreen Dynamic Island Floating Toolbar
@@ -866,9 +969,6 @@ void AppUi::drawFrame(float width, float height) {
         drawPairOfferModal(width, height, pairOfferModalAnimT_);
     }
 
-    if (fleetPickerAnimT_ > 0.004f) {
-        drawFleetPickerModal(width, height, fleetPickerAnimT_);
-    }
 
     // Mandatory Update Required Modal (v3.0.0)
     if (updateModalAnimT_ > 0.004f) {
@@ -964,8 +1064,8 @@ void AppUi::drawFrame(float width, float height) {
             float cardBottom = cardTop + cardH;
             UiRect cardRect = { cardLeft, cardTop, cardRight, cardBottom };
 
-            // Second-order spring scale (0.92f + 0.08f * alpha) and translateY float (6px to 0px)
-            float scale = 0.92f + 0.08f * alpha;
+            // Scales from 95% and floats 6px toward its target as it appears
+            float scale = 0.95f + 0.05f * alpha;
             float floatY = (1.0f - alpha) * 6.0f;
             float translateY = placeBelow ? -floatY : floatY;
 
@@ -1050,273 +1150,832 @@ void AppUi::drawFrame(float width, float height) {
     canvas_->endFrame();
 }
 
-void AppUi::drawTopNavBar(float width, float& outTopOffset) {
-    float navH = 58.0f;
-    outTopOffset = navH;
+void AppUi::drawRailIcon(int kind, float cx, float cy, ui::Color c) {
+    const float w = 1.6f;
+    if (kind == 0) {   // home
+        ui::Path roof;
+        roof.moveTo(cx - 8.5f, cy - 0.5f);
+        roof.lineTo(cx, cy - 8.0f);
+        roof.lineTo(cx + 8.5f, cy - 0.5f);
+        canvas_->strokePath(roof, c, w);
+        ui::Path body;
+        body.moveTo(cx - 6.0f, cy - 2.5f);
+        body.lineTo(cx - 6.0f, cy + 7.5f);
+        body.lineTo(cx + 6.0f, cy + 7.5f);
+        body.lineTo(cx + 6.0f, cy - 2.5f);
+        canvas_->strokePath(body, c, w);
+    } else if (kind == 1) {   // sessions: a monitor
+        strokeRoundRect({ cx - 9.5f, cy - 7.5f, cx + 9.5f, cy + 4.5f }, 2.5f, c, w);
+        canvas_->drawLine(cx, cy + 4.5f, cx, cy + 8.0f, c, w);
+        canvas_->drawLine(cx - 5.0f, cy + 8.0f, cx + 5.0f, cy + 8.0f, c, w);
+    } else if (kind == 2) {   // files: a folder
+        ui::Path p;
+        p.moveTo(cx - 9.5f, cy + 7.0f);
+        p.lineTo(cx - 9.5f, cy - 7.0f);
+        p.lineTo(cx - 3.5f, cy - 7.0f);
+        p.lineTo(cx - 1.0f, cy - 4.0f);
+        p.lineTo(cx + 9.5f, cy - 4.0f);
+        p.lineTo(cx + 9.5f, cy + 7.0f);
+        p.close();
+        canvas_->strokePath(p, c, w);
+    } else {   // settings: a gear
+        canvas_->strokeEllipse(cx, cy, 2.8f, 2.8f, c, w);
+        canvas_->strokeEllipse(cx, cy, 6.3f, 6.3f, c, w);
+        for (int i = 0; i < 8; ++i) {
+            const float a = static_cast<float>(i) * 0.7853982f;
+            canvas_->drawLine(cx + std::cos(a) * 6.3f, cy + std::sin(a) * 6.3f,
+                              cx + std::cos(a) * 9.0f, cy + std::sin(a) * 9.0f, c, 2.4f);
+        }
+    }
+}
 
-    UiRect navRect = { 0.0f, 0.0f, width, navH };
-    fillRoundRect(navRect, 0.0f, COL_BG_NAV);
-    fillRoundRect({ 0.0f, navH - 1.0f, width, navH }, 0.0f, COL_BORDER);
+void AppUi::selectRailItem(int index) {
+    homeMenu_ = false;
+    if (index == 0) {
+        switchTab(ActiveTab::Dashboard);
+        focusedField_ = FocusedField::RemoteId;
+    } else if (index == 1) {
+        if (fleet_.size() > 0 && sessionTabs_.tabCount() == 0) {   // a live grid is the only session
+            focusedField_ = FocusedField::None;
+            switchTab(ActiveTab::Fleet);
+        } else {
+            switchTab(ActiveTab::RemoteSession);
+        }
+    } else if (index == 2) {
+        if (showFileDrawer_ && drawerTab_ == DrawerTab::Diagnostics) {
+            network_.setDiagnosticsActive(false);
+        }
+        if (!showFileDrawer_ && network_.unreadChatCount() > 0) {
+            if (drawerTab_ == DrawerTab::Diagnostics) {
+                network_.setDiagnosticsActive(false);
+            }
+            drawerTab_ = DrawerTab::LiveChat;
+            network_.markChatRead();
+        }
+        showFileDrawer_ = !showFileDrawer_;
+    } else if (index == 3) {
+        switchTab(ActiveTab::Settings);
+    }
+    shell_->invalidate();
+}
 
-    // Center: Dead-Center macOS Segmented Control Track + Liquid Spring Pill
-    auto vStats = network_.viewerStats();
-    bool hasSession = (vStats.state != ViewerConnectionState::Disconnected) || (sessionTabs_.tabCount() > 0);
+void AppUi::drawNavRail(float height) {
+    const float railW = theme::railWidth;
+    fillRoundRect({ 0.0f, 0.0f, railW, height }, 0.0f, COL_RAIL_BG);
 
-    float dashW = 108.0f;
-    float sessW = hasSession ? 172.0f : 0.0f;
-    float settW = 102.0f;
-    float totalTabsW = dashW + (hasSession ? (sessW + 4.0f) : 0.0f) + 4.0f + settW;
-    float tabStartX = std::max(20.0f, (width - totalTabsW) * 0.5f);
+    const float itemH = 58.0f;
+    const float homeTop = 12.0f, sessTop = homeTop + itemH + 4.0f, filesTop = sessTop + itemH + 4.0f;
+    const float settTop = height - 12.0f - itemH, themeTop = settTop - 4.0f - itemH;
+    const float profTop = themeTop - 4.0f - 44.0f;   // the own avatar slot, 32 px circle in 44 px
 
-    UiRect dashTab = { tabStartX, 12.0f, tabStartX + dashW, 46.0f };
-    UiRect sessTab = hasSession
-        ? UiRect{ dashTab.right + 4.0f, 12.0f, dashTab.right + 4.0f + sessW, 46.0f }
-        : UiRect{ dashTab.right, 12.0f, dashTab.right, 46.0f };
-    float settLeft = (hasSession ? sessTab.right : dashTab.right) + 4.0f;
-    UiRect settTab = { settLeft, 12.0f, settLeft + settW, 46.0f };
+    // The page indicator slides between Home, Sessions and Settings; Files opens a drawer, so it lights on its own.
+    const bool onSessions = activeTab_ == ActiveTab::RemoteSession || activeTab_ == ActiveTab::Fleet;
+    railIndTarget_ = (activeTab_ == ActiveTab::Settings) ? settTop : onSessions ? sessTop : homeTop;
+    if (!railIndInit_) {
+        railIndY_ = railIndTarget_;
+        railIndVel_ = 0.0f;
+        railIndInit_ = true;
+    }
+    fillRoundRect({ 6.0f, railIndY_, railW - 6.0f, railIndY_ + itemH }, 12.0f, rgba(255, 255, 255, 0.10f));
+    fillRoundRect({ 0.0f, railIndY_ + 17.0f, 3.0f, railIndY_ + itemH - 17.0f }, 1.5f, COL_PRIMARY_ACCENT);
 
-    UiRect activeTargetRect = (activeTab_ == ActiveTab::Dashboard || activeTab_ == ActiveTab::Fleet) ? dashTab :
-                              (activeTab_ == ActiveTab::RemoteSession && hasSession) ? sessTab : settTab;
-    targetPillLeft_ = activeTargetRect.left;
-    targetPillRight_ = activeTargetRect.right;
-    if (!navPillInit_) {
-        navPillLeft_ = targetPillLeft_;
-        navPillRight_ = targetPillRight_;
-        navPillVelL_ = 0.0f;
-        navPillVelR_ = 0.0f;
-        navPillInit_ = true;
+    auto item = [&](const std::string& id, const std::string& label, int icon, float top, bool active, size_t badge,
+                    std::function<void()> onClick) {
+        const UiRect r = { 6.0f, top, railW - 6.0f, top + itemH };
+        clickRegions_.push_back({ r, id, std::move(onClick), false });
+        const UiRect ar = getWidgetAnimRect(id, r);
+        const float hT = std::clamp(widgetAnims_[id].hoverT, 0.0f, 1.0f);
+        if (!active && hT > 0.01f) fillRoundRect(ar, 12.0f, rgba(255, 255, 255, 0.06f * hT));
+        const ui::Color fg = active ? COL_RAIL_TEXT_ACTIVE : lerpColor(COL_RAIL_TEXT, COL_RAIL_TEXT_ACTIVE, hT);
+        if (icon < 0) {
+            drawIconTheme(ar.centerX(), ar.top + 21.0f, 7.5f, identity_.settings().darkTheme, fg);
+        } else {
+            drawRailIcon(icon, ar.centerX(), ar.top + 21.0f, fg);
+        }
+        drawText(label, { ar.left - 4.0f, ar.top + 36.0f, ar.right + 4.0f, ar.top + 52.0f },
+                 ui::FontRole::Small, fg, ui::HAlign::Center, ui::VAlign::Center);
+        if (badge > 0) {
+            const std::string b = badge > 99 ? "99+" : std::to_string(badge);
+            const float bw = std::max(16.0f, canvas_->measureTextWidth(b, ui::FontRole::Small) + 8.0f);
+            const UiRect br = { ar.centerX() + 3.0f, ar.top + 5.0f, ar.centerX() + 3.0f + bw, ar.top + 21.0f };
+            fillRoundRect(br.inflate(1.5f, 1.5f), 9.5f, COL_RAIL_BG);
+            fillRoundRect(br, 8.0f, COL_PRIMARY_ACCENT);
+            drawText(b, br, ui::FontRole::Small, COL_TEXT_ON_ACCENT, ui::HAlign::Center, ui::VAlign::Center);
+        }
+    };
+
+    const uint32_t unreadChat = network_.unreadChatCount();
+    const size_t transfers = network_.fileTransferManager().snapshotTransfers().size();
+    item("rail_home", "Home", 0, homeTop, activeTab_ == ActiveTab::Dashboard, 0, [this]() { selectRailItem(0); });
+    item("rail_sessions", "Sessions", 1, sessTop, onSessions, sessionTabs_.tabCount() + fleet_.size(),
+         [this]() { selectRailItem(1); });
+    if (showFileDrawer_) fillRoundRect({ 6.0f, filesTop, railW - 6.0f, filesTop + itemH }, 12.0f, rgba(255, 255, 255, 0.10f));
+    item("btn_drawer", "Files", 2, filesTop, showFileDrawer_, unreadChat > 0 ? unreadChat : transfers,
+         [this]() { selectRailItem(2); });
+    {   // Own avatar: opens Settings > Profile
+        const UiRect pr = { 6.0f, profTop, railW - 6.0f, profTop + 44.0f };
+        clickRegions_.push_back({ pr, "rail_profile", [this]() {
+            switchTab(ActiveTab::Settings);
+            settingsSection_ = SettingsSection::Profile;
+            settingsScrollOffset_ = settingsScrollTarget_ = settingsScrollVel_ = 0.0f;
+        }, false });
+        activeTooltips_.push_back({ pr, "Profile" });
+        const UiRect ar = getWidgetAnimRect("rail_profile", pr);   // press shrinks it to 0.97 like the other rail items
+        const float hT = std::clamp(widgetAnims_["rail_profile"].hoverT, 0.0f, 1.0f);
+        if (hT > 0.01f) fillRoundRect(ar, 12.0f, rgba(255, 255, 255, 0.06f * hT));
+        drawAvatar(ar.centerX(), ar.centerY(), 16.0f * ar.height() / pr.height(), identity_.deskId(), ownAvatarName(), 1.0f);
+    }
+    item("btn_nav_theme", "Theme", -1, themeTop, false, 0, [this]() {
+        AppSettings s = identity_.settings();
+        s.darkTheme = !s.darkTheme;
+        identity_.updateSettings(s);
+        applyWindowThemeAttribute();
+    });
+    item("rail_settings", "Settings", 3, settTop, activeTab_ == ActiveTab::Settings, 0, [this]() { selectRailItem(3); });
+}
+
+void AppUi::drawSessionsEmptyView(const UiRect& bounds, float alpha) {
+    const float cx = bounds.centerX(), cy = bounds.centerY();
+    const ui::Transform2D prev = canvas_->transform();
+    canvas_->setTransform(ui::Transform2D::scale(2.0f, 2.0f, cx, cy - 64.0f) * prev);
+    drawRailIcon(1, cx, cy - 64.0f, withAlpha(COL_TEXT_MUTED, alpha));
+    canvas_->setTransform(prev);
+    drawText("No sessions open", { bounds.left + 24.0f, cy - 34.0f, bounds.right - 24.0f, cy - 8.0f },
+             ui::FontRole::Heading, withAlpha(COL_TEXT_PRIMARY, alpha), ui::HAlign::Center);
+    drawText("Connect to a desk from Home and its session shows up here.",
+             { bounds.left + 24.0f, cy - 4.0f, bounds.right - 24.0f, cy + 18.0f },
+             ui::FontRole::Body, withAlpha(COL_TEXT_SECONDARY, alpha), ui::HAlign::Center);
+    drawButton("sessions_go_home", { cx - 72.0f, cy + 34.0f, cx + 72.0f, cy + 74.0f }, "Go to Home",
+               COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 9.0f, [this]() { selectRailItem(0); });
+}
+
+std::vector<AppUi::HomeRow> AppUi::buildHomeRows(size_t& nearbyStart) const {
+    const auto discovered = network_.discoveredPeers();
+    const auto recents = identity_.recentSessions();
+    const auto paired = identity_.pairedHosts();
+    auto isPaired = [&](uint64_t id) {
+        return id > 0 && std::any_of(paired.begin(), paired.end(), [&](const PairedPeer& p) { return p.deskId == id; });
+    };
+    auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+    };
+
+    std::vector<HomeRow> saved, nearby;
+    for (const auto& r : recents) {   // most recently used first
+        HomeRow row;
+        row.deskId = r.deskId;
+        row.hostname = r.hostname;
+        row.endpoint = r.address;
+        row.alias = r.alias;
+        row.tag = r.tag;
+        row.notes = r.notes;
+        row.favorite = r.isFavorite;
+        row.saved = true;
+        for (const auto& d : discovered) {
+            if (d.deskId != 0 && d.deskId == r.deskId) {
+                row.live = true;
+                row.endpoint = d.ip + ":" + std::to_string(d.port);
+                break;
+            }
+        }
+        saved.push_back(std::move(row));
+    }
+    for (const auto& d : discovered) {
+        if (std::any_of(saved.begin(), saved.end(), [&](const HomeRow& s) { return d.deskId != 0 && s.deskId == d.deskId; })) continue;
+        HomeRow row;
+        row.deskId = d.deskId;
+        row.hostname = d.hostname;
+        row.endpoint = d.ip + ":" + std::to_string(d.port);
+        row.live = true;
+        nearby.push_back(std::move(row));
     }
 
-    UiRect trackRect = { dashTab.left - 3.5f, 8.5f, settTab.right + 3.5f, 49.5f };
-    fillRoundRect(trackRect, 11.0f, COL_SEC_BTN_BG);
-    strokeRoundRect(trackRect, 11.0f, COL_BORDER, 1.0f);
+    // The connect box doubles as the search: an ID in any spacing matches that desk, anything else matches by text.
+    std::string q = remoteIdInput_;
+    q.erase(0, q.find_first_not_of(" \t"));
+    q.erase(q.find_last_not_of(" \t") + 1);
+    const uint64_t qId = CryptoUtils::parseDeskId(q);
+    q = lower(q);
+    const std::string tagFilter = lower(dashboardFilterTag_);
+    auto keep = [&](HomeRow& row) {
+        if (dashboardFilterTag_ == "Favorites" && !row.favorite) return false;
+        if (dashboardFilterTag_ == "Nearby" && !row.live) return false;
+        if (dashboardFilterTag_ != "All" && dashboardFilterTag_ != "Favorites" && dashboardFilterTag_ != "Nearby" &&
+            lower(row.tag) != tagFilter) return false;
+        if (qId != 0) {
+            if (row.deskId != qId) return false;
+        } else if (!q.empty()) {
+            const std::string hay = lower(std::to_string(row.deskId) + " " + CryptoUtils::formatDeskId(row.deskId) + " " +
+                                          row.hostname + " " + row.endpoint + " " + row.alias + " " + row.tag + " " + row.notes);
+            if (hay.find(q) == std::string::npos) return false;
+        }
+        const std::string id = row.deskId > 0 ? CryptoUtils::formatDeskId(row.deskId) : row.endpoint;
+        row.target = row.deskId > 0 ? id : row.endpoint;
+        const profile::WireName wn = profile::splitWireName(row.hostname);
+        row.name = !row.alias.empty() ? row.alias : !wn.name.empty() ? wn.name : id;
+        row.sub = id;
+        const std::string& shown = wn.computer.empty() ? wn.name : wn.computer;   // a 1.0 peer sent only the hostname
+        if (!shown.empty() && shown != row.name && shown != id) row.sub += "  \xC2\xB7  " + shown;
+        if (!row.saved && row.endpoint != id) row.sub += "  \xC2\xB7  " + row.endpoint.substr(0, row.endpoint.find(':'));
+        row.paired = isPaired(row.deskId);
+        return true;
+    };
 
-    UiRect slidingPill = { navPillLeft_, 12.0f, navPillRight_, 46.0f };
-    fillRoundRect(slidingPill.offset(0.0f, 1.8f), 8.5f, withAlpha(COL_PRIMARY_ACCENT, 0.24f));
-    fillRoundRect(slidingPill, 8.5f, COL_PRIMARY_ACCENT);
+    std::vector<HomeRow> rows;
+    for (auto& r : saved) if (keep(r)) rows.push_back(r);
+    nearbyStart = rows.size();
+    if (dashboardFilterTag_ == "All" || dashboardFilterTag_ == "Nearby") {
+        for (auto& r : nearby) if (keep(r)) rows.push_back(r);
+    }
+    if (dashboardFilterTag_ != "All") nearbyStart = rows.size();   // only All splits the list into two sections
+    return rows;
+}
 
-    bool onDash = (activeTab_ == ActiveTab::Dashboard || activeTab_ == ActiveTab::Fleet);
-    drawButton("tab_dash", dashTab, "Dashboard",
-               rgba(255, 255, 255, 0.0f),
-               onDash ? rgba(255, 255, 255, 0.08f) : COL_SEC_BTN_HV,
-               onDash ? COL_TEXT_ON_ACCENT : COL_TEXT_SECONDARY,
-               8.5f, [this]() {
-                   switchTab(ActiveTab::Dashboard);
-               }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0},
-               onDash ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+void AppUi::connectHomeRow(const HomeRow& row, bool keepPassword) {
+    homeMenu_ = false;
+    remoteIdInput_ = row.target;
+    if (!keepPassword) remotePasswordInput_.clear();
+    initiateConnection();
+}
 
-    if (hasSession) {
-        std::string sessLabel = (vStats.remoteDeskId > 0)
-            ? ("Session • " + CryptoUtils::formatDeskId(vStats.remoteDeskId))
-            : (sessionTabs_.tabCount() > 1 ? ("Sessions (" + std::to_string(sessionTabs_.tabCount()) + ")") : "Session");
-        bool onSess = (activeTab_ == ActiveTab::RemoteSession);
-        drawButton("tab_session", sessTab, sessLabel,
-                   rgba(255, 255, 255, 0.0f),
-                   onSess ? rgba(255, 255, 255, 0.08f) : COL_SEC_BTN_HV,
-                   onSess ? COL_TEXT_ON_ACCENT : COL_TEXT_SECONDARY,
-                   8.5f, [this]() {
-                       switchTab(ActiveTab::RemoteSession);
-                   }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0},
-                   onSess ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+void AppUi::connectFromHomeBar() {
+    if (homeSel_ >= 0 && homeSel_ < static_cast<int>(homeRows_.size())) {
+        connectHomeRow(homeRows_[static_cast<size_t>(homeSel_)], true);
+        return;
+    }
+    // A name dials the best match; an ID, address or link dials as typed.
+    std::string q = remoteIdInput_;
+    q.erase(0, q.find_first_not_of(" \t"));
+    if (!q.empty() && !homeRows_.empty() && CryptoUtils::parseDeskId(q) == 0 && q.find_first_of(".:") == std::string::npos &&
+        std::any_of(q.begin(), q.end(), [](unsigned char c) { return std::isalpha(c) != 0; })) {
+        connectHomeRow(homeRows_.front(), true);
+        return;
+    }
+    initiateConnection();
+}
+
+void AppUi::removeHomeDesk(const HomeRow& row) {
+    std::optional<RecentSessionEntry> removed;
+    for (const auto& e : identity_.recentSessions()) {
+        if (e.deskId == row.deskId) {
+            removed = e;
+            break;
+        }
+    }
+    identity_.removeRecentSession(row.deskId);
+    network_.storePeerPicture(row.deskId, {});   // drops the cached file; Undo gets the row back without a picture until the next connect
+    homeSel_ = -1;
+    showToast("Removed " + row.name, false, 6000);
+    undoRemoved_ = removed;   // after showToast, which drops any older undo
+}
+
+void AppUi::undoHomeRemove() {
+    if (!undoRemoved_) return;
+    // shortcut: the desk comes back at the top of the list, not at its old place; keep an index if people mind
+    const RecentSessionEntry e = *undoRemoved_;
+    undoRemoved_.reset();
+    identity_.addOrUpdateRecentSession(e.deskId, e.hostname, e.address, e.alias, e.tag, e.notes);
+    if (e.isFavorite) identity_.toggleFavoriteSession(e.deskId);
+    toastExpireTick_ = 0;
+    shell_->invalidate();
+}
+
+void AppUi::openHomeMenu(const HomeRow& row, float x, float y) {
+    homeMenuRow_ = row;
+    homeMenuX_ = x;
+    homeMenuY_ = y;
+    if (!homeMenu_) {
+        homeMenuAnimT_ = 0.0f;
+        homeMenuAnimVel_ = 0.0f;
+    }
+    homeMenu_ = true;
+    shell_->invalidate();
+}
+
+void AppUi::drawHomeMenu(float winW, float winH) {
+    if (homeMenuAnimT_ <= 0.004f && !homeMenu_) return;
+    const HomeRow row = homeMenuRow_;
+    std::vector<MenuEntry> items;
+    items.push_back({ "home_menu_connect", "Connect", false, [this, row]() { connectHomeRow(row, false); } });
+    items.push_back({ "home_menu_files", "Send files\xE2\x80\xA6", false, [this, row]() {
+        connectHomeRow(row, false);
+        drawerTab_ = DrawerTab::FilesAndClip;
+        showFileDrawer_ = true;
+    } });
+    if (row.deskId > 0) {
+        items.push_back({ "home_menu_fav", row.favorite ? "Remove from favorites" : "Add to favorites", false, [this, row]() {
+            if (!row.saved) identity_.addOrUpdateRecentSession(row.deskId, row.hostname, row.endpoint);
+            identity_.toggleFavoriteSession(row.deskId);
+        } });
+        items.push_back({ "home_menu_edit", "Rename & tags\xE2\x80\xA6", false, [this, row]() {
+            editingDeskId_ = row.deskId;
+            editAliasInput_ = row.alias;
+            editTagInput_ = row.tag;
+            editNotesInput_ = row.notes;
+            showAddressBookEditModal_ = true;
+        } });
+        if (shell_->has(ui::Capability::DesktopShortcut)) {
+            items.push_back({ "home_menu_lnk", "Desktop shortcut", false, [this, row]() {
+                if (ShortcutManager::createDesktopShortcut(std::to_string(row.deskId), row.alias)) {
+                    showToast("Desktop shortcut created: " + row.name);
+                } else {
+                    showToast("Failed to create desktop shortcut", true);
+                }
+            } });
+        }
+        if (row.saved) items.push_back({ "home_menu_remove", "Remove", true, [this, row]() { removeHomeDesk(row); } });
     }
 
-    bool onSett = (activeTab_ == ActiveTab::Settings);
-    drawButton("tab_settings", settTab, "Settings",
-               rgba(255, 255, 255, 0.0f),
-               onSett ? rgba(255, 255, 255, 0.08f) : COL_SEC_BTN_HV,
-               onSett ? COL_TEXT_ON_ACCENT : COL_TEXT_SECONDARY,
-               8.5f, [this]() {
-                   switchTab(ActiveTab::Settings);
-               }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0},
-               onSett ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+    drawPopoverMenu(items, homeMenuX_, homeMenuY_, false, homeMenu_, homeMenuAnimT_, winW, winH, "home_menu");
+}
 
-    // Right: Minimal Theme Icon Pill + Files & Chat Pill
-    bool isDark = identity_.settings().darkTheme;
-    UiRect themeBtn = { width - 56.0f, 12.0f, width - 20.0f, 46.0f };
-    drawButton("btn_nav_theme", themeBtn, "",
-               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
-               9.0f, [this]() {
-                   AppSettings s = identity_.settings();
-                   s.darkTheme = !s.darkTheme;
-                   identity_.updateSettings(s);
-                   applyWindowThemeAttribute();
-               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
-    UiRect themeAnim = getWidgetAnimRect("btn_nav_theme", themeBtn);
-    drawIconTheme(themeAnim.centerX(), themeAnim.centerY(), 7.5f, isDark, COL_TEXT_PRIMARY);
-
-    auto transfers = network_.fileTransferManager().snapshotTransfers();
-    uint32_t unreadChat = network_.unreadChatCount();
-    std::string fileBtnLabel = "Files & Chat";
-    if (unreadChat > 0) {
-        fileBtnLabel += " (" + std::to_string(unreadChat) + ")";
-    } else if (!transfers.empty()) {
-        fileBtnLabel += " (" + std::to_string(transfers.size()) + ")";
+// Every context menu looks and moves the same: a card at the anchor (left edge, or right edge when alignRight) that flips
+// above when it would run off the bottom, and grows 0.95 -> 1 from the anchor. A pick or a click outside closes it.
+void AppUi::drawSegmented(const UiRect& r, const std::vector<MenuEntry>& segs, int active) {
+    fillRoundRect(r, 9.0f, COL_BG_SUBTLE);
+    strokeRoundRect(r, 9.0f, COL_BORDER);
+    const float w = r.width() / static_cast<float>(segs.size());
+    for (size_t i = 0; i < segs.size(); ++i) {
+        const bool on = static_cast<int>(i) == active;
+        const UiRect sr = { r.left + w * i + 3.0f, r.top + 3.0f, r.left + w * (i + 1) - 3.0f, r.bottom - 3.0f };
+        drawButton(segs[i].id, sr, segs[i].label, on ? COL_BG_RAISED : ui::Color{ 0, 0, 0, 0 }, on ? COL_BG_RAISED : COL_SEC_BTN_HV,
+                   on ? COL_TEXT_PRIMARY : COL_TEXT_SECONDARY, 7.0f, segs[i].act, ui::FontRole::Small, on, COL_BORDER);
     }
-    UiRect filesBtn = { themeBtn.left - 126.0f, 12.0f, themeBtn.left - 8.0f, 46.0f };
-    drawButton("btn_drawer", filesBtn, fileBtnLabel,
-               (showFileDrawer_ || unreadChat > 0) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-               (showFileDrawer_ || unreadChat > 0) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-               (showFileDrawer_ || unreadChat > 0) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-               9.0f, [this, unreadChat]() {
-                   if (showFileDrawer_ && drawerTab_ == DrawerTab::Diagnostics) {
-                       network_.setDiagnosticsActive(false);
-                   }
-                   if (!showFileDrawer_ && unreadChat > 0) {
-                       if (drawerTab_ == DrawerTab::Diagnostics) {
-                           network_.setDiagnosticsActive(false);
-                       }
-                       drawerTab_ = DrawerTab::LiveChat;
-                       network_.markChatRead();
-                   }
-                   showFileDrawer_ = !showFileDrawer_;
-               }, ui::FontRole::Small, !(showFileDrawer_ || unreadChat > 0), COL_BORDER,
-               (showFileDrawer_ || unreadChat > 0) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+}
+
+void AppUi::drawPopoverMenu(const std::vector<MenuEntry>& items, float anchorX, float anchorY, bool alignRight,
+                            bool& open, float animT, float winW, float winH, const std::string& idPrefix) {
+    if (items.empty()) return;
+    const float w = 212.0f, itemH = 32.0f, pad = 6.0f;
+    const bool sep = items.back().danger;
+    const float h = pad * 2.0f + itemH * static_cast<float>(items.size()) + (sep ? 9.0f : 0.0f);
+    const float left = std::clamp(alignRight ? anchorX - w : anchorX, 8.0f, std::max(8.0f, winW - w - 8.0f));
+    const float top = (anchorY + h > winH - 8.0f) ? std::max(8.0f, anchorY - h) : anchorY;
+    const UiRect menu = { left, top, left + w, top + h };
+
+    if (open) {
+        clickRegions_.push_back({ { 0.0f, 0.0f, winW, winH }, idPrefix + "_scrim", [&open]() { open = false; }, false });
+        clickRegions_.push_back({ menu, idPrefix + "_absorb", []() {}, false });
+    }
+    const float t = std::clamp(animT, 0.0f, 1.0f);
+    const ui::Transform2D prev = canvas_->transform();
+    const float s = 0.95f + 0.05f * t;
+    canvas_->setTransform(ui::Transform2D::scale(s, s, anchorX, anchorY) * prev);
+    canvas_->pushOpacity(t);
+    drawCardShadow(menu, 10.0f, 1.2f);
+    fillRoundRect(menu, 10.0f, COL_BG_CARD);
+    strokeRoundRect(menu, 10.0f, COL_BORDER, 1.0f);
+    float y = menu.top + pad;
+    for (const auto& e : items) {
+        if (e.danger) {
+            fillRoundRect({ menu.left + 10.0f, y + 4.0f, menu.right - 10.0f, y + 5.0f }, 0.0f, COL_BORDER);
+            y += 9.0f;
+        }
+        const UiRect r = { menu.left + pad, y, menu.right - pad, y + itemH };
+        drawButton(e.id, r, "", ui::Color{ 0, 0, 0, 0 }, e.danger ? withAlpha(COL_DANGER, 0.12f) : COL_SEC_BTN_HV,
+                   COL_TEXT_PRIMARY, 6.0f, [&open, act = e.act]() {
+                       open = false;
+                       act();
+                   }, ui::FontRole::Body);
+        drawText(e.label, { r.left + 10.0f, r.top, r.right - 10.0f, r.bottom }, ui::FontRole::Body,
+                 e.danger ? COL_DANGER : COL_TEXT_PRIMARY);
+        y += itemH;
+    }
+    canvas_->popOpacity();
+    canvas_->setTransform(prev);
+}
+
+void AppUi::startUpdate() {
+    if (isDownloadingUpdate_) return;
+
+    const std::string dlUrl = latestUpdateInfo_.directDownloadUrl;
+    if (!shell_->has(ui::Capability::AutoUpdate) || dlUrl.empty()) {
+        shell_->openUrl(latestUpdateInfo_.releaseUrl.empty()
+            ? "https://github.com/oocsng/cppdesk/releases/latest"
+            : latestUpdateInfo_.releaseUrl);
+        return;
+    }
+
+    isDownloadingUpdate_ = true;
+    updateDownloadProgress_ = 0.0f;
+    updateDownloadedBytes_ = 0;
+    updateTotalBytes_ = latestUpdateInfo_.assetSizeBytes;
+    updateSpeedBps_ = 0.0;
+    updateStatusMsg_ = "Connecting to download server...";
+    shell_->invalidate();
+
+    auto doneBox = downloadDoneBox_;
+    shell_->startUpdateDownload(dlUrl, latestUpdateInfo_.assetSizeBytes, latestUpdateInfo_.assetSha256,
+        [doneBox](bool ok, const std::string& message) {
+            std::lock_guard<std::mutex> lk(doneBox->mtx);
+            if (!doneBox->alive) return;
+            doneBox->ok = ok;
+            doneBox->message = message;
+            doneBox->ready = true;
+        });
 }
 
 void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
     if (alpha <= 0.01f) return;
 
-    float s1 = std::clamp(tabEnterStaggerT_, 0.0f, 1.15f);
-    float s2 = std::clamp((tabEnterStaggerT_ - 0.06f) * 1.12f, 0.0f, 1.15f);
-    float s3 = std::clamp((tabEnterStaggerT_ - 0.12f) * 1.15f, 0.0f, 1.15f);
+    const float pad = 28.0f;
+    const float panelW = std::clamp(bounds.width() * 0.27f, 264.0f, 320.0f);
+    const UiRect panel = { bounds.right - pad - panelW, bounds.top + pad, bounds.right - pad, bounds.bottom - pad };
+    const float mx = bounds.left + pad, mrx = panel.left - 24.0f;
+    float y = bounds.top + pad;
 
-    float stagger1 = (1.0f - s1) * 14.0f;
-    float stagger2 = (1.0f - s2) * 16.0f;
-    float stagger3 = (1.0f - s3) * 18.0f;
+    // ========== CONNECT BAR ==========
+    drawText("Connect to a desk", { mx, y, mrx, y + 28.0f }, ui::FontRole::Heading, withAlpha(COL_TEXT_PRIMARY, alpha));
+    if (latestUpdateInfo_.success && latestUpdateInfo_.updateRequired) {   // pill on the heading line
+        std::string ver = latestUpdateInfo_.latestVersion;
+        if (!ver.empty() && (ver[0] == 'v' || ver[0] == 'V')) ver.erase(0, 1);
+        const float frac = std::clamp(updateDownloadProgress_, 0.0f, 1.0f);
+        const std::string label = isDownloadingUpdate_ ? "Updating " + std::to_string(static_cast<int>(frac * 100.0f)) + "%"
+                                                       : (shell_->has(ui::Capability::AutoUpdate) ? "Update to v" : "Get v") + ver;
+        const float pillW = canvas_->measureTextWidth(isDownloadingUpdate_ ? "Updating 100%" : label, ui::FontRole::Small) + 28.0f;
+        const float inT = 1.0f - std::pow(1.0f - std::clamp(updatePillT_, 0.0f, 1.0f), 3.0f);   // ease-out; fade, plus a 4 px slide unless motion is reduced
+        const float slide = reduceMotionActive() ? 0.0f : 4.0f * (1.0f - inT);
+        const float a = alpha * inT;
+        const UiRect pill = { mrx - pillW, y - 1.0f + slide, mrx, y + 29.0f + slide };
+        if (isDownloadingUpdate_) {   // the fill is the download progress
+            fillRoundRect(pill, 15.0f, withAlpha(COL_PRIMARY_ACCENT, 0.16f * a));
+            if (frac > 0.0f) fillRoundRect({ pill.left, pill.top, pill.left + pillW * frac, pill.bottom }, 15.0f, withAlpha(COL_PRIMARY_ACCENT, 0.35f * a));
+            drawButton("home_update_pill", pill, label, withAlpha(COL_PRIMARY_ACCENT, 0.0f), withAlpha(COL_PRIMARY_ACCENT, 0.0f),
+                       withAlpha(COL_TEXT_ACCENT, a), 15.0f, [this]() { startUpdate(); }, ui::FontRole::Small);
+        } else {
+            drawButton("home_update_pill", pill, label, withAlpha(COL_PRIMARY_ACCENT, a), withAlpha(COL_PRIMARY_ACCENT_HV, a),
+                       withAlpha(COL_TEXT_ON_ACCENT, a), 15.0f, [this]() { startUpdate(); }, ui::FontRole::Small);
+        }
+    }
+    y += 38.0f;
+    const float connectW = 112.0f, pwW = std::clamp((mrx - mx) * 0.28f, 150.0f, 200.0f);
+    const UiRect idField = { mx, y, mrx - connectW - pwW - 20.0f, y + 44.0f };
+    drawTextField("field_remote_id", FocusedField::RemoteId, idField, remoteIdInput_, "Desk ID or name", false);
+    const UiRect pwField = { idField.right + 10.0f, y, idField.right + 10.0f + pwW, y + 44.0f };
+    drawTextField("field_remote_pw", FocusedField::RemotePassword, pwField, remotePasswordInput_, "Password or code", true);
+    drawButton("btn_connect", { pwField.right + 10.0f, y, mrx, y + 44.0f }, "Connect",
+               COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 9.0f, [this]() { connectFromHomeBar(); });
+    y += 60.0f;
 
-    float pad = 24.0f;
-    float totalW = bounds.width() - pad * 2.0f;
-    float leftW = std::clamp(totalW * 0.39f, 380.0f, 456.0f);
+    // ========== FILTERS + LIST ACTIONS ==========
+    const auto recents = identity_.recentSessions();
+    const size_t fleetLive = fleet_.size();
+    const UiRect refreshBtn = { mrx - 84.0f, y, mrx, y + 30.0f };
+    drawButton("btn_refresh_lan", refreshBtn, "Refresh", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 15.0f, [this]() {
+        network_.sendDiscoveryQuery(0);
+        showToast("Looking for desks on this network\xE2\x80\xA6");
+    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+    const std::string fleetLabel = fleetLive > 0 ? "Back to grid (" + std::to_string(fleetLive) + ")" : "Do it on all";
+    const float fleetW = canvas_->measureTextWidth(fleetLabel, ui::FontRole::Small) + 28.0f;
+    const UiRect fleetBtn = { refreshBtn.left - 8.0f - fleetW, y, refreshBtn.left - 8.0f, y + 30.0f };
+    const bool gridOn = homeGridSelect_ && fleetLive == 0;
+    drawButton("dash_fleet", fleetBtn, fleetLabel, gridOn ? COL_TEXT_PRIMARY : COL_SEC_BTN_BG,
+               gridOn ? COL_TEXT_PRIMARY : COL_SEC_BTN_HV, gridOn ? COL_BG_CARD : COL_TEXT_PRIMARY, 15.0f, [this]() {
+                   if (fleet_.size() > 0) {
+                       focusedField_ = FocusedField::None;
+                       switchTab(ActiveTab::Fleet);
+                       return;
+                   }
+                   homeGridSelect_ = !homeGridSelect_;
+                   fleetPicked_.clear();
+               }, ui::FontRole::Small, !gridOn, COL_BORDER, gridOn ? COL_BG_CARD : COL_TEXT_ACCENT);
 
-    UiRect leftCol = UiRect{ bounds.left + pad, bounds.top + pad, bounds.left + pad + leftW, bounds.bottom - pad }.offset(0.0f, stagger1);
-    UiRect rightCol = { leftCol.right + pad, bounds.top + pad, bounds.right - pad, bounds.bottom - pad };
+    if (!gridOn) {   // All, Favorites, Nearby, then the tags people actually use
+        std::vector<std::string> chips = { "All", "Favorites", "Nearby" };
+        for (const auto& r : recents) {
+            if (r.tag.empty()) continue;
+            const bool seen = std::any_of(chips.begin() + 3, chips.end(), [&](const std::string& c) {
+                return c.size() == r.tag.size() && std::equal(c.begin(), c.end(), r.tag.begin(), [](char a, char b) {
+                    return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+                });
+            });
+            if (!seen) chips.push_back(r.tag);
+        }
+        if (std::find(chips.begin(), chips.end(), dashboardFilterTag_) == chips.end()) dashboardFilterTag_ = "All";
+        float chipX = mx;
+        for (const auto& c : chips) {
+            const float cw = canvas_->measureTextWidth(c, ui::FontRole::Small) + 28.0f;
+            if (chipX + cw > fleetBtn.left - 12.0f) break;
+            const bool on = dashboardFilterTag_ == c;
+            drawButton("tag_chip_" + c, { chipX, y, chipX + cw, y + 30.0f }, c, on ? COL_TEXT_PRIMARY : COL_SEC_BTN_BG,
+                       on ? COL_TEXT_PRIMARY : COL_SEC_BTN_HV, on ? COL_BG_CARD : COL_TEXT_PRIMARY, 15.0f, [this, c]() {
+                           dashboardFilterTag_ = c;
+                           homeSel_ = -1;
+                           homeScroll_ = 0.0f;
+                       }, ui::FontRole::Small, !on, COL_BORDER, on ? COL_BG_CARD : COL_TEXT_ACCENT);
+            chipX += cw + 6.0f;
+        }
+    } else {
+        drawText("Pick paired desks on this network to control them together.", { mx, y, fleetBtn.left - 12.0f, y + 30.0f },
+                 ui::FontRole::Small, COL_TEXT_SECONDARY);
+    }
+    y += 44.0f;
 
-    // ========== LEFT COLUMN: THIS DESK ==========
-    drawCardSurface(leftCol, 16.0f, alpha);
+    // ========== DESK LIST ==========
+    const UiRect listCard = { mx, y, mrx, bounds.bottom - pad };
+    drawCardSurface(listCard, 16.0f, alpha);
+    const float footH = gridOn ? 64.0f : 0.0f;
+    const UiRect listR = { listCard.left, listCard.top + 6.0f, listCard.right, listCard.bottom - 6.0f - footH };
+    homeListRect_ = listR;
+    homeRowRects_.clear();
+    homeRowTops_.clear();
+    const float rowH = 60.0f, headH = 34.0f;
+    const float rx0 = listR.left + 8.0f, rx1 = listR.right - 8.0f;
 
-    float lx = leftCol.left + 24.0f;
-    float rx = leftCol.right - 24.0f;
-    float curY = leftCol.top + 22.0f;
+    if (gridOn) {
+        // Tickable: paired and seen directly on this network. Paired desks discovery does not see are listed as offline.
+        homeRows_.clear();
+        const auto eligible = FleetManager::eligibleMembers(identity_, network_.discoveredPeers());
+        std::vector<PairedPeer> offline;
+        for (const auto& p : identity_.pairedHosts())
+            if (std::none_of(eligible.begin(), eligible.end(), [&](const FleetMember& m) { return m.deskId == p.deskId; }))
+                offline.push_back(p);
+        auto isPicked = [this](uint64_t id) { return std::find(fleetPicked_.begin(), fleetPicked_.end(), id) != fleetPicked_.end(); };
+        const size_t picked = static_cast<size_t>(std::count_if(eligible.begin(), eligible.end(),
+                                                                [&](const FleetMember& m) { return isPicked(m.deskId); }));
+        canvas_->pushClip(listR);
+        float ry = listR.top - homeScroll_;
+        if (eligible.empty()) {
+            drawText(offline.empty() ? "No paired desks yet. Connect to a desk once and choose Pair."
+                                     : "None of your paired desks are on this network right now.",
+                     { rx0 + 12.0f, ry, rx1 - 12.0f, ry + rowH }, ui::FontRole::Body, COL_TEXT_SECONDARY);
+            ry += rowH;
+        }
+        for (const auto& m : eligible) {
+            const UiRect row = { rx0, ry, rx1, ry + rowH };
+            const bool on = isPicked(m.deskId);
+            const bool can = on || picked < FleetManager::kMaxMembers;
+            const std::string rid = "fleet_pick_" + std::to_string(m.deskId);
+            const float hT = std::clamp(widgetAnims_[rid].hoverT, 0.0f, 1.0f);
+            fillRoundRect(row, 10.0f, lerpColor(COL_BG_CARD, on ? COL_BG_CARD_ALT : COL_BG_SUBTLE, on ? 1.0f : hT));
+            const UiRect box = { row.left + 14.0f, row.centerY() - 10.0f, row.left + 34.0f, row.centerY() + 10.0f };
+            if (on) {
+                fillRoundRect(box, 6.0f, COL_PRIMARY_ACCENT);
+                drawText("\xE2\x9C\x93", box, ui::FontRole::Small, COL_TEXT_ON_ACCENT, ui::HAlign::Center, ui::VAlign::Center);
+            } else {
+                strokeRoundRect(box, 6.0f, can ? COL_BORDER_ALT : COL_BORDER, 1.5f);
+            }
+            drawText(m.name, { row.left + 50.0f, row.top, row.right - 130.0f, row.bottom }, ui::FontRole::BodyBold,
+                     can ? COL_TEXT_PRIMARY : COL_TEXT_MUTED);
+            drawText(CryptoUtils::formatDeskId(m.deskId), { row.right - 126.0f, row.top, row.right - 14.0f, row.bottom },
+                     ui::FontRole::Small, COL_TEXT_SECONDARY, ui::HAlign::Trailing);
+            if (can && row.bottom <= listR.bottom && row.top >= listR.top) {   // a clipped row is not clickable
+                clickRegions_.push_back({ row, rid, [this, id = m.deskId]() {
+                    auto it = std::find(fleetPicked_.begin(), fleetPicked_.end(), id);
+                    if (it != fleetPicked_.end()) fleetPicked_.erase(it);
+                    else fleetPicked_.push_back(id);
+                }, false });
+            }
+            ry += rowH + 2.0f;
+        }
+        for (const auto& p : offline) {
+            const UiRect row = { rx0, ry, rx1, ry + rowH };
+            strokeRoundRect({ row.left + 14.0f, row.centerY() - 10.0f, row.left + 34.0f, row.centerY() + 10.0f }, 6.0f, COL_BORDER, 1.5f);
+            drawText(peerName(p.hostname), { row.left + 50.0f, row.top, row.right - 130.0f, row.bottom }, ui::FontRole::BodyBold, COL_TEXT_MUTED);
+            drawText("Offline", { row.right - 126.0f, row.top, row.right - 14.0f, row.bottom }, ui::FontRole::Small,
+                     COL_TEXT_MUTED, ui::HAlign::Trailing);
+            ry += rowH + 2.0f;
+        }
+        canvas_->popClip();
+        homeMaxScroll_ = std::max(0.0f, ry + homeScroll_ - listR.bottom);
 
-    bool elevated = InputInjector::isElevated() || !shell_->has(ui::Capability::Elevation);
-    drawText("This Desk", { lx, curY, rx - (elevated ? 0.0f : 110.0f), curY + 26.0f }, ui::FontRole::Heading, withAlpha(COL_TEXT_PRIMARY, alpha));
+        const float by = listCard.bottom - 16.0f - 36.0f;
+        drawButton("fleet_pick_cancel", { rx1 - 270.0f, by, rx1 - 160.0f, by + 36.0f }, "Cancel",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 9.0f, [this]() {
+                       homeGridSelect_ = false;
+                       fleetPicked_.clear();
+                   }, ui::FontRole::Small, true, COL_BORDER);
+        const UiRect openBtn = { rx1 - 150.0f, by, rx1, by + 36.0f };
+        const std::string openLabel = "Open grid (" + std::to_string(picked) + ")";
+        if (picked == 0) {   // disabled: nothing ticked
+            fillRoundRect(openBtn, 9.0f, COL_SEC_BTN_BG);
+            drawText(openLabel, openBtn, ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center, ui::VAlign::Center);
+        } else {
+            std::vector<FleetMember> chosen;
+            for (const auto& m : eligible)
+                if (isPicked(m.deskId)) chosen.push_back(m);
+            drawButton("fleet_pick_open", openBtn, openLabel, COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 9.0f,
+                       [this, chosen]() {
+                           homeGridSelect_ = false;
+                           fleetPicked_.clear();
+                           openFleetGrid(chosen);
+                       }, ui::FontRole::Small);
+        }
+    } else {
+        size_t nearbyStart = 0;
+        homeRows_ = buildHomeRows(nearbyStart);
+        if (homeSel_ >= static_cast<int>(homeRows_.size())) homeSel_ = -1;
+
+        if (homeRows_.empty()) {
+            const bool nothingAtAll = recents.empty() && network_.discoveredPeers().empty();
+            const uint64_t typedId = CryptoUtils::parseDeskId(remoteIdInput_);
+            const std::string title = nothingAtAll ? "No desks yet" : "No desks match";
+            const std::string body = nothingAtAll ? "Enter a desk ID above, or desks on your network will show up here."
+                                   : typedId != 0 ? "Press Enter to connect to " + CryptoUtils::formatDeskId(typedId) + "."
+                                                  : "Try another name, ID or filter.";
+            const float cy = listR.top + std::min(140.0f, listR.height() * 0.4f);
+            drawText(title, { rx0, cy - 26.0f, rx1, cy }, ui::FontRole::Subheading, COL_TEXT_PRIMARY, ui::HAlign::Center);
+            drawText(body, { rx0 + 24.0f, cy + 2.0f, rx1 - 24.0f, cy + 24.0f }, ui::FontRole::Body, COL_TEXT_SECONDARY, ui::HAlign::Center);
+        }
+
+        canvas_->pushClip(listR);
+        float ry = listR.top - homeScroll_;
+        for (size_t i = 0; i < homeRows_.size(); ++i) {
+            const HomeRow& row = homeRows_[i];
+            if (i == nearbyStart && dashboardFilterTag_ == "All") {
+                drawText("NEARBY ON THIS NETWORK", { rx0 + 12.0f, ry + 10.0f, rx1, ry + headH - 4.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
+                ry += headH;
+            }
+            // Rows cascade in 30 ms apart the first time Home shows, then appear at once
+            const float introT = std::clamp((homeIntroT_ - 0.03f * static_cast<float>(std::min<size_t>(i, 10))) / 0.16f, 0.0f, 1.0f);
+            const float introE = 1.0f - (1.0f - introT) * (1.0f - introT);
+            const UiRect rr = { rx0, ry + (1.0f - introE) * 8.0f, rx1, ry + rowH + (1.0f - introE) * 8.0f };
+            homeRowTops_.push_back(ry + homeScroll_ - listR.top);
+            homeRowRects_.push_back({ rr.left, std::max(rr.top, listR.top), rr.right, std::min(rr.bottom, listR.bottom) });
+            ry += rowH + 2.0f;
+            if (rr.bottom < listR.top || rr.top > listR.bottom) continue;
+
+            const std::string rid = "home_row_" + std::to_string(i);
+            const std::string cid = "home_conn_" + std::to_string(i);
+            const std::string oid = "home_more_" + std::to_string(i);
+            const float hT = std::clamp(std::max({ widgetAnims_[rid].hoverT, widgetAnims_[cid].hoverT, widgetAnims_[oid].hoverT }), 0.0f, 1.0f);
+            const bool sel = static_cast<int>(i) == homeSel_;
+            canvas_->pushOpacity(introE);
+            fillRoundRect(rr, 10.0f, sel ? COL_BG_CARD_ALT : lerpColor(COL_BG_CARD, COL_BG_SUBTLE, hT));
+            if (sel) strokeRoundRect(rr, 10.0f, COL_BORDER_ALT, 1.0f);
+
+            const UiRect hit = homeRowRects_.back();
+            clickRegions_.push_back({ hit, rid, [this, i]() {
+                const uint64_t now = shell_->nowMs();
+                const bool twice = homeLastClickRow_ == static_cast<int>(i) && now - homeLastClickTick_ < 450;
+                homeLastClickRow_ = static_cast<int>(i);
+                homeLastClickTick_ = now;
+                homeSel_ = static_cast<int>(i);
+                homeMenu_ = false;
+                if (twice && i < homeRows_.size()) connectHomeRow(homeRows_[i], false);
+            }, false });
+
+            drawAvatar(rr.left + 32.0f, rr.centerY(), 18.0f,
+                       row.deskId != 0 ? row.deskId : std::hash<std::string>{}(row.endpoint), row.name, 1.0f);
+
+            const bool showActions = hT > 0.5f || sel;
+            const float textRight = rr.right - (showActions ? 150.0f : 190.0f);
+            drawText(row.name, { rr.left + 62.0f, rr.top + 10.0f, textRight, rr.top + 30.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
+            drawText(row.sub, { rr.left + 62.0f, rr.top + 31.0f, textRight, rr.top + 49.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+
+            float cx = rr.right - 14.0f;
+            if (row.favorite) {
+                drawIconStar(cx - 8.0f, rr.centerY(), 6.0f, true, COL_PRIMARY_ACCENT);
+                cx -= 26.0f;
+            }
+            if (showActions) {
+                const UiRect more = { cx - 32.0f, rr.centerY() - 16.0f, cx, rr.centerY() + 16.0f };
+                drawButton(oid, more, "\xE2\x8B\xAF", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this, i, more]() {
+                    if (i < homeRows_.size()) {
+                        homeSel_ = static_cast<int>(i);
+                        openHomeMenu(homeRows_[i], more.right - 212.0f, more.bottom + 4.0f);
+                    }
+                }, ui::FontRole::BodyBold, true, COL_BORDER);
+                const UiRect conn = { more.left - 92.0f, more.top, more.left - 8.0f, more.bottom };
+                drawButton(cid, conn, "Connect", COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this, i]() {
+                    if (i < homeRows_.size()) connectHomeRow(homeRows_[i], false);
+                }, ui::FontRole::Small);
+            } else {
+                if (row.paired) {
+                    const UiRect chip = { cx - 54.0f, rr.centerY() - 11.0f, cx, rr.centerY() + 11.0f };
+                    fillRoundRect(chip, 11.0f, withAlpha(COL_PRIMARY_ACCENT, 0.14f));
+                    drawText("Paired", chip, ui::FontRole::Small, COL_TEXT_ACCENT, ui::HAlign::Center, ui::VAlign::Center);
+                    cx -= 64.0f;
+                }
+                if (row.live) {
+                    drawText("Online", { cx - 60.0f, rr.top, cx, rr.bottom }, ui::FontRole::Small, COL_TEXT_SECONDARY, ui::HAlign::Trailing);
+                    canvas_->fillEllipse(cx - 68.0f, rr.centerY(), 3.5f, 3.5f, COL_SUCCESS);
+                }
+            }
+            canvas_->popOpacity();
+        }
+        canvas_->popClip();
+        homeMaxScroll_ = std::max(0.0f, ry + homeScroll_ - listR.bottom);
+    }
+    homeScroll_ = std::clamp(homeScroll_, 0.0f, homeMaxScroll_);
+    if (homeMaxScroll_ > 0.5f) {   // a thin thumb says the list scrolls
+        const float trackH = listR.height() - 16.0f;
+        const float thumbH = std::max(28.0f, trackH * listR.height() / (listR.height() + homeMaxScroll_));
+        const float thumbY = listR.top + 8.0f + (trackH - thumbH) * (homeScroll_ / homeMaxScroll_);
+        fillRoundRect({ listR.right - 5.0f, thumbY, listR.right - 2.0f, thumbY + thumbH }, 1.5f, withAlpha(COL_TEXT_MUTED, 0.5f));
+    }
+
+    drawThisDeskPanel(panel, alpha);
+    if (homeMenu_ || homeMenuAnimT_ > 0.004f) drawHomeMenu(bounds.right, bounds.bottom);
+}
+
+void AppUi::drawThisDeskPanel(const UiRect& panel, float alpha) {
+    drawCardSurface(panel, 16.0f, alpha);
+    const float lx = panel.left + 20.0f, rx = panel.right - 20.0f;
+    float y = panel.top + 18.0f;
+
+    const bool elevated = InputInjector::isElevated() || !shell_->has(ui::Capability::Elevation);
+    drawText("This desk", { lx, y, rx - (elevated ? 0.0f : 112.0f), y + 24.0f }, ui::FontRole::Subheading, withAlpha(COL_TEXT_PRIMARY, alpha));
     if (!elevated) {
-        UiRect elevBtn = { rx - 108.0f, curY, rx, curY + 26.0f };
-        drawButton("btn_elevate_admin", elevBtn, "Elevate Admin",
-                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_PRIMARY_ACCENT, 6.5f, [this]() {
+        drawButton("btn_elevate_admin", { rx - 108.0f, y - 1.0f, rx, y + 25.0f }, "Elevate Admin",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_ACCENT, 13.0f, [this]() {
                        if (shell_->relaunchElevated()) {
                            shell_->quitApp();
                        }
                    }, ui::FontRole::Small, true, COL_BORDER);
     }
-    curY += 26.0f;
-    drawText("Share your ID and code to allow remote access.",
-             { lx, curY, rx, curY + 20.0f }, ui::FontRole::Small, withAlpha(COL_TEXT_SECONDARY, alpha));
-    curY += 28.0f;
+    y += 36.0f;
 
-    // Hero Desk ID Card
-    UiRect idBox = { lx, curY, rx, curY + 86.0f };
-    fillRoundRect(idBox, 13.0f, withAlpha(COL_BG_CARD_ALT, alpha));
-    strokeRoundRect(idBox, 13.0f, withAlpha(COL_BORDER_ALT, alpha), 1.2f);
-
-    drawText("YOUR DESK ID", { idBox.left + 18.0f, idBox.top + 10.0f, idBox.right - 18.0f, idBox.top + 24.0f },
-             ui::FontRole::Small, withAlpha(COL_TEXT_ACCENT, alpha));
-    drawText(identity_.formattedDeskId(), { idBox.left + 18.0f, idBox.top + 26.0f, idBox.right - 108.0f, idBox.bottom - 8.0f },
-             ui::FontRole::HeroId, withAlpha(COL_PRIMARY_ACCENT, alpha));
-
-    UiRect copyIdBtn = { idBox.right - 98.0f, idBox.top + 25.0f, idBox.right - 16.0f, idBox.bottom - 17.0f };
-    drawButton("btn_copy_id", copyIdBtn, "Copy ID",
-               COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.5f, [this]() {
+    drawText("Your desk ID", { lx, y, rx - 64.0f, y + 18.0f }, ui::FontRole::Small, withAlpha(COL_TEXT_SECONDARY, alpha));
+    drawButton("btn_copy_id", { rx - 58.0f, y - 4.0f, rx, y + 22.0f }, "Copy", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
+               13.0f, [this]() {
                    ClipboardManager::setClipboardUtf8(identity_.formattedDeskId());
                    showToast("Copied Desk ID");
-               }, ui::FontRole::Small);
+               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+    y += 22.0f;
+    drawText(identity_.formattedDeskId(), { lx, y, rx, y + 42.0f }, ui::FontRole::HeroId, withAlpha(COL_TEXT_ACCENT, alpha));
+    y += 52.0f;
 
-    curY = idBox.bottom + 16.0f;
-
-    // macOS Inset Group: Access & Password
-    UiRect unattBox = { lx, curY, rx, curY + 166.0f };
-    fillRoundRect(unattBox, 13.0f, withAlpha(COL_BG_SUBTLE, alpha));
-    strokeRoundRect(unattBox, 13.0f, withAlpha(COL_BORDER, alpha), 1.0f);
-
-    float ux = unattBox.left + 16.0f;
-    float urx = unattBox.right - 16.0f;
-    drawToggleSwitch("toggle_unattended", { ux, unattBox.top + 10.0f, urx, unattBox.top + 38.0f },
-                     identity_.unattendedEnabled(), "Allow Password Access", [this]() {
-                         identity_.setUnattendedEnabled(!identity_.unattendedEnabled());
-                     });
-
-    fillRoundRect({ ux, unattBox.top + 42.0f, urx, unattBox.top + 43.0f }, 0.0f, withAlpha(COL_BORDER, 0.7f * alpha));
-
-    // Session Code Row
-    float codeY = unattBox.top + 50.0f;
-    drawText("Session Code", { ux, codeY, ux + 96.0f, codeY + 32.0f }, ui::FontRole::Body, withAlpha(COL_TEXT_SECONDARY, alpha));
-    UiRect codeBadge = { ux + 100.0f, codeY, urx - 134.0f, codeY + 32.0f };
-    fillRoundRect(codeBadge, 7.5f, COL_BG_CARD);
-    strokeRoundRect(codeBadge, 7.5f, COL_BORDER);
-    drawText(identity_.sessionCode(), codeBadge, ui::FontRole::Mono, COL_PRIMARY_ACCENT, ui::HAlign::Center);
-
-    UiRect copyCodeBtn = { codeBadge.right + 6.0f, codeY, codeBadge.right + 66.0f, codeY + 32.0f };
-    drawButton("btn_copy_code", copyCodeBtn, "Copy",
-               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
+    drawText("Session code", { lx, y, rx, y + 18.0f }, ui::FontRole::Small, withAlpha(COL_TEXT_SECONDARY, alpha));
+    y += 22.0f;
+    const UiRect codeBadge = { lx, y, rx - 108.0f, y + 34.0f };
+    fillRoundRect(codeBadge, 8.0f, COL_BG_SUBTLE);
+    drawText(identity_.sessionCode(), codeBadge, ui::FontRole::Mono, COL_TEXT_PRIMARY, ui::HAlign::Center);
+    drawButton("btn_copy_code", { codeBadge.right + 6.0f, y, codeBadge.right + 56.0f, y + 34.0f }, "Copy",
+               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
                    ClipboardManager::setClipboardUtf8(identity_.sessionCode());
                    showToast("Copied session code");
                }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
-
-    UiRect regenCodeBtn = { copyCodeBtn.right + 6.0f, codeY, urx, codeY + 32.0f };
-    drawButton("btn_regen_code", regenCodeBtn, "New",
-               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
+    drawButton("btn_regen_code", { codeBadge.right + 62.0f, y, rx, y + 34.0f }, "New",
+               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
                    identity_.regenerateSessionCode();
                }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+    y += 50.0f;
 
-    fillRoundRect({ ux, codeY + 40.0f, urx, codeY + 41.0f }, 0.0f, withAlpha(COL_BORDER, 0.7f * alpha));
+    fillRoundRect({ lx, y, rx, y + 1.0f }, 0.0f, withAlpha(COL_BORDER, alpha));
+    y += 12.0f;
+    drawToggleSwitch("toggle_unattended", { lx, y, rx, y + 28.0f }, identity_.unattendedEnabled(), "Allow password access", [this]() {
+        identity_.setUnattendedEnabled(!identity_.unattendedEnabled());
+    });
+    y += 38.0f;
+    if (editingLocalPass_) {
+        drawTextField("field_local_pass", FocusedField::LocalPassword, { lx, y, rx, y + 38.0f },
+                      localPasswordEdit_, "Unattended password", !showLocalPassword_);
+        y += 46.0f;
+        drawButton("btn_show_local_pass", { lx, y, lx + 64.0f, y + 32.0f }, showLocalPassword_ ? "Hide" : "Show",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
+                       showLocalPassword_ = !showLocalPassword_;
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+        drawButton("btn_cancel_local_pass", { rx - 146.0f, y, rx - 76.0f, y + 32.0f }, "Cancel",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
+                       editingLocalPass_ = false;
+                       localPasswordEdit_.clear();
+                       if (focusedField_ == FocusedField::LocalPassword) focusedField_ = FocusedField::RemoteId;
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+        drawButton("btn_save_local_pass", { rx - 70.0f, y, rx, y + 32.0f }, "Save",
+                   COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
+                       if (!localPasswordEdit_.empty()) {
+                           identity_.setUnattendedPassword(localPasswordEdit_);
+                           showToast("Password saved");
+                           editingLocalPass_ = false;
+                       } else {
+                           showToast("Enter a password first", true);
+                       }
+                   }, ui::FontRole::Small);
+        y += 44.0f;
+    } else {
+        drawButton("btn_set_local_pass", { lx, y, rx, y + 34.0f }, "Set unattended password\xE2\x80\xA6",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
+                       editingLocalPass_ = true;
+                       localPasswordEdit_.clear();
+                       focusedField_ = FocusedField::LocalPassword;
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+        y += 46.0f;
+    }
 
-    // Unattended Password Row
-    float passY = codeY + 49.0f;
-    UiRect passField = { ux, passY, urx - 134.0f, passY + 36.0f };
-    drawTextField("field_local_pass", FocusedField::LocalPassword, passField,
-                  localPasswordEdit_, "Unattended password...", !showLocalPassword_);
-
-    UiRect showPassBtn = { passField.right + 6.0f, passField.top, passField.right + 66.0f, passField.bottom };
-    drawButton("btn_show_local_pass", showPassBtn, showLocalPassword_ ? "Hide" : "Show",
-               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
-                   showLocalPassword_ = !showLocalPassword_;
-               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
-
-    UiRect savePassBtn = { showPassBtn.right + 6.0f, passField.top, urx, passField.bottom };
-    drawButton("btn_save_local_pass", savePassBtn, "Save",
-               COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 7.5f, [this]() {
-                   if (!localPasswordEdit_.empty()) {
-                       identity_.setUnattendedPassword(localPasswordEdit_);
-                       showToast("Password saved");
-                   } else {
-                       showToast("Enter a password first", true);
-                   }
-               }, ui::FontRole::Small);
-
-    curY = unattBox.bottom + 16.0f;
-
-    // Host Session Status Box
+    // Host status: who is connected and what they may do, or that this desk is ready
     auto hStatus = snapshotHostStatus_ ? *snapshotHostStatus_ : network_.hostSessionStatus();
-    UiRect hostBox = { lx, curY, rx, leftCol.bottom - 22.0f };
-    fillRoundRect(hostBox, 13.0f, withAlpha(hStatus.active ? COL_BG_CARD_ALT : COL_BG_SUBTLE, alpha));
-    strokeRoundRect(hostBox, 13.0f, withAlpha(hStatus.active ? COL_BORDER_ALT : COL_BORDER, alpha), 1.0f);
+    const UiRect hostBox = { lx - 6.0f, y, rx + 6.0f, panel.bottom - 14.0f };
+    fillRoundRect(hostBox, 12.0f, withAlpha(hStatus.active ? COL_BG_CARD_ALT : COL_BG_SUBTLE, alpha));
+    if (hStatus.active) strokeRoundRect(hostBox, 12.0f, withAlpha(COL_BORDER_ALT, alpha), 1.0f);
 
-    float hx = hostBox.left + 18.0f;
-    float hrx = hostBox.right - 18.0f;
-    float hy = hostBox.top + 14.0f;
+    const float hx = hostBox.left + 14.0f;
+    const float hrx = hostBox.right - 14.0f;
+    float hy = hostBox.top + 12.0f;
 
     if (hStatus.active) {
         drawPulseDot(hx + 5.0f, hy + 10.0f, 4.0f, COL_PRIMARY_ACCENT, alpha);
-        drawText("ACTIVE SESSION", { hx + 16.0f, hy, hrx, hy + 20.0f }, ui::FontRole::Small, COL_PRIMARY_ACCENT);
+        drawText("ACTIVE SESSION", { hx + 16.0f, hy, hrx, hy + 20.0f }, ui::FontRole::Small, COL_TEXT_ACCENT);
         hy += 22.0f;
-        std::string who = hStatus.viewerHostname + " (" + CryptoUtils::formatDeskId(hStatus.viewerDeskId) + ")";
+        std::string who = peerName(hStatus.viewerHostname) + " (" + CryptoUtils::formatDeskId(hStatus.viewerDeskId) + ")";
         drawText(who, { hx, hy, hrx, hy + 24.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
         hy += 26.0f;
 
         // Screen sharing on Wayland: what the desktop said, when there is something to say. The switches give way
         // before the Disconnect button does.
         const wayland::NoticeText shareText = wayland::describeShareNotice(currentShareNotice());
-        const float discTop = hostBox.bottom - 8.0f - 32.0f;
+        const float discTop = hostBox.bottom - 10.0f - 32.0f;
         const bool micLive = currentHostMicLive();
         if (micLive) {   // the viewer's voice opened this computer's microphone
             const std::string micText = "Microphone is on: the viewer can hear this room";
@@ -1350,10 +2009,9 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
                          });
         hy += 30.0f;
 
-        const float discY = (hy + 32.0f > hostBox.bottom - 8.0f) ? discTop : hy;
-        if (discY + 32.0f <= hostBox.bottom - 8.0f) {
-            UiRect discHostBtn = { hx, discY, hrx, discY + 32.0f };
-            drawButton("btn_disc_host", discHostBtn, "Disconnect",
+        const float discY = (hy + 32.0f > hostBox.bottom - 10.0f) ? discTop : hy;
+        if (discY + 32.0f <= hostBox.bottom - 10.0f) {
+            drawButton("btn_disc_host", { hx, discY, hrx, discY + 32.0f }, "Disconnect",
                        COL_DANGER, COL_DANGER_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
                            network_.disconnectHostClient();
                            showToast("Disconnected viewer");
@@ -1364,357 +2022,10 @@ void AppUi::drawDashboardView(const UiRect& bounds, float alpha) {
         if (permCard.visible) {
             drawHostPermissionCard(hostBox, permCard, alpha);
         } else {
-            float midY = hostBox.centerY();
-            drawPulseDot(hx + 6.0f, midY - 10.0f, 4.2f, COL_SUCCESS, alpha);
-            drawText("Ready for connections", { hx + 18.0f, midY - 22.0f, hrx, midY + 2.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
-            drawText("Your desktop is ready to share.", { hx + 18.0f, midY + 2.0f, hrx, midY + 24.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
-        }
-    }
-
-    // ========== RIGHT COLUMN: REMOTE DESK & SAVED/NEARBY DESKS ==========
-    float topCardH = 148.0f;
-    UiRect connectCard = UiRect{ rightCol.left, rightCol.top, rightCol.right, rightCol.top + topCardH }.offset(0.0f, stagger2);
-    drawCardSurface(connectCard, 16.0f, alpha);
-
-    float cx = connectCard.left + 24.0f;
-    float crx = connectCard.right - 24.0f;
-    float cy = connectCard.top + 20.0f;
-
-    drawText("Remote Desk", { cx, cy, crx, cy + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
-    cy += 25.0f;
-    drawText("Enter a Desk ID to connect to another computer.",
-             { cx, cy, crx, cy + 20.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
-    cy += 28.0f;
-
-    float totalInputW = crx - cx;
-    float idW = totalInputW * 0.44f;
-    float pwW = totalInputW * 0.34f;
-
-    UiRect remoteIdField = { cx, cy, cx + idW, cy + 42.0f };
-    drawTextField("field_remote_id", FocusedField::RemoteId, remoteIdField,
-                  remoteIdInput_, "Enter 9-digit ID", false);
-
-    UiRect remotePwField = { remoteIdField.right + 10.0f, cy, remoteIdField.right + 10.0f + pwW, cy + 42.0f };
-    drawTextField("field_remote_pw", FocusedField::RemotePassword, remotePwField,
-                  remotePasswordInput_, "Password or code", true);
-
-    UiRect connectBtn = { remotePwField.right + 10.0f, cy, crx, cy + 42.0f };
-    drawButton("btn_connect", connectBtn, "Connect",
-               COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 9.0f, [this]() {
-                   initiateConnection();
-               });
-
-    // ========== SAVED & NEARBY DESKS GRID ==========
-    UiRect peersCard = UiRect{ rightCol.left, connectCard.bottom + 18.0f - stagger2, rightCol.right, rightCol.bottom }.offset(0.0f, stagger3);
-    drawCardSurface(peersCard, 16.0f, alpha);
-
-    float px = peersCard.left + 24.0f;
-    float prx = peersCard.right - 24.0f;
-    float py = peersCard.top + 20.0f;
-
-    auto discovered = network_.discoveredPeers();
-    auto recents = identity_.recentSessions();
-
-    // A grid kept alive by a tile's Open is one click away; otherwise the button starts a new one
-    const size_t fleetLive = fleet_.size();
-    const float fleetBtnW = fleetLive > 0 ? 130.0f : 110.0f;
-    drawText("Saved & Nearby Desks", { px, py, prx - 112.0f - fleetBtnW, py + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
-    UiRect fleetBtn = { prx - 102.0f - fleetBtnW, py - 2.0f, prx - 102.0f, py + 28.0f };
-    drawButton("dash_fleet", fleetBtn, fleetLive > 0 ? "Back to grid (" + std::to_string(fleetLive) + ")" : "Do it on all",
-               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
-                   if (fleet_.size() > 0) {
-                       focusedField_ = FocusedField::None;
-                       switchTab(ActiveTab::Fleet);
-                       return;
-                   }
-                   fleetPicked_.clear();
-                   showFleetPicker_ = true;
-               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
-    UiRect refreshBtn = { prx - 92.0f, py - 2.0f, prx, py + 28.0f };
-    drawButton("btn_refresh_lan", refreshBtn, "Refresh",
-               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.5f, [this]() {
-                   network_.sendDiscoveryQuery(0);
-                   showToast("Refreshing nearby desks...");
-               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
-
-    py += 38.0f;
-
-    // Address Book search bar & tag filter chips (v2.1.0)
-    float searchW = 160.0f;
-    UiRect searchBox = { px, py, px + searchW, py + 26.0f };
-    drawTextField("field_dash_search", FocusedField::DashboardSearch, searchBox,
-                  dashboardSearchQuery_, "Search desks...", false);
-
-    // Tag filter chips: All, Favorites, Work, Servers, Personal
-    float chipX = searchBox.right + 8.0f;
-    std::vector<std::string> tags = { "All", "Favorites", "Work", "Servers", "Personal" };
-    for (const auto& t : tags) {
-        float chipW = static_cast<float>(t.size()) * 7.2f + 16.0f;
-        if (chipX + chipW > prx) break;
-        UiRect chipRect = { chipX, py, chipX + chipW, py + 26.0f };
-        bool isActive = (dashboardFilterTag_ == t);
-        drawButton("tag_chip_" + t, chipRect, t,
-                   isActive ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   isActive ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   6.0f, [this, t]() {
-                       dashboardFilterTag_ = t;
-                   }, ui::FontRole::Small, !isActive, COL_BORDER,
-                   isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-        chipX = chipRect.right + 5.0f;
-    }
-    py += 34.0f;
-
-    struct PeerCardItem {
-        uint64_t    deskId;
-        std::string hostname;
-        std::string endpoint;
-        bool        isLive;
-        bool        isFavorite;
-        bool        isFromRecent;
-        std::string alias;
-        std::string tag;
-        std::string notes;
-    };
-    std::vector<PeerCardItem> cardItems;
-
-    for (const auto& r : recents) {
-        if (!r.isFavorite) continue;
-        bool liveNow = false;
-        std::string ep = r.address;
-        for (const auto& d : discovered) {
-            if (d.deskId == r.deskId) {
-                liveNow = true;
-                ep = d.ip + ":" + std::to_string(d.port);
-                break;
-            }
-        }
-        cardItems.push_back({ r.deskId, r.hostname, ep, liveNow, true, true, r.alias, r.tag, r.notes });
-    }
-
-    for (const auto& d : discovered) {
-        bool already = false;
-        for (const auto& c : cardItems) {
-            if (c.deskId == d.deskId) { already = true; break; }
-        }
-        if (!already) {
-            std::string dAlias, dTag, dNotes;
-            for (const auto& r : recents) {
-                if (r.deskId == d.deskId) {
-                    dAlias = r.alias;
-                    dTag = r.tag;
-                    dNotes = r.notes;
-                    break;
-                }
-            }
-            cardItems.push_back({ d.deskId, d.hostname, d.ip + ":" + std::to_string(d.port), true, false, false, dAlias, dTag, dNotes });
-        }
-    }
-
-    for (const auto& r : recents) {
-        bool already = false;
-        for (const auto& c : cardItems) {
-            if (r.deskId > 0 && c.deskId == r.deskId) { already = true; break; }
-        }
-        if (!already) {
-            cardItems.push_back({ r.deskId, r.hostname, r.address, false, r.isFavorite, true, r.alias, r.tag, r.notes });
-        }
-    }
-
-    // Filter cards by Tag and Search Query
-    {
-        std::vector<PeerCardItem> filtered;
-        std::string qLower = dashboardSearchQuery_;
-        std::transform(qLower.begin(), qLower.end(), qLower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-        for (const auto& item : cardItems) {
-            if (dashboardFilterTag_ == "Favorites") {
-                if (!item.isFavorite) continue;
-            } else if (dashboardFilterTag_ != "All") {
-                std::string itemTagLower = item.tag;
-                std::transform(itemTagLower.begin(), itemTagLower.end(), itemTagLower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                std::string filterTagLower = dashboardFilterTag_;
-                std::transform(filterTagLower.begin(), filterTagLower.end(), filterTagLower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (itemTagLower != filterTagLower) continue;
-            }
-
-            if (!qLower.empty()) {
-                std::string haystack = std::to_string(item.deskId) + " " +
-                                       CryptoUtils::formatDeskId(item.deskId) + " " +
-                                       item.hostname + " " + item.endpoint + " " +
-                                       item.alias + " " + item.tag + " " + item.notes;
-                std::transform(haystack.begin(), haystack.end(), haystack.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (haystack.find(qLower) == std::string::npos) {
-                    continue;
-                }
-            }
-            filtered.push_back(item);
-        }
-        cardItems = std::move(filtered);
-    }
-
-    if (cardItems.empty()) {
-        UiRect emptyBox = { px, py + 4.0f, prx, peersCard.bottom - 24.0f };
-        fillRoundRect(emptyBox, 13.0f, COL_BG_SUBTLE);
-        strokeRoundRect(emptyBox, 13.0f, COL_BORDER);
-
-        float cyEmpty = emptyBox.centerY();
-        drawPulseDot(emptyBox.centerX(), cyEmpty - 24.0f, 5.5f, COL_PRIMARY_ACCENT, alpha);
-        drawText("No matching desks found",
-                 { emptyBox.left + 24.0f, cyEmpty - 8.0f, emptyBox.right - 24.0f, cyEmpty + 16.0f },
-                 ui::FontRole::Subheading, COL_TEXT_PRIMARY, ui::HAlign::Center);
-        drawText("Try changing search keywords or active filter tag.",
-                 { emptyBox.left + 24.0f, cyEmpty + 18.0f, emptyBox.right - 24.0f, cyEmpty + 42.0f },
-                 ui::FontRole::Small, COL_TEXT_SECONDARY, ui::HAlign::Center);
-    } else {
-        int cols = 2;
-        float gap = 14.0f;
-        float cardW = (prx - px - gap) / 2.0f;
-        float cardH = 96.0f;
-        const auto pairedHostsNow = identity_.pairedHosts();
-
-        for (size_t i = 0; i < cardItems.size(); ++i) {
-            int row = static_cast<int>(i) / cols;
-            int col = static_cast<int>(i) % cols;
-            float itemLeft = px + col * (cardW + gap);
-            float itemTop = py + row * (cardH + gap);
-            if (itemTop + cardH > peersCard.bottom - 16.0f) break;
-
-            std::string cardBtnId = "peer_conn_" + std::to_string(i);
-            std::string cardItemId = "peer_card_" + std::to_string(i);
-            float cardHover = std::clamp(std::max(widgetAnims_[cardBtnId].hoverT, widgetAnims_[cardItemId].hoverT), 0.0f, 1.25f);
-            float cardPress = std::clamp(std::max(widgetAnims_[cardBtnId].pressT, widgetAnims_[cardItemId].pressT), 0.0f, 1.25f);
-
-            UiRect cardR = UiRect{ itemLeft, itemTop, itemLeft + cardW, itemTop + cardH }
-                .inflate(cardW * 0.010f * cardHover, cardH * 0.010f * cardHover)
-                .offset(0.0f, -2.4f * cardHover + 1.6f * cardPress);
-            drawCardShadow(cardR, 12.0f, 0.4f + 0.6f * cardHover);
-            fillRoundRect(cardR, 12.0f, lerpColor(COL_BG_SUBTLE, COL_BG_CARD, 0.5f + 0.5f * std::clamp(cardHover, 0.0f, 1.0f)));
-            strokeRoundRect(cardR, 12.0f, lerpColor(cardItems[i].isFavorite ? COL_BORDER_ALT : COL_BORDER, COL_PRIMARY_ACCENT, std::clamp(cardHover, 0.0f, 1.0f) * 0.7f), 1.0f + 0.5f * std::clamp(cardHover, 0.0f, 1.0f));
-
-            if (cardHover > 0.02f) {
-                fillRoundRect({ cardR.left + 8.0f, cardR.top + 0.8f, cardR.right - 8.0f, cardR.top + 2.0f },
-                              0.5f, rgba(255, 255, 255, 0.28f * cardHover));
-            }
-
-            float badgeEnd;
-            if (cardItems[i].isLive) {
-                drawPulseDot(cardR.left + 19.0f, cardR.top + 18.0f, 3.4f, COL_SUCCESS, alpha);
-                std::string badge = cardItems[i].isFavorite ? "FAVORITE • ONLINE" : "ONLINE";
-                if (!cardItems[i].tag.empty()) badge += " • [" + cardItems[i].tag + "]";
-                drawText(badge, { cardR.left + 28.0f, cardR.top + 10.0f, cardR.right - 92.0f, cardR.top + 26.0f },
-                         ui::FontRole::Small, cardItems[i].isFavorite ? COL_PRIMARY_ACCENT : COL_TEXT_SECONDARY);
-                badgeEnd = cardR.left + 28.0f + canvas_->measureTextBlock(badge, ui::FontRole::Small, cardW).x;
-            } else {
-                std::string badge = cardItems[i].isFavorite ? "FAVORITE" : "RECENT";
-                if (!cardItems[i].tag.empty()) badge += " • [" + cardItems[i].tag + "]";
-                drawText(badge, { cardR.left + 14.0f, cardR.top + 10.0f, cardR.right - 92.0f, cardR.top + 26.0f },
-                         ui::FontRole::Small, cardItems[i].isFavorite ? COL_PRIMARY_ACCENT : COL_TEXT_MUTED);
-                badgeEnd = cardR.left + 14.0f + canvas_->measureTextBlock(badge, ui::FontRole::Small, cardW).x;
-            }
-
-            // Pairing chip: this PC may enter that desk without a password
-            if (std::any_of(pairedHostsNow.begin(), pairedHostsNow.end(),
-                            [&](const PairedPeer& p) { return p.deskId == cardItems[i].deskId; }) &&
-                badgeEnd + 8.0f + 48.0f <= cardR.right - 124.0f) {
-                UiRect chip = { badgeEnd + 8.0f, cardR.top + 10.0f, badgeEnd + 56.0f, cardR.top + 26.0f };
-                fillRoundRect(chip, 8.0f, withAlpha(COL_PRIMARY_ACCENT, 0.14f));
-                drawText("Paired", chip, ui::FontRole::Small, COL_TEXT_ACCENT, ui::HAlign::Center, ui::VAlign::Center);
-            }
-
-            uint64_t peerId = cardItems[i].deskId;
-            std::string peerHost = cardItems[i].hostname;
-            std::string peerEp = cardItems[i].endpoint;
-
-            // Pushed before the card's buttons: the last region under the cursor wins, so a card-wide
-            // region added afterwards swallowed the shortcut, edit, star and remove clicks.
-            std::string targetStr = (peerId > 0) ? CryptoUtils::formatDeskId(peerId) : peerEp;
-            clickRegions_.push_back({ cardR, cardItemId, [this, targetStr]() {
-                remoteIdInput_ = targetStr;
-                remotePasswordInput_.clear();
-                initiateConnection();
-            }, false });
-
-            // Desktop Shortcut (.lnk) Button
-            if (peerId > 0 && shell_->has(ui::Capability::DesktopShortcut)) {
-                UiRect lnkBtn = { cardR.right - 120.0f, cardR.top + 7.0f, cardR.right - 96.0f, cardR.top + 27.0f };
-                drawButton("peer_lnk_" + std::to_string(i), lnkBtn, "↗",
-                           COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_SECONDARY,
-                           6.0f, [this, peerId, item = cardItems[i]]() {
-                               std::string idStr = std::to_string(peerId);
-                               if (ShortcutManager::createDesktopShortcut(idStr, item.alias)) {
-                                   showToast("Desktop shortcut created: " + (item.alias.empty() ? CryptoUtils::formatDeskId(peerId) : item.alias));
-                               } else {
-                                   showToast("Failed to create desktop shortcut", true);
-                               }
-                            }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
-            }
-
-            // Edit Alias / Tag / Notes Button
-            if (peerId > 0) {
-                UiRect editBtn = { cardR.right - 92.0f, cardR.top + 7.0f, cardR.right - 68.0f, cardR.top + 27.0f };
-                drawButton("peer_edit_" + std::to_string(i), editBtn, "✎",
-                           COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_SECONDARY,
-                           6.0f, [this, peerId, item = cardItems[i]]() {
-                               editingDeskId_ = peerId;
-                               editAliasInput_ = item.alias;
-                               editTagInput_ = item.tag;
-                               editNotesInput_ = item.notes;
-                               showAddressBookEditModal_ = true;
-                           }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
-            }
-
-            // Vector Star Favorite button
-            if (peerId > 0) {
-                std::string favId = "peer_fav_" + std::to_string(i);
-                UiRect favBtn = { cardR.right - 64.0f, cardR.top + 7.0f, cardR.right - 38.0f, cardR.top + 27.0f };
-                drawButton(favId, favBtn, "",
-                           COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_SECONDARY,
-                           6.0f, [this, peerId, peerHost, peerEp]() {
-                               identity_.addOrUpdateRecentSession(peerId, peerHost, peerEp);
-                               identity_.toggleFavoriteSession(peerId);
-                           }, ui::FontRole::Small);
-                UiRect favAnim = getWidgetAnimRect(favId, favBtn);
-                drawIconStar(favAnim.centerX(), favAnim.centerY(), 5.8f, cardItems[i].isFavorite,
-                             cardItems[i].isFavorite ? COL_PRIMARY_ACCENT : COL_TEXT_SECONDARY);
-            }
-
-            // Vector Close button for recent items
-            if (cardItems[i].isFromRecent && peerId > 0) {
-                std::string delId = "peer_del_" + std::to_string(i);
-                UiRect delBtn = { cardR.right - 34.0f, cardR.top + 7.0f, cardR.right - 10.0f, cardR.top + 27.0f };
-                drawButton(delId, delBtn, "",
-                           COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_SECONDARY,
-                           6.0f, [this, peerId]() {
-                               identity_.removeRecentSession(peerId);
-                           }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0}, COL_TEXT_ON_ACCENT);
-                UiRect delAnim = getWidgetAnimRect(delId, delBtn);
-                float delHover = std::clamp(widgetAnims_[delId].hoverT, 0.0f, 1.0f);
-                drawIconClose(delAnim.centerX(), delAnim.centerY(), 3.6f,
-                              lerpColor(COL_TEXT_SECONDARY, COL_TEXT_ON_ACCENT, delHover), 1.5f);
-            }
-
-            std::string idFormatted = (peerId > 0) ? CryptoUtils::formatDeskId(peerId) : peerEp;
-            std::string mainTitle = !cardItems[i].alias.empty() ? cardItems[i].alias : idFormatted;
-            drawText(mainTitle, { cardR.left + 14.0f, cardR.top + 28.0f, cardR.right - 128.0f, cardR.top + 54.0f },
-                     ui::FontRole::Subheading, lerpColor(COL_TEXT_PRIMARY, COL_PRIMARY_ACCENT, std::clamp(cardHover, 0.0f, 1.0f) * 0.7f));
-
-            std::string subInfo;
-            if (!cardItems[i].alias.empty()) {
-                subInfo = idFormatted + (!peerHost.empty() ? (" (" + peerHost + ")") : "");
-            } else {
-                subInfo = peerHost.empty() ? peerEp : peerHost;
-            }
-            drawText(subInfo, { cardR.left + 14.0f, cardR.top + 54.0f, cardR.right - 128.0f, cardR.bottom - 10.0f },
+            drawPulseDot(hx + 6.0f, hy + 11.0f, 4.2f, COL_SUCCESS, alpha);
+            drawText("Ready for connections", { hx + 18.0f, hy, hrx, hy + 22.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
+            drawText("Share your ID and code to let someone in.", { hx + 18.0f, hy + 22.0f, hrx, hy + 42.0f },
                      ui::FontRole::Small, COL_TEXT_SECONDARY);
-
-            UiRect quickConnBtn = { cardR.right - 98.0f, cardR.top + 38.0f, cardR.right - 12.0f, cardR.bottom - 16.0f };
-            drawButton(cardBtnId, quickConnBtn, "Connect",
-                       COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this, targetStr]() {
-                           remoteIdInput_ = targetStr;
-                           remotePasswordInput_.clear();
-                           initiateConnection();
-                       }, ui::FontRole::Small);
         }
     }
 }
@@ -1798,15 +2109,15 @@ void AppUi::drawRemoteSessionView(const UiRect& bounds, float alpha) {
 
         float barH = 48.0f;
         UiRect hudBar = { bounds.left, bounds.top + tabBarH, bounds.right, bounds.top + tabBarH + barH };
-        sessionHudBarRect_ = hudBar;
         fillRoundRect(hudBar, 0.0f, COL_BG_CARD);
         fillRoundRect({ hudBar.left, hudBar.bottom - 1.0f, hudBar.right, hudBar.bottom }, 0.0f, COL_BORDER);
 
         float bx = hudBar.left + 18.0f;
         std::string peerTitle = stats.remoteHostname.empty()
             ? CryptoUtils::formatDeskId(stats.remoteDeskId)
-            : stats.remoteHostname;
-        drawText(peerTitle, { bx, hudBar.top, bx + 170.0f, hudBar.bottom }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
+            : profile::splitWireName(stats.remoteHostname).name;
+        drawAvatar(bx + 12.0f, hudBar.centerY(), 12.0f, stats.remoteDeskId, peerTitle, alpha);
+        drawText(peerTitle, { bx + 30.0f, hudBar.top, bx + 170.0f, hudBar.bottom }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
         bx += 174.0f;
 
         ui::Color stateDotCol = COL_WARNING;
@@ -1919,10 +2230,8 @@ void AppUi::drawRemoteSessionView(const UiRect& bounds, float alpha) {
         std::string audioLabel = isMuted ? "Audio: Mute" : ("Vol: " + std::to_string(vol) + "%");
         hudButtons.push_back({
             "sess_audio_btn", audioLabel, 88.0f,
-            isMuted ? COL_SEC_BTN_BG : COL_PRIMARY_ACCENT,
-            isMuted ? COL_SEC_BTN_HV : COL_PRIMARY_ACCENT_HV,
-            isMuted ? COL_TEXT_PRIMARY : COL_TEXT_ON_ACCENT,
-            isMuted, COL_BORDER, isMuted ? COL_TEXT_ACCENT : COL_TEXT_ON_ACCENT,
+            // Status, not a call to action: neutral like the rest of the bar
+            COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, true, COL_BORDER, COL_TEXT_ACCENT,
             [this]() {
                 showAudioVolumePopup_ = !showAudioVolumePopup_;
             }
@@ -1934,10 +2243,7 @@ void AppUi::drawRemoteSessionView(const UiRect& bounds, float alpha) {
         std::string inputLabel = !canControl ? "View Only" : (inputActive ? "Control: ON" : "View Only");
         hudButtons.push_back({
             "sess_input_toggle", inputLabel, 98.0f,
-            inputActive ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-            inputActive ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-            inputActive ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-            !inputActive, COL_BORDER, inputActive ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT,
+            COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, true, COL_BORDER, COL_TEXT_ACCENT,
             [this, canControl]() {
                 if (canControl) {
                     remoteInputEnabled_ = !remoteInputEnabled_;
@@ -2210,75 +2516,36 @@ void AppUi::drawRemoteSessionView(const UiRect& bounds, float alpha) {
             }
         });
 
-        // Calculate total width of all session action buttons
-        float totalHudButtonsW = 0.0f;
-        for (size_t i = 0; i < hudButtons.size(); ++i) {
-            if (i > 0) totalHudButtonsW += 6.0f;
-            totalHudButtonsW += hudButtons[i].width;
+        // The bar keeps the everyday controls; the rest live under More. A narrow window folds the bar's leftmost ones into More too.
+        static const char* const kBarIds[] = { "sess_audio_btn", "sess_input_toggle", "sess_chat", "sess_fullscreen" };
+        std::vector<SessionHudButtonDef> bar;
+        sessMoreItems_.clear();
+        for (auto& b : hudButtons) {
+            if (std::any_of(std::begin(kBarIds), std::end(kBarIds), [&](const char* id) { return b.id == id; })) bar.push_back(std::move(b));
+            else sessMoreItems_.push_back({ b.id, b.label, false, std::move(b.onClick) });
         }
-
-        // Constrain horizontal menu container to display ~5 buttons at a time (~460px)
-        float availW = (discBtn.left - 14.0f) - (statusRight + 12.0f);
-        float containerW = std::min(460.0f, std::max(120.0f, availW));
-        UiRect containerRect = { statusRight + 12.0f, hudBar.top + 5.0f, statusRight + 12.0f + containerW, hudBar.bottom - 5.0f };
-
-        fillRoundRect(containerRect, 8.0f, rgba(255, 255, 255, 0.03f));
-        strokeRoundRect(containerRect, 8.0f, rgba(255, 255, 255, 0.07f), 1.0f);
-        sessionHudBarRect_ = containerRect;
-
-        UiRect stripViewport = { containerRect.left + 4.0f, containerRect.top + 1.0f, containerRect.right - 4.0f, containerRect.bottom - 1.0f };
-        bool canScroll = (totalHudButtonsW > stripViewport.width());
-        sessionHudMaxScroll_ = std::max(0.0f, totalHudButtonsW - (stripViewport.width() - (canScroll ? 52.0f : 0.0f)));
-        sessionHudScrollTarget_ = std::clamp(sessionHudScrollTarget_, 0.0f, sessionHudMaxScroll_);
-
-        if (canScroll) {
-            UiRect lBtn = { containerRect.left + 3.0f, containerRect.top + 2.0f, containerRect.left + 23.0f, containerRect.bottom - 2.0f };
-            bool hasLeft = sessionHudScrollTarget_ > 2.0f;
-            drawButton("sess_hud_scroll_left", lBtn, "<",
-                       hasLeft ? COL_SEC_BTN_BG : rgba(255, 255, 255, 0.02f),
-                       hasLeft ? COL_SEC_BTN_HV : rgba(255, 255, 255, 0.02f),
-                       hasLeft ? COL_TEXT_PRIMARY : rgba(255, 255, 255, 0.25f),
-                       6.0f, [this, hasLeft]() {
-                           if (hasLeft) {
-                               sessionHudScrollTarget_ = std::clamp(sessionHudScrollTarget_ - 110.0f, 0.0f, sessionHudMaxScroll_);
-                               shell_->invalidate();
-                           }
-                       }, ui::FontRole::Small, true, COL_BORDER, hasLeft ? COL_TEXT_ACCENT : rgba(255, 255, 255, 0.25f));
-
-            UiRect rBtn = { containerRect.right - 23.0f, containerRect.top + 2.0f, containerRect.right - 3.0f, containerRect.bottom - 2.0f };
-            bool hasRight = sessionHudScrollTarget_ < sessionHudMaxScroll_ - 2.0f;
-            drawButton("sess_hud_scroll_right", rBtn, ">",
-                       hasRight ? COL_SEC_BTN_BG : rgba(255, 255, 255, 0.02f),
-                       hasRight ? COL_SEC_BTN_HV : rgba(255, 255, 255, 0.02f),
-                       hasRight ? COL_TEXT_PRIMARY : rgba(255, 255, 255, 0.25f),
-                       6.0f, [this, hasRight]() {
-                           if (hasRight) {
-                               sessionHudScrollTarget_ = std::clamp(sessionHudScrollTarget_ + 110.0f, 0.0f, sessionHudMaxScroll_);
-                               shell_->invalidate();
-                           }
-                       }, ui::FontRole::Small, true, COL_BORDER, hasRight ? COL_TEXT_ACCENT : rgba(255, 255, 255, 0.25f));
-
-            stripViewport.left += 26.0f;
-            stripViewport.right -= 26.0f;
+        const float gap = 6.0f, moreW = 76.0f, barLeft = statusRight + 12.0f;
+        auto barWidth = [&]() { float w = moreW; for (const auto& b : bar) w += b.width + gap; return w; };
+        while (!bar.empty() && discBtn.left - 10.0f - barWidth() < barLeft) {
+            sessMoreItems_.insert(sessMoreItems_.begin(), MenuEntry{ bar.front().id, bar.front().label, false, std::move(bar.front().onClick) });
+            bar.erase(bar.begin());
         }
-
-        canvas_->pushClip(ui::Rect{stripViewport.left, stripViewport.top, stripViewport.right, stripViewport.bottom});
-
-        float curBtnX = stripViewport.left - sessionHudScrollOffset_;
-        for (const auto& btn : hudButtons) {
-            UiRect btnRect = { curBtnX, stripViewport.top + 2.0f, curBtnX + btn.width, stripViewport.bottom - 2.0f };
-            if (btnRect.right > stripViewport.left && btnRect.left < stripViewport.right) {
-                drawButton(btn.id, btnRect, btn.label, btn.bgColor, btn.hoverColor, btn.textColor,
-                           7.5f, btn.onClick, ui::FontRole::Small, btn.hasBorder, btn.borderColor, btn.hoverTextColor);
-                if (!clickRegions_.empty() && clickRegions_.back().id == btn.id) {
-                    clickRegions_.back().rect.left = std::max(clickRegions_.back().rect.left, stripViewport.left);
-                    clickRegions_.back().rect.right = std::min(clickRegions_.back().rect.right, stripViewport.right);
-                }
-            }
-            curBtnX += btn.width + 6.0f;
+        float btnX = discBtn.left - 10.0f - barWidth();
+        bool audioInBar = false;
+        for (const auto& btn : bar) {
+            const UiRect r = { btnX, hudBar.top + 8.0f, btnX + btn.width, hudBar.bottom - 8.0f };
+            drawButton(btn.id, r, btn.label, btn.bgColor, btn.hoverColor, btn.textColor,
+                       7.5f, btn.onClick, ui::FontRole::Small, btn.hasBorder, btn.borderColor, btn.hoverTextColor);
+            if (btn.id == "sess_audio_btn") { sessAudioBtnRect_ = r; audioInBar = true; }
+            btnX += btn.width + gap;
         }
-
-        canvas_->popClip();
+        sessMoreBtnRect_ = { btnX, hudBar.top + 8.0f, btnX + moreW, hudBar.bottom - 8.0f };
+        if (!audioInBar) sessAudioBtnRect_ = sessMoreBtnRect_;   // the volume popup still opens from where it was asked for
+        drawButton("sess_more", sessMoreBtnRect_, "More", sessMore_ ? COL_SEC_BTN_HV : COL_SEC_BTN_BG, COL_SEC_BTN_HV,
+                   COL_TEXT_PRIMARY, 7.5f, [this]() {
+                       if (!sessMore_) sessMoreAnimT_ = 0.0f;
+                       sessMore_ = true;
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         stageRect = { bounds.left, hudBar.bottom, bounds.right, bounds.bottom };
     }
@@ -2649,7 +2916,7 @@ void AppUi::drawRemoteSessionView(const UiRect& bounds, float alpha) {
 
     // Master Volume Popup
     if (audioPopAnimT_ > 0.005f && !isFullscreen_) {
-        drawAudioVolumePopup(stageRect_.right - 140.0f, stageRect_.top + 8.0f);
+        drawAudioVolumePopup(sessAudioBtnRect_.centerX(), sessAudioBtnRect_.bottom + 6.0f);
     }
 }
 
@@ -2685,7 +2952,7 @@ void AppUi::drawGlideSettings(float cx, float crx, float& cy) {
         return std::any_of(eligible.begin(), eligible.end(), [&](const FleetMember& m) { return m.deskId == id; });
     };
     auto nameOf = [&](uint64_t id) {
-        for (const auto& h : hosts) if (h.deskId == id) return h.hostname;
+        for (const auto& h : hosts) if (h.deskId == id) return peerName(h.hostname);
         return std::string();
     };
     const AppSettings s = identity_.settings();
@@ -2732,7 +2999,7 @@ void AppUi::drawGlideSettings(float cx, float crx, float& cy) {
     float ry = list.top + 40.0f;
     for (const auto& h : hosts) {
         const bool picked = h.deskId == glidePickedDesk_;
-        drawButton("glide_pc_" + std::to_string(h.deskId), { list.left + 12.0f, ry, list.right - 12.0f, ry + rowH - 6.0f }, h.hostname,
+        drawButton("glide_pc_" + std::to_string(h.deskId), { list.left + 12.0f, ry, list.right - 12.0f, ry + rowH - 6.0f }, peerName(h.hostname),
                    picked ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG, picked ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
                    picked ? COL_TEXT_ON_ACCENT : (online(h.deskId) ? COL_TEXT_PRIMARY : COL_TEXT_MUTED),
                    8.0f, [this, id = h.deskId]() { glidePickedDesk_ = (glidePickedDesk_ == id) ? 0 : id; },
@@ -2740,6 +3007,75 @@ void AppUi::drawGlideSettings(float cx, float crx, float& cy) {
         ry += rowH;
     }
     cy = list.bottom + 14.0f;
+}
+
+void AppUi::commitDisplayName() {
+    const std::string n = profile::normaliseName(displayNameEdit_);
+    displayNameEdit_ = n;
+    AppSettings s = identity_.settings();
+    if (s.displayName == n) return;
+    s.displayName = n;
+    identity_.updateSettings(s);
+}
+
+void AppUi::setOwnPicture(const std::string& path) {
+    namespace fs = std::filesystem;
+    const fs::path src{ std::u8string(path.begin(), path.end()) };
+    std::error_code ec;
+    const uintmax_t size = fs::file_size(src, ec);
+    std::optional<std::vector<uint8_t>> jpeg;
+    if (!ec && size <= avatar::kMaxInputBytes) {
+        std::ifstream in(src, std::ios::binary);
+        const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (!bytes.empty()) jpeg = avatar::normaliseJpeg(bytes);
+    }
+    const fs::path dst = identity_.ownPicturePath();
+    bool saved = false;
+    if (jpeg) {
+        fs::create_directories(dst.parent_path(), ec);
+        std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(jpeg->data()), static_cast<std::streamsize>(jpeg->size()));
+        saved = out.good();
+    }
+    if (!saved) {
+        showToast("That picture couldn't be used. Pick a JPEG image.", true);
+        return;
+    }
+    network_.sendProfilePicture();   // also refreshes the avatars here
+    showToast("Picture updated");
+}
+
+void AppUi::drawSettingsProfile(float cx, float crx, float& cy) {
+    drawText("Profile", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    cy += 25.0f;
+    drawText("Your name and picture, as the people you connect with see them.",
+             { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+    cy += 30.0f;
+
+    drawAvatar(cx + 32.0f, cy + 32.0f, 32.0f, identity_.deskId(), ownAvatarName(), 1.0f);
+    const float by = cy + 16.0f;
+    drawButton("sett_profile_pick", { cx + 84.0f, by, cx + 234.0f, by + 32.0f }, "Change picture...",
+               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
+                   shell_->chooseOpenFile("Choose a picture", "JPEG images", "*.jpg;*.jpeg",
+                                          [this](std::optional<std::string> path) { if (path) setOwnPicture(*path); });
+               }, ui::FontRole::Small);
+    std::error_code ec;
+    if (std::filesystem::exists(identity_.ownPicturePath(), ec)) {
+        drawButton("sett_profile_remove", { cx + 242.0f, by, cx + 322.0f, by + 32.0f }, "Remove",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
+                       std::error_code rec;
+                       std::filesystem::remove(identity_.ownPicturePath(), rec);
+                       network_.sendProfilePicture();
+                   }, ui::FontRole::Small);
+    }
+    cy += 80.0f;
+
+    drawText("Name", { cx, cy, cx + 60.0f, cy + 32.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
+    const UiRect field = { cx + 64.0f, cy, cx + 64.0f + 260.0f, cy + 32.0f };
+    drawTextField("field_display_name", FocusedField::DisplayName, field, displayNameEdit_, identity_.hostname(), false);
+    drawText("Shown to anyone you connect with", { field.right + 14.0f, cy, crx, cy + 32.0f },
+             ui::FontRole::Small, COL_TEXT_SECONDARY);
+    cy += 48.0f;
 }
 
 void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
@@ -2761,8 +3097,8 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
     // Sidebar header
     float navPad = 12.0f;
     float navY = navCard.top + 16.0f;
-    drawText("SETTINGS", { navCard.left + 16.0f, navY, navCard.right - 16.0f, navY + 18.0f }, ui::FontRole::Small, COL_TEXT_ACCENT);
-    navY += 26.0f;
+    drawText("Settings", { navCard.left + 16.0f, navY - 2.0f, navCard.right - 16.0f, navY + 22.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
+    navY += 34.0f;
 
     struct NavItem {
         SettingsSection section;
@@ -2770,28 +3106,29 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         const char* label;
     };
     static const NavItem navItems[] = {
+        { SettingsSection::Profile,        "sett_sec_profile", "Profile" },
         { SettingsSection::Appearance,     "sett_sec_app",    "Appearance" },
-        { SettingsSection::DisplayQuality, "sett_sec_disp",   "Display & Quality" },
-        { SettingsSection::AudioVoice,     "sett_sec_audio",  "Audio & Voice" },
+        { SettingsSection::DisplayQuality, "sett_sec_disp",   "Display & quality" },
+        { SettingsSection::AudioVoice,     "sett_sec_audio",  "Audio & voice" },
         { SettingsSection::Permissions,    "sett_sec_perm",   "Permissions" },
-        { SettingsSection::TwoFactorAuth,  "sett_sec_totp",   "Two-Factor Auth" },
-        { SettingsSection::NetworkRelay,   "sett_sec_net",    "Network & Relay" },
-        { SettingsSection::CurtainPrivacy, "sett_sec_priv",   "Curtain & Privacy" },
-        { SettingsSection::SystemService,  "sett_sec_svc",    "System & Service" },
-        { SettingsSection::About,          "sett_sec_about",  "About & Data" },
+        { SettingsSection::TwoFactorAuth,  "sett_sec_totp",   "Two-factor sign-in" },
+        { SettingsSection::NetworkRelay,   "sett_sec_net",    "Network" },
+        { SettingsSection::CurtainPrivacy, "sett_sec_priv",   "Privacy" },
+        { SettingsSection::SystemService,  "sett_sec_svc",    "System" },
+        { SettingsSection::About,          "sett_sec_about",  "About" },
         { SettingsSection::Glide,          "sett_sec_glide",  "Glide" },
     };
 
     for (const auto& item : navItems) {
         // The curtain and privacy cloak only exist in the Windows host.
         if (item.section == SettingsSection::CurtainPrivacy && !onWindowsShell()) continue;
-        UiRect itemRect = { navCard.left + navPad, navY, navCard.right - navPad, navY + 38.0f };
+        UiRect itemRect = { navCard.left + navPad, navY, navCard.right - navPad, navY + 36.0f };
         bool isActive = (settingsSection_ == item.section);
 
-        drawButton(item.id, itemRect, item.label,
-                   isActive ? COL_PRIMARY_ACCENT : COL_BG_SUBTLE,
-                   isActive ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
+        drawButton(item.id, itemRect, "",
+                   isActive ? COL_BG_SUBTLE : ui::Color{ 0, 0, 0, 0 },
+                   isActive ? COL_BG_SUBTLE : COL_SEC_BTN_HV,
+                   COL_TEXT_PRIMARY,
                    8.0f, [this, sec = item.section]() {
                        if (settingsSection_ == SettingsSection::AudioVoice && sec != SettingsSection::AudioVoice) {
                            network_.stopVoiceMonitor();
@@ -2806,9 +3143,14 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                        settingsScrollOffset_ = 0.0f;
                        settingsScrollTarget_ = 0.0f;
                        settingsScrollVel_ = 0.0f;
-                   }, ui::FontRole::Small, !isActive, COL_BORDER, isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+                   }, ui::FontRole::Small);
+        // Same marker as the rail: a short accent bar on the current page
+        if (isActive) fillRoundRect({ itemRect.left, itemRect.top + 9.0f, itemRect.left + 3.0f, itemRect.bottom - 9.0f }, 1.5f, COL_PRIMARY_ACCENT);
+        drawText(item.label, { itemRect.left + 14.0f, itemRect.top, itemRect.right - 8.0f, itemRect.bottom },
+                 isActive ? ui::FontRole::BodyBold : ui::FontRole::Body, isActive ? COL_TEXT_PRIMARY : COL_TEXT_SECONDARY,
+                 ui::HAlign::Leading, ui::VAlign::Center);
 
-        navY += 44.0f;
+        navY += 40.0f;
     }
 
     // Version label at bottom of sidebar
@@ -2823,7 +3165,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         pairedHosts = identity_.pairedHosts();
     }
     switch (settingsSection_) {
-        case SettingsSection::Appearance:     sectionContentH = 290.0f; break;
+        case SettingsSection::Appearance:     sectionContentH = 372.0f; break;
         case SettingsSection::DisplayQuality: sectionContentH = 550.0f; break;
         case SettingsSection::AudioVoice:     sectionContentH = 380.0f; break;
         // 280 + the Allow pairing row (28) + two list boxes (46 + 28 per row, one row when empty)
@@ -2834,6 +3176,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         case SettingsSection::SystemService:  sectionContentH = 360.0f; break;
         case SettingsSection::About:          sectionContentH = 350.0f; break;
         case SettingsSection::Glide:          sectionContentH = 330.0f + 38.0f * identity_.pairedHosts().size(); break;
+        case SettingsSection::Profile:        sectionContentH = 230.0f; break;
     }
 
     float availContentH = navCard.height();
@@ -2861,9 +3204,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
     float innerW = crx - cx;
 
     if (settingsSection_ == SettingsSection::Appearance) {
-        drawText("Appearance & Visuals", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+        drawText("Appearance", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
-        drawText("Customize color theme, remote cursor visibility, and performance telemetry.",
+        drawText("Theme, motion and what the session view shows.",
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
@@ -2872,64 +3215,68 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(themeBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(themeBox, 12.0f, COL_BORDER);
 
-        drawText("THEME", { themeBox.left + 16.0f, themeBox.top + 8.0f, themeBox.right - 16.0f, themeBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
-        float halfBtnW = (innerW - 32.0f - 10.0f) * 0.5f;
-        UiRect lightBtn = { themeBox.left + 16.0f, themeBox.top + 26.0f, themeBox.left + 16.0f + halfBtnW, themeBox.top + 58.0f };
-        UiRect darkBtn  = { lightBtn.right + 10.0f, themeBox.top + 26.0f, themeBox.right - 16.0f, themeBox.top + 58.0f };
-
-        drawButton("sett_theme_light", lightBtn, "Light",
-                   !s.darkTheme ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   !s.darkTheme ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   !s.darkTheme ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [this]() {
-                       AppSettings ns = identity_.settings();
-                       ns.darkTheme = false;
-                       identity_.updateSettings(ns);
-                       applyWindowThemeAttribute();
-                   }, ui::FontRole::Small, s.darkTheme, COL_BORDER, !s.darkTheme ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-        drawButton("sett_theme_dark", darkBtn, "Dark",
-                   s.darkTheme ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   s.darkTheme ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   s.darkTheme ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [this]() {
-                       AppSettings ns = identity_.settings();
-                       ns.darkTheme = true;
-                       identity_.updateSettings(ns);
-                       applyWindowThemeAttribute();
-                   }, ui::FontRole::Small, !s.darkTheme, COL_BORDER, s.darkTheme ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+        drawText("Theme", { themeBox.left + 16.0f, themeBox.top + 8.0f, themeBox.right - 16.0f, themeBox.top + 22.0f },
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
+        auto setTheme = [this](bool dark) {
+            AppSettings ns = identity_.settings();
+            ns.darkTheme = dark;
+            identity_.updateSettings(ns);
+            applyWindowThemeAttribute();
+        };
+        drawSegmented({ themeBox.left + 16.0f, themeBox.top + 30.0f, themeBox.right - 16.0f, themeBox.top + 62.0f },
+                      { { "sett_theme_light", "Light", false, [setTheme]() { setTheme(false); } },
+                        { "sett_theme_dark", "Dark", false, [setTheme]() { setTheme(true); } } },
+                      s.darkTheme ? 1 : 0);
 
         cy = themeBox.bottom + 14.0f;
+
+        // Reduce motion: follow the OS, or force it on or off
+        UiRect motionBox = { cx, cy, crx, cy + 68.0f };
+        fillRoundRect(motionBox, 12.0f, COL_BG_SUBTLE);
+        strokeRoundRect(motionBox, 12.0f, COL_BORDER);
+        drawText("Reduce motion", { motionBox.left + 16.0f, motionBox.top + 8.0f, motionBox.right - 16.0f, motionBox.top + 22.0f },
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
+        static const char* const motionLabels[3] = { "System", "On", "Off" };
+        std::vector<MenuEntry> motionSegs;
+        for (uint8_t m = 0; m < 3; ++m) {
+            motionSegs.push_back({ std::string("sett_motion_") + motionLabels[m], motionLabels[m], false, [this, m]() {
+                AppSettings ns = identity_.settings();
+                ns.reduceMotion = m;
+                identity_.updateSettings(ns);
+            } });
+        }
+        drawSegmented({ motionBox.left + 16.0f, motionBox.top + 30.0f, motionBox.right - 16.0f, motionBox.top + 62.0f },
+                      motionSegs, s.reduceMotion);
+        cy = motionBox.bottom + 14.0f;
 
         // 2. Cursor & HUD Box
         UiRect curBox = { cx, cy, crx, cy + 86.0f };
         fillRoundRect(curBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(curBox, 12.0f, COL_BORDER);
 
-        drawText("INTERFACE & CURSOR", { curBox.left + 16.0f, curBox.top + 8.0f, curBox.right - 16.0f, curBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+        drawText("Session view", { curBox.left + 16.0f, curBox.top + 8.0f, curBox.right - 16.0f, curBox.top + 22.0f },
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         drawToggleSwitch("sett_show_cursor", { curBox.left + 16.0f, curBox.top + 26.0f, curBox.right - 16.0f, curBox.top + 52.0f },
                          s.showRemoteCursor, "Show remote cursor", [this]() {
                              AppSettings ns = identity_.settings();
                              ns.showRemoteCursor = !ns.showRemoteCursor;
                              identity_.updateSettings(ns);
-                         }, "Display the remote host cursor ring and position over the canvas.");
+                         }, "Draw the remote pointer over the picture.");
 
         drawToggleSwitch("sett_show_hud", { curBox.left + 16.0f, curBox.top + 54.0f, curBox.right - 16.0f, curBox.top + 80.0f },
                          s.showSessionHud, "Show frame rate in session bar", [this]() {
                              AppSettings ns = identity_.settings();
                              ns.showSessionHud = !ns.showSessionHud;
                              identity_.updateSettings(ns);
-                         }, "Show live FPS, latency, and throughput statistics in the session bar.");
+                         }, "Frame rate, delay and speed, live.");
 
         cy = curBox.bottom + 14.0f;
     }
     else if (settingsSection_ == SettingsSection::DisplayQuality) {
-        drawText("Display & Streaming Quality", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+        drawText("Display & quality", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
-        drawText("Fine-tune connection presets, target framerate, video scaling, and hardware acceleration.",
+        drawText("How sharp and smooth the remote screen looks.",
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
@@ -2939,16 +3286,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         strokeRoundRect(profBox, 12.0f, COL_BORDER);
 
         ConnectionProfile curProf = inferConnectionProfile(s.defaultQuality, s.targetFps, s.adaptiveFps);
-        std::string profHeader = "QUALITY PRESET PROFILE: " + std::string(connectionProfileName(curProf));
-        drawText(profHeader,
+        drawText(curProf == ConnectionProfile::Custom ? "Connection preset \xC2\xB7 custom" : "Connection preset",
                  { profBox.left + 16.0f, profBox.top + 8.0f, profBox.right - 16.0f, profBox.top + 22.0f },
-                 ui::FontRole::Small, (curProf == ConnectionProfile::Custom) ? COL_WARNING : COL_TEXT_ACCENT);
-
-        float quarterW = (innerW - 32.0f - 24.0f) / 4.0f;
-        UiRect pLowBtn      = { profBox.left + 16.0f, profBox.top + 26.0f, profBox.left + 16.0f + quarterW, profBox.top + 58.0f };
-        UiRect pBalBtn      = { pLowBtn.right + 8.0f, profBox.top + 26.0f, pLowBtn.right + 8.0f + quarterW, profBox.top + 58.0f };
-        UiRect pHighBtn     = { pBalBtn.right + 8.0f, profBox.top + 26.0f, pBalBtn.right + 8.0f + quarterW, profBox.top + 58.0f };
-        UiRect pVeryHighBtn = { pHighBtn.right + 8.0f, profBox.top + 26.0f, profBox.right - 16.0f, profBox.top + 58.0f };
+                 ui::FontRole::BodyBold, (curProf == ConnectionProfile::Custom) ? COL_WARNING : COL_TEXT_PRIMARY);
 
         auto applyProfUi = [this](ConnectionProfile cp) {
             AppSettings ns = identity_.settings();
@@ -2963,37 +3303,17 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             showToast(std::string("Applied ") + connectionProfileName(cp) + " profile");
         };
 
-        drawButton("sett_prof_low", pLowBtn, "Low Bandwidth",
-                   (curProf == ConnectionProfile::LowBandwidth) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (curProf == ConnectionProfile::LowBandwidth) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (curProf == ConnectionProfile::LowBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [applyProfUi]() { applyProfUi(ConnectionProfile::LowBandwidth); }, ui::FontRole::Small,
-                   curProf != ConnectionProfile::LowBandwidth, COL_BORDER,
-                   (curProf == ConnectionProfile::LowBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-        drawButton("sett_prof_bal", pBalBtn, "Balanced",
-                   (curProf == ConnectionProfile::BalancedBandwidth) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (curProf == ConnectionProfile::BalancedBandwidth) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (curProf == ConnectionProfile::BalancedBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [applyProfUi]() { applyProfUi(ConnectionProfile::BalancedBandwidth); }, ui::FontRole::Small,
-                   curProf != ConnectionProfile::BalancedBandwidth, COL_BORDER,
-                   (curProf == ConnectionProfile::BalancedBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-        drawButton("sett_prof_high", pHighBtn, "High BW",
-                   (curProf == ConnectionProfile::HighBandwidth) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (curProf == ConnectionProfile::HighBandwidth) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (curProf == ConnectionProfile::HighBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [applyProfUi]() { applyProfUi(ConnectionProfile::HighBandwidth); }, ui::FontRole::Small,
-                   curProf != ConnectionProfile::HighBandwidth, COL_BORDER,
-                   (curProf == ConnectionProfile::HighBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-        drawButton("sett_prof_ultra", pVeryHighBtn, "Very High",
-                   (curProf == ConnectionProfile::VeryHighBandwidth) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (curProf == ConnectionProfile::VeryHighBandwidth) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (curProf == ConnectionProfile::VeryHighBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [applyProfUi]() { applyProfUi(ConnectionProfile::VeryHighBandwidth); }, ui::FontRole::Small,
-                   curProf != ConnectionProfile::VeryHighBandwidth, COL_BORDER,
-                   (curProf == ConnectionProfile::VeryHighBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+        static const ConnectionProfile kProfiles[] = { ConnectionProfile::LowBandwidth, ConnectionProfile::BalancedBandwidth,
+                                                       ConnectionProfile::HighBandwidth, ConnectionProfile::VeryHighBandwidth };
+        static const char* const kProfIds[] = { "sett_prof_low", "sett_prof_bal", "sett_prof_high", "sett_prof_ultra" };
+        static const char* const kProfLabels[] = { "Low bandwidth", "Balanced", "High", "Very high" };
+        std::vector<MenuEntry> profSegs;
+        int profOn = -1;
+        for (int i = 0; i < 4; ++i) {
+            if (curProf == kProfiles[i]) profOn = i;
+            profSegs.push_back({ kProfIds[i], kProfLabels[i], false, [applyProfUi, cp = kProfiles[i]]() { applyProfUi(cp); } });
+        }
+        drawSegmented({ profBox.left + 16.0f, profBox.top + 30.0f, profBox.right - 16.0f, profBox.top + 62.0f }, profSegs, profOn);
 
         cy = profBox.bottom + 12.0f;
 
@@ -3002,16 +3322,11 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(fpsBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(fpsBox, 12.0f, COL_BORDER);
 
-        drawText("FRAME RATE",
+        drawText("Frame rate",
                  { fpsBox.left + 16.0f, fpsBox.top + 8.0f, fpsBox.right - 16.0f, fpsBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         uint8_t curFps = clampTargetFps(s.targetFps);
-        UiRect fps15Btn = { fpsBox.left + 16.0f, fpsBox.top + 26.0f, fpsBox.left + 16.0f + quarterW, fpsBox.top + 58.0f };
-        UiRect fps30Btn = { fps15Btn.right + 8.0f, fpsBox.top + 26.0f, fps15Btn.right + 8.0f + quarterW, fpsBox.top + 58.0f };
-        UiRect fps45Btn = { fps30Btn.right + 8.0f, fpsBox.top + 26.0f, fps30Btn.right + 8.0f + quarterW, fpsBox.top + 58.0f };
-        UiRect fps60Btn = { fps45Btn.right + 8.0f, fpsBox.top + 26.0f, fpsBox.right - 16.0f, fpsBox.top + 58.0f };
-
         auto setFpsAction = [this](uint8_t fpsVal) {
             AppSettings ns = identity_.settings();
             ns.targetFps = fpsVal;
@@ -3019,33 +3334,15 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             network_.setSessionFpsConfig(fpsVal, ns.adaptiveFps);
         };
 
-        drawButton("sett_fps_15", fps15Btn, "15 FPS",
-                   (curFps == 15) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (curFps == 15) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (curFps == 15) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setFpsAction]() { setFpsAction(15); }, ui::FontRole::Small, curFps != 15, COL_BORDER,
-                   (curFps == 15) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-        drawButton("sett_fps_30", fps30Btn, "30 FPS",
-                   (curFps == 30) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (curFps == 30) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (curFps == 30) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setFpsAction]() { setFpsAction(30); }, ui::FontRole::Small, curFps != 30, COL_BORDER,
-                   (curFps == 30) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-        drawButton("sett_fps_45", fps45Btn, "45 FPS",
-                   (curFps == 45) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (curFps == 45) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (curFps == 45) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setFpsAction]() { setFpsAction(45); }, ui::FontRole::Small, curFps != 45, COL_BORDER,
-                   (curFps == 45) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-        drawButton("sett_fps_60", fps60Btn, "60 FPS",
-                   (curFps == 60) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (curFps == 60) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (curFps == 60) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setFpsAction]() { setFpsAction(60); }, ui::FontRole::Small, curFps != 60, COL_BORDER,
-                   (curFps == 60) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+        static const uint8_t kFps[] = { 15, 30, 45, 60 };
+        std::vector<MenuEntry> fpsSegs;
+        int fpsOn = -1;
+        for (int i = 0; i < 4; ++i) {
+            if (curFps == kFps[i]) fpsOn = i;
+            fpsSegs.push_back({ "sett_fps_" + std::to_string(kFps[i]), std::to_string(kFps[i]) + " FPS", false,
+                                [setFpsAction, f = kFps[i]]() { setFpsAction(f); } });
+        }
+        drawSegmented({ fpsBox.left + 16.0f, fpsBox.top + 30.0f, fpsBox.right - 16.0f, fpsBox.top + 62.0f }, fpsSegs, fpsOn);
 
         drawToggleSwitch("sett_adaptive_fps", { fpsBox.left + 16.0f, fpsBox.top + 68.0f, fpsBox.right - 16.0f, fpsBox.top + 98.0f },
                          s.adaptiveFps, "Adjust automatically on slow connections", [this]() {
@@ -3053,7 +3350,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                              ns.adaptiveFps = !ns.adaptiveFps;
                              identity_.updateSettings(ns);
                              network_.setSessionFpsConfig(ns.targetFps, ns.adaptiveFps);
-                         }, "Dynamically throttle target frame rate during network congestion to preserve low latency.");
+                         }, "Lowers the frame rate when the network is busy, so input stays quick.");
 
         cy = fpsBox.bottom + 12.0f;
 
@@ -3062,15 +3359,10 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(qualBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(qualBox, 12.0f, COL_BORDER);
 
-        drawText("QUALITY & SCALING", { qualBox.left + 16.0f, qualBox.top + 8.0f, qualBox.right - 16.0f, qualBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+        drawText("Picture quality and scaling", { qualBox.left + 16.0f, qualBox.top + 8.0f, qualBox.right - 16.0f, qualBox.top + 22.0f },
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         QualityPreset defQ = s.defaultQuality;
-        float thirdW = (innerW - 32.0f - 16.0f) / 3.0f;
-        UiRect qUltraBtn = { qualBox.left + 16.0f, qualBox.top + 26.0f, qualBox.left + 16.0f + thirdW, qualBox.top + 58.0f };
-        UiRect qBalBtn   = { qUltraBtn.right + 8.0f, qualBox.top + 26.0f, qUltraBtn.right + 8.0f + thirdW, qualBox.top + 58.0f };
-        UiRect qFastBtn  = { qBalBtn.right + 8.0f, qualBox.top + 26.0f, qualBox.right - 16.0f, qualBox.top + 58.0f };
-
         auto setQualAction = [this](QualityPreset qp) {
             AppSettings ns = identity_.settings();
             ns.defaultQuality = qp;
@@ -3081,34 +3373,13 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             }
         };
 
-        drawButton("sett_q_ultra", qUltraBtn, "High",
-                   (defQ == QualityPreset::Ultra) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (defQ == QualityPreset::Ultra) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (defQ == QualityPreset::Ultra) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setQualAction]() { setQualAction(QualityPreset::Ultra); }, ui::FontRole::Small, defQ != QualityPreset::Ultra, COL_BORDER,
-                   (defQ == QualityPreset::Ultra) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+        drawSegmented({ qualBox.left + 16.0f, qualBox.top + 30.0f, qualBox.right - 16.0f, qualBox.top + 62.0f },
+                      { { "sett_q_ultra", "High", false, [setQualAction]() { setQualAction(QualityPreset::Ultra); } },
+                        { "sett_q_bal", "Balanced", false, [setQualAction]() { setQualAction(QualityPreset::Balanced); } },
+                        { "sett_q_fast", "Fast", false, [setQualAction]() { setQualAction(QualityPreset::LowBandwidth); } } },
+                      defQ == QualityPreset::Ultra ? 0 : defQ == QualityPreset::Balanced ? 1 : defQ == QualityPreset::LowBandwidth ? 2 : -1);
 
-        drawButton("sett_q_bal", qBalBtn, "Balanced",
-                   (defQ == QualityPreset::Balanced) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (defQ == QualityPreset::Balanced) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (defQ == QualityPreset::Balanced) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setQualAction]() { setQualAction(QualityPreset::Balanced); }, ui::FontRole::Small, defQ != QualityPreset::Balanced, COL_BORDER,
-                   (defQ == QualityPreset::Balanced) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-        drawButton("sett_q_fast", qFastBtn, "Fast",
-                   (defQ == QualityPreset::LowBandwidth) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (defQ == QualityPreset::LowBandwidth) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (defQ == QualityPreset::LowBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setQualAction]() { setQualAction(QualityPreset::LowBandwidth); }, ui::FontRole::Small, defQ != QualityPreset::LowBandwidth, COL_BORDER,
-                   (defQ == QualityPreset::LowBandwidth) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-        uint8_t defScale = s.defaultScaleMode;
-        quarterW = (innerW - 32.0f - 24.0f) / 4.0f;
-        UiRect scFitBtn  = { qualBox.left + 16.0f, qualBox.top + 68.0f, qualBox.left + 16.0f + quarterW, qualBox.top + 100.0f };
-        UiRect scFillBtn = { scFitBtn.right + 8.0f, qualBox.top + 68.0f, scFitBtn.right + 8.0f + quarterW, qualBox.top + 100.0f };
-        UiRect scStrBtn  = { scFillBtn.right + 8.0f, qualBox.top + 68.0f, scFillBtn.right + 8.0f + quarterW, qualBox.top + 100.0f };
-        UiRect scOrigBtn = { scStrBtn.right + 8.0f, qualBox.top + 68.0f, qualBox.right - 16.0f, qualBox.top + 100.0f };
-
+        const uint8_t defScale = s.defaultScaleMode;
         auto setScaleAction = [this](uint8_t scMode) {
             AppSettings ns = identity_.settings();
             ns.defaultScaleMode = scMode;
@@ -3116,33 +3387,12 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             scaleMode_ = static_cast<ScaleMode>(scMode);
         };
 
-        drawButton("sett_sc_fit", scFitBtn, "Fit",
-                   (defScale == 0) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (defScale == 0) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (defScale == 0) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setScaleAction]() { setScaleAction(0); }, ui::FontRole::Small, defScale != 0, COL_BORDER,
-                   (defScale == 0) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-        drawButton("sett_sc_fill", scFillBtn, "Fill",
-                   (defScale == 3) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (defScale == 3) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (defScale == 3) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setScaleAction]() { setScaleAction(3); }, ui::FontRole::Small, defScale != 3, COL_BORDER,
-                   (defScale == 3) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-        drawButton("sett_sc_str", scStrBtn, "Stretch",
-                   (defScale == 1) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (defScale == 1) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (defScale == 1) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setScaleAction]() { setScaleAction(1); }, ui::FontRole::Small, defScale != 1, COL_BORDER,
-                   (defScale == 1) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-        drawButton("sett_sc_orig", scOrigBtn, "1:1",
-                   (defScale == 2) ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   (defScale == 2) ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   (defScale == 2) ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   8.0f, [setScaleAction]() { setScaleAction(2); }, ui::FontRole::Small, defScale != 2, COL_BORDER,
-                   (defScale == 2) ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
+        drawSegmented({ qualBox.left + 16.0f, qualBox.top + 72.0f, qualBox.right - 16.0f, qualBox.top + 104.0f },
+                      { { "sett_sc_fit", "Fit", false, [setScaleAction]() { setScaleAction(0); } },
+                        { "sett_sc_fill", "Fill", false, [setScaleAction]() { setScaleAction(3); } },
+                        { "sett_sc_str", "Stretch", false, [setScaleAction]() { setScaleAction(1); } },
+                        { "sett_sc_orig", "1:1", false, [setScaleAction]() { setScaleAction(2); } } },
+                      defScale == 0 ? 0 : defScale == 3 ? 1 : defScale == 1 ? 2 : defScale == 2 ? 3 : -1);
 
         cy = qualBox.bottom + 12.0f;
 
@@ -3151,17 +3401,17 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(ovBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(ovBox, 12.0f, COL_BORDER);
 
-        drawText("GRAPHICS ACCELERATION & VIRTUAL DISPLAY", { ovBox.left + 16.0f, ovBox.top + 8.0f, ovBox.right - 16.0f, ovBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+        drawText("Graphics", { ovBox.left + 16.0f, ovBox.top + 8.0f, ovBox.right - 16.0f, ovBox.top + 22.0f },
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         drawToggleSwitch("sett_hw_accel", { ovBox.left + 16.0f, ovBox.top + 26.0f, ovBox.right - 16.0f, ovBox.top + 52.0f },
-                         s.hardwareAcceleration, "Hardware accelerated rendering (GPU)", [this]() {
+                         s.hardwareAcceleration, "Use the graphics card", [this]() {
                              AppSettings ns = identity_.settings();
                              pendingHwAccelChoice_ = !ns.hardwareAcceleration;
                              ns.hardwareAcceleration = pendingHwAccelChoice_;
                              identity_.updateSettings(ns);
                              showHwAccelRestartModal_ = true;
-                         }, "Use Direct3D 11 hardware acceleration instead of software rasterization.");
+                         }, "Faster drawing with Direct3D 11. Turn it off if the picture glitches.");
 
         drawToggleSwitch("sett_auto_virtual_display", { ovBox.left + 16.0f, ovBox.top + 54.0f, ovBox.right - 16.0f, ovBox.top + 80.0f },
                          s.autoVirtualDisplay, "Placeholder screen for headless host", [this]() {
@@ -3180,9 +3430,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             }
         }
 
-        drawText("Audio & Voice Intercom", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+        drawText("Audio & voice", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
-        drawText("Configure microphone, output audio devices, live input levels, and playback defaults.",
+        drawText("Your microphone, your speakers and the default volume.",
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
@@ -3194,9 +3444,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(inBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(inBox, 12.0f, COL_BORDER);
 
-        drawText("MICROPHONE & INPUT LEVEL",
+        drawText("Microphone",
                  { inBox.left + 16.0f, inBox.top + 8.0f, inBox.right - 16.0f, inBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         std::string activeInputName = "System Default";
         for (const auto& dev : cachedInputDevices_) {
@@ -3220,7 +3470,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                    showAudioInputMenu_ ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
 
         // Live VU Meter Bar
-        drawText("Input Level", { inBox.left + 16.0f, inBox.top + 64.0f, inBox.left + 90.0f, inBox.top + 82.0f },
+        drawText("Input level", { inBox.left + 16.0f, inBox.top + 64.0f, inBox.left + 90.0f, inBox.top + 82.0f },
                  ui::FontRole::Small, COL_TEXT_SECONDARY);
         UiRect vuTrack = { inBox.left + 95.0f, inBox.top + 69.0f, inBox.right - 16.0f, inBox.top + 77.0f };
         fillRoundRect(vuTrack, 4.0f, COL_STAGE_BG);
@@ -3248,9 +3498,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(outBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(outBox, 12.0f, COL_BORDER);
 
-        drawText("OUTPUT DEVICE & CHIME",
+        drawText("Speakers",
                  { outBox.left + 16.0f, outBox.top + 8.0f, outBox.right - 16.0f, outBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         std::string activeOutputName = "System Default";
         for (const auto& dev : cachedOutputDevices_) {
@@ -3261,7 +3511,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         }
 
         UiRect chimeBtnRect = { outBox.right - 104.0f, outBox.top + 26.0f, outBox.right - 16.0f, outBox.top + 52.0f };
-        drawButton("sett_audio_test_chime", chimeBtnRect, "Test Chime",
+        drawButton("sett_audio_test_chime", chimeBtnRect, "Play test sound",
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 6.0f, [this]() {
                        shell_->playAlertSound();
                    }, ui::FontRole::Small);
@@ -3286,12 +3536,12 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(defBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(defBox, 12.0f, COL_BORDER);
 
-        drawText("VOLUME & MUTE DEFAULTS",
+        drawText("Volume",
                  { defBox.left + 16.0f, defBox.top + 8.0f, defBox.right - 16.0f, defBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         float vy = defBox.top + 32.0f;
-        drawText("Default Volume", { defBox.left + 16.0f, vy - 4.0f, defBox.left + 115.0f, vy + 16.0f },
+        drawText("Default volume", { defBox.left + 16.0f, vy - 4.0f, defBox.left + 115.0f, vy + 16.0f },
                  ui::FontRole::Small, COL_TEXT_SECONDARY);
         UiRect volTrack = { defBox.left + 120.0f, vy, defBox.right - 64.0f, vy + 8.0f };
         fillRoundRect(volTrack, 4.0f, COL_STAGE_BG);
@@ -3330,14 +3580,14 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                              identity_.updateSettings(ns);
                              identity_.saveConfig();
                              network_.setAudioMuted(ns.audioMutedDefault);
-                         }, "Automatically mute incoming remote desktop audio stream upon connection.");
+                         }, "Start every session with the remote sound off.");
 
         cy = defBox.bottom + 12.0f;
     }
     else if (settingsSection_ == SettingsSection::Permissions) {
-        drawText("Access Permissions", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+        drawText("Permissions", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
-        drawText("Configure default security permissions for incoming viewer connections.",
+        drawText("What people who connect to this desk can do.",
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
@@ -3345,9 +3595,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(permBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(permBox, 12.0f, COL_BORDER);
 
-        drawText("DEFAULT HOST PERMISSIONS",
+        drawText("When someone connects",
                  { permBox.left + 16.0f, permBox.top + 8.0f, permBox.right - 16.0f, permBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         float py = permBox.top + 26.0f;
         drawToggleSwitch("sett_auto_accept", { permBox.left + 16.0f, py, permBox.right - 16.0f, py + 24.0f },
@@ -3356,7 +3606,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                              ns.autoAcceptIncoming = !ns.autoAcceptIncoming;
                              identity_.updateSettings(ns);
                              network_.setAutoAcceptIncoming(ns.autoAcceptIncoming, ns.defaultPermissions);
-                         }, "Bypass interactive confirmation prompt and accept incoming requests automatically.");
+                         }, "Skip the prompt. Anyone with the password or code gets in.");
         py += 28.0f;
 
         drawToggleSwitch("sett_def_perm_input", { permBox.left + 16.0f, py, permBox.right - 16.0f, py + 24.0f },
@@ -3365,7 +3615,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                              ns.defaultPermissions ^= PERM_INPUT;
                              identity_.updateSettings(ns);
                              network_.setAutoAcceptIncoming(ns.autoAcceptIncoming, ns.defaultPermissions);
-                         }, "Grant remote control of mouse pointer and keyboard input events.");
+                         }, "They can move your mouse and type.");
         py += 28.0f;
 
         drawToggleSwitch("sett_def_perm_clip", { permBox.left + 16.0f, py, permBox.right - 16.0f, py + 24.0f },
@@ -3374,7 +3624,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                              ns.defaultPermissions ^= PERM_CLIPBOARD;
                              identity_.updateSettings(ns);
                              network_.setAutoAcceptIncoming(ns.autoAcceptIncoming, ns.defaultPermissions);
-                         }, "Synchronize clipboard text and image buffers between host and client.");
+                         }, "Copy on one desk, paste on the other.");
         py += 28.0f;
 
         drawToggleSwitch("sett_def_perm_file", { permBox.left + 16.0f, py, permBox.right - 16.0f, py + 24.0f },
@@ -3383,7 +3633,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                              ns.defaultPermissions ^= PERM_FILE_TRANSFER;
                              identity_.updateSettings(ns);
                              network_.setAutoAcceptIncoming(ns.autoAcceptIncoming, ns.defaultPermissions);
-                         }, "Permit bidirectional file transfers and downloads during the session.");
+                         }, "Send files both ways during a session.");
         py += 28.0f;
 
         drawToggleSwitch("sett_lock_disc", { permBox.left + 16.0f, py, permBox.right - 16.0f, py + 24.0f },
@@ -3391,7 +3641,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                              AppSettings ns = identity_.settings();
                              ns.lockWorkstationOnDisconnect = !ns.lockWorkstationOnDisconnect;
                              identity_.updateSettings(ns);
-                         }, "Immediately lock the host Windows desktop session upon client disconnection.");
+                         }, "Lock this desk as soon as they disconnect.");
         py += 28.0f;
 
         drawToggleSwitch("sett_allow_pairing", { permBox.left + 16.0f, py, permBox.right - 16.0f, py + 24.0f },
@@ -3399,7 +3649,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                              AppSettings ns = identity_.settings();
                              ns.allowPairing = !ns.allowPairing;
                              identity_.updateSettings(ns);
-                         }, "Let PCs that have logged in once come back without a password. Off by default.");
+                         }, "Desks that got in once can come back without a password. Off by default.");
 
         cy = permBox.bottom + 12.0f;
 
@@ -3408,7 +3658,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             fillRoundRect(box, 12.0f, COL_BG_SUBTLE);
             strokeRoundRect(box, 12.0f, COL_BORDER);
             drawText(heading, { box.left + 16.0f, box.top + 8.0f, box.right - 16.0f, box.top + 22.0f },
-                     ui::FontRole::Small, COL_TEXT_ACCENT);
+                     ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
             float ry = box.top + 26.0f;
             if (peers.empty()) {
                 drawText("None yet", { box.left + 16.0f, ry, box.right - 16.0f, ry + 28.0f },
@@ -3427,7 +3677,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                 if (when <= 0 || !tmOk || std::strftime(date, sizeof(date), "%Y-%m-%d", &tmUtc) == 0) {
                     std::snprintf(date, sizeof(date), "unknown");
                 }
-                drawText(p.hostname + " \xC2\xB7 " + CryptoUtils::formatDeskId(p.deskId) + " \xC2\xB7 paired " + date,
+                drawText(peerName(p.hostname) + " \xC2\xB7 " + CryptoUtils::formatDeskId(p.deskId) + " \xC2\xB7 paired " + date,
                          { box.left + 16.0f, ry, box.right - 96.0f, ry + 28.0f },
                          ui::FontRole::Small, COL_TEXT_PRIMARY, ui::HAlign::Leading, ui::VAlign::Center);
                 uint64_t deskId = p.deskId;
@@ -3441,13 +3691,13 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             }
             cy = box.bottom + 12.0f;
         };
-        drawPairedList("PAIRED PCS", pairedViewers, true);
-        drawPairedList("PCS THIS ONE CAN ENTER", pairedHosts, false);
+        drawPairedList("Paired desks", pairedViewers, true);
+        drawPairedList("Desks this one can enter", pairedHosts, false);
     }
     else if (settingsSection_ == SettingsSection::TwoFactorAuth) {
         drawText("Two-Factor Authentication", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
-        drawText("Require an RFC 6238 time-based authenticator code (TOTP) when connecting unattended.",
+        drawText("Ask for a code from an authenticator app when someone connects while you are away.",
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
@@ -3455,9 +3705,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(totpBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(totpBox, 12.0f, COL_BORDER);
 
-        drawText("TWO-FACTOR AUTHENTICATION (TOTP)",
+        drawText("Authenticator app",
                  { totpBox.left + 16.0f, totpBox.top + 8.0f, totpBox.right - 16.0f, totpBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         drawToggleSwitch("sett_totp_enable",
                          { totpBox.left + 16.0f, totpBox.top + 26.0f, totpBox.right - 16.0f, totpBox.top + 50.0f },
@@ -3480,7 +3730,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         float totpInfoX = qrRect.right + 12.0f;
         float totpInfoRx = totpBox.right - 16.0f;
 
-        drawText("Secret Key (Base32):", { totpInfoX, qrRect.top, totpInfoRx, qrRect.top + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+        drawText("Secret key", { totpInfoX, qrRect.top, totpInfoRx, qrRect.top + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
 
         std::string curSecret = s.totpSecret.empty() ? identity_.totpManager().getSecretBase32() : s.totpSecret;
         std::string formattedKey = TotpManager::formatBase32Secret(curSecret);
@@ -3499,7 +3749,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         UiRect regenBtn = { totpInfoX, keyBox.bottom + 8.0f, totpInfoRx, keyBox.bottom + 36.0f };
-        drawButton("sett_totp_regen", regenBtn, "Regenerate Secret Key",
+        drawButton("sett_totp_regen", regenBtn, "New key",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
                        identity_.totpManager().generateNewSecret();
                        std::string newSecret = identity_.totpManager().getSecretBase32();
@@ -3515,7 +3765,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
         float verifyY = qrRect.bottom + 10.0f;
-        drawText("Enrollment Code Verification:", { totpBox.left + 16.0f, verifyY, totpBox.right - 16.0f, verifyY + 16.0f },
+        drawText("Code from your app", { totpBox.left + 16.0f, verifyY, totpBox.right - 16.0f, verifyY + 16.0f },
                  ui::FontRole::Small, COL_TEXT_SECONDARY);
         verifyY += 18.0f;
 
@@ -3536,15 +3786,15 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                                ns.totpEnabled = true;
                                identity_.updateSettings(ns);
                                totpEnrollSuccess_ = true;
-                               totpEnrollFeedback_ = "Code verified! 2FA enabled.";
+                               totpEnrollFeedback_ = "Code accepted. Two-factor sign-in is on.";
                                showToast("Two-Factor Authentication Enabled");
                            } else {
                                totpEnrollSuccess_ = false;
-                               totpEnrollFeedback_ = "Invalid 6-digit code. Check authenticator clock.";
+                               totpEnrollFeedback_ = "That code didn't match. Check your phone's clock.";
                                showToast("Invalid 2FA code", true);
                            }
                        } else {
-                           totpEnrollFeedback_ = "Please enter 6 digits.";
+                           totpEnrollFeedback_ = "Enter all 6 digits.";
                        }
                    }, ui::FontRole::Small, s.totpEnabled, COL_BORDER);
 
@@ -3556,9 +3806,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         cy = totpBox.bottom + 12.0f;
     }
     else if (settingsSection_ == SettingsSection::NetworkRelay) {
-        drawText("Network & Relay", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+        drawText("Network", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
-        drawText("Configure rendezvous servers, relay routing, and RFC 5389 STUN NAT traversal.",
+        drawText("How this desk reaches others that are not on the same network.",
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
@@ -3566,9 +3816,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(netBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(netBox, 12.0f, COL_BORDER);
 
-        drawText("RELAY & RENDEZVOUS NETWORK",
+        drawText("Relay server",
                  { netBox.left + 16.0f, netBox.top + 8.0f, netBox.left + 240.0f, netBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         float presetW = 54.0f;
         float presetH = 20.0f;
@@ -3660,7 +3910,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         std::string diagText;
         if (isDiagActive) {
             dotCol = COL_WARNING;
-            diagText = "Probing relay TCP and RFC 5389 STUN NAT traversal...";
+            diagText = "Testing the relay and your network\xE2\x80\xA6";
         } else if (hasResult) {
             if (rDiag.reachable) {
                 dotCol = COL_SUCCESS;
@@ -3682,9 +3932,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         cy = netBox.bottom + 12.0f;
     }
     else if (settingsSection_ == SettingsSection::CurtainPrivacy) {
-        drawText("Curtain Screen & Privacy", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+        drawText("Privacy", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
-        drawText("Customize privacy curtain display and organization security branding.",
+        drawText("What people at this desk see while you work, and which windows stay hidden.",
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
@@ -3692,9 +3942,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(privBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(privBox, 12.0f, COL_BORDER);
 
-        drawText("CURTAIN SCREEN & PRIVACY BRANDING",
+        drawText("Privacy screen",
                  { privBox.left + 16.0f, privBox.top + 8.0f, privBox.right - 16.0f, privBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         float py1 = privBox.top + 25.0f;
         float pSaveW = 68.0f;
@@ -3702,7 +3952,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         UiRect privSaveBtn = { privBox.right - 16.0f - pSaveW, py1, privBox.right - 16.0f, py1 + 28.0f };
 
         drawTextField("field_priv_brand", FocusedField::PrivacyBrand, brandField,
-                      privacyBrandEdit_, "Organization / Brand Name...", false);
+                      privacyBrandEdit_, "Organization name", false);
 
         drawButton("sett_priv_save", privSaveBtn, "Save",
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 6.0f, [this]() {
@@ -3711,22 +3961,22 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                        ns.privacyCustomNotice = privacyNoticeEdit_.empty() ? "Privacy screen is on. Move the mouse or press a key on this PC to end it." : privacyNoticeEdit_;
                        identity_.updateSettings(ns);
                        network_.configurePrivacyCurtain(ns.privacyCustomNotice, ns.privacyBrandName, ns.privacyShowDeskId);
-                       showToast("Privacy screen branding updated");
+                       showToast("Privacy screen updated");
                    }, ui::FontRole::Small);
 
         float py2 = py1 + 32.0f;
         UiRect noticeField = { privBox.left + 16.0f, py2, privBox.right - 16.0f, py2 + 28.0f };
         drawTextField("field_priv_notice", FocusedField::PrivacyNotice, noticeField,
-                      privacyNoticeEdit_, "Custom Security Notice Text...", false);
+                      privacyNoticeEdit_, "Message on the privacy screen", false);
 
         float py3 = py2 + 32.0f;
         UiRect showIdToggle = { privBox.left + 16.0f, py3, privBox.right - 16.0f, py3 + 24.0f };
-        drawToggleSwitch("sett_priv_show_id", showIdToggle, s.privacyShowDeskId, "Display Workstation Desk ID on Curtain Screen", [this]() {
+        drawToggleSwitch("sett_priv_show_id", showIdToggle, s.privacyShowDeskId, "Show this desk's ID on the privacy screen", [this]() {
             AppSettings ns = identity_.settings();
             ns.privacyShowDeskId = !ns.privacyShowDeskId;
             identity_.updateSettings(ns);
             network_.configurePrivacyCurtain(ns.privacyCustomNotice, ns.privacyBrandName, ns.privacyShowDeskId);
-        }, "Render the host 9-digit Desk ID overlay on the physical privacy curtain screen.");
+        }, "People at this desk can read the ID off the screen.");
 
         cy = privBox.bottom + 12.0f;
 
@@ -3735,53 +3985,36 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(cloakBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(cloakBox, 12.0f, COL_BORDER);
 
-        drawText("PRIVACY CLOAK SENSITIVE WINDOW & PII AUTO-REDACTION",
+        drawText("Hide sensitive windows",
                  { cloakBox.left + 16.0f, cloakBox.top + 8.0f, cloakBox.right - 16.0f, cloakBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         float cy1 = cloakBox.top + 26.0f;
         drawToggleSwitch("sett_cloak_enable", { cloakBox.left + 16.0f, cy1, cloakBox.right - 16.0f, cy1 + 24.0f },
-                         s.privacyCloakEnabled, "Enable pre-capture sensitive window redaction", [this]() {
+                         s.privacyCloakEnabled, "Hide sensitive windows from the remote view", [this]() {
                              AppSettings ns = identity_.settings();
                              ns.privacyCloakEnabled = !ns.privacyCloakEnabled;
                              identity_.updateSettings(ns);
                              network_.configurePrivacyCloak(ns.privacyCloakEnabled, ns.privacyCloakStyle, ns.privacyCloakKeywords);
-                             showToast(ns.privacyCloakEnabled ? "Privacy Cloak Enabled" : "Privacy Cloak Disabled");
-                         }, "Black out or pixelate designated sensitive windows prior to frame encoding.");
+                             showToast(ns.privacyCloakEnabled ? "Sensitive windows hidden" : "Sensitive windows shown");
+                         }, "Windows whose titles match the list below are covered before the picture leaves this desk.");
 
         float cy2 = cy1 + 30.0f;
-        drawText("REDACTION STYLE", { cloakBox.left + 16.0f, cy2, cloakBox.left + 160.0f, cy2 + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
-        float styleHalfW = (innerW - 32.0f - 8.0f) * 0.5f;
-        UiRect charBtn = { cloakBox.left + 16.0f, cy2 + 18.0f, cloakBox.left + 16.0f + styleHalfW, cy2 + 46.0f };
-        UiRect mosaicBtn = { charBtn.right + 8.0f, cy2 + 18.0f, cloakBox.right - 16.0f, cy2 + 46.0f };
-
-        bool isCharcoal = (s.privacyCloakStyle == 0);
-        drawButton("sett_cloak_style_char", charBtn, "Solid Charcoal",
-                   isCharcoal ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   isCharcoal ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   isCharcoal ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   6.0f, [this]() {
-                       AppSettings ns = identity_.settings();
-                       ns.privacyCloakStyle = 0;
-                       identity_.updateSettings(ns);
-                       network_.configurePrivacyCloak(ns.privacyCloakEnabled, ns.privacyCloakStyle, ns.privacyCloakKeywords);
-                       showToast("Redaction style: Solid Charcoal");
-                   }, ui::FontRole::Small, !isCharcoal, COL_BORDER);
-
-        drawButton("sett_cloak_style_mos", mosaicBtn, "Mosaic Blurring",
-                   !isCharcoal ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                   !isCharcoal ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                   !isCharcoal ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                   6.0f, [this]() {
-                       AppSettings ns = identity_.settings();
-                       ns.privacyCloakStyle = 1;
-                       identity_.updateSettings(ns);
-                       network_.configurePrivacyCloak(ns.privacyCloakEnabled, ns.privacyCloakStyle, ns.privacyCloakKeywords);
-                       showToast("Redaction style: Mosaic Blurring");
-                   }, ui::FontRole::Small, isCharcoal, COL_BORDER);
+        drawText("How they look", { cloakBox.left + 16.0f, cy2, cloakBox.left + 160.0f, cy2 + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+        auto setCloakStyle = [this](uint8_t style) {
+            AppSettings ns = identity_.settings();
+            ns.privacyCloakStyle = style;
+            identity_.updateSettings(ns);
+            network_.configurePrivacyCloak(ns.privacyCloakEnabled, ns.privacyCloakStyle, ns.privacyCloakKeywords);
+            showToast(style == 0 ? "Hidden windows show as a solid block" : "Hidden windows are pixelated");
+        };
+        drawSegmented({ cloakBox.left + 16.0f, cy2 + 18.0f, cloakBox.right - 16.0f, cy2 + 46.0f },
+                      { { "sett_cloak_style_char", "Solid block", false, [setCloakStyle]() { setCloakStyle(0); } },
+                        { "sett_cloak_style_mos", "Pixelate", false, [setCloakStyle]() { setCloakStyle(1); } } },
+                      s.privacyCloakStyle == 0 ? 0 : 1);
 
         float cy3 = cy2 + 52.0f;
-        drawText("SENSITIVE WINDOW KEYWORDS (COMMA-SEPARATED)", { cloakBox.left + 16.0f, cy3, cloakBox.right - 16.0f, cy3 + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+        drawText("Window titles to hide, separated by commas", { cloakBox.left + 16.0f, cy3, cloakBox.right - 16.0f, cy3 + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         float cSaveW = 68.0f;
         UiRect kwField = { cloakBox.left + 16.0f, cy3 + 18.0f, cloakBox.right - 16.0f - cSaveW - 8.0f, cy3 + 48.0f };
         UiRect kwSaveBtn = { cloakBox.right - 16.0f - cSaveW, cy3 + 18.0f, cloakBox.right - 16.0f, cy3 + 48.0f };
@@ -3795,16 +4028,16 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                        ns.privacyCloakKeywords = privacyKeywordsEdit_;
                        identity_.updateSettings(ns);
                        network_.configurePrivacyCloak(ns.privacyCloakEnabled, ns.privacyCloakStyle, ns.privacyCloakKeywords);
-                       showToast("Privacy Cloak keywords saved");
+                       showToast("Window list saved");
                    }, ui::FontRole::Small);
 
         cy = cloakBox.bottom + 12.0f;
     }
     else if (settingsSection_ == SettingsSection::SystemService) {
-        drawText("System Service & Integration", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+        drawText("System", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
-        drawText(onWindowsShell() ? "Manage the elevated Windows service daemon, desktop shortcuts, and Action Center notifications."
-                                  : "Manage notifications, the tray icon, and cppdesk:// links.",
+        drawText(onWindowsShell() ? "Run CppDesk as a Windows service, and choose how it gets your attention."
+                                  : "Choose how CppDesk gets your attention and opens links.",
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
@@ -3814,9 +4047,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             UiRect shareBox = { cx, cy, crx, cy + 62.0f + bodyH };
             fillRoundRect(shareBox, 12.0f, COL_BG_SUBTLE);
             strokeRoundRect(shareBox, 12.0f, COL_BORDER);
-            drawText("WAYLAND SCREEN SHARING (EXPERIMENTAL)",
+            drawText("Wayland screen sharing (experimental)",
                      { shareBox.left + 16.0f, shareBox.top + 8.0f, shareBox.right - 16.0f, shareBox.top + 22.0f },
-                     ui::FontRole::Small, COL_TEXT_ACCENT);
+                     ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
             drawText(shareText.title, { shareBox.left + 16.0f, shareBox.top + 28.0f, shareBox.right - 16.0f, shareBox.top + 50.0f },
                      ui::FontRole::Body, COL_TEXT_PRIMARY);
             drawText(shareText.body, { shareBox.left + 16.0f, shareBox.top + 52.0f, shareBox.right - 16.0f, shareBox.top + 52.0f + bodyH },
@@ -3829,8 +4062,8 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             UiRect permBox = { cx, cy, crx, cy + 112.0f };
             fillRoundRect(permBox, 12.0f, COL_BG_SUBTLE);
             strokeRoundRect(permBox, 12.0f, COL_BORDER);
-            drawText("MAC PERMISSIONS", { permBox.left + 16.0f, permBox.top + 8.0f, permBox.right - 16.0f, permBox.top + 22.0f },
-                     ui::FontRole::Small, COL_TEXT_ACCENT);
+            drawText("macOS permissions", { permBox.left + 16.0f, permBox.top + 8.0f, permBox.right - 16.0f, permBox.top + 22.0f },
+                     ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
             struct PermRow { ui::HostPermission which; const char* name; bool granted; const char* id; };
             const PermRow permRows[] = {
                 { ui::HostPermission::ScreenRecording, "Screen Recording", hostPerms_.screenRecording, "sett_perm_screen" },
@@ -3858,9 +4091,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             fillRoundRect(svcBox, 12.0f, COL_BG_SUBTLE);
             strokeRoundRect(svcBox, 12.0f, COL_BORDER);
 
-            drawText("WINDOWS SYSTEM SERVICE",
+            drawText("Windows service",
                      { svcBox.left + 16.0f, svcBox.top + 8.0f, svcBox.left + 240.0f, svcBox.top + 22.0f },
-                     ui::FontRole::Small, COL_TEXT_ACCENT);
+                     ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
             if (!systemServiceCacheValid_) {
                 refreshSystemServiceCache();
@@ -3868,7 +4101,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             ui::ServiceState svcState = cachedServiceState_;
             std::string svcStateLabel = (svcState == ui::ServiceState::Running) ? "Running" :
                                         (svcState == ui::ServiceState::Stopped) ? "Stopped" :
-                                        (svcState == ui::ServiceState::Pending) ? "Pending..." : "Not Installed";
+                                        (svcState == ui::ServiceState::Pending) ? "Pending..." : "Not installed";
             ui::Color svcStateCol = (svcState == ui::ServiceState::Running) ? COL_SUCCESS :
                                        (svcState == ui::ServiceState::Stopped || svcState == ui::ServiceState::Pending) ? COL_WARNING : COL_TEXT_MUTED;
 
@@ -3961,23 +4194,23 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         fillRoundRect(notifBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(notifBox, 12.0f, COL_BORDER);
 
-        drawText("SYSTEM & NOTIFICATIONS",
+        drawText("Notifications",
                  { notifBox.left + 16.0f, notifBox.top + 8.0f, notifBox.right - 16.0f, notifBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         float ny = notifBox.top + 26.0f;
         if (shell_->has(ui::Capability::ActionCenterToasts)) {
             drawToggleSwitch("sett_push_notif", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
-                             s.enablePushNotifications, "Windows Action Center push toasts", [this]() {
+                             s.enablePushNotifications, "Windows notifications", [this]() {
                                  AppSettings ns = identity_.settings();
                                  ns.enablePushNotifications = !ns.enablePushNotifications;
                                  identity_.updateSettings(ns);
-                             }, "Deliver native Windows Action Center banner notifications for session events.");
+                             }, "Show a banner when a session starts or ends.");
             ny += 25.0f;
         }
 
         drawToggleSwitch("sett_taskbar_flash", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
-                         s.enableTaskbarFlash, "Flash taskbar orange when unfocused", [this]() {
+                         s.enableTaskbarFlash, "Flash the taskbar", [this]() {
                              AppSettings ns = identity_.settings();
                              ns.enableTaskbarFlash = !ns.enableTaskbarFlash;
                              identity_.updateSettings(ns);
@@ -3986,21 +4219,21 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         ny += 25.0f;
 
         drawToggleSwitch("sett_notif_sound", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
-                         s.enableNotificationSounds, "Play sound on incoming alerts", [this]() {
+                         s.enableNotificationSounds, "Play a sound for requests", [this]() {
                              AppSettings ns = identity_.settings();
                              ns.enableNotificationSounds = !ns.enableNotificationSounds;
                              identity_.updateSettings(ns);
-                         }, "Play an audio notification chime when incoming session alerts occur.");
+                         }, "A short chime when someone asks to connect.");
         ny += 25.0f;
 
         if (shell_->has(ui::Capability::TrayIcon)) {
             drawToggleSwitch("sett_min_to_tray", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
-                             s.minimizeToTray, "Minimize window to system tray", [this]() {
+                             s.minimizeToTray, "Minimize to the tray", [this]() {
                                  AppSettings ns = identity_.settings();
                                  ns.minimizeToTray = !ns.minimizeToTray;
                                  identity_.updateSettings(ns);
-                             }, onWindowsShell() ? "Minimize application window to the Windows system notification tray area."
-                                                 : "Minimize application window to the system tray.");
+                             }, onWindowsShell() ? "Minimizing hides CppDesk in the notification area."
+                                                 : "Minimizing hides CppDesk in the tray.");
             ny += 25.0f;
         }
 
@@ -4010,7 +4243,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             }
             bool isUriReg = cachedUriProtocolReg_;
             drawToggleSwitch("sett_reg_uri", { notifBox.left + 16.0f, ny, notifBox.right - 16.0f, ny + 24.0f },
-                             isUriReg, "Register cppdesk:// URL Protocol Handler", [this, isUriReg]() {
+                             isUriReg, "Open cppdesk:// links", [this, isUriReg]() {
                                  if (ShortcutManager::setUriProtocolRegistered(!isUriReg)) {
                                      cachedUriProtocolReg_ = !isUriReg;
                                      showToast(!isUriReg ? "Registered cppdesk:// URL protocol" : "Unregistered cppdesk:// URL protocol");
@@ -4018,7 +4251,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                                      showToast("Failed to update cppdesk:// URL protocol", true);
                                  }
                                  refreshSystemServiceCache();
-                             }, "Register custom cppdesk:// URL scheme in Windows Registry for one-click browser links.");
+                             }, "Links like cppdesk://123456789 in a browser open here.");
         }
 
         cy = notifBox.bottom + 12.0f;
@@ -4026,7 +4259,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
     else if (settingsSection_ == SettingsSection::About) {
         drawText("About & Maintenance", { cx, cy, crx, cy + 24.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         cy += 25.0f;
-        drawText("Software version, update checks, local file storage, and configuration reset.",
+        drawText("Version, updates and the data CppDesk keeps on this desk.",
                  { cx, cy, crx, cy + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
         cy += 22.0f;
 
@@ -4075,7 +4308,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
 
         float relW = 110.0f;
         UiRect relBtn = { chkBtn.left - 8.0f - relW, btnY, chkBtn.left - 8.0f, btnY + btnH };
-        drawButton("sett_view_release_top", relBtn, "Release Notes",
+        drawButton("sett_view_release_top", relBtn, "Release notes",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY,
                    8.0f, [this]() {
                        shell_->openUrl("https://github.com/oocsng/cppdesk/releases/latest");
@@ -4089,9 +4322,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         strokeRoundRect(aboutBox, 12.0f, COL_BORDER);
 
         float aPad = 16.0f;
-        drawText("ABOUT CPPDESK",
+        drawText("About CppDesk",
                  { aboutBox.left + aPad, aboutBox.top + 8.0f, aboutBox.right - aPad, aboutBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         float aBtnW = 68.0f;
         float aBtnH = 26.0f;
@@ -4117,36 +4350,70 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
         cy = aboutBox.bottom + 14.0f;
 
         // 3. Data & Reset Actions
-        UiRect maintBox = { cx, cy, crx, cy + 78.0f };
+        UiRect maintBox = { cx, cy, crx, cy + 114.0f };
         fillRoundRect(maintBox, 12.0f, COL_BG_SUBTLE);
         strokeRoundRect(maintBox, 12.0f, COL_BORDER);
 
-        drawText("DATA & MAINTENANCE",
+        drawText("Your data",
                  { maintBox.left + 16.0f, maintBox.top + 8.0f, maintBox.right - 16.0f, maintBox.top + 22.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
 
         float mThirdW = (innerW - 32.0f - 16.0f) / 3.0f;
-        float mBtnTop = maintBox.top + 28.0f;
-        float mBtnBot = maintBox.top + 64.0f;
+        // Received-files folder row: label, current path (tail kept when it is too long), Change button
+        const float rowTop = maintBox.top + 28.0f;
+        UiRect chgBtn = { maintBox.right - 16.0f - 68.0f, rowTop, maintBox.right - 16.0f, rowTop + 26.0f };
+        const float pathLeft = maintBox.left + 16.0f + 140.0f;
+        drawText("Received files folder",
+                 { maintBox.left + 16.0f, rowTop + 6.0f, pathLeft, rowTop + 20.0f },
+                 ui::FontRole::Small, COL_TEXT_SECONDARY);
+        std::string recvShown = network_.fileTransferManager().receiveDirectory();
+        const float recvMaxW = chgBtn.left - 8.0f - pathLeft;
+        if (canvas_->measureTextWidth(recvShown, ui::FontRole::Small) > recvMaxW) {
+            size_t cut = 0;
+            std::string tail;
+            do {
+                cut += 1;
+                while (cut < recvShown.size() && (static_cast<unsigned char>(recvShown[cut]) & 0xC0) == 0x80) ++cut; // whole UTF-8 chars
+                tail = "..." + recvShown.substr(cut);
+            } while (cut < recvShown.size() && canvas_->measureTextWidth(tail, ui::FontRole::Small) > recvMaxW);
+            recvShown = tail;
+        }
+        drawText(recvShown, { pathLeft, rowTop + 6.0f, chgBtn.left - 8.0f, rowTop + 20.0f },
+                 ui::FontRole::Small, COL_TEXT_PRIMARY);
+        drawButton("sett_recv_dir_change", chgBtn, "Change",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
+                       shell_->chooseFolder("Choose where received files go", [this](std::optional<std::string> path) {
+                           if (!path) return;
+                           AppSettings ns = identity_.settings();
+                           ns.receiveDir = *path;
+                           identity_.updateSettings(ns);
+                           network_.applyReceiveDirectory();
+                           showToast("Received files will go to " + std::filesystem::path(*path).filename().string());
+                       });
+                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+
+        float mBtnTop = maintBox.top + 64.0f;
+        float mBtnBot = maintBox.top + 100.0f;
 
         UiRect openRecvBtn = { maintBox.left + 16.0f, mBtnTop, maintBox.left + 16.0f + mThirdW, mBtnBot };
         UiRect clearRecBtn = { openRecvBtn.right + 8.0f, mBtnTop, openRecvBtn.right + 8.0f + mThirdW, mBtnBot };
         UiRect resetBtn    = { clearRecBtn.right + 8.0f, mBtnTop, maintBox.right - 16.0f, mBtnBot };
 
-        drawButton("sett_open_recv", openRecvBtn, "Received Files",
+        drawButton("sett_open_recv", openRecvBtn, "Received files",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
                        network_.fileTransferManager().openReceiveDirectoryInExplorer();
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
-        drawButton("sett_clear_recents", clearRecBtn, "Clear History",
+        drawButton("sett_clear_recents", clearRecBtn, "Clear history",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
                        identity_.clearRecentSessions();
                        showToast("History cleared");
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
 
-        drawButton("sett_reset_defaults", resetBtn, "Reset Settings",
+        drawButton("sett_reset_defaults", resetBtn, "Reset settings",
                    COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_PRIMARY, 8.0f, [this]() {
                        identity_.resetSettingsToDefault();
+                       network_.applyReceiveDirectory();
                        const auto& ds = identity_.settings();
                        relayServerEdit_ = ds.relayServer.empty() ? identity_.relayServerAddress() : ds.relayServer;
                        relayAuthKeyEdit_ = ds.relayAuthKey;
@@ -4155,6 +4422,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
                        privacyBrandEdit_ = ds.privacyBrandName;
                        privacyNoticeEdit_ = ds.privacyCustomNotice;
                        privacyKeywordsEdit_ = ds.privacyCloakKeywords;
+                       displayNameEdit_ = ds.displayName;
                        totpEnrollCodeEdit_.clear();
                        totpEnrollFeedback_.clear();
                        totpEnrollSuccess_ = false;
@@ -4177,6 +4445,9 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
     }
     else if (settingsSection_ == SettingsSection::Glide) {
         drawGlideSettings(cx, crx, cy);
+    }
+    else if (settingsSection_ == SettingsSection::Profile) {
+        drawSettingsProfile(cx, crx, cy);
     }
 
     // Clamp hit-test regions inside contentPane viewport
@@ -4248,7 +4519,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             dropTop = audioInputBtnRect_.top - dropH - 4.0f;
         }
         UiRect baseDropRect = { dropLeft, dropTop, dropRight, dropTop + dropH };
-        UiRect dropRect = UiPlatform::computeSpringRect(baseDropRect, audioInputMenuAnimT_, 0.0f);
+        UiRect dropRect = UiPlatform::popoverRect(baseDropRect, audioInputMenuAnimT_, baseDropRect.centerX(), baseDropRect.top);
 
         if (showAudioInputMenu_) {
             clickRegions_.push_back(ClickRegion{ dropRect, "audio_in_menu_absorb", []() {}, false });
@@ -4310,7 +4581,7 @@ void AppUi::drawSettingsView(const UiRect& bounds, float alpha) {
             dropTop = audioOutputBtnRect_.top - dropH - 4.0f;
         }
         UiRect baseDropRect = { dropLeft, dropTop, dropRight, dropTop + dropH };
-        UiRect dropRect = UiPlatform::computeSpringRect(baseDropRect, audioOutputMenuAnimT_, 0.0f);
+        UiRect dropRect = UiPlatform::popoverRect(baseDropRect, audioOutputMenuAnimT_, baseDropRect.centerX(), baseDropRect.top);
 
         if (showAudioOutputMenu_) {
             clickRegions_.push_back(ClickRegion{ dropRect, "audio_out_menu_absorb", []() {}, false });
@@ -4372,231 +4643,181 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
                   lerpColor(COL_TEXT_SECONDARY, COL_TEXT_ON_ACCENT, closeHover), 1.6f);
 
     uint32_t unread = network_.unreadChatCount();
-    std::string chatTabLbl = unread > 0 ? ("Chat (" + std::to_string(unread) + ")") : "Chat";
 
-    if (drawerTab_ == DrawerTab::Diagnostics) {
-        drawText("Task Manager", { x, y + 2.0f, closeBtn.left - 8.0f, y + 28.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
-        y += 36.0f;
-    } else {
-        struct DrawerTabDef {
-            DrawerTab tab;
-            std::string id;
-            std::string label;
-            float width;
-            bool isActive;
-            std::function<void()> onClick;
+    // Header: a segmented control picks the group, underline tabs pick the page inside it
+    struct DrawerTabDef { DrawerTab tab; int group; std::string id, label; std::function<void()> onClick; };
+    const std::vector<DrawerTabDef> drawerTabs = {
+        { DrawerTab::FilesAndClip, 0, "drawer_tab_files", "Transfers", [this]() { drawerTab_ = DrawerTab::FilesAndClip; } },
+        { DrawerTab::FileManager, 0, "drawer_tab_filemgr", "Explorer", [this]() {
+            drawerTab_ = DrawerTab::FileManager;
+            if (localFilePane_.entries.empty()) {
+                std::string canon, err;
+                RemoteFileBrowserManager::listLocalDirectory("$DRIVES$", localFilePane_.entries, canon, err);
+                localFilePane_.currentPath = canon;
+                localFilePane_.availableDrives = RemoteFileBrowserManager::getLocalDrives();
+                fileBrowserInputLocalPath_.clear();
+            }
+            if (remoteFilePane_.entries.empty()) {
+                network_.requestRemoteFileList("$DRIVES$");
+                remoteFilePane_.beginLoading(shell_->nowMs());
+            }
+        } },
+        { DrawerTab::Sync, 0, "drawer_tab_sync", "Sync", [this]() { drawerTab_ = DrawerTab::Sync; } },
+        { DrawerTab::ClipboardHistory, 0, "drawer_tab_hist", "Clipboard", [this]() {
+            drawerTab_ = DrawerTab::ClipboardHistory;
+            focusedField_ = FocusedField::ClipboardSearch;
+        } },
+        { DrawerTab::LiveChat, 1, "drawer_tab_chat", "Messages", [this]() {
+            drawerTab_ = DrawerTab::LiveChat;
+            network_.markChatRead();
+        } },
+        { DrawerTab::Notes, 1, "drawer_tab_notes", "Notes", [this]() {
+            drawerTab_ = DrawerTab::Notes;
+            focusedField_ = FocusedField::ScratchpadText;
+        } },
+        { DrawerTab::RemoteTerminal, 2, "drawer_tab_term", "Terminal", [this]() {
+            drawerTab_ = DrawerTab::RemoteTerminal;
+            focusedField_ = FocusedField::TerminalInput;
+        } },
+        { DrawerTab::Diagnostics, 2, "drawer_tab_diag", "Task Manager", [this]() {
+            drawerTab_ = DrawerTab::Diagnostics;
+            network_.setDiagnosticsActive(true);
+        } },
+    };
+    auto pick = [this](const DrawerTabDef& t) {
+        return [this, tab = t.tab, act = t.onClick]() {
+            if (drawerTab_ == DrawerTab::Diagnostics && tab != DrawerTab::Diagnostics) network_.setDiagnosticsActive(false);
+            act();
         };
+    };
+    int activeGroup = 0;
+    for (const auto& t : drawerTabs) if (t.tab == drawerTab_) activeGroup = t.group;
 
-        std::vector<DrawerTabDef> drawerTabsList = {
-            { DrawerTab::FilesAndClip, "drawer_tab_files", "Files", 58.0f, (drawerTab_ == DrawerTab::FilesAndClip), [this]() {
-                drawerTab_ = DrawerTab::FilesAndClip;
-            }},
-            { DrawerTab::FileManager, "drawer_tab_filemgr", "Explorer", 72.0f, (drawerTab_ == DrawerTab::FileManager), [this]() {
-                drawerTab_ = DrawerTab::FileManager;
-                if (localFilePane_.entries.empty()) {
-                    std::string canon, err;
-                    RemoteFileBrowserManager::listLocalDirectory("$DRIVES$", localFilePane_.entries, canon, err);
-                    localFilePane_.currentPath = canon;
-                    localFilePane_.availableDrives = RemoteFileBrowserManager::getLocalDrives();
-                    fileBrowserInputLocalPath_.clear();
-                }
-                if (remoteFilePane_.entries.empty()) {
-                    network_.requestRemoteFileList("$DRIVES$");
-                    remoteFilePane_.beginLoading(shell_->nowMs());
-                }
-            }},
-            { DrawerTab::LiveChat, "drawer_tab_chat", chatTabLbl, (unread > 0 ? 76.0f : 56.0f), (drawerTab_ == DrawerTab::LiveChat), [this]() {
-                drawerTab_ = DrawerTab::LiveChat;
-                network_.markChatRead();
-            }},
-            { DrawerTab::RemoteTerminal, "drawer_tab_term", "Terminal", 74.0f, (drawerTab_ == DrawerTab::RemoteTerminal), [this]() {
-                drawerTab_ = DrawerTab::RemoteTerminal;
-                focusedField_ = FocusedField::TerminalInput;
-            }},
-            { DrawerTab::ClipboardHistory, "drawer_tab_hist", "History", 70.0f, (drawerTab_ == DrawerTab::ClipboardHistory), [this]() {
-                drawerTab_ = DrawerTab::ClipboardHistory;
-                focusedField_ = FocusedField::ClipboardSearch;
-            }},
-            { DrawerTab::Sync, "drawer_tab_sync", "Sync", 58.0f, (drawerTab_ == DrawerTab::Sync), [this]() {
-                drawerTab_ = DrawerTab::Sync;
-            }},
-            { DrawerTab::Notes, "drawer_tab_notes", "Notes", 58.0f, (drawerTab_ == DrawerTab::Notes), [this]() {
-                drawerTab_ = DrawerTab::Notes;
-                focusedField_ = FocusedField::ScratchpadText;
-            }}
-        };
-
-        UiRect tabsViewport = { x, y, closeBtn.left - 8.0f, y + 32.0f };
-        float totalTabsW = 0.0f;
-        for (size_t i = 0; i < drawerTabsList.size(); ++i) {
-            if (i > 0) totalTabsW += 5.0f;
-            totalTabsW += drawerTabsList[i].width;
-        }
-
-        float tabsAvailW = (totalTabsW > tabsViewport.width())
-            ? std::max(40.0f, tabsViewport.width() - 22.0f)
-            : tabsViewport.width();
-        drawerTabsMaxScroll_ = std::max(0.0f, totalTabsW - tabsAvailW);
-        drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_, 0.0f, drawerTabsMaxScroll_);
-
-        // Auto-scroll to ensure active tab is visible
-        float activeTabStart = 0.0f;
-        for (const auto& t : drawerTabsList) {
-            if (t.isActive) {
-                if (activeTabStart < drawerTabsScrollTarget_) {
-                    drawerTabsScrollTarget_ = activeTabStart;
-                } else if (activeTabStart + t.width > drawerTabsScrollTarget_ + tabsAvailW) {
-                    drawerTabsScrollTarget_ = activeTabStart + t.width - tabsAvailW;
-                }
-                break;
-            }
-            activeTabStart += t.width + 5.0f;
-        }
-        drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_, 0.0f, drawerTabsMaxScroll_);
-
-        if (drawerTabsMaxScroll_ > 2.0f) {
-            if (drawerTabsScrollTarget_ > 2.0f) {
-                UiRect lBtn = { tabsViewport.left, tabsViewport.top + 2.0f, tabsViewport.left + 18.0f, tabsViewport.bottom - 2.0f };
-                drawButton("drawer_tab_scroll_l", lBtn, "◀", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
-                    drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_ - 60.0f, 0.0f, drawerTabsMaxScroll_);
-                    shell_->invalidate();
-                }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
-                tabsViewport.left += 22.0f;
-            }
-            if (drawerTabsScrollTarget_ < drawerTabsMaxScroll_ - 2.0f) {
-                UiRect rBtn = { tabsViewport.right - 18.0f, tabsViewport.top + 2.0f, tabsViewport.right, tabsViewport.bottom - 2.0f };
-                drawButton("drawer_tab_scroll_r", rBtn, "▶", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this]() {
-                    drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_ + 60.0f, 0.0f, drawerTabsMaxScroll_);
-                    shell_->invalidate();
-                }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
-                tabsViewport.right -= 22.0f;
-            }
-        }
-
-        canvas_->pushClip(ui::Rect{tabsViewport.left, tabsViewport.top, tabsViewport.right, tabsViewport.bottom});
-
-        float curTabX = tabsViewport.left - drawerTabsScrollOffset_;
-        for (const auto& t : drawerTabsList) {
-            UiRect tRect = { curTabX, tabsViewport.top, curTabX + t.width, tabsViewport.bottom };
-            if (tRect.right > tabsViewport.left && tRect.left < tabsViewport.right) {
-                drawButton(t.id, tRect, t.label,
-                           t.isActive ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-                           t.isActive ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-                           t.isActive ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-                           8.0f, t.onClick, ui::FontRole::Small);
-                auto& cr = clickRegions_.back();
-                cr.rect.left = std::max(cr.rect.left, tabsViewport.left);
-                cr.rect.right = std::min(cr.rect.right, tabsViewport.right);
-                if (cr.rect.right <= cr.rect.left) {
-                    cr.rect = { -10000.0f, -10000.0f, -10000.0f, -10000.0f };
-                }
-            }
-            curTabX += t.width + 5.0f;
-        }
-
-        canvas_->popClip();
-        y += 44.0f;
+    static const char* const kGroupLabels[] = { "Files", "Chat", "Tools" };
+    static const char* const kGroupIds[] = { "drawer_group_files", "drawer_group_chat", "drawer_group_tools" };
+    std::vector<MenuEntry> groupSegs;
+    for (int g = 0; g < 3; ++g) {
+        std::string label = kGroupLabels[g];
+        if (g == 1 && unread > 0) label += " (" + std::to_string(unread) + ")";
+        const auto first = std::find_if(drawerTabs.begin(), drawerTabs.end(), [g](const DrawerTabDef& t) { return t.group == g; });
+        groupSegs.push_back({ kGroupIds[g], label, false, g == activeGroup ? std::function<void()>([]() {}) : pick(*first) });
     }
+    drawSegmented({ x, y, closeBtn.left - 10.0f, y + 32.0f }, groupSegs, activeGroup);
+    y += 42.0f;
+
+    float tabX = x;
+    for (const auto& t : drawerTabs) {
+        if (t.group != activeGroup) continue;
+        const bool on = t.tab == drawerTab_;
+        const float tw = canvas_->measureTextWidth(t.label, ui::FontRole::Small) + 20.0f;
+        const UiRect tr = { tabX, y, tabX + tw, y + 30.0f };
+        drawButton(t.id, tr, t.label, ui::Color{ 0, 0, 0, 0 }, COL_SEC_BTN_HV, on ? COL_TEXT_PRIMARY : COL_TEXT_SECONDARY,
+                   6.0f, pick(t), ui::FontRole::Small);
+        if (on) fillRoundRect({ tr.left + 8.0f, tr.bottom - 2.0f, tr.right - 8.0f, tr.bottom }, 1.0f, COL_PRIMARY_ACCENT);
+        tabX += tw + 4.0f;
+    }
+    fillRoundRect({ x, y + 30.0f, rx, y + 31.0f }, 0.0f, COL_BORDER);
+    y += 42.0f;
 
     if (drawerTab_ == DrawerTab::FilesAndClip) {
-        drawText("Drop files anywhere or use the actions below.",
-                 { x, y, rx, y + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
-        y += 24.0f;
-
-        float halfW = (rx - x - 8.0f) * 0.5f;
-        UiRect sendFileBtn = { x, y, x + halfW, y + 36.0f };
-        drawButton("drawer_send_file", sendFileBtn, "Send File...",
+        // The drop target leads: most sends start with a drag
+        const UiRect drop = { x, y, rx, y + 118.0f };
+        fillRoundRect(drop, 12.0f, COL_BG_SUBTLE);
+        strokeRoundRect(drop, 12.0f, COL_BORDER_ALT, 1.0f);
+        drawRailIcon(2, drop.centerX(), drop.top + 24.0f, COL_TEXT_SECONDARY);
+        drawText("Drop files anywhere to send them", { drop.left + 12.0f, drop.top + 40.0f, drop.right - 12.0f, drop.top + 60.0f },
+                 ui::FontRole::BodyBold, COL_TEXT_PRIMARY, ui::HAlign::Center);
+        const UiRect sendFileBtn = { drop.centerX() - 66.0f, drop.top + 72.0f, drop.centerX() + 66.0f, drop.top + 104.0f };
+        drawButton("drawer_send_file", sendFileBtn, "Choose files\xE2\x80\xA6",
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
                        openSendFileDialog();
                    }, ui::FontRole::Small);
+        y = drop.bottom + 8.0f;
 
-        UiRect openDirBtn = { sendFileBtn.right + 8.0f, y, rx, y + 36.0f };
-        drawButton("drawer_open_dir", openDirBtn, "Received Files",
-                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
-                       network_.fileTransferManager().openReceiveDirectoryInExplorer();
-                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
-        y += 44.0f;
-
-        UiRect openPlayerBtn = { x, y, rx, y + 34.0f };
-        drawButton("drawer_open_player", openPlayerBtn, "Recording Player...",
-                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
-                       openRecordingPlayer();
-                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
-        y += 42.0f;
-
-        UiRect syncClipBtn = { x, y, rx, y + 34.0f };
-        drawButton("drawer_sync_clip", syncClipBtn, "Sync Clipboard",
-                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
-                       network_.pushLocalClipboardNow();
-                       showToast("Clipboard synced");
-                   }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
-        y += 42.0f;
-        double activeBw = network_.fileTransferManager().aggregateActiveBandwidthBps();
-        std::string xferHeader = "TRANSFERS";
-        if (activeBw > 0.0) {
-            xferHeader += " • " + FileTransferItem::formatSpeed(activeBw);
+        // Less frequent actions stay one click away as quiet links
+        struct DrawerLink { const char* id; const char* label; std::function<void()> act; };
+        const DrawerLink links[] = {
+            { "drawer_open_dir", "Received files", [this]() { network_.fileTransferManager().openReceiveDirectoryInExplorer(); } },
+            { "drawer_sync_clip", "Send clipboard", [this]() {
+                network_.pushLocalClipboardNow();
+                showToast("Clipboard synced");
+            } },
+            { "drawer_open_player", "Recordings\xE2\x80\xA6", [this]() { openRecordingPlayer(); } },
+        };
+        float linkX = x - 8.0f;
+        for (const auto& l : links) {
+            const float lw = canvas_->measureTextWidth(l.label, ui::FontRole::Small) + 16.0f;
+            drawButton(l.id, { linkX, y, linkX + lw, y + 28.0f }, l.label, ui::Color{ 0, 0, 0, 0 }, COL_SEC_BTN_HV,
+                       COL_TEXT_ACCENT, 6.0f, l.act, ui::FontRole::Small);
+            linkX += lw + 2.0f;
         }
-        drawText(xferHeader, { x, y, rx - 60.0f, y + 18.0f }, ui::FontRole::Small, activeBw > 0.0 ? COL_PRIMARY_ACCENT : COL_TEXT_MUTED);
-        UiRect clrBtn = { rx - 56.0f, y - 2.0f, rx, y + 20.0f };
-        drawButton("drawer_clear_done", clrBtn, "Clear", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_SECONDARY, 6.0f, [this]() {
-            network_.fileTransferManager().clearCompleted();
-        }, ui::FontRole::Small);
-        y += 26.0f;
+        y += 40.0f;
 
         auto items = network_.fileTransferManager().snapshotTransfers();
+        const double activeBw = network_.fileTransferManager().aggregateActiveBandwidthBps();
+        std::string xferHeader = "Transfers";
+        if (activeBw > 0.0) xferHeader += " \xC2\xB7 " + FileTransferItem::formatSpeed(activeBw);
+        drawText(xferHeader, { x, y, rx - 60.0f, y + 20.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
+        const bool anyDone = std::any_of(items.begin(), items.end(), [](const FileTransferItem& it) { return it.status != TransferStatus::InProgress; });
+        if (anyDone) {
+            drawButton("drawer_clear_done", { rx - 52.0f, y - 3.0f, rx + 6.0f, y + 23.0f }, "Clear", ui::Color{ 0, 0, 0, 0 }, COL_SEC_BTN_HV,
+                       COL_TEXT_SECONDARY, 6.0f, [this]() { network_.fileTransferManager().clearCompleted(); }, ui::FontRole::Small);
+        }
+        y += 30.0f;
+
         if (items.empty()) {
-            drawText("No file transfers yet.", { x, y + 20.0f, rx, y + 50.0f },
+            drawText("Files you send or receive show up here.", { x, y + 12.0f, rx, y + 32.0f },
                      ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
         } else {
             for (size_t i = 0; i < items.size() && i < 16; ++i) {
-                if (y + 62.0f > r.bottom - 14.0f) break;
+                if (y + 52.0f > r.bottom - 14.0f) break;
                 const auto& it = items[i];
 
                 if (stepExp(transferProgSmooth_[i], std::clamp(it.progressFraction(), 0.0f, 1.0f), 18.0f, lastDt_)) {
                     inlineAnimActive_ = true;
                 }
+                const bool failed = it.status == TransferStatus::Failed || it.status == TransferStatus::Cancelled;
+                const bool done = it.status == TransferStatus::Completed;
+                const ui::Color tone = done ? COL_SUCCESS : failed ? COL_DANGER : COL_PRIMARY_ACCENT;
 
-                UiRect card = { x, y, rx, y + 56.0f };
-                fillRoundRect(card, 10.0f, COL_BG_SUBTLE);
-                strokeRoundRect(card, 10.0f, COL_BORDER);
+                // Direction badge: up for sent, down for received
+                const float bx = x + 16.0f, by = y + 20.0f;
+                canvas_->fillEllipse(bx, by, 16.0f, 16.0f, withAlpha(tone, 0.14f));
+                const float dir = it.isOutgoing ? -1.0f : 1.0f;
+                canvas_->drawLine(bx, by - 6.0f * dir, bx, by + 6.0f * dir, tone, 1.6f);
+                canvas_->drawLine(bx - 4.5f, by + 1.5f * dir, bx, by + 6.0f * dir, tone, 1.6f);
+                canvas_->drawLine(bx + 4.5f, by + 1.5f * dir, bx, by + 6.0f * dir, tone, 1.6f);
 
-                drawText(it.fileName, { card.left + 12.0f, card.top + 6.0f, card.right - 70.0f, card.top + 24.0f },
-                         ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
-                drawText(it.statusText, { card.left + 12.0f, card.top + 24.0f, card.right - 70.0f, card.top + 40.0f },
-                         ui::FontRole::Small, it.status == TransferStatus::Completed ? COL_SUCCESS :
-                                    (it.status == TransferStatus::Failed || it.status == TransferStatus::Cancelled) ? COL_DANGER : COL_PRIMARY_ACCENT);
+                const float textL = x + 42.0f, textR = rx - (it.status == TransferStatus::InProgress ? 66.0f : 0.0f);
+                drawText(it.fileName, { textL, y + 2.0f, textR, y + 20.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
+                drawText(it.statusText, { textL, y + 20.0f, textR, y + 36.0f }, ui::FontRole::Small, failed ? COL_DANGER : COL_TEXT_SECONDARY);
 
                 if (it.status == TransferStatus::InProgress) {
-                    uint32_t tid = it.transferId;
-                    UiRect cancelBtn = { card.right - 62.0f, card.top + 8.0f, card.right - 8.0f, card.top + 34.0f };
-                    drawButton("xfer_cancel_" + std::to_string(tid), cancelBtn, "Cancel",
-                               COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_PRIMARY, 6.5f, [this, tid]() {
+                    const uint32_t tid = it.transferId;
+                    drawButton("xfer_cancel_" + std::to_string(tid), { rx - 60.0f, y + 4.0f, rx, y + 30.0f }, "Cancel",
+                               ui::Color{ 0, 0, 0, 0 }, withAlpha(COL_DANGER, 0.12f), COL_TEXT_SECONDARY, 6.0f, [this, tid]() {
                                    network_.cancelFileTransfer(tid);
                                    showToast("Transfer cancelled");
-                               }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ON_ACCENT);
+                               }, ui::FontRole::Small, false, COL_BORDER, COL_DANGER);
                 }
-
-                UiRect progBg = { card.left + 12.0f, card.bottom - 10.0f, card.right - 12.0f, card.bottom - 5.5f };
-                fillRoundRect(progBg, 2.2f, COL_BORDER);
-                float fillW = progBg.width() * transferProgSmooth_[i];
-                if (fillW > 1.0f) {
-                    UiRect progFg = { progBg.left, progBg.top, progBg.left + fillW, progBg.bottom };
-                    fillRoundRect(progFg, 2.2f, it.status == TransferStatus::Completed ? COL_SUCCESS : COL_PRIMARY_ACCENT);
+                if (!done && !failed) {
+                    const UiRect progBg = { textL, y + 40.0f, rx, y + 43.0f };
+                    fillRoundRect(progBg, 1.5f, COL_BORDER);
+                    const float fillW = progBg.width() * transferProgSmooth_[i];
+                    if (fillW > 1.0f) fillRoundRect({ progBg.left, progBg.top, progBg.left + fillW, progBg.bottom }, 1.5f, tone);
                 }
-
-                y += 64.0f;
+                fillRoundRect({ textL, y + 50.0f, rx, y + 51.0f }, 0.0f, COL_BORDER);
+                y += 56.0f;
             }
         }
     } else if (drawerTab_ == DrawerTab::LiveChat) {
-        drawText("Messages",
-                 { x, y, rx, y + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
-        y += 24.0f;
-
         UiRect chatBox = { x, y, rx, r.bottom - 64.0f };
         fillRoundRect(chatBox, 11.0f, COL_BG_SUBTLE);
         strokeRoundRect(chatBox, 11.0f, COL_BORDER);
 
         auto msgs = network_.chatMessages();
+        const uint64_t chatPeerDesk = network_.viewerStats().state != ViewerConnectionState::Disconnected
+            ? network_.viewerStats().remoteDeskId : network_.hostSessionStatus().viewerDeskId;
         if (msgs.empty()) {
             drawText("No messages yet.",
                      { chatBox.left + 14.0f, chatBox.centerY() - 14.0f, chatBox.right - 14.0f, chatBox.centerY() + 14.0f },
@@ -4628,7 +4849,9 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
                 fillRoundRect(bubble, 9.5f, m.fromLocal ? COL_BG_CARD_ALT : COL_BG_CARD);
                 strokeRoundRect(bubble, 9.5f, m.fromLocal ? COL_BORDER_ALT : COL_BORDER);
 
-                drawText(m.senderName, { bubble.left + 10.0f, bubble.top + 4.0f, bubble.right - 10.0f, bubble.top + 20.0f },
+                const std::string sender = profile::splitWireName(m.senderName).name;
+                drawAvatar(bubble.left + 20.0f, bubble.top + 12.0f, 10.0f, m.fromLocal ? identity_.deskId() : chatPeerDesk, sender, 1.0f);
+                drawText(sender, { bubble.left + 36.0f, bubble.top + 4.0f, bubble.right - 10.0f, bubble.top + 20.0f },
                          ui::FontRole::Small, m.fromLocal ? COL_PRIMARY_ACCENT : COL_TEXT_ACCENT);
 
                 if (m.hasImage) {
@@ -4654,12 +4877,12 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
             canvas_->popClip();
         }
 
-        UiRect chatField = { x, r.bottom - 52.0f, rx - 114.0f, r.bottom - 14.0f };
+        UiRect chatField = { x, r.bottom - 52.0f, rx - 136.0f, r.bottom - 14.0f };
         drawTextField("field_chat_input", FocusedField::ChatInput, chatField,
                       chatInput_, "Message...", false);
 
-        UiRect clipImgBtn = { chatField.right + 4.0f, chatField.top, chatField.right + 40.0f, chatField.bottom };
-        drawButton("btn_send_img", clipImgBtn, "Pic",
+        UiRect clipImgBtn = { chatField.right + 6.0f, chatField.top, chatField.right + 64.0f, chatField.bottom };
+        drawButton("btn_send_img", clipImgBtn, "Image",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.5f, [this]() {
                        std::vector<uint8_t> jpeg;
                        uint32_t w = 0, h = 0;
@@ -4672,52 +4895,36 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
                        }
                    }, ui::FontRole::Small);
 
-        UiRect sendChatBtn = { clipImgBtn.right + 4.0f, chatField.top, rx, chatField.bottom };
+        UiRect sendChatBtn = { clipImgBtn.right + 6.0f, chatField.top, rx, chatField.bottom };
         drawButton("btn_send_chat", sendChatBtn, "Send",
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.5f, [this]() {
                        sendChatFromInput();
                    }, ui::FontRole::Small);
     } else if (drawerTab_ == DrawerTab::RemoteTerminal) {
-        drawText("Interactive Remote Host Console",
-                 { x, y, rx, y + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
-        y += 24.0f;
-
-        float qBtnW = (rx - x - 20.0f) / 5.0f;
-        UiRect b1 = { x, y, x + qBtnW, y + 26.0f };
-        UiRect b2 = { b1.right + 5.0f, y, b1.right + 5.0f + qBtnW, y + 26.0f };
-        UiRect b3 = { b2.right + 5.0f, y, b2.right + 5.0f + qBtnW, y + 26.0f };
-        UiRect b4 = { b3.right + 5.0f, y, b3.right + 5.0f + qBtnW, y + 26.0f };
-        UiRect b5 = { b4.right + 5.0f, y, rx, y + 26.0f };
-
-        drawButton("term_ipconfig", b1, "ipconfig", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
-            network_.sendTerminalCommand("ipconfig");
-        }, ui::FontRole::Small, true, COL_BORDER);
-
-        drawButton("term_tasklist", b2, "tasklist", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
-            network_.sendTerminalCommand("tasklist");
-        }, ui::FontRole::Small, true, COL_BORDER);
-
-        drawButton("term_netstat", b3, "netstat", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
-            network_.sendTerminalCommand("netstat -ano");
-        }, ui::FontRole::Small, true, COL_BORDER);
-
-        drawButton("term_whoami", b4, "whoami", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
-            network_.sendTerminalCommand("whoami");
-        }, ui::FontRole::Small, true, COL_BORDER);
-
-        drawButton("term_clear", b5, "Clear", COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_SECONDARY, 6.0f, [this]() {
-            network_.clearTerminalScrollback();
-        }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0}, COL_TEXT_ON_ACCENT);
-
-        y += 32.0f;
+        // Quick commands as chips sized to their text; Clear sits apart on the right
+        struct QuickCmd { const char* id; const char* label; const char* cmd; };
+        static const QuickCmd kQuick[] = {
+            { "term_ipconfig", "ipconfig", "ipconfig" }, { "term_tasklist", "tasklist", "tasklist" },
+            { "term_netstat", "netstat", "netstat -ano" }, { "term_whoami", "whoami", "whoami" },
+        };
+        float chipX = x;
+        for (const auto& q : kQuick) {
+            const float cw = canvas_->measureTextWidth(q.label, ui::FontRole::Small) + 22.0f;
+            drawButton(q.id, { chipX, y, chipX + cw, y + 28.0f }, q.label, COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 14.0f,
+                       [this, cmd = q.cmd]() { network_.sendTerminalCommand(cmd); }, ui::FontRole::Small, true, COL_BORDER);
+            chipX += cw + 6.0f;
+        }
+        drawButton("term_clear", { rx - 54.0f, y, rx, y + 28.0f }, "Clear", ui::Color{ 0, 0, 0, 0 }, COL_SEC_BTN_HV, COL_TEXT_SECONDARY, 6.0f,
+                   [this]() { network_.clearTerminalScrollback(); }, ui::FontRole::Small);
+        y += 38.0f;
 
         UiRect termBox = { x, y, rx, r.bottom - 64.0f };
-        fillRoundRect(termBox, 11.0f, rgba(12, 16, 24, 0.95f));
+        fillRoundRect(termBox, 11.0f, rgba(30, 26, 23, 1.0f));   // espresso console in both themes
         strokeRoundRect(termBox, 11.0f, COL_BORDER);
 
         auto lines = network_.getTerminalScrollback();
         if (lines.empty()) {
-            drawText("Host console ready. Type commands below or click quick actions.",
+            drawText("Run a command on the remote desk.",
                      { termBox.left + 14.0f, termBox.centerY() - 14.0f, termBox.right - 14.0f, termBox.centerY() + 14.0f },
                      ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
         } else {
@@ -4735,7 +4942,7 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
                 UiRect lr = { termBox.left + 10.0f, ly, termBox.right - 10.0f, ly + lineH };
                 ui::Color lineCol = (lines[i].rfind("> ", 0) == 0)
                     ? COL_PRIMARY_ACCENT
-                    : rgba(140, 235, 175, 0.95f);
+                    : rgba(232, 222, 208, 0.95f);
                 drawText(lines[i], lr, ui::FontRole::Mono, lineCol, ui::HAlign::Leading);
                 ly += lineH;
             }
@@ -5010,20 +5217,16 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
     } else if (drawerTab_ == DrawerTab::FileManager) {
         drawFileManagerDrawer({ x, y, rx, r.bottom - 16.0f });
     } else if (drawerTab_ == DrawerTab::ClipboardHistory) {
-        drawText("In-Session Clipboard History Hub",
-                 { x, y, rx, y + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
-        y += 24.0f;
-
-        UiRect searchField = { x, y, rx - 72.0f, y + 32.0f };
+        UiRect searchField = { x, y, rx - 66.0f, y + 32.0f };
         drawTextField("field_clip_search", FocusedField::ClipboardSearch, searchField,
-                      clipSearchQuery_, "Search history...", false);
+                      clipSearchQuery_, "Search copied text", false);
 
         UiRect clearBtn = { searchField.right + 6.0f, y, rx, y + 32.0f };
         drawButton("btn_clip_clear", clearBtn, "Clear",
-                   COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_SECONDARY, 7.5f, [this]() {
+                   ui::Color{ 0, 0, 0, 0 }, withAlpha(COL_DANGER, 0.12f), COL_TEXT_SECONDARY, 7.5f, [this]() {
                        network_.clipboardManager().history().clear();
                        showToast("Clipboard history cleared");
-                   }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0}, COL_TEXT_ON_ACCENT);
+                   }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0}, COL_DANGER);
 
         y += 40.0f;
 
@@ -5033,7 +5236,7 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
 
         auto histItems = network_.clipboardManager().history().search(clipSearchQuery_);
         if (histItems.empty()) {
-            drawText("No clipboard history yet.",
+            drawText("Text you copy during a session shows up here.",
                      { listBox.left + 14.0f, listBox.centerY() - 14.0f, listBox.right - 14.0f, listBox.centerY() + 14.0f },
                      ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
         } else {
@@ -5055,20 +5258,12 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
                 // Type badge pill
                 float bx = card.left + 8.0f;
                 UiRect badgeRect = { bx, card.top + 6.0f, bx + 42.0f, card.top + 22.0f };
-                ui::Color badgeBg = (item.typeBadge == "URL") ? rgba(0, 122, 255, 0.25f) :
-                                       (item.typeBadge == "Code") ? rgba(175, 82, 222, 0.25f) :
-                                       (item.typeBadge == "Path") ? rgba(52, 199, 89, 0.25f) :
-                                       rgba(142, 142, 147, 0.25f);
-                ui::Color badgeFg = (item.typeBadge == "URL") ? COL_PRIMARY_ACCENT :
-                                       (item.typeBadge == "Code") ? rgba(191, 90, 242, 1.0f) :
-                                       (item.typeBadge == "Path") ? COL_SUCCESS :
-                                       COL_TEXT_SECONDARY;
-                fillRoundRect(badgeRect, 4.0f, badgeBg);
-                drawText(item.typeBadge, badgeRect, ui::FontRole::Small, badgeFg, ui::HAlign::Center);
+                fillRoundRect(badgeRect, 4.0f, COL_BG_SUBTLE);
+                drawText(item.typeBadge, badgeRect, ui::FontRole::Small, COL_TEXT_SECONDARY, ui::HAlign::Center);
 
                 // Origin & chars
                 char metaStr[64];
-                std::snprintf(metaStr, sizeof(metaStr), "%s - %zu chars",
+                std::snprintf(metaStr, sizeof(metaStr), "%s \xC2\xB7 %zu characters",
                               item.isFromRemote ? "Remote" : "Local", item.charCount);
                 drawText(metaStr, { badgeRect.right + 8.0f, card.top + 6.0f, card.right - 90.0f, card.top + 22.0f },
                          ui::FontRole::Small, COL_TEXT_MUTED);
@@ -5077,7 +5272,7 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
                 uint32_t iid = item.id;
                 UiRect copyBtn = { card.right - 82.0f, card.top + 6.0f, card.right - 36.0f, card.top + 26.0f };
                 drawButton("clip_copy_" + std::to_string(iid), copyBtn, "Copy",
-                           COL_SEC_BTN_BG, COL_PRIMARY_ACCENT, COL_TEXT_PRIMARY, 5.0f, [this, iid]() {
+                           COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 5.0f, [this, iid]() {
                                if (network_.clipboardManager().history().copyItemToClipboard(iid)) {
                                    showToast("Copied to clipboard");
                                }
@@ -5085,8 +5280,8 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
 
                 // Delete button
                 UiRect delBtn = { card.right - 30.0f, card.top + 6.0f, card.right - 6.0f, card.top + 26.0f };
-                drawButton("clip_del_" + std::to_string(iid), delBtn, "X",
-                           COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_MUTED, 5.0f, [this, iid]() {
+                drawButton("clip_del_" + std::to_string(iid), delBtn, "\xC3\x97",
+                           ui::Color{ 0, 0, 0, 0 }, withAlpha(COL_DANGER, 0.12f), COL_TEXT_MUTED, 5.0f, [this, iid]() {
                                network_.clipboardManager().history().deleteItem(iid);
                            }, ui::FontRole::Small);
 
@@ -5100,46 +5295,32 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
     } else if (drawerTab_ == DrawerTab::Sync) {
         drawSyncDrawer({ x, y, rx, r.bottom - 16.0f });
     } else if (drawerTab_ == DrawerTab::Notes) {
-        drawText("Collaborative Dual-Peer Real-Time Scratchpad",
-                 { x, y, rx, y + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
-        y += 24.0f;
-
-        // Diagnostic quick snippets toolbar
-        float snipW = (rx - x - 12.0f) / 3.0f;
-        UiRect btnInfo = { x, y, x + snipW, y + 26.0f };
-        UiRect btnSec  = { btnInfo.right + 6.0f, y, btnInfo.right + 6.0f + snipW, y + 26.0f };
-        UiRect btnTime = { btnSec.right + 6.0f, y, rx, y + 26.0f };
-
-        drawButton("btn_snip_info", btnInfo, "+ Host Info",
-                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
-                       auto s = network_.viewerStats();
-                       std::string snip = ScratchpadManager::generateSnippet("host", static_cast<uint32_t>(s.remoteDeskId), s.remoteHostname);
-                       scratchpadTextEdit_ += snip;
-                       network_.sendScratchpadText(scratchpadTextEdit_);
-                   }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
-
-        drawButton("btn_snip_sec", btnSec, "+ Security",
-                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
-                       std::string snip = ScratchpadManager::generateSnippet("security");
-                       scratchpadTextEdit_ += snip;
-                       network_.sendScratchpadText(scratchpadTextEdit_);
-                   }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
-
-        drawButton("btn_snip_time", btnTime, "+ Timestamp",
-                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this]() {
-                       std::string snip = ScratchpadManager::generateSnippet("timestamp");
-                       scratchpadTextEdit_ += snip;
-                       network_.sendScratchpadText(scratchpadTextEdit_);
-                   }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
-
-        y += 32.0f;
+        // Snippets as chips sized to their text
+        struct Snip { const char* id; const char* label; const char* kind; };
+        static const Snip kSnips[] = {
+            { "btn_snip_info", "+ Host info", "host" }, { "btn_snip_sec", "+ Security", "security" }, { "btn_snip_time", "+ Timestamp", "timestamp" },
+        };
+        float snipX = x;
+        for (const auto& sn : kSnips) {
+            const float sw = canvas_->measureTextWidth(sn.label, ui::FontRole::Small) + 24.0f;
+            drawButton(sn.id, { snipX, y, snipX + sw, y + 28.0f }, sn.label, COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 14.0f,
+                       [this, kind = std::string(sn.kind)]() {
+                           const auto s = network_.viewerStats();
+                           scratchpadTextEdit_ += kind == "host"
+                               ? ScratchpadManager::generateSnippet("host", static_cast<uint32_t>(s.remoteDeskId), s.remoteHostname)
+                               : ScratchpadManager::generateSnippet(kind);
+                           network_.sendScratchpadText(scratchpadTextEdit_);
+                       }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
+            snipX += sw + 6.0f;
+        }
+        y += 38.0f;
 
         // Status metadata bar
         uint64_t rev = network_.scratchpadManager().getRevision();
         uint32_t lastEd = network_.scratchpadManager().getLastEditor();
-        std::string metaStr = "Revision #" + std::to_string(rev);
+        std::string metaStr = "Revision " + std::to_string(rev);
         if (lastEd > 0) {
-            metaStr += " - Last edit by Desk: " + std::to_string(lastEd);
+            metaStr += " \xC2\xB7 last edit by " + CryptoUtils::formatDeskId(lastEd);
         }
         drawText(metaStr, { x, y, rx, y + 16.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
         y += 20.0f;
@@ -5154,17 +5335,17 @@ void AppUi::drawFileTransferDrawer(const UiRect& bounds, float slideProgress) {
             focusedField_ = FocusedField::ScratchpadText;
         }, true });
 
-        std::string displayText = scratchpadTextEdit_.empty() ? "Type shared notes here in real time with peer..." : scratchpadTextEdit_;
+        std::string displayText = scratchpadTextEdit_.empty() ? "Shared notes. Both desks see every edit as it happens." : scratchpadTextEdit_;
         ui::Color textCol = scratchpadTextEdit_.empty() ? COL_TEXT_MUTED : COL_TEXT_PRIMARY;
         drawText(displayText, { textBox.left + 8.0f, textBox.top + 8.0f, textBox.right - 8.0f, textBox.bottom - 8.0f },
                  ui::FontRole::Small, textCol, ui::HAlign::Leading, ui::VAlign::Top);
 
         // Clear button
         UiRect clrBtn = { rx - 70.0f, r.bottom - 40.0f, rx, r.bottom - 12.0f };
-        drawButton("btn_scratch_clear", clrBtn, "Clear", COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_SECONDARY, 6.0f, [this]() {
+        drawButton("btn_scratch_clear", clrBtn, "Clear", ui::Color{ 0, 0, 0, 0 }, withAlpha(COL_DANGER, 0.12f), COL_TEXT_SECONDARY, 6.0f, [this]() {
             scratchpadTextEdit_.clear();
             network_.sendScratchpadText("");
-        }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0}, COL_TEXT_ON_ACCENT);
+        }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0}, COL_DANGER);
     }
 }
 
@@ -5173,70 +5354,54 @@ void AppUi::drawSyncDrawer(const UiRect& contentRect) {
     float rx = contentRect.right;
     float y = contentRect.top;
 
-    drawText("Synchronize local and remote folder directories.",
+    drawText("Keep a folder here and one on the remote desk the same.",
              { x, y, rx, y + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     y += 22.0f;
 
     // 1. Local Folder Input
-    drawText("LOCAL FOLDER", { x, y, rx, y + 14.0f }, ui::FontRole::Small, COL_TEXT_ACCENT);
-    y += 16.0f;
+    drawText("Folder on this desk", { x, y, rx, y + 14.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+    y += 18.0f;
     float browseW = 68.0f;
     UiRect localFieldRect = { x, y, rx - browseW - 6.0f, y + 30.0f };
     drawTextField("sync_local_path", FocusedField::SyncLocalPath, localFieldRect,
                   syncLocalPathEdit_, "C:/local/folder/path", false);
 
     UiRect browseBtnRect = { rx - browseW, y, rx, y + 30.0f };
-    drawButton("sync_browse_btn", browseBtnRect, "Browse...",
+    drawButton("sync_browse_btn", browseBtnRect, "Browse\xE2\x80\xA6",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 7.0f, [this]() {
                    openPickFolderDialog(syncLocalPathEdit_);
                }, ui::FontRole::Small, true, COL_BORDER, COL_PRIMARY_ACCENT);
     y += 36.0f;
 
     // 2. Remote Folder Input
-    drawText("REMOTE FOLDER", { x, y, rx, y + 14.0f }, ui::FontRole::Small, COL_TEXT_ACCENT);
-    y += 16.0f;
+    drawText("Folder on the remote desk", { x, y, rx, y + 14.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+    y += 18.0f;
     UiRect remoteFieldRect = { x, y, rx, y + 30.0f };
     drawTextField("sync_remote_path", FocusedField::SyncRemotePath, remoteFieldRect,
                   syncRemotePathEdit_, "C:/remote/sync/path", false);
     y += 36.0f;
 
     // 3. Sync Mode Segmented Selector (Push, Pull, Two-Way)
-    drawText("SYNC MODE", { x, y, rx, y + 14.0f }, ui::FontRole::Small, COL_TEXT_ACCENT);
-    y += 16.0f;
-    float modeW = (rx - x - 8.0f) / 3.0f;
-    UiRect modePush = { x, y, x + modeW, y + 28.0f };
-    UiRect modePull = { modePush.right + 4.0f, y, modePush.right + 4.0f + modeW, y + 28.0f };
-    UiRect modeTwoWay = { modePull.right + 4.0f, y, rx, y + 28.0f };
-
-    bool isPush = (syncSelectedMode_ == SyncMode::PushMirror);
-    bool isPull = (syncSelectedMode_ == SyncMode::PullMirror);
-    bool isTwoWay = (syncSelectedMode_ == SyncMode::TwoWay);
-
-    drawButton("sync_mode_push", modePush, "Push (->)",
-               isPush ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-               isPush ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-               isPush ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-               6.5f, [this]() { syncSelectedMode_ = SyncMode::PushMirror; },
-               ui::FontRole::Small, !isPush, COL_BORDER, isPush ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-    drawButton("sync_mode_pull", modePull, "Pull (<-)",
-               isPull ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-               isPull ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-               isPull ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-               6.5f, [this]() { syncSelectedMode_ = SyncMode::PullMirror; },
-               ui::FontRole::Small, !isPull, COL_BORDER, isPull ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-
-    drawButton("sync_mode_twoway", modeTwoWay, "Two-Way (<->)",
-               isTwoWay ? COL_PRIMARY_ACCENT : COL_SEC_BTN_BG,
-               isTwoWay ? COL_PRIMARY_ACCENT_HV : COL_SEC_BTN_HV,
-               isTwoWay ? COL_TEXT_ON_ACCENT : COL_TEXT_PRIMARY,
-               6.5f, [this]() { syncSelectedMode_ = SyncMode::TwoWay; },
-               ui::FontRole::Small, !isTwoWay, COL_BORDER, isTwoWay ? COL_TEXT_ON_ACCENT : COL_TEXT_ACCENT);
-    y += 34.0f;
+    drawText("Direction", { x, y, rx, y + 14.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+    y += 18.0f;
+    struct ModeDef { const char* id; const char* label; SyncMode mode; };
+    static const ModeDef kModes[] = {
+        { "sync_mode_push", "Push \xE2\x86\x92", SyncMode::PushMirror },
+        { "sync_mode_pull", "Pull \xE2\x86\x90", SyncMode::PullMirror },
+        { "sync_mode_twoway", "Two-way \xE2\x86\x94", SyncMode::TwoWay },
+    };
+    std::vector<MenuEntry> modeSegs;
+    int modeOn = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (syncSelectedMode_ == kModes[i].mode) modeOn = i;
+        modeSegs.push_back({ kModes[i].id, kModes[i].label, false, [this, m = kModes[i].mode]() { syncSelectedMode_ = m; } });
+    }
+    drawSegmented({ x, y, rx, y + 32.0f }, modeSegs, modeOn);
+    y += 40.0f;
 
     // 4. Purge Toggle
     drawToggleSwitch("sync_purge_toggle", { x, y, rx, y + 24.0f },
-                     syncMirrorPurgeChoice_, "Purge remote orphaned items", [this]() {
+                     syncMirrorPurgeChoice_, "Remove files missing from the source", [this]() {
                          syncMirrorPurgeChoice_ = !syncMirrorPurgeChoice_;
                      });
     y += 30.0f;
@@ -5253,7 +5418,7 @@ void AppUi::drawSyncDrawer(const UiRect& contentRect) {
     UiRect btnScan = { x, y, x + actW, y + 30.0f };
     UiRect btnAction = { btnScan.right + 8.0f, y, rx, y + 30.0f };
 
-    drawButton("sync_btn_scan", btnScan, scanBusy ? "Scanning..." : "Scan / Compare",
+    drawButton("sync_btn_scan", btnScan, scanBusy ? "Scanning\xE2\x80\xA6" : "Preview changes",
                COL_SEC_BTN_BG, scanBusy ? COL_SEC_BTN_BG : COL_SEC_BTN_HV,
                scanBusy ? COL_TEXT_MUTED : COL_TEXT_PRIMARY, 7.5f, [this, scanBusy]() {
                    if (scanBusy) return;
@@ -5272,16 +5437,16 @@ void AppUi::drawSyncDrawer(const UiRect& contentRect) {
                        localSyncScanRunning_.store(false);
                    });
                    showToast("Scanning folder trees...");
-               }, ui::FontRole::Small, true, COL_BORDER, scanBusy ? COL_TEXT_MUTED : COL_PRIMARY_ACCENT);
+               }, ui::FontRole::Small, true, COL_BORDER, scanBusy ? COL_TEXT_MUTED : COL_TEXT_ACCENT);
 
     if (isRunning) {
-        drawButton("sync_btn_cancel", btnAction, "Cancel Sync",
+        drawButton("sync_btn_cancel", btnAction, "Cancel sync",
                    COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_PRIMARY, 7.5f, [this]() {
                        network_.cancelFolderSync();
                        showToast("Folder sync cancelled");
                    }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ON_ACCENT);
     } else {
-        drawButton("sync_btn_start", btnAction, "Start Sync",
+        drawButton("sync_btn_start", btnAction, "Start sync",
                    COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 7.5f, [this]() {
                        if (syncLocalPathEdit_.empty() || syncRemotePathEdit_.empty()) {
                            showToast("Enter both local and remote folders", true);
@@ -5297,13 +5462,13 @@ void AppUi::drawSyncDrawer(const UiRect& contentRect) {
     // 6. Status and Telemetry Bar
     std::string stateStr;
     switch (status.state) {
-        case SyncState::Scanning: stateStr = "Scanning trees..."; break;
-        case SyncState::Comparing: stateStr = "Comparing differential trees..."; break;
-        case SyncState::Transferring: stateStr = "Transferring delta blocks..."; break;
-        case SyncState::Completed: stateStr = "Sync Completed Successfully"; break;
-        case SyncState::Failed: stateStr = "Sync Failed: " + status.errorMessage; break;
-        case SyncState::Cancelled: stateStr = "Sync Cancelled"; break;
-        default: stateStr = "Idle"; break;
+        case SyncState::Scanning: stateStr = "Scanning folders\xE2\x80\xA6"; break;
+        case SyncState::Comparing: stateStr = "Comparing folders\xE2\x80\xA6"; break;
+        case SyncState::Transferring: stateStr = "Copying changes\xE2\x80\xA6"; break;
+        case SyncState::Completed: stateStr = "Sync complete"; break;
+        case SyncState::Failed: stateStr = "Sync failed: " + status.errorMessage; break;
+        case SyncState::Cancelled: stateStr = "Sync cancelled"; break;
+        default: stateStr = "Ready"; break;
     }
 
     ui::Color statusCol = (status.state == SyncState::Completed) ? COL_SUCCESS :
@@ -5320,7 +5485,7 @@ void AppUi::drawSyncDrawer(const UiRect& contentRect) {
     progress = std::clamp(progress, 0.0f, 1.0f);
 
     UiRect progBg = { x, y, rx, y + 6.0f };
-    fillRoundRect(progBg, 3.0f, rgba(255, 255, 255, 0.08f));
+    fillRoundRect(progBg, 3.0f, COL_BORDER);
     if (progress > 0.001f) {
         UiRect progFg = { x, y, x + (rx - x) * progress, y + 6.0f };
         fillRoundRect(progFg, 3.0f, COL_PRIMARY_ACCENT);
@@ -5332,16 +5497,16 @@ void AppUi::drawSyncDrawer(const UiRect& contentRect) {
     double mbDone = static_cast<double>(status.bytesTransferred) / (1024.0 * 1024.0);
     double mbTotal = static_cast<double>(status.totalBytes) / (1024.0 * 1024.0);
     double kbSec = static_cast<double>(status.bytesPerSec) / 1024.0;
-    std::snprintf(statBuf, sizeof(statBuf), "Files: %u / %u  •  %.1f / %.1f MB  •  %.0f KB/s",
+    std::snprintf(statBuf, sizeof(statBuf), "%u of %u files \xC2\xB7 %.1f of %.1f MB \xC2\xB7 %.0f KB/s",
                   status.filesCompleted, status.totalFiles, mbDone, mbTotal, kbSec);
     drawText(statBuf, { x, y, rx, y + 14.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
     y += 20.0f;
 
     // 7. Diff Actions List
     auto diffPlan = syncMgr.currentDiffPlan();
-    std::string planHeader = "PLANNED ACTIONS (" + std::to_string(diffPlan.size()) + ")";
-    drawText(planHeader, { x, y, rx, y + 14.0f }, ui::FontRole::Small, COL_TEXT_ACCENT);
-    y += 18.0f;
+    std::string planHeader = "Planned changes (" + std::to_string(diffPlan.size()) + ")";
+    drawText(planHeader, { x, y, rx, y + 20.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
+    y += 26.0f;
 
     float listBottom = contentRect.bottom;
     if (listBottom > y + 40.0f) {
@@ -5350,7 +5515,7 @@ void AppUi::drawSyncDrawer(const UiRect& contentRect) {
         strokeRoundRect(listBox, 8.0f, COL_BORDER);
 
         if (diffPlan.empty()) {
-            drawText("No pending synchronization actions.",
+            drawText("Preview changes to see what a sync would do.",
                      listBox, ui::FontRole::Small, COL_TEXT_MUTED,
                      ui::HAlign::Center, ui::VAlign::Center);
         } else {
@@ -5377,24 +5542,24 @@ void AppUi::drawSyncDrawer(const UiRect& contentRect) {
                 switch (item.action) {
                     case SyncActionType::CreateDir:
                         badge = "DIR";
-                        badgeBg = rgba(52, 199, 89, 0.22f);
+                        badgeBg = withAlpha(COL_SUCCESS, 0.14f);
                         badgeFg = COL_SUCCESS;
                         break;
                     case SyncActionType::DeleteFile:
                     case SyncActionType::DeleteDir:
                         badge = "DEL";
-                        badgeBg = rgba(255, 59, 48, 0.22f);
+                        badgeBg = withAlpha(COL_DANGER, 0.14f);
                         badgeFg = COL_DANGER;
                         break;
                     case SyncActionType::RequestFile:
                         badge = "PULL";
-                        badgeBg = rgba(50, 173, 230, 0.22f);
-                        badgeFg = rgba(50, 173, 230, 1.0f);
+                        badgeBg = COL_BG_CARD_ALT;
+                        badgeFg = COL_TEXT_ACCENT;
                         break;
                     default:
                         badge = "PUSH";
-                        badgeBg = rgba(0, 122, 255, 0.22f);
-                        badgeFg = COL_PRIMARY_ACCENT;
+                        badgeBg = withAlpha(COL_PRIMARY_ACCENT, 0.14f);
+                        badgeFg = COL_TEXT_ACCENT;
                         break;
                 }
 
@@ -5441,10 +5606,10 @@ void AppUi::drawIncomingApprovalModal(float width, float height, float modalProg
     // A host whose macOS permissions are off says so before it accepts: the other person would see nothing.
     const ui::HostPermissionCard permCard = hostPermissionsActive() ? hostPermissionCard() : ui::HostPermissionCard{};
     float mw = 440.0f;
-    float mh = 326.0f + (permCard.approvalWarning.empty() ? 0.0f : 52.0f);
+    float mh = 276.0f + (permCard.approvalWarning.empty() ? 0.0f : 52.0f);
     UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
 
-    float scale = 0.88f + 0.12f * modalProgress;
+    float scale = 0.95f + 0.05f * modalProgress;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 20.0f, alpha);
@@ -5456,14 +5621,19 @@ void AppUi::drawIncomingApprovalModal(float width, float height, float modalProg
     float mrx = modal.right - 26.0f;
     float my = modal.top + 24.0f;
 
-    drawText("Connection Request", { mx, my, mrx, my + 28.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    const std::string callerName = profile::splitWireName(req.callerHostname).name;
+    // The picture is only the caller's while the request is open; the request keeps it after a decision
+    const std::vector<uint8_t>& callerPic = req.active ? req.callerPicture : snapshotCallerPicture_;
+    drawAvatar(mx + 22.0f, my + 27.0f, 22.0f, req.callerDeskId, callerName, alpha, &callerPic);
+    drawText("Someone wants to connect", { mx + 56.0f, my, mrx, my + 28.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
     my += 30.0f;
 
-    std::string callerLine = req.callerHostname + " (" + CryptoUtils::formatDeskId(req.callerDeskId) + ")";
-    drawText(callerLine, { mx, my, mrx, my + 24.0f }, ui::FontRole::Subheading, COL_PRIMARY_ACCENT);
+    const std::string callerId = CryptoUtils::formatDeskId(req.callerDeskId);
+    const std::string callerLine = callerName.empty() ? "Desk " + callerId : callerName + " \xC2\xB7 " + callerId;
+    drawText(callerLine, { mx + 56.0f, my, mrx, my + 24.0f }, ui::FontRole::Subheading, COL_TEXT_PRIMARY);
     my += 24.0f;
 
-    drawText("Wants to connect to your desktop.",
+    drawText("They will see your screen. Choose what else they can do.",
              { mx, my, mrx, my + 20.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 28.0f;
 
@@ -5539,8 +5709,9 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
 
     std::string peerTitle = stats.remoteHostname.empty()
         ? CryptoUtils::formatDeskId(stats.remoteDeskId)
-        : stats.remoteHostname;
-    drawText(peerTitle, { curX, pillTop, curX + 130.0f, pillBottom }, ui::FontRole::Small, COL_TEXT_PRIMARY);
+        : profile::splitWireName(stats.remoteHostname).name;
+    drawAvatar(curX + 9.0f, pillRect.centerY(), 9.0f, stats.remoteDeskId, peerTitle, 1.0f);
+    drawText(peerTitle, { curX + 22.0f, pillTop, curX + 130.0f, pillBottom }, ui::FontRole::Small, COL_TEXT_PRIMARY);
     curX += 136.0f;
 
     // 1. Display Switcher
@@ -5790,7 +5961,7 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
         float dropH = count * itemH + 16.0f + bottomAddH;
         float dropW = 280.0f;
         UiRect baseDropRect = { monBtn.left - 30.0f, pillBottom + 6.0f, monBtn.left - 30.0f + dropW, pillBottom + 6.0f + dropH };
-        UiRect dropRect = UiPlatform::computeSpringRect(baseDropRect, displayMenuAnimT_, 0.0f);
+        UiRect dropRect = UiPlatform::popoverRect(baseDropRect, displayMenuAnimT_, baseDropRect.centerX(), baseDropRect.top);
         drawCardShadow(dropRect, 14.0f, 0.95f * menuAlpha);
         fillRoundRect(dropRect, 14.0f, withAlpha(COL_BG_CARD, 0.98f * menuAlpha));
         strokeRoundRect(dropRect, 14.0f, withAlpha(COL_BORDER, menuAlpha), 1.2f);
@@ -5924,7 +6095,7 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
         float itemH = 32.0f;
         float dropH = 4 * itemH + 16.0f;
         UiRect baseDropRect = { adminBtn.left - 20.0f, pillBottom + 6.0f, adminBtn.left + 210.0f, pillBottom + 6.0f + dropH };
-        UiRect dropRect = UiPlatform::computeSpringRect(baseDropRect, adminMenuAnimT_, 0.0f);
+        UiRect dropRect = UiPlatform::popoverRect(baseDropRect, adminMenuAnimT_, baseDropRect.centerX(), baseDropRect.top);
         drawCardShadow(dropRect, 14.0f, 0.95f * menuAlpha);
         fillRoundRect(dropRect, 14.0f, withAlpha(COL_BG_CARD, 0.98f * menuAlpha));
         strokeRoundRect(dropRect, 14.0f, withAlpha(COL_BORDER, menuAlpha), 1.2f);
@@ -5974,7 +6145,7 @@ void AppUi::drawDynamicIslandToolbar(float width, float height) {
         float itemH = 30.0f;
         float dropH = 8 * itemH + 20.0f;
         UiRect baseDropRect = { qualBtn.left - 40.0f, pillBottom + 6.0f, qualBtn.left + 220.0f, pillBottom + 6.0f + dropH };
-        UiRect dropRect = UiPlatform::computeSpringRect(baseDropRect, qualityMenuAnimT_, 0.0f);
+        UiRect dropRect = UiPlatform::popoverRect(baseDropRect, qualityMenuAnimT_, baseDropRect.centerX(), baseDropRect.top);
         drawCardShadow(dropRect, 14.0f, 0.95f * menuAlpha);
         fillRoundRect(dropRect, 14.0f, withAlpha(COL_BG_CARD, 0.98f * menuAlpha));
         strokeRoundRect(dropRect, 14.0f, withAlpha(COL_BORDER, menuAlpha), 1.2f);
@@ -6132,7 +6303,7 @@ void AppUi::drawShortcutsModal(float width, float height, float modalProgress) {
 
     clickRegions_.push_back({ modal, "modal_sc_absorb", []() {}, false });
 
-    float scale = 0.90f + 0.10f * modalProgress;
+    float scale = 0.95f + 0.05f * modalProgress;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 20.0f, alpha);
@@ -6141,7 +6312,7 @@ void AppUi::drawShortcutsModal(float width, float height, float modalProgress) {
     float mrx = modal.right - 28.0f;
     float my = modal.top + 24.0f;
 
-    drawText("Keyboard Shortcuts", { mx, my, mrx - 40.0f, my + 28.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    drawText("Keyboard shortcuts", { mx, my, mrx - 40.0f, my + 28.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
 
     UiRect closeBtn = { mrx - 28.0f, my, mrx, my + 28.0f };
     drawButton("modal_sc_close", closeBtn, "×",
@@ -6149,7 +6320,7 @@ void AppUi::drawShortcutsModal(float width, float height, float modalProgress) {
                [this]() { showShortcutsModal_ = false; }, ui::FontRole::Heading);
     my += 38.0f;
 
-    drawText("Speed up remote navigation and desktop control with global hotkeys.",
+    drawText("Work faster in a session.",
              { mx, my, mrx, my + 20.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 26.0f;
 
@@ -6186,7 +6357,7 @@ void AppUi::drawShortcutsModal(float width, float height, float modalProgress) {
     }
 
     my += 8.0f;
-    drawText("Tip: In Fullscreen, move your mouse to the top edge to reveal the Dynamic Island.",
+    drawText("In full screen, move the pointer to the top edge to show the session bar.",
              { mx, my, mrx, my + 20.0f }, ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
 
     canvas_->setTransform(ui::Transform2D::identity());
@@ -6209,7 +6380,7 @@ void AppUi::drawPortForwardModal(float width, float height, float modalProgress)
 
     clickRegions_.push_back({ modal, "modal_pf_absorb", []() {}, false });
 
-    float scale = 0.90f + 0.10f * modalProgress;
+    float scale = 0.95f + 0.05f * modalProgress;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 20.0f, alpha);
@@ -6218,7 +6389,7 @@ void AppUi::drawPortForwardModal(float width, float height, float modalProgress)
     float mrx = modal.right - 28.0f;
     float my = modal.top + 22.0f;
 
-    drawText("TCP Port Forwarding & Tunneling", { mx, my, mrx - 40.0f, my + 28.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    drawText("Port forwarding", { mx, my, mrx - 40.0f, my + 28.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
 
     UiRect closeBtn = { mrx - 28.0f, my, mrx, my + 28.0f };
     drawButton("modal_pf_close", closeBtn, "×",
@@ -6226,12 +6397,12 @@ void AppUi::drawPortForwardModal(float width, float height, float modalProgress)
                [this]() { showPortForwardModal_ = false; }, ui::FontRole::Heading);
     my += 34.0f;
 
-    drawText("Forward local network ports securely to services on the remote PC.",
+    drawText("Reach a service on the remote desk through a port on this one.",
              { mx, my, mrx, my + 20.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 26.0f;
 
     // Presets Row
-    drawText("QUICK PRESETS", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
+    drawText("Presets", { mx, my, mrx, my + 16.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
     my += 20.0f;
 
     float preW = (mrx - mx - 18.0f) / 4.0f;
@@ -6267,7 +6438,7 @@ void AppUi::drawPortForwardModal(float width, float height, float modalProgress)
     my += 36.0f;
 
     // Add Rule Inputs Row
-    drawText("NEW TUNNEL RULE", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
+    drawText("New rule", { mx, my, mrx, my + 16.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
     my += 20.0f;
 
     float fLocalW = 100.0f;
@@ -6276,16 +6447,16 @@ void AppUi::drawPortForwardModal(float width, float height, float modalProgress)
     float fDescW = mrx - mx - fLocalW - fTargetW - fAddW - 24.0f;
 
     UiRect rLocal = { mx, my, mx + fLocalW, my + 32.0f };
-    drawTextField("field_fwd_local", FocusedField::ForwardLocal, rLocal, forwardLocalPortEdit_, "Local Port", false);
+    drawTextField("field_fwd_local", FocusedField::ForwardLocal, rLocal, forwardLocalPortEdit_, "Port here", false);
 
     UiRect rTarget = { rLocal.right + 8.0f, my, rLocal.right + 8.0f + fTargetW, my + 32.0f };
-    drawTextField("field_fwd_target", FocusedField::ForwardTarget, rTarget, forwardTargetPortEdit_, "Target Port", false);
+    drawTextField("field_fwd_target", FocusedField::ForwardTarget, rTarget, forwardTargetPortEdit_, "Port there", false);
 
     UiRect rDesc = { rTarget.right + 8.0f, my, rTarget.right + 8.0f + fDescW, my + 32.0f };
     drawTextField("field_fwd_desc", FocusedField::ForwardDesc, rDesc, forwardDescEdit_, "Description (optional)", false);
 
     UiRect rAdd = { rDesc.right + 8.0f, my, mrx, my + 32.0f };
-    drawButton("btn_add_fwd_rule", rAdd, "Add Rule", COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 7.5f, [this]() {
+    drawButton("btn_add_fwd_rule", rAdd, "Add", COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 7.5f, [this]() {
         try {
             int lp = std::stoi(forwardLocalPortEdit_);
             int tp = std::stoi(forwardTargetPortEdit_);
@@ -6303,7 +6474,7 @@ void AppUi::drawPortForwardModal(float width, float height, float modalProgress)
     my += 44.0f;
 
     // Active Rules Table
-    drawText("ACTIVE TUNNELS", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_MUTED);
+    drawText("Rules", { mx, my, mrx, my + 16.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
     my += 20.0f;
 
     UiRect tableBox = { mx, my, mrx, modal.bottom - 22.0f };
@@ -6312,7 +6483,7 @@ void AppUi::drawPortForwardModal(float width, float height, float modalProgress)
 
     auto rules = network_.portForwardRules();
     if (rules.empty()) {
-        drawText("No port forwarding rules configured. Add one above or select a preset.",
+        drawText("No rules yet. Add one above or start from a preset.",
                  { tableBox.left + 16.0f, tableBox.centerY() - 14.0f, tableBox.right - 16.0f, tableBox.centerY() + 14.0f },
                  ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
     } else {
@@ -6351,11 +6522,11 @@ void AppUi::drawPortForwardModal(float width, float height, float modalProgress)
                        }, ui::FontRole::Small, isAct, COL_BORDER);
 
             UiRect delBtn = { cardR.right - 60.0f, cardR.top + 7.0f, cardR.right - 8.0f, cardR.bottom - 7.0f };
-            drawButton("rule_del_" + std::to_string(rid), delBtn, "Del",
+            drawButton("rule_del_" + std::to_string(rid), delBtn, "Remove",
                        COL_SEC_BTN_BG, COL_DANGER, COL_TEXT_SECONDARY,
                        6.0f, [this, rid]() {
                            network_.removePortForwardRule(rid);
-                           showToast("Tunnel rule removed");
+                           showToast("Rule removed");
                        }, ui::FontRole::Small, false, ui::Color{0, 0, 0, 0}, COL_TEXT_ON_ACCENT);
 
             rTop += itemH;
@@ -6377,12 +6548,12 @@ void AppUi::drawAddressBookModal(float width, float height, float modalProgress)
     }, false });
 
     float mw = 480.0f;
-    float mh = 380.0f;
+    float mh = 330.0f;
     UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
 
     clickRegions_.push_back({ modal, "modal_ab_absorb", []() {}, false });
 
-    float scale = 0.90f + 0.10f * modalProgress;
+    float scale = 0.95f + 0.05f * modalProgress;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 20.0f, alpha);
@@ -6391,7 +6562,7 @@ void AppUi::drawAddressBookModal(float width, float height, float modalProgress)
     float mrx = modal.right - 28.0f;
     float my = modal.top + 22.0f;
 
-    drawText("Edit Desk Details", { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    drawText("Edit desk", { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
 
     UiRect closeBtn = { mrx - 28.0f, my, mrx, my + 28.0f };
     drawButton("modal_ab_close", closeBtn, "×",
@@ -6399,48 +6570,48 @@ void AppUi::drawAddressBookModal(float width, float height, float modalProgress)
                [this]() { showAddressBookEditModal_ = false; }, ui::FontRole::Heading);
     my += 34.0f;
 
-    std::string idText = "Desk ID: " + CryptoUtils::formatDeskId(editingDeskId_);
-    drawText(idText, { mx, my, mrx, my + 18.0f }, ui::FontRole::Small, COL_PRIMARY_ACCENT);
+    std::string idText = "Desk " + CryptoUtils::formatDeskId(editingDeskId_);
+    drawText(idText, { mx, my, mrx, my + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 24.0f;
 
     // Alias Field
-    drawText("Machine Alias / Display Name", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+    drawText("Name", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 18.0f;
     UiRect aliasField = { mx, my, mrx, my + 34.0f };
     drawTextField("field_edit_alias", FocusedField::EditAlias, aliasField,
-                  editAliasInput_, "e.g. Office Workstation...", false);
+                  editAliasInput_, "Office PC", false);
     my += 44.0f;
 
     // Tag Field
-    drawText("Category Tag (e.g. Work, Servers, Personal)", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+    drawText("Group", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 18.0f;
     UiRect tagField = { mx, my, mrx, my + 34.0f };
     drawTextField("field_edit_tag", FocusedField::EditTag, tagField,
-                  editTagInput_, "e.g. Work, Servers, Personal...", false);
+                  editTagInput_, "Work, Servers, Home", false);
     my += 44.0f;
 
     // Notes Field
-    drawText("Notes & Remarks", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
+    drawText("Notes", { mx, my, mrx, my + 16.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 18.0f;
     UiRect notesField = { mx, my, mrx, my + 34.0f };
     drawTextField("field_edit_notes", FocusedField::EditNotes, notesField,
-                  editNotesInput_, "e.g. Port 3389 forwarded, VPN needed...", false);
+                  editNotesInput_, "Anything worth remembering", false);
     my += 48.0f;
 
     // Action Buttons
-    float btnW = (mrx - mx - 12.0f) * 0.5f;
-    UiRect cancelBtn = { mx, my, mx + btnW, my + 36.0f };
+    const float btnW = 100.0f;
+    UiRect cancelBtn = { mrx - btnW * 2.0f - 10.0f, my, mrx - btnW - 10.0f, my + 36.0f };
     drawButton("modal_ab_cancel", cancelBtn, "Cancel",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
                    showAddressBookEditModal_ = false;
                }, ui::FontRole::Small, true, COL_BORDER);
 
-    UiRect saveBtn = { cancelBtn.right + 12.0f, my, mrx, my + 36.0f };
-    drawButton("modal_ab_save", saveBtn, "Save Details",
+    UiRect saveBtn = { mrx - btnW, my, mrx, my + 36.0f };
+    drawButton("modal_ab_save", saveBtn, "Save",
                COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
                    identity_.updateRecentSessionMetadata(editingDeskId_, editAliasInput_, editTagInput_, editNotesInput_);
                    showAddressBookEditModal_ = false;
-                   showToast("Saved desk details");
+                   showToast("Desk saved");
                }, ui::FontRole::Small);
 
     canvas_->setTransform(ui::Transform2D::identity());
@@ -6461,7 +6632,7 @@ void AppUi::drawPairOfferModal(float width, float height, float modalProgress) {
 
     clickRegions_.push_back({ modal, "modal_pair_absorb", []() {}, false });
 
-    float scale = 0.90f + 0.10f * modalProgress;
+    float scale = 0.95f + 0.05f * modalProgress;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, modal.centerX(), modal.centerY()));
 
     drawCardSurface(modal, 20.0f, alpha);
@@ -6470,7 +6641,7 @@ void AppUi::drawPairOfferModal(float width, float height, float modalProgress) {
     float mrx = modal.right - 28.0f;
     float my = modal.top + 22.0f;
 
-    drawText("Pair with this PC?", { mx, my, mrx, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    drawText("Pair with this desk?", { mx, my, mrx, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
     my += 38.0f;
 
     // Body text does not wrap, so a long line was cut off at "no passw"; the tooltip format wraps.
@@ -6519,113 +6690,6 @@ int fleetTileAt(const std::vector<UiRect>& tiles, float x, float y) {
     for (size_t i = 0; i < tiles.size(); ++i)
         if (tiles[i].contains(x, y)) return static_cast<int>(i);
     return -1;
-}
-
-void AppUi::drawFleetPickerModal(float width, float height, float modalProgress) {
-    if (!showFleetPicker_ && modalProgress <= 0.01f) return;
-
-    float alpha = std::clamp(modalProgress, 0.0f, 1.0f);
-    fillRoundRect({ 0.0f, 0.0f, width, height }, 0.0f, rgba(28, 24, 20, 0.52f * alpha));
-    clickRegions_.push_back({ { 0.0f, 0.0f, width, height }, "fleet_pick_scrim", [this]() { showFleetPicker_ = false; }, false });
-
-    // Tickable: paired and seen directly on this network. Paired hosts discovery does not see are listed as offline.
-    const auto eligible = FleetManager::eligibleMembers(identity_, network_.discoveredPeers());
-    std::vector<PairedPeer> offline;
-    for (const auto& p : identity_.pairedHosts())
-        if (std::none_of(eligible.begin(), eligible.end(), [&](const FleetMember& m) { return m.deskId == p.deskId; }))
-            offline.push_back(p);
-    auto isPicked = [this](uint64_t id) { return std::find(fleetPicked_.begin(), fleetPicked_.end(), id) != fleetPicked_.end(); };
-    const size_t picked = static_cast<size_t>(std::count_if(eligible.begin(), eligible.end(),
-                                                            [&](const FleetMember& m) { return isPicked(m.deskId); }));
-
-    float mw = 460.0f;
-    const std::string emptyText = "No paired PCs found on this network. Pair with a PC first: connect to it once and choose Pair.";
-    const float emptyH = eligible.empty() ? canvas_->measureTextBlock(emptyText, ui::FontRole::Tooltip, mw - 56.0f).y + 12.0f : 0.0f;
-    const float rowH = 36.0f;
-    const float listH = emptyH + rowH * static_cast<float>(eligible.size() + offline.size());
-    // shortcut: rows past the window height are clipped, not scrolled; add scrolling if people pair that many PCs
-    float mh = std::min(height - 40.0f, 22.0f + 60.0f + listH + 16.0f + 36.0f + 24.0f);
-    UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
-    clickRegions_.push_back({ modal, "fleet_pick_absorb", []() {}, false });
-
-    float scale = 0.90f + 0.10f * modalProgress;
-    canvas_->setTransform(ui::Transform2D::scale(scale, scale, modal.centerX(), modal.centerY()));
-    drawCardSurface(modal, 20.0f, alpha);
-
-    float mx = modal.left + 28.0f;
-    float mrx = modal.right - 28.0f;
-    float my = modal.top + 22.0f;
-    drawText("Do it on all", { mx, my, mrx, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
-    my += 30.0f;
-    drawText("Paired PCs on this network", { mx, my, mrx, my + 20.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
-    my += 30.0f;
-
-    const float btnTop = modal.bottom - 24.0f - 36.0f;
-    canvas_->pushClip({ modal.left, my, modal.right, btnTop - 8.0f });
-    if (eligible.empty()) {   // Tooltip is the font that wraps
-        drawText(emptyText, { mx, my, mrx, my + emptyH - 12.0f }, ui::FontRole::Tooltip, COL_TEXT_SECONDARY);
-        my += emptyH;
-    }
-    for (const auto& m : eligible) {
-        UiRect row = { mx, my, mrx, my + rowH };
-        const bool on = isPicked(m.deskId);
-        const bool can = on || picked < FleetManager::kMaxMembers;
-        UiRect box = { mx + 2.0f, row.centerY() - 9.0f, mx + 20.0f, row.centerY() + 9.0f };
-        if (on) {
-            fillRoundRect(box, 5.0f, COL_PRIMARY_ACCENT);
-            drawText("\xE2\x9C\x93", box, ui::FontRole::Small, COL_TEXT_ON_ACCENT, ui::HAlign::Center, ui::VAlign::Center);
-        } else {
-            strokeRoundRect(box, 5.0f, can ? COL_BORDER_ALT : COL_BORDER, 1.5f);
-        }
-        drawText(m.name, { mx + 32.0f, row.top, mrx - 120.0f, row.bottom }, ui::FontRole::Body,
-                 can ? COL_TEXT_PRIMARY : COL_TEXT_MUTED, ui::HAlign::Leading, ui::VAlign::Center);
-        drawText(CryptoUtils::formatDeskId(m.deskId), { mrx - 116.0f, row.top, mrx, row.bottom }, ui::FontRole::Small,
-                 COL_TEXT_SECONDARY, ui::HAlign::Trailing, ui::VAlign::Center);
-        if (can && row.bottom <= btnTop - 8.0f) {   // a clipped row is not clickable
-            clickRegions_.push_back({ row, "fleet_pick_" + std::to_string(m.deskId), [this, id = m.deskId]() {
-                auto it = std::find(fleetPicked_.begin(), fleetPicked_.end(), id);
-                if (it != fleetPicked_.end()) fleetPicked_.erase(it);
-                else fleetPicked_.push_back(id);
-            }, false });
-        }
-        my += rowH;
-    }
-    for (const auto& p : offline) {
-        UiRect row = { mx, my, mrx, my + rowH };
-        strokeRoundRect({ mx + 2.0f, row.centerY() - 9.0f, mx + 20.0f, row.centerY() + 9.0f }, 5.0f, COL_BORDER, 1.5f);
-        drawText(p.hostname, { mx + 32.0f, row.top, mrx - 120.0f, row.bottom }, ui::FontRole::Body, COL_TEXT_MUTED,
-                 ui::HAlign::Leading, ui::VAlign::Center);
-        drawText("Offline", { mrx - 116.0f, row.top, mrx, row.bottom }, ui::FontRole::Small, COL_TEXT_MUTED,
-                 ui::HAlign::Trailing, ui::VAlign::Center);
-        my += rowH;
-    }
-    canvas_->popClip();
-
-    float btnW = (mrx - mx - 12.0f) * 0.5f;
-    UiRect cancelBtn = { mx, btnTop, mx + btnW, btnTop + 36.0f };
-    drawButton("fleet_pick_cancel", cancelBtn, "Cancel",
-               COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f, [this]() {
-                   showFleetPicker_ = false;
-               }, ui::FontRole::Small, true, COL_BORDER);
-
-    UiRect openBtn = { cancelBtn.right + 12.0f, btnTop, mrx, btnTop + 36.0f };
-    const std::string openLabel = "Open grid (" + std::to_string(picked) + ")";
-    if (picked == 0) {   // disabled: nothing ticked
-        fillRoundRect(openBtn, 8.0f, COL_SEC_BTN_BG);
-        drawText(openLabel, openBtn, ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center, ui::VAlign::Center);
-    } else {
-        std::vector<FleetMember> chosen;
-        for (const auto& m : eligible)
-            if (isPicked(m.deskId)) chosen.push_back(m);
-        drawButton("fleet_pick_open", openBtn, openLabel,
-                   COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this, chosen]() {
-                       showFleetPicker_ = false;
-                       fleetPicked_.clear();
-                       openFleetGrid(chosen);
-                   }, ui::FontRole::Small);
-    }
-
-    canvas_->setTransform(ui::Transform2D::identity());
 }
 
 void AppUi::openFleetGrid(const std::vector<FleetMember>& members) {
@@ -6726,7 +6790,10 @@ void AppUi::drawFleetView(const UiRect& bounds, float alpha) {
         // Name, state and the newest send; Open hands the PC to a normal session tab
         const float bx = tr.left + 10.0f, by = tr.bottom - barH;
         UiRect openBtn = { tr.right - 64.0f, by + 8.0f, tr.right - 10.0f, by + 32.0f };
-        drawText(t.name.empty() ? CryptoUtils::formatDeskId(t.deskId) : t.name, { bx, by + 3.0f, openBtn.left - 6.0f, by + 20.0f },
+        const std::string tileName = t.name.empty() ? CryptoUtils::formatDeskId(t.deskId) : profile::splitWireName(t.name).name;
+        const float tx = bx + 22.0f;
+        drawAvatar(bx + 9.0f, by + 20.0f, 9.0f, t.deskId, tileName, alpha);
+        drawText(tileName, { tx, by + 3.0f, openBtn.left - 6.0f, by + 20.0f },
                  ui::FontRole::Small, COL_TEXT_PRIMARY);
         std::string state = "Connecting\xE2\x80\xA6";
         ui::Color stateCol = COL_TEXT_SECONDARY;
@@ -6738,9 +6805,9 @@ void AppUi::drawFleetView(const UiRect& bounds, float alpha) {
             state = busy ? "Busy" : "Failed: " + t.statusMessage;
             stateCol = busy ? COL_WARNING : COL_DANGER;
         }
-        const float stateW = canvas_->measureTextBlock(state, ui::FontRole::Small, openBtn.left - 6.0f - bx).x;
-        drawText(state, { bx, by + 20.0f, openBtn.left - 6.0f, by + 37.0f }, ui::FontRole::Small, stateCol);
-        if (t.lastOutgoing && bx + stateW + 10.0f < openBtn.left - 6.0f) {
+        const float stateW = canvas_->measureTextBlock(state, ui::FontRole::Small, openBtn.left - 6.0f - tx).x;
+        drawText(state, { tx, by + 20.0f, openBtn.left - 6.0f, by + 37.0f }, ui::FontRole::Small, stateCol);
+        if (t.lastOutgoing && tx + stateW + 10.0f < openBtn.left - 6.0f) {
             std::string sent;
             ui::Color sentCol = COL_TEXT_SECONDARY;
             switch (t.lastOutgoing->status) {
@@ -6750,7 +6817,7 @@ void AppUi::drawFleetView(const UiRect& bounds, float alpha) {
                 case TransferStatus::Completed: sent = "\xE2\x9C\x93 Sent"; sentCol = COL_SUCCESS; break;
                 default: sent = "\xE2\x9C\x97 Failed"; sentCol = COL_DANGER; break;
             }
-            drawText(sent, { bx + stateW + 10.0f, by + 20.0f, openBtn.left - 6.0f, by + 37.0f }, ui::FontRole::Small, sentCol);
+            drawText(sent, { tx + stateW + 10.0f, by + 20.0f, openBtn.left - 6.0f, by + 37.0f }, ui::FontRole::Small, sentCol);
         }
         drawButton("fleet_open_" + std::to_string(t.deskId), openBtn, "Open",
                    COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 6.0f, [this, deskId = t.deskId]() {
@@ -6940,7 +7007,7 @@ void AppUi::drawFileManagerDrawer(const UiRect& contentRect) {
         const float px = area.left + 8.0f;
         const float prx = area.right - 8.0f;
         float py = area.top + 6.0f;
-        drawText(paneIdx == 0 ? "This PC" : "Remote Host", { px, py, prx, py + 16.0f }, ui::FontRole::Small,
+        drawText(paneIdx == 0 ? "This desk" : "Remote desk", { px, py, prx, py + 16.0f }, ui::FontRole::Small,
                  active ? COL_TEXT_ACCENT : COL_TEXT_SECONDARY);
         py += 18.0f;
 
@@ -6961,7 +7028,7 @@ void AppUi::drawFileManagerDrawer(const UiRect& contentRect) {
         UiRect pathField = { upBtn.right + 4.0f, py, refreshBtn.left - 4.0f, py + 28.0f };
         drawTextField(idp + "path", paneIdx == 0 ? FocusedField::FileBrowserLocalPath : FocusedField::FileBrowserRemotePath,
                       pathField, paneIdx == 0 ? fileBrowserInputLocalPath_ : fileBrowserInputRemotePath_,
-                      "Drives - type a path, Enter", false);
+                      "Type a path, press Enter", false);
         py += 34.0f;
 
         UiRect listBox = { px, py, prx, area.bottom - 22.0f };
@@ -6975,7 +7042,7 @@ void AppUi::drawFileManagerDrawer(const UiRect& contentRect) {
         const int first = static_cast<int>(st.scrollOffset);
 
         if (st.isLoading) {
-            drawText("Loading...", listBox, ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
+            drawText("Loading\xE2\x80\xA6", listBox, ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center);
         } else if (total == 0) {
             std::string msg = !st.statusMessage.empty() ? st.statusMessage
                               : (st.currentPath.empty() ? "Not loaded" : "Empty");
@@ -7036,7 +7103,7 @@ void AppUi::drawFileManagerDrawer(const UiRect& contentRect) {
     const float bw = (contentRect.width() - btnGap * 4.0f) / 5.0f;
     auto btnRect = [&](int i) { return UiRect{ contentRect.left + i * (bw + btnGap), by, contentRect.left + i * (bw + btnGap) + bw, by + actionBarH }; };
 
-    drawButton("fm_upload", btnRect(0), "Upload →", COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
+    drawButton("fm_upload", btnRect(0), "Upload \xE2\x86\x92", COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
         const FileBrowserItemEntry* sel = localFilePane_.selectedEntry();
         if (!sel || sel->isDirectory) {
             showToast("Select a file in 'This PC' to upload", true);
@@ -7059,7 +7126,7 @@ void AppUi::drawFileManagerDrawer(const UiRect& contentRect) {
         showToast("Requested " + name + " - progress is in the Files tab");
     }, ui::FontRole::Small);
 
-    drawButton("fm_newdir", btnRect(2), "New Folder", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f,
+    drawButton("fm_newdir", btnRect(2), "New folder", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f,
                [this]() { openFileBrowserModal(activeFilePane_, 0); }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
     drawButton("fm_rename", btnRect(3), "Rename", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f,
                [this]() { openFileBrowserModal(activeFilePane_, 1); }, ui::FontRole::Small, true, COL_BORDER, COL_TEXT_ACCENT);
@@ -7083,7 +7150,7 @@ void AppUi::drawRunTaskModal(float width, float height, float modalProgress) {
     UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
     clickRegions_.push_back({ modal, "modal_runtask_absorb", []() {}, false });
 
-    float scale = 0.90f + 0.10f * modalProgress;
+    float scale = 0.95f + 0.05f * modalProgress;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
     drawCardSurface(modal, 18.0f, alpha);
 
@@ -7091,7 +7158,7 @@ void AppUi::drawRunTaskModal(float width, float height, float modalProgress) {
     float mrx = modal.right - 26.0f;
     float my = modal.top + 22.0f;
 
-    drawText("Run Task on Host", { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    drawText("Run a program", { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
     UiRect closeBtn = { mrx - 26.0f, my, mrx, my + 26.0f };
     drawButton("modal_runtask_close", closeBtn, "×", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 13.0f, [this]() {
         showRunTaskModal_ = false;
@@ -7099,7 +7166,7 @@ void AppUi::drawRunTaskModal(float width, float height, float modalProgress) {
     }, ui::FontRole::Heading);
     my += 34.0f;
 
-    drawText("Launches a program on the remote desktop. Needs remote input permission.",
+    drawText("Starts a program on the remote desk. You need permission to control it.",
              { mx, my, mrx, my + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 26.0f;
 
@@ -7149,7 +7216,7 @@ void AppUi::drawFileBrowserActionModal(float width, float height, float modalPro
     UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
     clickRegions_.push_back({ modal, "modal_fileaction_absorb", []() {}, false });
 
-    float scale = 0.90f + 0.10f * modalProgress;
+    float scale = 0.95f + 0.05f * modalProgress;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
     drawCardSurface(modal, 18.0f, alpha);
 
@@ -7157,14 +7224,14 @@ void AppUi::drawFileBrowserActionModal(float width, float height, float modalPro
     float mrx = modal.right - 26.0f;
     float my = modal.top + 22.0f;
 
-    const char* title = (kind == 0) ? "New Folder" : (kind == 1 ? "Rename" : "Delete");
+    const char* title = (kind == 0) ? "New folder" : (kind == 1 ? "Rename" : "Delete");
     drawText(title, { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
     UiRect closeBtn = { mrx - 26.0f, my, mrx, my + 26.0f };
     drawButton("modal_fileaction_close", closeBtn, "×", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 13.0f,
                [this]() { closeFileBrowserModal(); }, ui::FontRole::Heading);
     my += 36.0f;
 
-    const std::string where = local ? "This PC" : "the remote host";
+    const std::string where = local ? "this desk" : "the remote desk";
     if (kind == 0) {
         const std::string& dir = local ? localFilePane_.currentPath : remoteFilePane_.currentPath;
         drawText("Create in " + dir, { mx, my, mrx, my + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
@@ -7209,12 +7276,11 @@ void AppUi::drawUpdateRequiredModal(float width, float height, float modalProgre
     float mh = isDownloadingUpdate_ ? 360.0f : 330.0f;
     UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
 
-    float scale = 0.90f + 0.10f * modalProgress;
+    float scale = 0.95f + 0.05f * modalProgress;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardShadow(modal, 24.0f, 1.5f * alpha);
     drawCardSurface(modal, 20.0f, alpha);
-    strokeRoundRect(modal, 20.0f, withAlpha(COL_DANGER, 0.6f * alpha), 1.5f);
 
     float mx = modal.left + 32.0f;
     float mrx = modal.right - 32.0f;
@@ -7225,31 +7291,31 @@ void AppUi::drawUpdateRequiredModal(float width, float height, float modalProgre
         UiRect badgeRect = { mx, my, mx + 160.0f, my + 24.0f };
         fillRoundRect(badgeRect, 6.0f, rgba(217, 130, 43, 0.18f));
         strokeRoundRect(badgeRect, 6.0f, rgba(217, 130, 43, 0.45f), 1.0f);
-        drawText("VERSION MISMATCH", badgeRect, ui::FontRole::Small, COL_WARNING, ui::HAlign::Center);
+        drawText("Version mismatch", badgeRect, ui::FontRole::Small, COL_WARNING, ui::HAlign::Center);
         my += 34.0f;
 
-        drawText("Host Version Upgrade Notice", { mx, my, mrx, my + 30.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+        drawText("The other desk has a newer CppDesk", { mx, my, mrx, my + 30.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         my += 34.0f;
 
-        std::string verText = "Host is running v" + peerMismatchHostVer_ + " (Local Viewer is v" + peerMismatchViewerVer_ + ").";
-        drawText(verText, { mx, my, mrx, my + 20.0f }, ui::FontRole::BodyBold, COL_PRIMARY_ACCENT);
+        std::string verText = "It runs v" + peerMismatchHostVer_ + ". You have v" + peerMismatchViewerVer_ + ".";
+        drawText(verText, { mx, my, mrx, my + 20.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
         my += 28.0f;
     } else {
         UiRect badgeRect = { mx, my, mx + 160.0f, my + 24.0f };
         fillRoundRect(badgeRect, 6.0f, rgba(235, 87, 87, 0.18f));
         strokeRoundRect(badgeRect, 6.0f, rgba(235, 87, 87, 0.45f), 1.0f);
-        drawText("MANDATORY UPDATE", badgeRect, ui::FontRole::Small, COL_DANGER, ui::HAlign::Center);
+        drawText("Update required", badgeRect, ui::FontRole::Small, COL_DANGER, ui::HAlign::Center);
         my += 34.0f;
 
-        drawText("Update Required to Continue", { mx, my, mrx, my + 30.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+        drawText("Update CppDesk to keep connecting", { mx, my, mrx, my + 30.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
         my += 34.0f;
 
         std::string latestVerClean = latestUpdateInfo_.latestVersion;
         if (!latestVerClean.empty() && (latestVerClean[0] == 'v' || latestVerClean[0] == 'V')) {
             latestVerClean = latestVerClean.substr(1);
         }
-        std::string verText = "CppDesk v" + latestVerClean + " is now available (Current: v" + CPP_DESK_VERSION + ").";
-        drawText(verText, { mx, my, mrx, my + 20.0f }, ui::FontRole::BodyBold, COL_PRIMARY_ACCENT);
+        std::string verText = "Version " + latestVerClean + " is out. You have v" + std::string(CPP_DESK_VERSION) + ".";
+        drawText(verText, { mx, my, mrx, my + 20.0f }, ui::FontRole::BodyBold, COL_TEXT_PRIMARY);
         my += 28.0f;
     }
 
@@ -7259,8 +7325,8 @@ void AppUi::drawUpdateRequiredModal(float width, float height, float modalProgre
     strokeRoundRect(infoBox, 10.0f, COL_BORDER);
 
     std::string descText = showPeerMismatchModal_
-        ? "The remote host is running a newer version of CppDesk with updated protocol features.\n\nUpgrading to v" + peerMismatchHostVer_ + " is recommended for full feature compatibility."
-        : "To ensure end-to-end cryptographic security, protocol compatibility, and uninterrupted remote desktop connections, all clients must update to the latest release.\n\nRemote sessions are locked until CppDesk is updated.";
+        ? "You can keep going. Update to v" + peerMismatchHostVer_ + " so every feature works on both desks."
+        : "Both desks must run the same protocol to connect safely.\n\nSessions stay locked until you update.";
     drawText(descText, { infoBox.left + 14.0f, infoBox.top + 8.0f, infoBox.right - 14.0f, infoBox.bottom - 8.0f },
              ui::FontRole::Small, COL_TEXT_SECONDARY);
     my = infoBox.bottom + 16.0f;
@@ -7315,42 +7381,13 @@ void AppUi::drawUpdateRequiredModal(float width, float height, float modalProgre
     UiRect dlBtn = { leftBtn.right + 14.0f, my, mrx, my + 40.0f };
     std::string dlBtnLabel = isDownloadingUpdate_
         ? ("Downloading " + std::to_string(static_cast<int>(updateDownloadProgress_ * 100.0f)) + "%")
-        : "Download & Update Now";
+        : (shell_->has(ui::Capability::AutoUpdate) ? "Download and update" : "View release");
 
     drawButton("update_modal_download", dlBtn, dlBtnLabel,
                isDownloadingUpdate_ ? COL_SEC_BTN_BG : COL_PRIMARY_ACCENT,
                isDownloadingUpdate_ ? COL_SEC_BTN_BG : COL_PRIMARY_ACCENT_HV,
                isDownloadingUpdate_ ? COL_TEXT_MUTED : COL_TEXT_ON_ACCENT,
-               9.0f, [this]() {
-                   if (isDownloadingUpdate_) return;
-
-                   std::string dlUrl = latestUpdateInfo_.directDownloadUrl;
-                   if (dlUrl.empty()) {
-                       std::string targetUrl = latestUpdateInfo_.releaseUrl.empty()
-                           ? "https://github.com/oocsng/cppdesk/releases/latest"
-                           : latestUpdateInfo_.releaseUrl;
-                       shell_->openUrl(targetUrl);
-                       return;
-                   }
-
-                   isDownloadingUpdate_ = true;
-                   updateDownloadProgress_ = 0.0f;
-                   updateDownloadedBytes_ = 0;
-                   updateTotalBytes_ = latestUpdateInfo_.assetSizeBytes;
-                   updateSpeedBps_ = 0.0;
-                   updateStatusMsg_ = "Connecting to download server...";
-                   shell_->invalidate();
-
-                   auto doneBox = downloadDoneBox_;
-                   shell_->startUpdateDownload(dlUrl, latestUpdateInfo_.assetSizeBytes, latestUpdateInfo_.assetSha256,
-                       [doneBox](bool ok, const std::string& message) {
-                           std::lock_guard<std::mutex> lk(doneBox->mtx);
-                           if (!doneBox->alive) return;
-                           doneBox->ok = ok;
-                           doneBox->message = message;
-                           doneBox->ready = true;
-                       });
-               }, ui::FontRole::Small);
+               9.0f, [this]() { startUpdate(); }, ui::FontRole::Small);
 
     canvas_->setTransform(ui::Transform2D::identity());
 }
@@ -7372,7 +7409,7 @@ void AppUi::drawRebootConfirmModal(float width, float height, float modalProgres
 
     clickRegions_.push_back({ modal, "modal_reboot_absorb", []() {}, false });
 
-    float scale = 0.90f + 0.10f * modalProgress;
+    float scale = 0.95f + 0.05f * modalProgress;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 18.0f, alpha);
@@ -7381,7 +7418,7 @@ void AppUi::drawRebootConfirmModal(float width, float height, float modalProgres
     float mrx = modal.right - 26.0f;
     float my = modal.top + 22.0f;
 
-    drawText(rebootIsEmergency_ ? "Emergency Remote Reboot" : "Remote Reboot & Reconnect",
+    drawText(rebootIsEmergency_ ? "Force restart the remote desk" : "Restart the remote desk",
              { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
 
     UiRect closeBtn = { mrx - 26.0f, my, mrx, my + 26.0f };
@@ -7425,7 +7462,7 @@ void AppUi::drawRebootConfirmModal(float width, float height, float modalProgres
                    showRebootConfirmModal_ = false;
                    if (rebootIsEmergency_) {
                        network_.sendSystemAction(SystemActionType::EmergencyReboot);
-                       showToast("Remote Emergency Reboot sent", true);
+                       showToast("Force restart sent", true);
                    } else if (network_.requestRemoteReboot(rebootSafeModeChoice_, 5)) {
                        showToast("Reboot requested. Reconnecting once online...");
                    } else {
@@ -7454,7 +7491,7 @@ void AppUi::drawHwAccelRestartModal(float width, float height, float modalProgre
 
     clickRegions_.push_back({ modal, "modal_hwaccel_absorb", []() {}, false });
 
-    float scale = 0.90f + 0.10f * modalProgress;
+    float scale = 0.95f + 0.05f * modalProgress;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 18.0f, alpha);
@@ -7466,7 +7503,7 @@ void AppUi::drawHwAccelRestartModal(float width, float height, float modalProgre
     drawText("Restart CppDesk", { mx, my, mrx - 40.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
 
     UiRect closeBtn = { mrx - 26.0f, my, mrx, my + 26.0f };
-    drawButton("modal_hwaccel_close", closeBtn, "x",
+    drawButton("modal_hwaccel_close", closeBtn, "\xC3\x97",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 13.0f,
                [this]() {
                    showHwAccelRestartModal_ = false;
@@ -7488,14 +7525,14 @@ void AppUi::drawHwAccelRestartModal(float width, float height, float modalProgre
     UiRect laterBtn = { mrx - btnW * 2.0f - 10.0f, my, mrx - btnW - 10.0f, my + btnH };
     UiRect nowBtn   = { mrx - btnW, my, mrx, my + btnH };
 
-    drawButton("modal_hwaccel_later", laterBtn, "Restart Later",
+    drawButton("modal_hwaccel_later", laterBtn, "Later",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f,
                [this]() {
                    showHwAccelRestartModal_ = false;
                    showToast("Setting saved. Restart CppDesk to apply changes.");
                }, ui::FontRole::Small, true, COL_BORDER);
 
-    drawButton("modal_hwaccel_now", nowBtn, "Restart Now",
+    drawButton("modal_hwaccel_now", nowBtn, "Restart now",
                COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f,
                [this]() {
                    showHwAccelRestartModal_ = false;
@@ -7551,7 +7588,7 @@ void AppUi::drawRecordingPlayerModal(float width, float height, float modalProgr
 
     clickRegions_.push_back({ modal, "player_absorb", []() {}, false });
 
-    float scale = 0.90f + 0.10f * modalProgress;
+    float scale = 0.95f + 0.05f * modalProgress;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 18.0f, alpha);
@@ -7561,11 +7598,11 @@ void AppUi::drawRecordingPlayerModal(float width, float height, float modalProgr
     float my = modal.top + 20.0f;
 
     // Header bar
-    drawText("Session Recording Player", { mx, my, mrx - 120.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    drawText("Recordings", { mx, my, mrx - 120.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
 
-    // "Open..." button
+    // "Open\xE2\x80\xA6" button
     UiRect openBtnRect = { mrx - 110.0f, my, mrx - 40.0f, my + 28.0f };
-    drawButton("player_open_btn", openBtnRect, "Open...",
+    drawButton("player_open_btn", openBtnRect, "Open\xE2\x80\xA6",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 8.0f,
                [this]() {
                    shell_->chooseOpenFile("Open Session Recording", "AVI Session Recordings", "*.avi",
@@ -7590,7 +7627,7 @@ void AppUi::drawRecordingPlayerModal(float width, float height, float modalProgr
                    std::to_string(recordingPlayer_->frameHeight()) + " @ " +
                    std::to_string(recordingPlayer_->fps()) + " fps)";
     } else {
-        subtitle = "No recording loaded. Click Open to select an AVI file.";
+        subtitle = "Open a recording (.avi) to play it here.";
     }
     drawText(subtitle, { mx, my, mrx, my + 18.0f }, ui::FontRole::Small, COL_TEXT_SECONDARY);
     my += 24.0f;
@@ -7945,7 +7982,7 @@ void AppUi::drawTotpChallengeModal(float clientW, float clientH) {
 
     clickRegions_.push_back({ modal, "modal_totp_absorb", []() {}, false });
 
-    float scale = 0.90f + 0.10f * totpModalAnimT_;
+    float scale = 0.95f + 0.05f * totpModalAnimT_;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardShadow(modal, 24.0f, 1.4f * alpha);
@@ -7959,17 +7996,17 @@ void AppUi::drawTotpChallengeModal(float clientW, float clientH) {
     UiRect badge = { mx, my, mx + 160.0f, my + 22.0f };
     fillRoundRect(badge, 5.0f, rgba(217, 119, 87, 0.18f));
     strokeRoundRect(badge, 5.0f, rgba(217, 119, 87, 0.45f), 1.0f);
-    drawText("TWO-FACTOR AUTHENTICATION", badge, ui::FontRole::Small, COL_PRIMARY_ACCENT, ui::HAlign::Center);
+    drawText("Two-factor sign-in", badge, ui::FontRole::Small, COL_PRIMARY_ACCENT, ui::HAlign::Center);
 
     UiRect closeBtn = { mrx - 26.0f, my, mrx, my + 26.0f };
-    drawButton("modal_totp_close", closeBtn, "x",
+    drawButton("modal_totp_close", closeBtn, "\xC3\x97",
                COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_PRIMARY, 13.0f, [this]() {
                    network_.cancelViewerTotp();
                    showTotpModal_ = false;
                }, ui::FontRole::Heading);
     my += 30.0f;
 
-    drawText("Enter Security Code", { mx, my, mrx - 30.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
+    drawText("Enter the code from your app", { mx, my, mrx - 30.0f, my + 26.0f }, ui::FontRole::Heading, COL_TEXT_PRIMARY);
     my += 28.0f;
 
     std::string promptText = "The host requires a 6-digit TOTP verification code from your authenticator app to authorize unattended access.";
@@ -7995,13 +8032,13 @@ void AppUi::drawTotpChallengeModal(float clientW, float clientH) {
                }, ui::FontRole::Small, true, COL_BORDER);
 
     UiRect verifyBtn = { cancelBtn.right + 12.0f, my, mrx, my + 36.0f };
-    drawButton("modal_totp_submit", verifyBtn, "Verify & Connect",
+    drawButton("modal_totp_submit", verifyBtn, "Connect",
                COL_PRIMARY_ACCENT, COL_PRIMARY_ACCENT_HV, COL_TEXT_ON_ACCENT, 8.0f, [this]() {
                    if (totpModalInput_.size() == 6) {
                        network_.submitViewerTotpCode(totpModalInput_);
                        totpModalError_.clear();
                    } else {
-                       totpModalError_ = "Please enter 6 digits.";
+                       totpModalError_ = "Enter all 6 digits.";
                    }
                }, ui::FontRole::Small);
 
@@ -8200,7 +8237,7 @@ void AppUi::drawPerformanceHud(const UiRect& stageRect, float alpha) {
     UiRect hudCard = { hudLeft, hudTop, hudRight, hudBottom };
 
     // Apply spring slide & scale transform
-    float scale = 0.94f + 0.06f * hudProgress;
+    float scale = 0.95f + 0.05f * hudProgress;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{hudCard.right, hudCard.top}).x, (ui::Point{hudCard.right, hudCard.top}).y));
 
     // Frosted glass card surface with specular highlight (hud-sci-fi-fui)
@@ -8319,8 +8356,13 @@ void AppUi::drawToastBanner(float width, float height, float toastProgress) {
     strokeRoundRect(r, bh * 0.5f, withAlpha(toastIsError_ ? COL_DANGER : COL_BORDER_ALT, alpha), 1.2f);
 
     drawPulseDot(r.left + 18.0f, r.centerY(), 3.6f, toastIsError_ ? COL_DANGER : COL_PRIMARY_ACCENT, alpha);
-    drawText(toastText_, { r.left + 28.0f, r.top, r.right - 18.0f, r.bottom },
+    const float undoW = undoRemoved_ ? 76.0f : 0.0f;
+    drawText(toastText_, { r.left + 28.0f, r.top, r.right - 18.0f - undoW, r.bottom },
              ui::FontRole::BodyBold, withAlpha(COL_TEXT_PRIMARY, alpha), ui::HAlign::Center);
+    if (undoRemoved_) {
+        drawButton("toast_undo", { r.right - 6.0f - undoW, r.top + 6.0f, r.right - 6.0f, r.bottom - 6.0f }, "Undo",
+                   COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_ACCENT, 14.0f, [this]() { undoHomeRemove(); }, ui::FontRole::Small);
+    }
 }
 
 void AppUi::drawAudioVolumePopup(float anchorX, float anchorY) {
@@ -8339,7 +8381,7 @@ void AppUi::drawAudioVolumePopup(float anchorX, float anchorY) {
     float px = std::clamp(anchorX - pw * 0.5f, 20.0f, std::max(20.0f, winW - pw - 20.0f));
     float py = std::min(anchorY, winH - ph - 20.0f);
     UiRect basePopRect = { px, py, px + pw, py + ph };
-    UiRect popRect = UiPlatform::computeSpringRect(basePopRect, audioPopAnimT_, 0.0f);
+    UiRect popRect = UiPlatform::popoverRect(basePopRect, audioPopAnimT_, basePopRect.centerX(), basePopRect.top);
 
     // Scrim/click outside to dismiss, plus popup-body absorb region so clicking padding does not dismiss
     if (showAudioVolumePopup_) {
@@ -8438,7 +8480,7 @@ void AppUi::drawAudioVolumePopup(float anchorX, float anchorY) {
 
 bool AppUi::anyModalActive() const {
     return modalAnimT_ > 0.004f || shortcutsModalAnimT_ > 0.004f || portForwardModalAnimT_ > 0.004f ||
-           addressBookModalAnimT_ > 0.004f || pairOfferModalAnimT_ > 0.004f || fleetPickerAnimT_ > 0.004f ||
+           addressBookModalAnimT_ > 0.004f || pairOfferModalAnimT_ > 0.004f ||
            totpModalAnimT_ > 0.004f || omnibarModalAnimT_ > 0.004f ||
            recordingPlayerModalAnimT_ > 0.004f || updateModalAnimT_ > 0.004f ||
            rebootModalAnimT_ > 0.004f || hwAccelModalAnimT_ > 0.004f || showPeerMismatchModal_ ||
@@ -8501,11 +8543,11 @@ std::string* AppUi::activeFocusedTextBuffer() {
     if (focusedField_ == FocusedField::ForwardLocal) return &forwardLocalPortEdit_;
     if (focusedField_ == FocusedField::ForwardTarget) return &forwardTargetPortEdit_;
     if (focusedField_ == FocusedField::ForwardDesc) return &forwardDescEdit_;
-    if (focusedField_ == FocusedField::DashboardSearch) return &dashboardSearchQuery_;
     if (focusedField_ == FocusedField::EditAlias) return &editAliasInput_;
     if (focusedField_ == FocusedField::EditTag) return &editTagInput_;
     if (focusedField_ == FocusedField::EditNotes) return &editNotesInput_;
     if (focusedField_ == FocusedField::ClipboardSearch) return &clipSearchQuery_;
+    if (focusedField_ == FocusedField::DisplayName) return &displayNameEdit_;
     if (focusedField_ == FocusedField::PrivacyBrand) return &privacyBrandEdit_;
     if (focusedField_ == FocusedField::PrivacyNotice) return &privacyNoticeEdit_;
     if (focusedField_ == FocusedField::TotpEnrollTestCode) return &totpEnrollCodeEdit_;
@@ -8807,6 +8849,19 @@ void AppUi::onMouseButton(MouseButtonId btn, bool isDown, float x, float y) {
         return;
     }
 
+    if (btn == MouseButtonId::Right && isDown && activeTab_ == ActiveTab::Dashboard && !anyModalActive()) {
+        for (size_t i = 0; i < homeRowRects_.size() && i < homeRows_.size(); ++i) {
+            if (homeRowRects_[i].contains(x, y) && homeListRect_.contains(x, y)) {
+                homeSel_ = static_cast<int>(i);
+                openHomeMenu(homeRows_[i], x, y);
+                return;
+            }
+        }
+        homeMenu_ = false;
+        shell_->invalidate();
+        return;
+    }
+
     if (activeTab_ == ActiveTab::Fleet && isDown && !anyModalActive()) {
         const int i = fleetTileAt(fleetFrameRects_, x, y);
         float nx = 0.0f, ny = 0.0f;
@@ -8874,13 +8929,6 @@ void AppUi::onMouseWheel(int delta) {
         float w = clientSizeDips().width;
         float drawerW = std::min(drawerWidth_, w * 0.48f);
         if (mouseX_ >= (w - drawerW - 14.0f)) {
-            // Horizontal scroll for drawer tabs header if mouse is at the top
-            if (mouseY_ >= 10.0f && mouseY_ <= 56.0f && drawerTabsMaxScroll_ > 0.5f) {
-                float step = (static_cast<float>(delta) / 120.0f) * 60.0f;
-                drawerTabsScrollTarget_ = std::clamp(drawerTabsScrollTarget_ - step, 0.0f, drawerTabsMaxScroll_);
-                shell_->invalidate();
-                return;
-            }
             if (drawerTab_ == DrawerTab::LiveChat) {
                 chatScrollOffset_ += (delta > 0 ? 1 : -1);
                 if (chatScrollOffset_ < 0) chatScrollOffset_ = 0;
@@ -8911,16 +8959,11 @@ void AppUi::onMouseWheel(int delta) {
         }
     }
 
-    // Horizontal scroll for RemoteSession windowed HUD bar
-    if (activeTab_ == ActiveTab::RemoteSession && !isFullscreen_) {
-        if (mouseY_ >= sessionHudBarRect_.top && mouseY_ <= sessionHudBarRect_.bottom &&
-            mouseX_ >= sessionHudBarRect_.left && mouseX_ <= sessionHudBarRect_.right &&
-            sessionHudMaxScroll_ > 0.5f) {
-            float step = (static_cast<float>(delta) / 120.0f) * 90.0f;
-            sessionHudScrollTarget_ = std::clamp(sessionHudScrollTarget_ - step, 0.0f, sessionHudMaxScroll_);
-            shell_->invalidate();
-            return;
-        }
+    if (activeTab_ == ActiveTab::Dashboard && homeMaxScroll_ > 0.5f && homeListRect_.contains(mouseX_, mouseY_)) {
+        homeMenu_ = false;
+        homeScroll_ = std::clamp(homeScroll_ - (static_cast<float>(delta) / 120.0f) * 62.0f, 0.0f, homeMaxScroll_);
+        shell_->invalidate();
+        return;
     }
 
     if (activeTab_ == ActiveTab::Settings && settingsMaxScroll_ > 0.5f) {
@@ -8968,6 +9011,8 @@ void AppUi::onCharInput(char16_t ch) {
         maxLen = 512;
     } else if (focusedField_ == FocusedField::FileBrowserNewDir || focusedField_ == FocusedField::FileBrowserRename) {
         maxLen = 128;
+    } else if (focusedField_ == FocusedField::DisplayName) {
+        maxLen = 128;   // commitDisplayName caps at 32 code points
     } else if (focusedField_ == FocusedField::PrivacyBrand) {
         maxLen = 63;
     } else if (isTotp) {
@@ -8991,13 +9036,17 @@ void AppUi::onCharInput(char16_t ch) {
         }
     } else if (ch == L'\r' || ch == L'\n') {
         if (focusedField_ == FocusedField::RemoteId || focusedField_ == FocusedField::RemotePassword) {
-            initiateConnection();
+            if (activeTab_ == ActiveTab::Dashboard) connectFromHomeBar();
+            else initiateConnection();
         } else if (focusedField_ == FocusedField::LocalPassword && !localPasswordEdit_.empty()) {
             identity_.setUnattendedPassword(localPasswordEdit_);
             showToast("Password saved");
+            editingLocalPass_ = false;
         } else if (focusedField_ == FocusedField::RelayServer && !relayServerEdit_.empty()) {
             identity_.setRelayServerAddress(relayServerEdit_);
             showToast("Relay server saved");
+        } else if (focusedField_ == FocusedField::DisplayName) {
+            commitDisplayName();
         } else if (focusedField_ == FocusedField::ChatInput) {
             sendChatFromInput();
         } else if (focusedField_ == FocusedField::TerminalInput) {
@@ -9026,7 +9075,7 @@ void AppUi::onCharInput(char16_t ch) {
             ns.privacyCustomNotice = privacyNoticeEdit_.empty() ? "Privacy screen is on. Move the mouse or press a key on this PC to end it." : privacyNoticeEdit_;
             identity_.updateSettings(ns);
             network_.configurePrivacyCurtain(ns.privacyCustomNotice, ns.privacyBrandName, ns.privacyShowDeskId);
-            showToast("Privacy screen branding updated");
+            showToast("Privacy screen updated");
         } else if (focusedField_ == FocusedField::TotpEnrollTestCode) {
             if (totpEnrollCodeEdit_.size() == 6) {
                 if (identity_.totpManager().verifyCode(totpEnrollCodeEdit_)) {
@@ -9034,22 +9083,22 @@ void AppUi::onCharInput(char16_t ch) {
                     ns.totpEnabled = true;
                     identity_.updateSettings(ns);
                     totpEnrollSuccess_ = true;
-                    totpEnrollFeedback_ = "Code verified! 2FA enabled.";
+                    totpEnrollFeedback_ = "Code accepted. Two-factor sign-in is on.";
                     showToast("Two-Factor Authentication Enabled");
                 } else {
                     totpEnrollSuccess_ = false;
-                    totpEnrollFeedback_ = "Invalid 6-digit code. Check authenticator clock.";
+                    totpEnrollFeedback_ = "That code didn't match. Check your phone's clock.";
                     showToast("Invalid 2FA code", true);
                 }
             } else {
-                totpEnrollFeedback_ = "Please enter 6 digits.";
+                totpEnrollFeedback_ = "Enter all 6 digits.";
             }
         } else if (focusedField_ == FocusedField::TotpModalCode) {
             if (totpModalInput_.size() == 6) {
                 network_.submitViewerTotpCode(totpModalInput_);
                 totpModalError_.clear();
             } else {
-                totpModalError_ = "Please enter 6 digits.";
+                totpModalError_ = "Enter all 6 digits.";
             }
         }
     } else if (ch == L'\t') {
@@ -9140,6 +9189,22 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
                 omnibarHasOutput_ = false;
             } else {
                 focusedField_ = FocusedField::None;
+            }
+            shell_->invalidate();
+            return;
+        }
+
+        if (activeTab_ == ActiveTab::Dashboard && !anyModalActive() && !homeGridSelect_ && !homeRows_.empty() &&
+            (vk == VK_UP || vk == VK_DOWN) &&
+            (focusedField_ == FocusedField::RemoteId || focusedField_ == FocusedField::RemotePassword || focusedField_ == FocusedField::None)) {
+            const int last = static_cast<int>(homeRows_.size()) - 1;
+            homeSel_ = (vk == VK_DOWN) ? std::min(homeSel_ + 1, last) : std::max(homeSel_ - 1, -1);
+            homeMenu_ = false;
+            if (homeSel_ >= 0 && static_cast<size_t>(homeSel_) < homeRowTops_.size()) {   // keep the row in view
+                const float top = homeRowTops_[static_cast<size_t>(homeSel_)];
+                const float viewH = homeListRect_.height();
+                if (top < homeScroll_) homeScroll_ = top;
+                else if (top + 60.0f > homeScroll_ + viewH) homeScroll_ = top + 60.0f - viewH;
             }
             shell_->invalidate();
             return;
@@ -9237,8 +9302,15 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
                 shell_->invalidate();
                 return;
             }
-            if (showFleetPicker_) {
-                showFleetPicker_ = false;
+            if (homeMenu_ || sessMore_) {
+                homeMenu_ = false;
+                sessMore_ = false;
+                shell_->invalidate();
+                return;
+            }
+            if (homeGridSelect_ && activeTab_ == ActiveTab::Dashboard) {
+                homeGridSelect_ = false;
+                fleetPicked_.clear();
                 shell_->invalidate();
                 return;
             }
@@ -9366,12 +9438,17 @@ void AppUi::onKeyEvent(uint16_t vk, uint16_t scan, bool isDown, bool isExtended)
                 focusedField_ = FocusedField::RemoteId;
                 return;
             }
-            if (vk >= '1' && vk <= '9' && !shell_->isKeyDown(VK_SHIFT) && sessionTabs_.tabCount() > 1) {
+            if (vk >= '1' && vk <= '9' && !shell_->isKeyDown(VK_SHIFT) && sessionTabs_.tabCount() > 1 &&
+                activeTab_ == ActiveTab::RemoteSession) {
                 size_t tabIdx = static_cast<size_t>(vk - '1');
                 if (tabIdx < sessionTabs_.tabCount()) {
                     switchToSessionTab(sessionTabs_.tabs()[tabIdx].id);
                     return;
                 }
+            }
+            if (vk >= '1' && vk <= '4' && !shell_->isKeyDown(VK_SHIFT) && !anyModalActive()) {
+                selectRailItem(vk - '1');
+                return;
             }
         }
 
@@ -9526,6 +9603,13 @@ void AppUi::initiateConnection() {
         showToast("Update required to connect to remote sessions!", true);
         return;
     }
+    // A pasted cppdesk:// link or padded text dials what it names; parseDeskId already takes spaces and dashes
+    if (remoteIdInput_.rfind("cppdesk://", 0) == 0) {
+        remoteIdInput_.erase(0, 10);
+        while (!remoteIdInput_.empty() && (remoteIdInput_.back() == '/' || remoteIdInput_.back() == '\\')) remoteIdInput_.pop_back();
+    }
+    remoteIdInput_.erase(0, remoteIdInput_.find_first_not_of(" \t"));
+    remoteIdInput_.erase(remoteIdInput_.find_last_not_of(" \t") + 1);
     if (remoteIdInput_.empty()) {
         showToast("Enter a 9-digit Desk ID", true);
         return;
@@ -9724,6 +9808,7 @@ void AppUi::toggleShortcutsModal() {
 }
 
 void AppUi::showToast(const std::string& message, bool isError, uint32_t durationMs) {
+    undoRemoved_.reset();
     toastText_ = message;
     toastIsError_ = isError;
     toastExpireTick_ = shell_->nowMs() + durationMs;
@@ -9865,12 +9950,12 @@ void AppUi::drawOmnibarModal(float width, float height, float modalProgress) {
     }, false });
 
     float mw = 640.0f;
-    float mh = omnibarHasOutput_ ? 460.0f : 340.0f;
+    float mh = omnibarHasOutput_ ? 460.0f : 288.0f;
     UiRect modal = { (width - mw) * 0.5f, (height - mh) * 0.5f, (width + mw) * 0.5f, (height + mh) * 0.5f };
 
     clickRegions_.push_back({ modal, "modal_omni_absorb", []() {}, false });
 
-    float scale = 0.92f + 0.08f * modalProgress;
+    float scale = 0.95f + 0.05f * modalProgress;
     canvas_->setTransform(ui::Transform2D::scale(scale, scale, (ui::Point{modal.centerX(), modal.centerY()}).x, (ui::Point{modal.centerX(), modal.centerY()}).y));
 
     drawCardSurface(modal, 16.0f, alpha);
@@ -9881,10 +9966,10 @@ void AppUi::drawOmnibarModal(float width, float height, float modalProgress) {
 
     UiRect searchBox = { mx, my, mrx - 36.0f, my + 38.0f };
     drawTextField("field_omni_search", FocusedField::OmnibarInput, searchBox,
-                  omnibarQuery_, "Type a command or filter (e.g. ipconfig, ping, tasklist)...", false);
+                  omnibarQuery_, "Search commands, like ipconfig or ping", false);
 
     UiRect closeBtn = { mrx - 30.0f, my + 4.0f, mrx, my + 34.0f };
-    drawButton("modal_omni_close", closeBtn, "x", COL_SEC_BTN_BG, COL_SEC_BTN_HV, COL_TEXT_SECONDARY, 6.0f, [this]() {
+    drawButton("modal_omni_close", closeBtn, "\xC3\x97", ui::Color{ 0, 0, 0, 0 }, COL_SEC_BTN_HV, COL_TEXT_SECONDARY, 8.0f, [this]() {
         showOmnibarModal_ = false;
         focusedField_ = FocusedField::None;
     }, ui::FontRole::Small);
@@ -9901,7 +9986,7 @@ void AppUi::drawOmnibarModal(float width, float height, float modalProgress) {
     strokeRoundRect(listBox, 8.0f, COL_BORDER, 1.0f);
 
     if (omnibarFiltered_.empty()) {
-        drawText("No matching commands found. Type custom command or check query.", listBox,
+        drawText("No matching commands.", listBox,
                  ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Center, ui::VAlign::Center);
     } else {
         float itemH = 36.0f;
@@ -9914,18 +9999,17 @@ void AppUi::drawOmnibarModal(float width, float height, float modalProgress) {
             bool isSel = (i == omnibarSelectedIndex_);
             UiRect itemR = { listBox.left + 4.0f, listBox.top + 4.0f + row * itemH, listBox.right - 4.0f, listBox.top + 4.0f + (row + 1) * itemH - 2.0f };
 
-            if (isSel) {
-                fillRoundRect(itemR, 6.0f, withAlpha(COL_PRIMARY_ACCENT, 0.22f));
-                strokeRoundRect(itemR, 6.0f, COL_PRIMARY_ACCENT, 1.0f);
-            }
+            // Instant highlight: the palette is used too often to animate (frequency of use)
+            if (isSel) fillRoundRect(itemR, 6.0f, COL_BG_RAISED);
 
-            UiRect catBadge = { itemR.left + 8.0f, itemR.top + 6.0f, itemR.left + 74.0f, itemR.bottom - 6.0f };
-            fillRoundRect(catBadge, 4.0f, withAlpha(COL_PRIMARY_ACCENT, 0.15f));
-            drawText(cmd.category, catBadge, ui::FontRole::Small, COL_TEXT_ACCENT, ui::HAlign::Center, ui::VAlign::Center);
+            UiRect catBadge = { itemR.left + 8.0f, itemR.top + 7.0f, itemR.left + 74.0f, itemR.bottom - 7.0f };
+            fillRoundRect(catBadge, 4.0f, isSel ? COL_BG_SUBTLE : COL_BG_CARD);
+            drawText(cmd.category, catBadge, ui::FontRole::Small, COL_TEXT_SECONDARY, ui::HAlign::Center, ui::VAlign::Center);
 
-            std::string line = cmd.title + "  (" + cmd.commandLine + ")";
-            drawText(line, { catBadge.right + 10.0f, itemR.top + 6.0f, itemR.right - 60.0f, itemR.bottom - 6.0f },
-                     ui::FontRole::Small, isSel ? COL_TEXT_PRIMARY : COL_TEXT_SECONDARY, ui::HAlign::Leading, ui::VAlign::Center);
+            drawText(cmd.title, { catBadge.right + 10.0f, itemR.top + 6.0f, itemR.right - 170.0f, itemR.bottom - 6.0f },
+                     isSel ? ui::FontRole::BodyBold : ui::FontRole::Body, COL_TEXT_PRIMARY, ui::HAlign::Leading, ui::VAlign::Center);
+            drawText(cmd.commandLine, { itemR.right - 166.0f, itemR.top + 6.0f, itemR.right - 10.0f, itemR.bottom - 6.0f },
+                     ui::FontRole::Small, COL_TEXT_MUTED, ui::HAlign::Trailing, ui::VAlign::Center);
 
             clickRegions_.push_back({ itemR, "omni_item_" + std::to_string(i), [this, i, cmd]() {
                 omnibarSelectedIndex_ = i;
@@ -9940,19 +10024,19 @@ void AppUi::drawOmnibarModal(float width, float height, float modalProgress) {
 
     if (omnibarHasOutput_) {
         UiRect outBox = { mx, my, mrx, modal.bottom - 16.0f };
-        fillRoundRect(outBox, 8.0f, rgba(20, 20, 20, 0.85f));
-        strokeRoundRect(outBox, 8.0f, COL_BORDER, 1.0f);
+        // Same console colours as the drawer terminal, in both themes
+        fillRoundRect(outBox, 8.0f, rgba(30, 26, 23));
 
-        std::string outHdr = "Output (Exit Code: " + std::to_string(omnibarLastExitCode_) + "):";
-        drawText(outHdr, { outBox.left + 8.0f, outBox.top + 6.0f, outBox.right - 8.0f, outBox.top + 20.0f },
-                 ui::FontRole::Small, COL_TEXT_ACCENT);
+        std::string outHdr = "Output \xC2\xB7 exit code " + std::to_string(omnibarLastExitCode_);
+        drawText(outHdr, { outBox.left + 10.0f, outBox.top + 8.0f, outBox.right - 10.0f, outBox.top + 22.0f },
+                 ui::FontRole::Small, rgba(176, 164, 150));
 
-        std::string displayOut = omnibarLastOutput_.empty() ? "[No stdout output]" : omnibarLastOutput_;
+        std::string displayOut = omnibarLastOutput_.empty() ? "No output." : omnibarLastOutput_;
         if (displayOut.size() > 500) {
             displayOut = displayOut.substr(0, 500) + "...";
         }
-        drawText(displayOut, { outBox.left + 8.0f, outBox.top + 22.0f, outBox.right - 8.0f, outBox.bottom - 6.0f },
-                 ui::FontRole::Small, COL_TEXT_PRIMARY, ui::HAlign::Leading, ui::VAlign::Top);
+        drawText(displayOut, { outBox.left + 10.0f, outBox.top + 26.0f, outBox.right - 10.0f, outBox.bottom - 8.0f },
+                 ui::FontRole::Mono, rgba(232, 222, 208), ui::HAlign::Leading, ui::VAlign::Top);
     }
 
     canvas_->setTransform(ui::Transform2D::identity());
@@ -9965,6 +10049,7 @@ void AppUi::toggleFullscreen() {
     }
     if (shell_->setFullscreen(!isFullscreen_)) {
         isFullscreen_ = !isFullscreen_;
+        sessMore_ = false;
     }
 }
 
@@ -9974,7 +10059,7 @@ void AppUi::glideTick(uint64_t nowMs, const ViewerSessionStats& viewer, bool hos
         // Failed or ended (Error can come before any frame): slide home. Reconnecting and connecting are left alone.
         if (!tab || viewer.state == ViewerConnectionState::Error || viewer.state == ViewerConnectionState::Disconnected) {
             const auto host = identity_.findPairedHost(glide_->deskId);
-            const std::string name = host ? host->hostname : CryptoUtils::formatDeskId(glide_->deskId);
+            const std::string name = host ? peerName(host->hostname) : CryptoUtils::formatDeskId(glide_->deskId);
             std::string toast = name + ": " + viewer.statusMessage;
             if (viewer.statusMessage.find("already in an active remote session") != std::string::npos)   // HostBusy
                 toast = name + " is in use by someone else";
@@ -10038,7 +10123,7 @@ void AppUi::glideOut(GlideEdge edge, ui::Point cursor, uint64_t nowMs) {
         if (said != glideOfflineNotifiedMs_.end() && nowMs - said->second < 60000) return;
         glideOfflineNotifiedMs_[deskId] = nowMs;
         const auto host = identity_.findPairedHost(deskId);
-        const std::string name = host ? host->hostname : CryptoUtils::formatDeskId(deskId);
+        const std::string name = host ? peerName(host->hostname) : CryptoUtils::formatDeskId(deskId);
         if (notificationMgr_) notificationMgr_->notify(NotificationType::GeneralInfo, "Glide", name + " is offline", identity_.settings());
         return;
     }
@@ -10182,6 +10267,7 @@ void AppUi::drawHostPermissionCard(const UiRect& box, const ui::HostPermissionCa
 }
 
 void AppUi::onFocusChanged(bool focused) {
+    if (focused) systemReducedMotion_ = shell_->systemPrefersReducedMotion();
     if (!focused) {
         mouseLeftDown_ = false;
         draggingRewindScrubber_ = false;
@@ -10253,8 +10339,7 @@ ui::CursorShape AppUi::cursorShape() const {
 }
 
 void AppUi::onResized() {
-    sessionHudScrollOffset_ = std::clamp(sessionHudScrollOffset_, 0.0f, sessionHudMaxScroll_);
-    navPillInit_ = false;
+    railIndInit_ = false;
     activeTooltipText_.clear();
     tooltipAnimT_ = 0.0f;
     tooltipAnimVel_ = 0.0f;
@@ -10414,7 +10499,7 @@ void AppUi::onTick() {
             if (!glideHome) showToast("Connected on same PC. View-Only enabled (F8 to toggle).");
         } else {
             remoteInputEnabled_ = true;
-            if (!glideHome) showToast("Connected to " + vStats.remoteHostname);
+            if (!glideHome) showToast("Connected to " + profile::splitWireName(vStats.remoteHostname).name);
         }
 
         SessionTab* activeTab = sessionTabs_.activeTab();
@@ -10423,7 +10508,7 @@ void AppUi::onTick() {
             activeTab->deskId = vStats.remoteDeskId;
             activeTab->remoteHostname = vStats.remoteHostname;
             if (!vStats.remoteHostname.empty()) {
-                activeTab->title = vStats.remoteHostname;
+                activeTab->title = profile::splitWireName(vStats.remoteHostname).name;
             }
             activeTab->connectedSinceTickMs = tickNow;
         }
@@ -10451,7 +10536,7 @@ void AppUi::onTick() {
         rewindFrozen_ = false;
         rewindOffsetMs_ = 0;
         if (notificationMgr_) {
-            std::string hName = prevViewerHostname_.empty() ? "Remote Desktop" : prevViewerHostname_;
+            std::string hName = prevViewerHostname_.empty() ? "Remote Desktop" : peerName(prevViewerHostname_);
             notificationMgr_->notify(NotificationType::SessionDropped, "Session Disconnected",
                                      "Remote session with " + hName + " ended.", identity_.settings());
         }
@@ -10477,7 +10562,7 @@ void AppUi::onTick() {
             curTab->privacyModeEngaged = vStats.privacyModeEngaged;
             if (!vStats.remoteHostname.empty() && curTab->remoteHostname != vStats.remoteHostname) {
                 curTab->remoteHostname = vStats.remoteHostname;
-                curTab->title = vStats.remoteHostname;
+                curTab->title = profile::splitWireName(vStats.remoteHostname).name;
             }
         }
     }
@@ -10491,7 +10576,7 @@ void AppUi::onTick() {
         }
     } else if (vStats.offerPairing && !pairOfferShown_) {
         pairOfferShown_ = showPairOfferModal_ = true;
-        pairOfferName_ = vStats.remoteHostname.empty() ? CryptoUtils::formatDeskId(vStats.remoteDeskId) : vStats.remoteHostname;
+        pairOfferName_ = vStats.remoteHostname.empty() ? CryptoUtils::formatDeskId(vStats.remoteDeskId) : peerName(vStats.remoteHostname);
         shell_->invalidate();
     }
     const PairingRequestState pairState = network_.pairingRequestState();
@@ -10504,7 +10589,7 @@ void AppUi::onTick() {
     // Host session disconnect detection
     auto hostStatus = network_.hostSessionStatus();
     if (hostStatus.active && !prevHostActive_ && hostStatus.paired && notificationMgr_) {
-        std::string caller = hostStatus.viewerHostname.empty() ? "Remote User" : hostStatus.viewerHostname;
+        std::string caller = hostStatus.viewerHostname.empty() ? "Remote User" : peerName(hostStatus.viewerHostname);
         notificationMgr_->notify(NotificationType::IncomingConnection, "Paired PC connected",
                                  caller + " (" + CryptoUtils::formatDeskId(hostStatus.viewerDeskId) + ") connected without a password (paired).",
                                  identity_.settings());
@@ -10517,7 +10602,7 @@ void AppUi::onTick() {
         }
     }
     if (hostStatus.active) {
-        prevHostClientName_ = hostStatus.viewerHostname;
+        prevHostClientName_ = peerName(hostStatus.viewerHostname);
     }
     prevHostActive_ = hostStatus.active;
 
@@ -10530,13 +10615,13 @@ void AppUi::onTick() {
     if (unreadChat > lastSeenUnreadChat_) {
         auto msgs = network_.chatMessages();
         if (!msgs.empty() && !msgs.back().fromLocal) {
-            showToast(msgs.back().senderName + ": " + msgs.back().text);
+            showToast(profile::splitWireName(msgs.back().senderName).name + ": " + msgs.back().text);
             bool isUnfocused = !shell_->isWindowForeground();
             bool drawerClosed = (!showFileDrawer_ || drawerTab_ != DrawerTab::LiveChat);
             if ((isUnfocused || drawerClosed) && notificationMgr_) {
                 notificationMgr_->notify(
                     NotificationType::ChatMessage,
-                    msgs.back().senderName.empty() ? "New Chat Message" : msgs.back().senderName,
+                    msgs.back().senderName.empty() ? "New Chat Message" : profile::splitWireName(msgs.back().senderName).name,
                     msgs.back().text,
                     identity_.settings()
                 );
@@ -10568,7 +10653,7 @@ void AppUi::onTick() {
         shell_->bringToFront();
         if (notificationMgr_) {
             std::string title = "Incoming Connection Request";
-            std::string caller = pending.callerHostname.empty() ? "Remote User" : pending.callerHostname;
+            std::string caller = pending.callerHostname.empty() ? "Remote User" : profile::splitWireName(pending.callerHostname).name;
             std::string msg = caller + " (" + CryptoUtils::formatDeskId(pending.callerDeskId) + ") is requesting remote control.";
             notificationMgr_->notify(NotificationType::IncomingConnection, title, msg, identity_.settings());
         }
@@ -10671,7 +10756,7 @@ void AppUi::toggleNotificationsMuted() {
 std::string AppUi::trayStatusText() const {
     auto vStats = network_.viewerStats();
     if (vStats.state == ViewerConnectionState::Connected) {
-        return "Controlling " + vStats.remoteHostname;
+        return "Controlling " + peerName(vStats.remoteHostname);
     }
     if (network_.hostSessionStatus().active) {
         return "Host Active";
@@ -10756,6 +10841,7 @@ AppUi::AppUi(IdentityManager& identity, NetworkEngine& network, ui::PlatformShel
     relayModeEdit_ = s.relayMode;
     privacyBrandEdit_ = s.privacyBrandName;
     privacyNoticeEdit_ = s.privacyCustomNotice;
+    displayNameEdit_ = identity_.displayName();
     themeAnimT_ = s.darkTheme ? 1.0f : 0.0f;
     scaleMode_ = static_cast<ScaleMode>(std::clamp<int>(s.defaultScaleMode, 0, 3));
     network_.setAudioVolume(s.defaultAudioVolume);
@@ -10769,6 +10855,7 @@ AppUi::AppUi(IdentityManager& identity, NetworkEngine& network, ui::PlatformShel
     updateTotpQrMatrix();
     privacyKeywordsEdit_ = s.privacyCloakKeywords;
     refreshHostPermissions();
+    systemReducedMotion_ = shell_->systemPrefersReducedMotion();
 
     // Unit star (outer radius 1), scaled and translated when drawn.
     constexpr float PI = 3.14159265f;
@@ -10838,15 +10925,26 @@ void AppUi::ensureAppIconImage() {
 std::vector<std::string> AppUi::snapshotStateNames() {
     return { "dashboard_light", "dashboard_dark", "theme_mid_blend", "settings_appearance", "settings_display",
              "settings_audio", "settings_permissions", "settings_2fa", "settings_network", "settings_privacy",
-             "settings_system", "settings_about", "settings_glide", "session_view", "session_tabs_3", "drawer_file_transfer",
-             "drawer_file_manager", "drawer_sync", "chat_long_text", "modal_approval", "modal_totp", "modal_run_task",
+             "settings_system", "settings_about", "settings_glide", "settings_profile", "session_view", "session_more_menu", "session_tabs_3", "drawer_file_transfer", "drawer_terminal", "drawer_notes",
+             "drawer_file_manager", "drawer_sync", "chat_long_text", "modal_approval", "modal_approval_picture", "modal_totp", "modal_run_task",
              "modal_address_book", "modal_recording_player", "modal_omnibar", "toast", "tooltip",
-             "modal_pair_offer", "settings_permissions_paired", "fleet_picker", "fleet_grid",
+             "modal_pair_offer", "settings_permissions_paired", "home_grid_select", "fleet_grid",
+             "home_desks", "home_desks_pictures", "home_menu", "sessions_empty",
+             // Dark twins of the screens the redesign touched (light and dark are both first-class)
+             "settings_appearance_dark", "settings_display_dark", "settings_profile_dark", "settings_privacy_dark", "drawer_file_transfer_dark", "drawer_terminal_dark", "drawer_sync_dark", "chat_long_text_dark", "modal_approval_dark", "modal_address_book_dark", "modal_omnibar_dark", "session_more_menu_dark", "home_menu_dark", "home_update_available", "home_update_available_dark", "home_updating",
              "dashboard_mac_permissions", "dashboard_mac_restart", "dashboard_wayland_denied", "dashboard_wayland_view_only",
              "dashboard_mic_on" };
 }
 
 void AppUi::applySnapshotState(const std::string& name) {
+    // "<state>_dark" is <state> in the dark theme
+    if (name.size() > 5 && name.compare(name.size() - 5, 5, "_dark") == 0 && name != "dashboard_dark") {
+        applySnapshotState(name.substr(0, name.size() - 5));
+        AppSettings s = identity_.settings();
+        s.darkTheme = true;
+        identity_.updateSettings(s);
+        return;
+    }
     snapshotFrozen_ = true;
     snapshotPerFrame_ = nullptr;
     snapshotHostPerms_.reset();
@@ -10883,6 +10981,7 @@ void AppUi::applySnapshotState(const std::string& name) {
         { "settings_2fa", SettingsSection::TwoFactorAuth }, { "settings_network", SettingsSection::NetworkRelay },
         { "settings_privacy", SettingsSection::CurtainPrivacy }, { "settings_system", SettingsSection::SystemService },
         { "settings_about", SettingsSection::About }, { "settings_glide", SettingsSection::Glide },
+        { "settings_profile", SettingsSection::Profile },
     };
 
     // Pairing states seed these two peers; clear them so no other state shows them
@@ -10891,12 +10990,45 @@ void AppUi::applySnapshotState(const std::string& name) {
     identity_.removePairedHost(kSeedHost);
     showPairOfferModal_ = false;
     pairOfferShown_ = false;
-    showFleetPicker_ = false;
+    homeGridSelect_ = false;
+    homeMenu_ = false;
+    homeMenuAnimT_ = 0.0f;
+    sessMore_ = false;
+    sessMoreAnimT_ = 0.0f;
+    homeIntroT_ = 1.0f;   // no row cascade in a still
+    latestUpdateInfo_ = {};
+    isDownloadingUpdate_ = false;
+    updateDownloadProgress_ = 0.0f;
+    updatePillT_ = 1.0f;
     fleetPicked_.clear();
+    constexpr uint64_t kSeedDesks[] = { 555000401, 555000402, 555000403 };   // home_desks and home_menu seed these
+    for (uint64_t d : kSeedDesks) identity_.removeRecentSession(d);
+    for (uint64_t d : kSeedDesks) network_.injectPeerPictureForTest(d, {});
+    snapshotCallerPicture_.clear();
+    // A 96x96 gradient stands in for a profile picture
+    auto syntheticPicture = [](uint8_t tint) {
+        std::vector<uint8_t> px(96u * 96u * 4u);
+        for (int y = 0; y < 96; ++y) {
+            for (int x = 0; x < 96; ++x) {
+                uint8_t* p = &px[(static_cast<size_t>(y) * 96 + x) * 4];
+                p[0] = static_cast<uint8_t>(x * 255 / 95);
+                p[1] = static_cast<uint8_t>(y * 255 / 95);
+                p[2] = tint;
+                p[3] = 255;
+            }
+        }
+        return TileCodec::encodeJpeg(px.data(), 96, 96, 85);
+    };
     fleet_.closeAll();
     snapshotFleetTiles_ = nullptr;
 
     setDark(false);
+    {   // A fixed username: the rail avatar would otherwise show this machine's computer name
+        AppSettings s = identity_.settings();
+        s.displayName = "Jane";
+        identity_.updateSettings(s);
+        displayNameEdit_ = "Jane";
+    }
     network_.injectViewerFrameForTest({}, 0, 0);
     if (name == "dashboard_light") {
         activeTab_ = ActiveTab::Dashboard;
@@ -10907,7 +11039,9 @@ void AppUi::applySnapshotState(const std::string& name) {
         setDark(true);
         activeTab_ = ActiveTab::Dashboard;
         snapshotPerFrame_ = [](AppUi& a) { a.themeAnimT_ = 0.5f; a.themeAnimVel_ = 0.0f; };
-    } else if (name == "session_view") {
+    } else if (name == "session_view" || name == "session_more_menu") {
+        if (name == "session_more_menu") { sessMore_ = true; sessMoreAnimT_ = 1.0f; }
+        sessionTabs_.createTab(111222333, "111222333", "Office");   // a live session, else Sessions shows its empty state
         activeTab_ = ActiveTab::RemoteSession;
         network_.injectViewerFrameForTest(remoteFrame(), 1920, 1080);
     } else if (name == "session_tabs_3") {
@@ -10916,10 +11050,13 @@ void AppUi::applySnapshotState(const std::string& name) {
         sessionTabs_.createTab(777888999, "777888999", "Home");
         activeTab_ = ActiveTab::RemoteSession;
         network_.injectViewerFrameForTest(remoteFrame(), 1920, 1080);
-    } else if (name == "drawer_file_transfer" || name == "drawer_file_manager" || name == "drawer_sync") {
+    } else if (name == "drawer_file_transfer" || name == "drawer_file_manager" || name == "drawer_sync" ||
+               name == "drawer_terminal" || name == "drawer_notes") {
         showFileDrawer_ = true;
         drawerTab_ = (name == "drawer_file_transfer") ? DrawerTab::FilesAndClip
-                   : (name == "drawer_file_manager") ? DrawerTab::FileManager : DrawerTab::Sync;
+                   : (name == "drawer_file_manager") ? DrawerTab::FileManager
+                   : (name == "drawer_terminal") ? DrawerTab::RemoteTerminal
+                   : (name == "drawer_notes") ? DrawerTab::Notes : DrawerTab::Sync;
     } else if (name == "chat_long_text") {
         showFileDrawer_ = true;
         drawerTab_ = DrawerTab::LiveChat;
@@ -10949,12 +11086,13 @@ void AppUi::applySnapshotState(const std::string& name) {
         HostSessionStatus viewer;
         viewer.active = true;
         viewer.viewerDeskId = 123456789;
-        viewer.viewerHostname = "Office";
+        viewer.viewerHostname = "Dana \xC2\xB7 Office";   // the ACTIVE SESSION card shows the username only
         viewer.viewerIp = "192.168.1.20";
         snapshotHostStatus_ = viewer;
         snapshotHostMicLive_ = true;
-    } else if (name == "modal_approval") {
+    } else if (name == "modal_approval" || name == "modal_approval_picture") {
         activeTab_ = ActiveTab::Dashboard;
+        if (name == "modal_approval_picture") snapshotCallerPicture_ = syntheticPicture(60);
         snapshotPerFrame_ = [](AppUi& a) { a.modalAnimT_ = 1.0f; a.modalAnimVel_ = 0.0f; };
     } else if (name == "modal_totp") {
         showTotpModal_ = true;
@@ -10978,9 +11116,41 @@ void AppUi::applySnapshotState(const std::string& name) {
         p.hostname = "Build Server";
         p.deskId = kSeedHost;
         identity_.addPairedHost(p);
-    } else if (name == "fleet_picker") {
+    } else if (name == "home_desks" || name == "home_desks_pictures" || name == "home_menu") {
         activeTab_ = ActiveTab::Dashboard;
-        showFleetPicker_ = true;
+        const bool pics = name == "home_desks_pictures";
+        identity_.addOrUpdateRecentSession(kSeedDesks[2], "mums-laptop", "", "Mum's laptop");
+        identity_.addOrUpdateRecentSession(kSeedDesks[1], pics ? "Sam \xC2\xB7 build-01" : "build-01", "", "", "Servers");
+        identity_.addOrUpdateRecentSession(kSeedDesks[0], "OFFICE-PC", "", "Office", "Work");
+        if (pics) {   // the middle row keeps its initial
+            network_.injectPeerPictureForTest(kSeedDesks[0], syntheticPicture(200));
+            network_.injectPeerPictureForTest(kSeedDesks[2], syntheticPicture(120));
+        }
+        identity_.toggleFavoriteSession(kSeedDesks[0]);
+        if (name == "home_menu") {
+            snapshotPerFrame_ = [](AppUi& a) {
+                if (!a.homeRows_.empty() && !a.homeMenu_) {
+                    a.homeSel_ = 0;
+                    a.openHomeMenu(a.homeRows_.front(), 640.0f, 240.0f);
+                }
+                a.homeMenuAnimT_ = 1.0f;
+                a.homeMenuAnimVel_ = 0.0f;
+            };
+        }
+    } else if (name == "home_update_available" || name == "home_updating") {
+        activeTab_ = ActiveTab::Dashboard;
+        latestUpdateInfo_.success = latestUpdateInfo_.checkSucceeded = latestUpdateInfo_.updateRequired = true;
+        latestUpdateInfo_.latestVersion = "1.0.2";
+        latestUpdateInfo_.directDownloadUrl = "https://github.com/oocsng/cppdesk/releases/download/v1.0.2/CppDesk.exe";
+        if (name == "home_updating") {
+            isDownloadingUpdate_ = true;
+            updateDownloadProgress_ = 0.4f;
+        }
+    } else if (name == "sessions_empty") {
+        activeTab_ = ActiveTab::RemoteSession;
+    } else if (name == "home_grid_select") {
+        activeTab_ = ActiveTab::Dashboard;
+        homeGridSelect_ = true;
         PairedPeer p;   // paired, but discovery does not see it: listed as offline
         p.hostname = "Build Server";
         p.pairedAtUnix = 1700000000;
@@ -11024,7 +11194,7 @@ void AppUi::applySnapshotState(const std::string& name) {
             { "act.reboot", "Restart Host", "Actions", "shutdown /r /t 0", true },
         };
     } else if (name == "toast") {
-        showToast("Saved desk details");
+        showToast("Desk saved");
         toastExpireTick_ = UINT64_MAX;
     } else if (name == "tooltip") {
         activeTab_ = ActiveTab::Settings;
@@ -11040,6 +11210,7 @@ void AppUi::applySnapshotState(const std::string& name) {
             if (name == sec.first) {
                 activeTab_ = ActiveTab::Settings;
                 settingsSection_ = sec.second;
+                if (sec.second == SettingsSection::Profile) focusedField_ = FocusedField::DisplayName;
             }
         }
     }

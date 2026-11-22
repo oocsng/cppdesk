@@ -660,6 +660,10 @@ bool TileCodec::decodeJpegIntoCanvas(const uint8_t*, size_t, uint8_t*, int, int,
 
 #endif
 
+bool TileCodec::jpegDimensions(const uint8_t* jpegData, size_t jpegLen, int& outW, int& outH) {
+    return parseJpegDimensions(jpegData, jpegLen, outW, outH);
+}
+
 EncodedTile TileCodec::encodeRect(
     uint16_t x,
     uint16_t y,

@@ -1,5 +1,6 @@
 #include "crypto_identity.hpp"
 #include "protocol.hpp"
+#include "profile.hpp"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -584,6 +585,26 @@ IdentityManager::IdentityManager(int instanceId)
 #endif
 }
 
+std::string IdentityManager::displayName() const {
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    return profile::normaliseName(settings_.displayName);
+}
+
+std::string IdentityManager::wireName(size_t maxBytes) const {
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    return profile::composeWireName(profile::normaliseName(settings_.displayName), hostname_, maxBytes);
+}
+
+std::filesystem::path IdentityManager::ownPicturePath() const {
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    return profile::ownPicturePath(configPath_, instanceId_);
+}
+
+std::filesystem::path IdentityManager::peerPicturePath(uint64_t deskId) const {
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    return profile::peerPicturePath(configPath_, instanceId_, deskId);
+}
+
 std::string IdentityManager::configFilePath() const {
     std::lock_guard<std::mutex> lk(stateMutex_);
     auto u8 = configPath_.u8string();
@@ -642,12 +663,16 @@ bool IdentityManager::loadOrCreate() {
                 }
             } else if (key == "relay_auth_key") {
                 settings_.relayAuthKey = val;
+            } else if (key == "display_name") {
+                settings_.displayName = val;
             } else if (key == "stun_server") {
                 if (!val.empty()) settings_.stunServer = val;
             } else if (key == "relay_mode") {
                 try { settings_.relayMode = static_cast<uint8_t>(std::clamp(std::stoi(val), 0, 2)); } catch (...) {}
             } else if (key == "dark_theme") {
                 settings_.darkTheme = (val == "1" || val == "true");
+            } else if (key == "reduce_motion") {
+                try { settings_.reduceMotion = static_cast<uint8_t>(std::clamp(std::stoi(val), 0, 2)); } catch (...) {}
             } else if (key == "target_fps") {
                 try { settings_.targetFps = clampTargetFps(static_cast<uint8_t>(std::stoi(val))); } catch (...) {}
             } else if (key == "adaptive_fps") {
@@ -703,6 +728,8 @@ bool IdentityManager::loadOrCreate() {
                 settings_.audioInputDeviceName = val;
             } else if (key == "audio_output_device_name") {
                 settings_.audioOutputDeviceName = val;
+            } else if (key == "receive_dir") {
+                settings_.receiveDir = val;
             } else if (key == "wayland_restore_token") {
                 if (val.size() <= 256) settings_.waylandRestoreToken = val;
             } else if (key == "auto_virtual_display") {
@@ -882,8 +909,10 @@ bool IdentityManager::save() const {
         out << "relay_server=" << sanitizeIniLine(settings_.relayServer.empty() ? relayServerAddr_ : settings_.relayServer) << "\n";
         out << "relay_auth_key=" << sanitizeIniLine(settings_.relayAuthKey) << "\n";
         out << "stun_server=" << sanitizeIniLine(settings_.stunServer) << "\n";
+        out << "display_name=" << sanitizeIniLine(settings_.displayName) << "\n";
         out << "relay_mode=" << static_cast<int>(settings_.relayMode) << "\n";
         out << "dark_theme=" << (settings_.darkTheme ? "1" : "0") << "\n";
+        out << "reduce_motion=" << static_cast<int>(settings_.reduceMotion) << "\n";
         out << "target_fps=" << static_cast<int>(clampTargetFps(settings_.targetFps)) << "\n";
         out << "adaptive_fps=" << (settings_.adaptiveFps ? "1" : "0") << "\n";
         out << "default_quality=" << static_cast<int>(settings_.defaultQuality) << "\n";
@@ -905,6 +934,7 @@ bool IdentityManager::save() const {
         out << "audio_output_device_id=" << settings_.audioOutputDeviceId << "\n";
         out << "audio_input_device_name=" << sanitizeIniLine(settings_.audioInputDeviceName) << "\n";
         out << "audio_output_device_name=" << sanitizeIniLine(settings_.audioOutputDeviceName) << "\n";
+        out << "receive_dir=" << sanitizeIniLine(settings_.receiveDir) << "\n";
         out << "wayland_restore_token=" << sanitizeIniLine(settings_.waylandRestoreToken) << "\n";
         out << "auto_virtual_display=" << (settings_.autoVirtualDisplay ? "1" : "0") << "\n";
         out << "privacy_notice=" << sanitizeIniValue(settings_.privacyCustomNotice) << "\n";

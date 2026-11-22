@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # ScreenCaptureKit (macOS host capture) needs 12.3; must be set before project().
 set(CMAKE_OSX_DEPLOYMENT_TARGET "12.3" CACHE STRING "")
-project(CppDesk VERSION 1.0.0 LANGUAGES C CXX)
+project(CppDesk VERSION 1.0.1 LANGUAGES C CXX)
 if(NOT MSVC)
     enable_language(ASM)
 endif()
@@ -13,12 +13,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Common core sources
 set(CORE_SOURCES
     src/core/crypto_identity.cpp
+    src/core/profile.cpp
     src/core/totp_manager.cpp
     src/core/qr_matrix.cpp
     src/net/network_engine.cpp
     src/net/fleet_manager.cpp
     src/net/updater.cpp
     src/capture/screen_capture.cpp
+    src/capture/avatar_image.cpp
     src/capture/display_manager.cpp
     src/capture/virtual_display_manager.cpp
     src/capture/screen_blank_manager.cpp

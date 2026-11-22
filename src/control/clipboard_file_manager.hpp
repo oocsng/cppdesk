@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <memory>
 #include <functional>
+#include <optional>
 #include <algorithm>
 #include "shell_clipboard.hpp"
 
@@ -100,6 +101,12 @@ private:
     ClipboardHistoryManager history_;
 };
 
+#if defined(_WIN32)
+// The folder shown under a screen point: the desktop, or the folder of an Explorer window.
+// nullopt for any other window, a virtual folder, a failed lookup, or when it takes over 1000 ms.
+std::optional<std::filesystem::path> resolveDropFolder(int screenX, int screenY);
+#endif
+
 class FileTransferManager {
 public:
     using SendPacketFn = std::function<bool(PacketType, const std::vector<uint8_t>&)>;
@@ -107,6 +114,7 @@ public:
     FileTransferManager();
     ~FileTransferManager();
 
+    static std::string defaultReceiveDirectory();
     void setReceiveDirectory(const std::string& dirPath);
     std::string receiveDirectory() const;
     void openReceiveDirectoryInExplorer() const;
@@ -135,9 +143,9 @@ public:
     void abortActiveTransfers();
 
     // Handle incoming file transfer packets from remote peer
+    // dropFolder (if an existing directory) is where the file lands; otherwise the receive directory
     void handleFileOffer(uint32_t transferId, uint64_t totalBytes, const std::string& fileName,
-                         FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads,
-                         float dropNx = 0.0f, float dropNy = 0.0f);
+                         const std::filesystem::path& dropFolder = {});
     void handleFileChunk(uint32_t transferId, uint64_t offset, const uint8_t* chunkData, size_t chunkLen);
     void handleFileComplete(uint32_t transferId, const std::string& sha256Hex);
     void handleFileCancel(uint32_t transferId);

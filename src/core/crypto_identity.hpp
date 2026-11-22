@@ -26,6 +26,7 @@ struct RecentSessionEntry {
 
 struct AppSettings {
     bool          darkTheme = false;                     // false = Light (White & Blue), true = Dark (Black & Blue)
+    uint8_t       reduceMotion = 0;                      // 0 = follow the OS, 1 = on, 2 = off
     uint8_t       targetFps = 30;                        // 15, 30, 45, or 60 FPS
     bool          adaptiveFps = true;                    // Auto-drop FPS when network connection is poor
     QualityPreset defaultQuality = QualityPreset::Balanced;
@@ -40,6 +41,7 @@ struct AppSettings {
     bool          enableTaskbarFlash = true;             // Pulse taskbar orange when background alerts arrive
     bool          enableNotificationSounds = true;       // Audio chime on incoming alerts
     bool          minimizeToTray = false;                // Minimize window to Windows Notification Area
+    std::string   receiveDir = "";                       // Folder for received files (UTF-8); empty = built-in default
 
     // Self-Hosted Relay & STUN Configuration
     std::string   relayServer = "127.0.0.1:50999";
@@ -84,6 +86,9 @@ struct AppSettings {
 
     // Glide: desk ID of the paired PC placed past each screen edge (config keys glide_left/right/top/bottom); 0 = nothing placed
     uint64_t      glideLeft = 0, glideRight = 0, glideTop = 0, glideBottom = 0;
+
+    // Profile: the username shown to peers (config key display_name); empty = peers see only the hostname
+    std::string   displayName = "";
 };
 
 class CryptoUtils {
@@ -389,6 +394,12 @@ public:
     const TotpManager& totpManager() const { return totpManager_; }
 
     std::string configFilePath() const;
+
+    // Profile: the normalised username, and what peers are sent in place of the hostname ("Name \xC2\xB7 HOST", or just HOST)
+    std::string displayName() const;
+    std::string wireName(size_t maxBytes = 255) const;
+    std::filesystem::path ownPicturePath() const;
+    std::filesystem::path peerPicturePath(uint64_t deskId) const;
     void setConfigPathForTest(const std::filesystem::path& path);
 
     // Pairing (thread-safe; getters return copies). The add/remove calls save the config.

@@ -1,5 +1,7 @@
 #include "../src/core/protocol.hpp"
 #include "../src/core/crypto_identity.hpp"
+#include "../src/core/profile.hpp"
+#include "../src/capture/avatar_image.hpp"
 #include "../src/simd/simd_kernels.hpp"
 #include "../src/capture/screen_capture.hpp"
 #include "../src/control/input_injector.hpp"
@@ -622,6 +624,7 @@ void testAppSettingsAndAdaptiveFps() {
         idSave.loadOrCreate();
         AppSettings s = idSave.settings();
         s.darkTheme = true;
+        s.reduceMotion = 1;
         s.targetFps = 60;
         s.adaptiveFps = false;
         s.defaultQuality = QualityPreset::LowBandwidth;
@@ -643,6 +646,7 @@ void testAppSettingsAndAdaptiveFps() {
         idLoad.loadOrCreate();
         AppSettings loaded = idLoad.settings();
         TEST_ASSERT(loaded.darkTheme == true);
+        TEST_ASSERT(loaded.reduceMotion == 1);
         TEST_ASSERT(loaded.targetFps == 60);
         TEST_ASSERT(loaded.adaptiveFps == false);
         TEST_ASSERT(loaded.defaultQuality == QualityPreset::LowBandwidth);
@@ -662,11 +666,30 @@ void testAppSettingsAndAdaptiveFps() {
         idLoad.resetSettingsToDefault();
         AppSettings def = idLoad.settings();
         TEST_ASSERT(def.darkTheme == false);
+        TEST_ASSERT(def.reduceMotion == 0);
         TEST_ASSERT(def.targetFps == 30);
         TEST_ASSERT(def.adaptiveFps == true);
         TEST_ASSERT(def.defaultQuality == QualityPreset::Balanced);
         TEST_ASSERT(def.defaultPermissions == PERM_ALL);
         TEST_ASSERT(def.hardwareAcceleration == true);
+    }
+
+    // 4. Received-files folder: persists, is applied to the file manager, and Reset puts the default back
+    {
+        IdentityManager idA(104);
+        TEST_ASSERT(idA.settings().receiveDir.empty());
+        AppSettings s = idA.settings();
+        const auto dir = (std::filesystem::temp_directory_path() / "cppdesk_recv_setting").string();
+        s.receiveDir = dir;
+        idA.updateSettings(s);
+        IdentityManager idB(104);
+        TEST_ASSERT(idB.loadOrCreate());
+        TEST_ASSERT(idB.settings().receiveDir == dir);
+        NetworkEngine eng(idB);
+        TEST_ASSERT(eng.fileTransferManager().receiveDirectory() == dir);
+        idB.resetSettingsToDefault();
+        eng.applyReceiveDirectory();
+        TEST_ASSERT(eng.fileTransferManager().receiveDirectory() == FileTransferManager::defaultReceiveDirectory());
     }
 }
 
@@ -1301,8 +1324,8 @@ void testAutoUpdaterAndProtocolV3() {
     TEST_ASSERT(PROTOCOL_MAGIC == 0x43505044); // "CPPD"
     TEST_ASSERT(RELAY_MAGIC == 0x4344534B);    // "CDSK"
     TEST_ASSERT(PROTOCOL_VERSION == 4);
-    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "1.0.0");
-    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x010000);
+    TEST_ASSERT(std::string(CPP_DESK_VERSION) == "1.0.1");
+    TEST_ASSERT(CPP_DESK_VERSION_NUM == 0x010001);
 
     // 2. Semantic Version Triad Parsing
     int maj = 0, min = 0, pat = 0;
@@ -6661,34 +6684,39 @@ void testCrossPlatformUiWindowingAndMacOsViewer() {
         TEST_ASSERT(std::abs(vel) < 0.01f);
         TEST_ASSERT(maxOvershoot > 0.005f);
 
-        // 4.2: Tactile transformed rect geometry (UiPlatform::computeSpringRect)
+        // 4.2: Press shrinks to 97% around the centre; at rest the rect is unchanged
         UiPlatformRect baseBtn = { 100.0f, 200.0f, 200.0f, 240.0f };
+        UiPlatformRect restRect = UiPlatform::computeSpringRect(baseBtn, 0.0f);
+        TEST_ASSERT(std::abs(restRect.left - baseBtn.left) < 0.001f && std::abs(restRect.bottom - baseBtn.bottom) < 0.001f);
+        UiPlatformRect pressRect = UiPlatform::computeSpringRect(baseBtn, 1.0f);
+        TEST_ASSERT(std::abs(pressRect.width() - 97.0f) < 0.01f && std::abs(pressRect.height() - 38.8f) < 0.01f);
+        TEST_ASSERT(std::abs(pressRect.centerX() - baseBtn.centerX()) < 0.001f && std::abs(pressRect.centerY() - baseBtn.centerY()) < 0.001f);
 
-        // Resting state: hoverT = 0, pressT = 0
-        UiPlatformRect restRect = UiPlatform::computeSpringRect(baseBtn, 0.0f, 0.0f);
-        TEST_ASSERT(std::abs(restRect.left - baseBtn.left) < 0.001f);
-        TEST_ASSERT(std::abs(restRect.top - baseBtn.top) < 0.001f);
-        TEST_ASSERT(std::abs(restRect.width() - baseBtn.width()) < 0.001f);
-        TEST_ASSERT(std::abs(restRect.height() - baseBtn.height()) < 0.001f);
+        // 4.3: Popovers grow from 95% around their trigger point
+        UiPlatformRect menu = { 100.0f, 50.0f, 300.0f, 250.0f };
+        UiPlatformRect start = UiPlatform::popoverRect(menu, 0.0f, 200.0f, 50.0f);
+        TEST_ASSERT(std::abs(start.top - 50.0f) < 0.001f && std::abs(start.width() - 190.0f) < 0.01f);
+        UiPlatformRect end = UiPlatform::popoverRect(menu, 1.0f, 200.0f, 50.0f);
+        TEST_ASSERT(std::abs(end.left - menu.left) < 0.001f && std::abs(end.bottom - menu.bottom) < 0.001f);
 
-        // Hover state (hoverT = 1.0, pressT = 0): expands bounds, lifts upward
-        UiPlatformRect hoverRect = UiPlatform::computeSpringRect(baseBtn, 1.0f, 0.0f);
-        TEST_ASSERT(hoverRect.width() > baseBtn.width());
-        TEST_ASSERT(hoverRect.height() > baseBtn.height());
-        TEST_ASSERT(hoverRect.top < baseBtn.top);
-        TEST_ASSERT(std::abs(hoverRect.centerY() - (baseBtn.centerY() - 1.8f)) < 0.05f);
-
-        // Pressed state (hoverT = 1.0, pressT = 1.0): squishes down, depresses downward
-        UiPlatformRect pressRect = UiPlatform::computeSpringRect(baseBtn, 1.0f, 1.0f);
-        TEST_ASSERT(pressRect.width() < hoverRect.width());
-        TEST_ASSERT(pressRect.height() < hoverRect.height());
-        TEST_ASSERT(pressRect.top > hoverRect.top);
-
-        // Standalone press from rest (hoverT = 0, pressT = 1.0)
-        UiPlatformRect pressFromRest = UiPlatform::computeSpringRect(baseBtn, 0.0f, 1.0f);
-        TEST_ASSERT(pressFromRest.width() < baseBtn.width());
-        TEST_ASSERT(pressFromRest.height() < baseBtn.height());
-        TEST_ASSERT(pressFromRest.top > baseBtn.top);
+        // 4.4: App motion never overshoots, exits finish sooner, and reduced motion jumps to the target
+        auto framesToSettle = [](float from, float to, bool reduced, float& maxOvershoot) {
+            float p = from, v = 0.0f;
+            maxOvershoot = 0.0f;
+            for (int f = 1; f <= 120; ++f) {
+                UiPlatform::stepMotion(p, v, to, 32.0f, 0.72f, 0.016f, 0.0012f, reduced);
+                maxOvershoot = std::max(maxOvershoot, (to > from) ? p - to : to - p);
+                if (std::fabs(p - to) < 0.01f) return f;
+            }
+            return 999;
+        };
+        float over = 0.0f;
+        const int enterFrames = framesToSettle(0.0f, 1.0f, false, over);
+        TEST_ASSERT(over <= 0.0f);
+        const int exitFrames = framesToSettle(1.0f, 0.0f, false, over);
+        TEST_ASSERT(over <= 0.0f);
+        TEST_ASSERT(exitFrames < enterFrames);
+        TEST_ASSERT(framesToSettle(0.0f, 1.0f, true, over) == 1);
     }
 }
 
@@ -6837,6 +6865,10 @@ void testThemePaletteContrast() {
         // Exemption: white label on the terracotta fill is about 3.1:1; the Connect-screen sub-project owns the button design.
         CONTRAST_CHECK(COL_TEXT_ON_ACCENT, COL_PRIMARY_ACCENT, 3.0);
 
+        // The espresso rail stays dark in both modes.
+        CONTRAST_CHECK(COL_RAIL_TEXT, COL_RAIL_BG, 4.5);
+        CONTRAST_CHECK(COL_RAIL_TEXT_ACTIVE, COL_RAIL_BG, 4.5);
+
         // Not covered: COL_STAGE_BG (sits behind the remote canvas, no text) and the rewind-bar label (drawn over video).
         TEST_ASSERT(std::fabs(COL_HUD_BG.a - 0.94f) < 1e-5f);
 
@@ -6866,19 +6898,11 @@ void testThemeScales() {
     TEST_ASSERT(theme::type::mono.size == 14.0f && theme::type::mono.weight == 700);
     TEST_ASSERT(theme::type::tooltip.size == 11.5f && theme::type::tooltip.weight == 400);
 
-    // Motion scale equals the spring parameters the update loop used before the scale existed.
-    TEST_ASSERT(theme::motion::themeBlend.omega == 20.0f && theme::motion::themeBlend.zeta == 0.92f);
-    TEST_ASSERT(theme::motion::hover.omega == 32.0f && theme::motion::hover.zeta == 0.72f);
-    TEST_ASSERT(theme::motion::press.omega == 38.0f && theme::motion::press.zeta == 0.68f);
-    TEST_ASSERT(theme::motion::standard.omega == 28.0f && theme::motion::standard.zeta == 0.74f);
-    TEST_ASSERT(theme::motion::menu.omega == 32.0f && theme::motion::menu.zeta == 0.76f);
-    TEST_ASSERT(theme::motion::panel.omega == 26.0f && theme::motion::panel.zeta == 0.78f);
-    TEST_ASSERT(theme::motion::drawer.omega == 26.0f && theme::motion::drawer.zeta == 0.80f);
-    TEST_ASSERT(theme::motion::scroll.omega == 32.0f && theme::motion::scroll.zeta == 0.88f);
+    // Everyday UI never bounces: every motion spring is critically damped.
     for (const auto& s : { theme::motion::themeBlend, theme::motion::hover, theme::motion::press,
                            theme::motion::standard, theme::motion::menu, theme::motion::panel,
                            theme::motion::drawer, theme::motion::scroll }) {
-        TEST_ASSERT(s.omega > 0.0f && s.zeta > 0.0f && s.zeta < 1.0f);
+        TEST_ASSERT(s.omega > 0.0f && s.zeta >= 1.0f);
     }
 }
 
@@ -8100,6 +8124,13 @@ bool textInField(AppUi& app, float wDip, float hDip, const std::string& text, co
     return r && r->top < field.bottom && r->bottom > field.top && r->left < field.right && r->right > field.left;
 }
 
+// A fresh window has the desk box focused, which hides its placeholder; Esc blurs it so the box can be found.
+std::optional<ui::Rect> findDeskField(AppUi& app, float wDip, float hDip) {
+    app.onKey(KeyEvent{ VK_ESCAPE, 0x01, true, false });
+    app.onKey(KeyEvent{ VK_ESCAPE, 0x01, false, false });
+    return findTextRect(app, wDip, hDip, "Desk ID or name");
+}
+
 #endif
 
 #if defined(__linux__)
@@ -8174,7 +8205,7 @@ void testLinuxWindow() {
         }
 
         // Click the desk search box and type into it.
-        auto field = findTextRect(w.app(), wDip, hDip, "Search desks...");
+        auto field = findDeskField(w.app(), wDip, hDip);
         TEST_ASSERT(field.has_value());
         if (field) {
             sendButton(peer, win, static_cast<int>((field->left + field->right) / 2),
@@ -8264,7 +8295,7 @@ void testLinuxWindow() {
         }));
         TEST_ASSERT(attrs.width >= 2 * 900);   // at least the 900-DIP minimum, doubled
         const float wd = attrs.width / 2.0f, hd = attrs.height / 2.0f;
-        auto field = findTextRect(w.app(), wd, hd, "Search desks...");
+        auto field = findDeskField(w.app(), wd, hd);
         TEST_ASSERT(field.has_value());
         if (field) {
             sendButton(peer, win, static_cast<int>(field->left + field->right), static_cast<int>(field->top + field->bottom));
@@ -8302,7 +8333,7 @@ void testMacWindow() {
         TEST_ASSERT(macWindowDrewVariedPixels(w.nativeWindow()));
 
         // Click the desk search box and type into it: once each, not twice (keyDown and the text input client).
-        auto field = findTextRect(w.app(), wDip, hDip, "Search desks...");
+        auto field = findDeskField(w.app(), wDip, hDip);
         TEST_ASSERT(field.has_value());
         if (field) {
             macClick(w.nativeWindow(), (field->left + field->right) / 2, (field->top + field->bottom) / 2);
@@ -8852,7 +8883,7 @@ void testLinuxTray() {
         w.app().applySnapshotState("settings_system");
         ui::RecordingCanvas rc;
         for (int i = 0; i < 30; ++i) w.app().render(rc, 1220, 760, 1.0 / 60.0);
-        return rc.serialize().find("Minimize window to system tray") != std::string::npos;
+        return rc.serialize().find("Minimize to the tray") != std::string::npos;
     };
 
     // No tray: the toggle is hidden and closing quits instead of hiding the window for good.
@@ -9044,9 +9075,12 @@ public:
     uint64_t clock = 10000;
     uint64_t nowMs() const override { return clock; }
     void setTextInputActive(bool) override {}
-    void chooseOpenFile(const std::string&, const std::string&, const std::string&, ChosenPath chosen) override { chosen(std::nullopt); }
+    std::optional<std::string> pickPath;   // what chooseOpenFile "chooses"; nullopt = the user cancels
+    void chooseOpenFile(const std::string&, const std::string&, const std::string&, ChosenPath chosen) override { chosen(pickPath); }
     void chooseFolder(const std::string&, ChosenPath chosen) override { chosen(std::nullopt); }
-    void openUrl(const std::string&) override {}
+    std::vector<std::string> openedUrls, updateDownloads;
+    bool autoUpdate = true;
+    void openUrl(const std::string& url) override { openedUrls.push_back(url); }
     int relaunches = 0;
     void relaunchApp() override { ++relaunches; }
     void setFrameIntervalMs(unsigned) override {}
@@ -9080,8 +9114,8 @@ public:
     void trackMouseLeave() override {}
     bool loadAppIcon(std::vector<uint8_t>&, int&, int&) override { return false; }
     void checkForUpdates(bool) override {}
-    void startUpdateDownload(const std::string&, uint64_t, const std::string&,
-                             std::function<void(bool, const std::string&)>) override {}
+    void startUpdateDownload(const std::string& url, uint64_t, const std::string&,
+                             std::function<void(bool, const std::string&)>) override { updateDownloads.push_back(url); }
     ui::ServiceState serviceState() const override { return ui::ServiceState::NotInstalled; }
     bool runServiceAction(ui::ServiceAction) override { return false; }
     bool has(ui::Capability c) const override {
@@ -9093,6 +9127,7 @@ public:
             case ui::Capability::ActionCenterToasts: return actionCenter;
             case ui::Capability::TrayIcon: return tray;
             case ui::Capability::HostPermissions: return hostPermsCap;
+            case ui::Capability::AutoUpdate: return autoUpdate;
         }
         return false;
     }
@@ -9117,17 +9152,17 @@ void testShellCapabilityGating() {
     std::string sysAll = renderAppState(id, net, all, "settings_system");
     std::string dashAll = renderAppState(id, net, all, "dashboard_light");
     TEST_ASSERT(sysAll.find("|Uninstall") != std::string::npos);
-    TEST_ASSERT(sysAll.find("WINDOWS SYSTEM SERVICE") != std::string::npos);
-    TEST_ASSERT(sysAll.find("Windows Action Center push toasts") != std::string::npos);
+    TEST_ASSERT(sysAll.find("Windows service") != std::string::npos);
+    TEST_ASSERT(sysAll.find("Windows notifications") != std::string::npos);
 
     FakeShell none;
     none.service = none.elevation = none.shortcut = none.actionCenter = none.tray = false;
     std::string sysNone = renderAppState(id, net, none, "settings_system");
     std::string dashNone = renderAppState(id, net, none, "dashboard_light");
     TEST_ASSERT(sysNone.find("|Uninstall") == std::string::npos);
-    TEST_ASSERT(sysNone.find("WINDOWS SYSTEM SERVICE") == std::string::npos);
-    TEST_ASSERT(sysNone.find("Windows Action Center push toasts") == std::string::npos);
-    TEST_ASSERT(sysNone.find("Minimize window to system tray") == std::string::npos);
+    TEST_ASSERT(sysNone.find("Windows service") == std::string::npos);
+    TEST_ASSERT(sysNone.find("Windows notifications") == std::string::npos);
+    TEST_ASSERT(sysNone.find("Minimize to the tray") == std::string::npos);
     TEST_ASSERT(dashNone.find("|Elevate Admin") == std::string::npos);
     // No Windows wording where the platform is not Windows.
     TEST_ASSERT(sysNone.find("Windows") == std::string::npos);
@@ -9155,7 +9190,7 @@ void testAppUiRendersEveryScreenHeadless() {
         TEST_ASSERT(rc.ops().size() > 20);
     }
     std::string approval = renderAppState(id, net, shell, "modal_approval");
-    TEST_ASSERT(approval.find("|Connection Request") != std::string::npos);
+    TEST_ASSERT(approval.find("|Someone wants to connect") != std::string::npos);
     std::string dash = renderAppState(id, net, shell, "dashboard_light");
     TEST_ASSERT(dash.find("|" + CryptoUtils::formatDeskId(id.deskId())) != std::string::npos);
 
@@ -9163,13 +9198,13 @@ void testAppUiRendersEveryScreenHeadless() {
     TEST_ASSERT(std::find(names.begin(), names.end(), "modal_pair_offer") != names.end());
     TEST_ASSERT(std::find(names.begin(), names.end(), "settings_permissions_paired") != names.end());
     std::string offer = renderAppState(id, net, shell, "modal_pair_offer");
-    TEST_ASSERT(offer.find("|Pair with this PC?") != std::string::npos);
+    TEST_ASSERT(offer.find("|Pair with this desk?") != std::string::npos);
     TEST_ASSERT(offer.find("|Not now") != std::string::npos);
     TEST_ASSERT(offer.find("|Pair\n") != std::string::npos);
     std::string paired = renderAppState(id, net, shell, "settings_permissions_paired");
     TEST_ASSERT(paired.find("|Allow pairing") != std::string::npos);
-    TEST_ASSERT(paired.find("|PAIRED PCS") != std::string::npos);
-    TEST_ASSERT(paired.find("|PCS THIS ONE CAN ENTER") != std::string::npos);
+    TEST_ASSERT(paired.find("|Paired desks") != std::string::npos);
+    TEST_ASSERT(paired.find("|Desks this one can enter") != std::string::npos);
     TEST_ASSERT(paired.find("|Forget") != std::string::npos);
     TEST_ASSERT(paired.find("|Office \xC2\xB7 555 000 111 \xC2\xB7 paired 2023-11-14") != std::string::npos);
     TEST_ASSERT(paired.find("None yet") == std::string::npos);
@@ -9556,7 +9591,7 @@ void testWaylandShareNoticeUi() {
     {   // Settings: the same words, labelled experimental; gone again when there is nothing to say
         net.setShareNoticeForTest({ShareState::Denied, ""});
         const std::string settings = renderAppState(id, net, shell, "settings_system");
-        TEST_ASSERT(settings.find("|WAYLAND SCREEN SHARING (EXPERIMENTAL)") != npos && settings.find("|Screen sharing is off") != npos);
+        TEST_ASSERT(settings.find("|Wayland screen sharing (experimental)") != npos && settings.find("|Screen sharing is off") != npos);
         net.setShareNoticeForTest({ShareState::Running, ""});
         TEST_ASSERT(renderAppState(id, net, shell, "settings_system").find("WAYLAND SCREEN SHARING") == npos);
         net.setShareNoticeForTest({});
@@ -10285,11 +10320,10 @@ void testFleetUi() {
     NetworkEngine net(id);
     FakeShell shell;
     const auto names = AppUi::snapshotStateNames();
-    TEST_ASSERT(std::find(names.begin(), names.end(), "fleet_picker") != names.end());
+    TEST_ASSERT(std::find(names.begin(), names.end(), "home_grid_select") != names.end());
     TEST_ASSERT(std::find(names.begin(), names.end(), "fleet_grid") != names.end());
-    const std::string picker = renderAppState(id, net, shell, "fleet_picker");
-    TEST_ASSERT(picker.find("|Do it on all") != std::string::npos);
-    TEST_ASSERT(picker.find("|Paired PCs on this network") != std::string::npos);
+    const std::string picker = renderAppState(id, net, shell, "home_grid_select");
+    TEST_ASSERT(picker.find("|Build Server") != std::string::npos);
     TEST_ASSERT(picker.find("|Offline") != std::string::npos);      // a paired PC discovery does not see
     TEST_ASSERT(picker.find("|Open grid (0)") != std::string::npos);
     const std::string grid = renderAppState(id, net, shell, "fleet_grid");
@@ -10351,7 +10385,7 @@ void testFleetUi() {
             app.onKey({0xBF, 0x35, false, false});
             app.onKey({VK_F1, 0x3B, true, false});  // the help sheet opens while Shift is still held
             for (int i = 0; i < 10; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);
-            TEST_ASSERT(rc.serialize().find("|Keyboard Shortcuts") != std::string::npos);   // a modal is up
+            TEST_ASSERT(rc.serialize().find("|Keyboard shortcuts") != std::string::npos);   // a modal is up
             app.onKey({VK_F1, 0x3B, false, false});
             app.onKey({VK_SHIFT, 0x2A, false, false});
             TEST_ASSERT(waitFor([&] { return saw(VK_SHIFT, true) && saw(0xBF, true) && saw(0xBF, false) && saw(VK_SHIFT, false); }, 2000));
@@ -10408,7 +10442,7 @@ void testFleetUi() {
             app.onTick();   // dials Alpha in a session tab; leaving the grid keeps Bravo
             TEST_ASSERT(count(frame(), "Type into all") == 0);   // off the grid
             TEST_ASSERT(hostB.hostSessionStatus().active);
-            TEST_ASSERT(clickText(app, frame(), "Dashboard"));
+            TEST_ASSERT(clickText(app, frame(), "Home"));
             ops = frame();
             TEST_ASSERT(count(ops, "Back to grid (1)") == 1 && count(ops, "Do it on all") == 0);
             TEST_ASSERT(clickText(app, ops, "Back to grid (1)"));
@@ -10421,7 +10455,7 @@ void testFleetUi() {
             plainShell.clock += 301;
             app.onTick();
             frame();
-            TEST_ASSERT(clickText(app, frame(), "Dashboard"));
+            TEST_ASSERT(clickText(app, frame(), "Home"));
             ops = frame();
             TEST_ASSERT(count(ops, "Do it on all") == 1 && ops.find("|Back to grid") == std::string::npos);
         }
@@ -10576,7 +10610,7 @@ void testGlideSettingsUi() {
             app.onMouseButton(MouseButtonId::Left, false, x, y);
             settle();
         };
-        const float rowX = 990.0f, officeY = 198.0f, receptionY = 237.0f, leftX = 350.0f, slotY = 267.0f;
+        const float rowX = 990.0f, officeY = 140.0f, receptionY = 179.0f, leftX = 422.0f, slotY = 209.0f;   // below no top bar, right of the 72-DIP rail
         click(rowX, officeY);
         click(leftX, slotY);
         TEST_ASSERT(glidePcAt(id.settings(), GlideEdge::Left) == 555000401);
@@ -10997,7 +11031,7 @@ void testPairingOfferEveryConnection() {
             for (int i = 0; i < 60; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);   // long enough for a modal to settle
             return rc.serialize();
         };
-        auto offered = [&] { return frame().find("|Pair with this PC?") != std::string::npos; };
+        auto offered = [&] { return frame().find("|Pair with this desk?") != std::string::npos; };
         auto connected = [&] { return viewerNet.viewerStats().state == ViewerConnectionState::Connected; };
         auto waitFor = [](const std::function<bool()>& cond, int ms) {
             for (int i = 0; i < ms / 50 && !cond(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -11025,7 +11059,7 @@ void testPairingOfferEveryConnection() {
 
         // Back on the dashboard with A still connected, dial B. The UI does not tick until B is up, as when a quick
         // LAN handshake (or a busy message queue) beats the next timer tick: B still gets its own offer.
-        TEST_ASSERT(clickText("Dashboard") && connected());
+        TEST_ASSERT(clickText("Home") && connected());
         app.onText(std::string(40, '\b') + "127.0.0.1:" + std::to_string(hostB.hostListenPort()));
         TEST_ASSERT(clickText("Connect"));
         TEST_ASSERT(waitFor([&] { return connected() && viewerNet.viewerStats().remoteDeskId == hostBId.deskId(); }, 4000));
@@ -11051,7 +11085,7 @@ void testIdleFocusedFieldDoesNotSpin() {
         ui::RecordingCanvas rc;
         for (int i = 0; i < 240; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);   // past the 2 s startup timer
         TEST_ASSERT(!app.wantsAnimationFrame());   // the idle tick repaints for the caret; no 60 fps loop
-        TEST_ASSERT(rc.serialize().find("Remote Desk") != std::string::npos);
+        TEST_ASSERT(rc.serialize().find("|Connect to a desk") != std::string::npos);
     }
     std::filesystem::remove(probe.configFilePath(), ec);
 }
@@ -11175,7 +11209,8 @@ void testUiGoldens() {
     std::filesystem::remove(id.configFilePath(), ec);
     {
         std::ofstream cfg(id.configFilePath(), std::ios::trunc);
-        cfg << "desk_id=482910375\n" << "totp_secret=JBSWY3DPEHPK3PXP\n";
+        // A fixed folder, so the Settings golden does not carry this machine's profile path
+        cfg << "desk_id=482910375\n" << "totp_secret=JBSWY3DPEHPK3PXP\n" << "receive_dir=cppdesk_ui_golden_recv\n";
     }
     id.loadOrCreate();
     id.setSessionCode("k7m2qp");
@@ -11209,6 +11244,7 @@ void testUiGoldens() {
         TEST_ASSERT(got == want);
     }
     std::filesystem::remove(id.configFilePath(), ec);
+    std::filesystem::remove("cppdesk_ui_golden_recv", ec);   // the engine created it empty
 }
 
 void testWaylandHelpers() {
@@ -12921,7 +12957,7 @@ void testMacAudioPaths() {
 } // namespace
 
 void testRecentCardButtonsClickable() {
-    std::cout << "[TEST 121] Dashboard: the remove button on a recent-desk card removes it instead of connecting..." << std::endl;
+    std::cout << "[TEST 121] Home: a desk's menu removes it, Undo puts it back, the connect box finds desks; the session bar's More menu..." << std::endl;
     std::error_code ec;
     IdentityManager id(4371);
     std::filesystem::remove(id.configFilePath(), ec);
@@ -12932,24 +12968,73 @@ void testRecentCardButtonsClickable() {
     AppUi app(id, net, shell);
     ui::RecordingCanvas rc;
     auto frame = [&] { for (int i = 0; i < 30; ++i) app.render(rc, 1280, 800, 1.0 / 60.0); return rc.serialize(); };
-    float t = 0, r = 0;
-    std::istringstream in(frame());
-    for (std::string line; std::getline(in, line);) {   // the card's own Connect button is 86 wide, unlike the Remote Desk one
-        const std::string tail = "|Connect";
-        if (line.rfind("drawText ", 0) != 0 || line.size() < tail.size() ||
-            line.compare(line.size() - tail.size(), std::string::npos, tail) != 0) continue;
-        float l = 0, tt = 0, rr = 0, b = 0;
-        std::istringstream(line.substr(9)) >> l >> tt >> rr >> b;
-        if (std::fabs((rr - l) - 86.0f) < 1.0f) { t = tt; r = rr; }
+    auto centre = [](const std::string& ops, const std::string& text) -> std::optional<std::pair<float, float>> {
+        std::istringstream in(ops);
+        for (std::string line; std::getline(in, line);) {
+            if (line.rfind("drawText ", 0) != 0 || !line.ends_with("|" + text)) continue;
+            float l = 0, t = 0, r = 0, b = 0;
+            std::istringstream(line.substr(9)) >> l >> t >> r >> b;
+            return std::make_pair((l + r) / 2, (t + b) / 2);
+        }
+        return std::nullopt;
+    };
+    auto click = [&](MouseButtonId btn, std::pair<float, float> p) {
+        app.onMouseMove(p.first, p.second);
+        frame();
+        app.onMouseButton(btn, true, p.first, p.second);
+        app.onMouseButton(btn, false, p.first, p.second);
+        return frame();
+    };
+
+    std::string ops = frame();
+    const auto row = centre(ops, "Office");
+    TEST_ASSERT(row.has_value());
+    if (row) {
+        ops = click(MouseButtonId::Right, *row);   // right-click opens the row's menu; nothing dials
+        const auto remove = centre(ops, "Remove");
+        TEST_ASSERT(remove.has_value() && centre(ops, "Rename & tags\xE2\x80\xA6").has_value());
+        if (remove) ops = click(MouseButtonId::Left, *remove);
+        TEST_ASSERT(id.recentSessions().empty());
+        const auto undo = centre(ops, "Undo");
+        TEST_ASSERT(undo.has_value());
+        if (undo) click(MouseButtonId::Left, *undo);
+        const auto back = id.recentSessions();
+        TEST_ASSERT(back.size() == 1 && back[0].deskId == 987654321ull && back[0].address == "127.0.0.1:1");
     }
-    TEST_ASSERT(r > 0.0f);
-    const float x = r - 10.0f, y = t - 21.0f;   // centre of the card's X button
-    app.onMouseMove(x, y);
-    frame();
-    app.onMouseButton(MouseButtonId::Left, true, x, y);
-    app.onMouseButton(MouseButtonId::Left, false, x, y);
-    frame();
-    TEST_ASSERT(id.recentSessions().empty());
+
+    // The connect box is also the search: an ID in any spacing finds its desk, other text matches by name.
+    if (const auto box = centre(frame(), "Desk ID or name")) click(MouseButtonId::Left, *box);
+    app.onText("987-654 321");
+    TEST_ASSERT(frame().find("|Office") != std::string::npos);
+    app.onText("\x01zzz");   // Ctrl+A clears the box first
+    ops = frame();
+    TEST_ASSERT(ops.find("|Office") == std::string::npos && ops.find("|No desks match") != std::string::npos);
+
+    {   // The session bar keeps the everyday controls; the rest sit under More, and a narrow window folds the bar's leftmost into More
+        AppUi s(id, net, shell, "");
+        ui::RecordingCanvas src;
+        s.applySnapshotState("session_more_menu");
+        auto draw = [&](int w) { for (int i = 0; i < 30; ++i) s.render(src, w, 800, 1.0 / 60.0); return src.serialize(); };
+        auto lineOf = [](const std::string& o, const std::string& text) {
+            std::istringstream in(o);
+            for (std::string line; std::getline(in, line);) if (line.rfind("drawText ", 0) == 0 && line.ends_with("|" + text)) return line;
+            return std::string();
+        };
+        std::string wide = draw(1280);
+        TEST_ASSERT(lineOf(wide, "Vol: 100%").find(" Small ") != std::string::npos);   // in the bar
+        TEST_ASSERT(lineOf(wide, "Record").find(" Body ") != std::string::npos);        // in the menu
+        std::string narrow = draw(900);
+        TEST_ASSERT(lineOf(narrow, "Vol: 100%").find(" Body ") != std::string::npos);
+        TEST_ASSERT(lineOf(narrow, "Fullscreen").find(" Small ") != std::string::npos);
+        if (const auto board = centre(narrow, "Board")) {
+            s.onMouseMove(board->first, board->second);
+            draw(900);
+            s.onMouseButton(MouseButtonId::Left, true, board->first, board->second);
+            s.onMouseButton(MouseButtonId::Left, false, board->first, board->second);
+        }
+        narrow = draw(900);
+        TEST_ASSERT(narrow.find("|Whiteboard active") != std::string::npos && narrow.find("|Record") == std::string::npos);
+    }
     std::filesystem::remove(id.configFilePath(), ec);
 }
 
@@ -12986,6 +13071,686 @@ void testOsAssignedPorts() {
 #include "fix_tests_e.inc"
 #include "fix_tests_f.inc"
 #include "fix_tests_g.inc"
+
+// Username helpers: normalising, the "Name \xC2\xB7 HOST" wire form, and the setting's round trip through the config file.
+void testProfileNames() {
+    std::cout << "[TEST 122] Username normalising, wire name compose/split, setting round trip...\n";
+    using namespace cppdesk::profile;
+    auto isValidUtf8 = [](const std::string& s) {
+        size_t i = 0;
+        while (i < s.size()) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+            if (n == 0 || i + n > s.size()) return false;
+            for (size_t k = 1; k < n; ++k) if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) return false;
+            i += n;
+        }
+        return true;
+    };
+
+    TEST_ASSERT(composeWireName("", "DESKTOP-4F2") == "DESKTOP-4F2");
+    TEST_ASSERT(composeWireName("Jane", "DESKTOP-4F2") == "Jane \xC2\xB7 DESKTOP-4F2");
+    WireName w = splitWireName("Jane \xC2\xB7 DESKTOP-4F2");
+    TEST_ASSERT(w.name == "Jane" && w.computer == "DESKTOP-4F2");
+    w = splitWireName("A \xC2\xB7 B \xC2\xB7 PC");
+    TEST_ASSERT(w.name == "A \xC2\xB7 B" && w.computer == "PC");
+    w = splitWireName("PC");
+    TEST_ASSERT(w.name == "PC" && w.computer.empty());
+
+    TEST_ASSERT(normaliseName("  Jane  ") == "Jane");
+    TEST_ASSERT(normaliseName(" Ja\tne\n\x01 ") == "Jane");
+    std::string longName;
+    for (int i = 0; i < 40; ++i) longName += "\xE6\x97\xA5";
+    TEST_ASSERT(normaliseName(longName).size() == 96);
+
+    // Direction and zero-width formatting marks cannot spoof a name; plain CJK and emoji survive
+    TEST_ASSERT(normaliseName("Ja\xE2\x80\xAEne\xE2\x80\x8B\xEF\xBB\xBF\xE2\x81\xA6") == "Jane");
+    TEST_ASSERT(normaliseName("\xE2\x80\x8F" "\xE6\x97\xA5\xF0\x9F\x98\x80") == "\xE6\x97\xA5\xF0\x9F\x98\x80");
+    TEST_ASSERT(stripFormatting("evil\xE2\x80\xAE") == "evil");
+    TEST_ASSERT(splitWireName("Ja\xE2\x80\xAEne \xC2\xB7 P\xE2\x80\x8B" "C").name == "Jane");
+    TEST_ASSERT(splitWireName("Ja\xE2\x80\xAEne \xC2\xB7 P\xE2\x80\x8B" "C").computer == "PC");
+    {
+        std::string mixed;
+        for (int i = 0; i < 40; ++i) mixed += "\xE2\x80\xAE\xF0\x9F\x98\x80";
+        const std::string m = normaliseName(mixed);
+        TEST_ASSERT(m.size() == 128 && isValidUtf8(m));   // 32 emoji, the marks do not count toward the cap
+    }
+
+    std::string emoji;
+    for (int i = 0; i < 32; ++i) emoji += "\xF0\x9F\x98\x80";
+    std::string tight = composeWireName(emoji, "VERY-LONG-HOSTNAME", 63);
+    TEST_ASSERT(tight.size() <= 63 && isValidUtf8(tight));
+    std::string wideHost;
+    for (int i = 0; i < 10; ++i) wideHost += "\xE6\x97\xA5";
+    std::string cutHost = composeWireName("Jane", wideHost, 14);   // 4 + 3 separator bytes leave 7: two 3-byte characters
+    TEST_ASSERT(cutHost.size() <= 14 && isValidUtf8(cutHost) && splitWireName(cutHost).computer == "\xE6\x97\xA5\xE6\x97\xA5");
+
+    std::filesystem::path cfg;
+    { IdentityManager probe(4410); cfg = probe.configFilePath(); }
+    std::error_code ec;
+    std::filesystem::remove(cfg, ec);
+    {
+        IdentityManager id(4410);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(id.displayName().empty() && id.wireName() == id.hostname());
+        AppSettings s = id.settings();
+        s.displayName = "Jane";
+        id.updateSettings(s);
+        TEST_ASSERT(id.save());
+    }
+    {
+        IdentityManager id(4410);
+        TEST_ASSERT(id.loadOrCreate());
+        TEST_ASSERT(id.settings().displayName == "Jane" && id.displayName() == "Jane");
+        TEST_ASSERT(id.wireName() == "Jane \xC2\xB7 " + id.hostname());
+        TEST_ASSERT(id.peerPicturePath(42) == peerPicturePath(cfg, 4410, 42));
+        TEST_ASSERT(id.ownPicturePath() == ownPicturePath(cfg, 4410));
+    }
+    std::filesystem::remove(cfg, ec);
+    TEST_ASSERT(peerPicturePath("cfg/config_3.ini", 3, 42).generic_string().ends_with("avatars_3/42.jpg"));
+    TEST_ASSERT(ownPicturePath("cfg/config_3.ini", 3).generic_string().ends_with("profile_3.jpg"));
+}
+
+// Profile picture model: centre-crop to 96x96 JPEG, wire validation, circular alpha mask.
+void testAvatarImage() {
+    std::cout << "[TEST 123] Avatar JPEG normalise, validate, circle mask...\n";
+    namespace av = cppdesk::avatar;
+    auto gradient = [](int w, int h) {
+        std::vector<uint8_t> px(static_cast<size_t>(w) * h * 4);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                uint8_t* p = &px[(static_cast<size_t>(y) * w + x) * 4];
+                p[0] = static_cast<uint8_t>(x * 255 / w); p[1] = static_cast<uint8_t>(y * 255 / h); p[2] = 128; p[3] = 255;
+            }
+        return px;
+    };
+    auto src = gradient(300, 200);
+    auto jpg = TileCodec::encodeJpeg(src.data(), 300, 200, 85);
+    TEST_ASSERT(!jpg.empty());
+
+    auto norm = av::normaliseJpeg(jpg);
+    TEST_ASSERT(norm.has_value());
+    if (norm) {
+        TEST_ASSERT(norm->size() <= av::kMaxWireBytes);
+        std::vector<uint8_t> bgra; int w = 0, h = 0;
+        TEST_ASSERT(TileCodec::decodeJpeg(norm->data(), norm->size(), bgra, w, h) && w == 96 && h == 96);
+        TEST_ASSERT(av::validateWireJpeg(*norm));
+
+        std::vector<uint8_t> circ; int cw = 0, ch = 0;
+        TEST_ASSERT(av::decodeCircleBgra(*norm, circ, cw, ch) && cw == 96 && ch == 96);
+        if (circ.size() == 96u * 96u * 4u) {
+            TEST_ASSERT(circ[3] == 0);
+            TEST_ASSERT(circ[(48u * 96u + 48u) * 4 + 3] == 255);
+        }
+    }
+
+    TEST_ASSERT(!av::validateWireJpeg({}));
+    std::vector<uint8_t> noise(20000);
+    uint32_t s = 12345;
+    for (auto& b : noise) { s = s * 1664525u + 1013904223u; b = static_cast<uint8_t>(s >> 24); }
+    TEST_ASSERT(!av::validateWireJpeg(noise));
+    auto big = gradient(400, 400);
+    auto bigJpg = TileCodec::encodeJpeg(big.data(), 400, 400, 30);
+    TEST_ASSERT(!bigJpg.empty() && bigJpg.size() <= av::kMaxWireBytes);   // size alone must not be what rejects it
+    TEST_ASSERT(!av::validateWireJpeg(bigJpg));
+    if (norm) {   // header claims 8000x8000: refused from the header, before any 256 MB decode
+        auto lying = *norm;
+        for (size_t i = 2; i + 8 < lying.size(); ++i)
+            if (lying[i] == 0xFF && lying[i + 1] == 0xC0) {   // baseline SOF0: len(2) precision(1) height(2) width(2)
+                lying[i + 5] = lying[i + 7] = 8000 >> 8; lying[i + 6] = lying[i + 8] = 8000 & 0xFF;
+                break;
+            }
+        int lw = 0, lh = 0;
+        TEST_ASSERT(TileCodec::jpegDimensions(lying.data(), lying.size(), lw, lh) && lw == 8000 && lh == 8000);
+        TEST_ASSERT(!av::validateWireJpeg(lying));
+    }
+
+    TEST_ASSERT(!av::normaliseJpeg(std::vector<uint8_t>(11u << 20, 0xFF)).has_value());
+    TEST_ASSERT(!av::normaliseJpeg(noise).has_value());
+}
+
+void testWireNameOnTheWire() {
+    std::cout << "[TEST 124] The viewer sees the host's username with its computer name...\n";
+    IdentityManager hostId(4340), viewerId(4341);
+    for (auto* id : {&hostId, &viewerId}) { std::error_code ec; std::filesystem::remove(id->configFilePath(), ec); }
+    TEST_ASSERT(hostId.loadOrCreate() && viewerId.loadOrCreate());
+    hostId.setUnattendedEnabled(true);
+    hostId.setUnattendedPassword("HostPw1");
+    { AppSettings s = hostId.settings(); s.displayName = "Jane"; hostId.updateSettings(s); }
+
+    NetworkEngine hostNet(hostId);
+    NetworkEngine viewerNet(viewerId);
+    TEST_ASSERT(hostNet.start() && viewerNet.start());
+    const std::string target = "127.0.0.1:" + std::to_string(hostNet.hostListenPort());
+
+    auto dial = [&]() {
+        viewerNet.connectToRemote(target, "HostPw1");
+        ViewerSessionStats st;
+        for (int i = 0; i < 80; ++i) {
+            st = viewerNet.viewerStats();
+            if (st.state == ViewerConnectionState::Connected || st.state == ViewerConnectionState::Error) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return st;
+    };
+    auto hangUp = [&]() {
+        viewerNet.disconnectViewer();
+        hostNet.disconnectHostClient();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    };
+
+    auto st = dial();
+    TEST_ASSERT(st.state == ViewerConnectionState::Connected);
+    TEST_ASSERT(st.remoteHostname == "Jane \xC2\xB7 " + hostId.hostname());
+    hangUp();
+
+    { AppSettings s = hostId.settings(); s.displayName = ""; hostId.updateSettings(s); }
+    st = dial();
+    TEST_ASSERT(st.state == ViewerConnectionState::Connected);
+    TEST_ASSERT(st.remoteHostname == hostId.hostname());
+    hangUp();
+}
+
+void testAuthResponseTrailingPicture() {
+    std::cout << "[TEST 125] AUTH_RESPONSE trailing picture: 1.0 parse unchanged, new parse extracts it...\n";
+    std::vector<uint8_t> px(96u * 96u * 4u, 0x80);
+    const auto pic = TileCodec::encodeJpeg(px.data(), 96, 96, 85);
+    TEST_ASSERT(cppdesk::avatar::validateWireJpeg(pic));
+
+    for (uint8_t mode : {AUTH_MODE_NONE, AUTH_MODE_PASSWORD_BOUND, AUTH_MODE_REBOOT_TOKEN, AUTH_MODE_PAIRED}) {
+        for (int withPic = 0; withPic < 2; ++withPic) {
+            std::array<uint8_t, 32> digest{}; digest.fill(0x5A);
+            PairingKey::Signature sig{}; sig.fill(0xC3);
+            ByteWriter w;
+            w.writeU8(mode);
+            w.writeBytes(digest.data(), digest.size());
+            if (mode == AUTH_MODE_PAIRED) { w.writeU16(static_cast<uint16_t>(sig.size())); w.writeBytes(sig.data(), sig.size()); }
+            if (withPic) writeWirePicture(w, pic);
+
+            // The 1.0 host's sequence: mode, 32 bytes, and for PAIRED a guarded u16 + signature
+            ByteReader r(w.buffer());
+            TEST_ASSERT(r.readU8() == mode);
+            std::array<uint8_t, 32> gotDigest{};
+            r.readBytes(gotDigest.data(), gotDigest.size());
+            TEST_ASSERT(gotDigest == digest);
+            if (mode == AUTH_MODE_PAIRED) {
+                PairingKey::Signature gotSig{};
+                const bool present = r.hasRemaining(2 + gotSig.size()) && r.readU16() == gotSig.size();
+                if (present) r.readBytes(gotSig.data(), gotSig.size());
+                TEST_ASSERT(present && gotSig == sig);
+            }
+            // The new host reads on from there
+            const auto got = readWirePicture(r);
+            TEST_ASSERT(withPic ? (got && *got == pic) : !got);
+        }
+    }
+
+    auto parse = [](const std::vector<uint8_t>& bytes) { ByteReader r(bytes); return readWirePicture(r); };
+    { ByteWriter w; writeWirePicture(w, {}); auto p = parse(w.buffer()); TEST_ASSERT(p && p->empty()); }   // explicit none
+    { ByteWriter w; w.writeU16(100); w.writeBytes(pic.data(), 10); TEST_ASSERT(!parse(w.buffer())); }        // truncated
+    { ByteWriter w; writeWirePicture(w, std::vector<uint8_t>(cppdesk::avatar::kMaxWireBytes + 1, 0xFF)); TEST_ASSERT(!parse(w.buffer())); }
+    std::vector<uint8_t> noise(3000);
+    uint32_t s = 777;
+    for (auto& b : noise) { s = s * 1664525u + 1013904223u; b = static_cast<uint8_t>(s >> 24); }
+    { ByteWriter w; writeWirePicture(w, noise); TEST_ASSERT(!parse(w.buffer())); }
+    std::vector<uint8_t> big(400u * 400u * 4u, 0x40);
+    { ByteWriter w; writeWirePicture(w, TileCodec::encodeJpeg(big.data(), 400, 400, 30)); TEST_ASSERT(!parse(w.buffer())); }
+}
+
+namespace {
+// A host and a viewer whose config (and so profile_/avatars_ files) live in a fresh temp dir.
+struct PictureRig {
+    std::filesystem::path dir;
+    IdentityManager hostId, viewerId;
+    std::vector<uint8_t> hostPic, viewerPic;
+    PictureRig(const char* name, int inst) : hostId(inst), viewerId(inst + 1) {
+        dir = std::filesystem::temp_directory_path() / name;
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        std::filesystem::create_directories(dir);
+        hostId.setConfigPathForTest(dir / "host.ini");
+        viewerId.setConfigPathForTest(dir / "viewer.ini");
+        std::vector<uint8_t> a(96u * 96u * 4u, 0x30), b(96u * 96u * 4u, 0xD0);
+        hostPic = TileCodec::encodeJpeg(a.data(), 96, 96, 85);
+        viewerPic = TileCodec::encodeJpeg(b.data(), 96, 96, 85);
+    }
+    ~PictureRig() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
+    static void writeFile(const std::filesystem::path& p, const std::vector<uint8_t>& bytes) {
+        std::ofstream(p, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+};
+
+template <class F> bool waitFor(F cond, int ms = 4000) {
+    for (int i = 0; i < ms / 25; ++i) { if (cond()) return true; std::this_thread::sleep_for(std::chrono::milliseconds(25)); }
+    return cond();
+}
+} // namespace
+
+void testPeerPictureCachedOnlyAfterAccept() {
+    std::cout << "[TEST 126] Peer pictures are cached only after the host accepts...\n";
+    PictureRig rig("cppdesk_pic_accept", 4342);
+    TEST_ASSERT(rig.hostId.loadOrCreate() && rig.viewerId.loadOrCreate());
+    PictureRig::writeFile(rig.hostId.ownPicturePath(), rig.hostPic);
+    PictureRig::writeFile(rig.viewerId.ownPicturePath(), rig.viewerPic);
+    const uint64_t hostDesk = rig.hostId.deskId(), viewerDesk = rig.viewerId.deskId();
+    const auto hostAvatars = rig.hostId.peerPicturePath(viewerDesk).parent_path();
+    const auto viewerAvatars = rig.viewerId.peerPicturePath(hostDesk).parent_path();
+
+    NetworkEngine hostNet(rig.hostId);
+    NetworkEngine viewerNet(rig.viewerId);
+    TEST_ASSERT(hostNet.start() && viewerNet.start());
+    const std::string target = "127.0.0.1:" + std::to_string(hostNet.hostListenPort());
+
+    const uint32_t gen0 = viewerNet.peerPictureGeneration();
+    viewerNet.sendProfilePicture();   // no session: still counts as an own-picture change
+    TEST_ASSERT(viewerNet.peerPictureGeneration() == gen0 + 1);
+
+    auto ask = [&](bool accept) {
+        TEST_ASSERT(viewerNet.connectToRemote(target, ""));
+        PendingIncomingRequest req;
+        TEST_ASSERT(waitFor([&] { req = hostNet.pendingIncomingRequest(); return req.active; }));
+        TEST_ASSERT(req.callerDeskId == viewerDesk && req.callerPicture == rig.viewerPic);   // the modal sees it before any decision
+        hostNet.respondToIncomingRequest(accept, PERM_ALL);
+        const auto want = accept ? ViewerConnectionState::Connected : ViewerConnectionState::Error;
+        TEST_ASSERT(waitFor([&] { return viewerNet.viewerStats().state == want; }));
+    };
+
+    ask(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    TEST_ASSERT(!std::filesystem::exists(hostAvatars) && !std::filesystem::exists(viewerAvatars));
+    TEST_ASSERT(hostNet.peerPicture(viewerDesk).empty() && viewerNet.peerPicture(hostDesk).empty());
+    viewerNet.disconnectViewer();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    ask(true);
+    // The host stores after sending AUTH_RESULT, so the viewer can be Connected first
+    TEST_ASSERT(waitFor([&] { return std::filesystem::exists(rig.hostId.peerPicturePath(viewerDesk)); }));
+    TEST_ASSERT(waitFor([&] { return hostNet.peerPicture(viewerDesk) == rig.viewerPic; }));
+    TEST_ASSERT(waitFor([&] { return viewerNet.peerPicture(hostDesk) == rig.hostPic; }));
+    TEST_ASSERT(std::filesystem::exists(rig.viewerId.peerPicturePath(hostDesk)));
+
+    viewerNet.disconnectViewer();
+    hostNet.disconnectHostClient();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // A fresh engine (no memory copy) reads the cached file
+    NetworkEngine later(rig.hostId);
+    TEST_ASSERT(later.peerPicture(viewerDesk) == rig.viewerPic);
+}
+
+void testProfilePictureRejectsHostile() {
+    std::cout << "[TEST 127] Hostile PROFILE_PICTURE payloads are ignored and the session stays up...\n";
+    PictureRig rig("cppdesk_pic_hostile", 4344);
+    TEST_ASSERT(rig.hostId.loadOrCreate() && rig.viewerId.loadOrCreate());
+    rig.hostId.setUnattendedEnabled(true);
+    rig.hostId.setUnattendedPassword("HostPw1");
+    PictureRig::writeFile(rig.viewerId.ownPicturePath(), rig.viewerPic);
+    const uint64_t viewerDesk = rig.viewerId.deskId();
+
+    NetworkEngine hostNet(rig.hostId);
+    NetworkEngine viewerNet(rig.viewerId);
+    TEST_ASSERT(hostNet.start() && viewerNet.start());
+    TEST_ASSERT(viewerNet.connectToRemote("127.0.0.1:" + std::to_string(hostNet.hostListenPort()), "HostPw1"));
+    TEST_ASSERT(waitFor([&] { return viewerNet.viewerStats().state == ViewerConnectionState::Connected; }));
+    TEST_ASSERT(waitFor([&] { return hostNet.peerPicture(viewerDesk) == rig.viewerPic; }));
+
+    std::vector<uint8_t> noise(3000);
+    uint32_t s = 4242;
+    for (auto& b : noise) { s = s * 1664525u + 1013904223u; b = static_cast<uint8_t>(s >> 24); }
+    std::vector<uint8_t> big(400u * 400u * 4u, 0x40);
+    const std::vector<std::vector<uint8_t>> hostile = {
+        std::vector<uint8_t>(cppdesk::avatar::kMaxWireBytes + 1, 0xFF), noise, TileCodec::encodeJpeg(big.data(), 400, 400, 30)};
+    const uint32_t gen = hostNet.peerPictureGeneration();
+    for (const auto& bad : hostile) {
+        PictureRig::writeFile(rig.viewerId.ownPicturePath(), bad);
+        viewerNet.sendProfilePicture();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    TEST_ASSERT(hostNet.peerPictureGeneration() == gen);
+    TEST_ASSERT(hostNet.peerPicture(viewerDesk) == rig.viewerPic);
+    TEST_ASSERT(viewerNet.viewerStats().state == ViewerConnectionState::Connected && hostNet.hostSessionStatus().active);
+
+    // The same path still carries a good picture, and an explicit none deletes the cache
+    PictureRig::writeFile(rig.viewerId.ownPicturePath(), rig.hostPic);
+    viewerNet.sendProfilePicture();
+    TEST_ASSERT(waitFor([&] { return hostNet.peerPicture(viewerDesk) == rig.hostPic; }));
+    std::filesystem::remove(rig.viewerId.ownPicturePath());
+    viewerNet.sendProfilePicture();
+    TEST_ASSERT(waitFor([&] { return hostNet.peerPicture(viewerDesk).empty(); }));
+    TEST_ASSERT(!std::filesystem::exists(rig.hostId.peerPicturePath(viewerDesk)));
+
+    viewerNet.disconnectViewer();
+    hostNet.disconnectHostClient();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+}
+
+
+// Row names show the username, the hostname goes to the sub line, and a stored picture replaces the initial disc.
+void testSettingsProfile() {
+    std::cout << "[TEST 129] Settings > Profile saves the name, sets and removes the picture; the rail avatar opens it...\n";
+    IdentityManager id(4254);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    FakeShell shell;
+    AppUi app(id, net, shell, "");
+    ui::RecordingCanvas rc;
+    auto settle = [&] { for (int i = 0; i < 150; ++i) app.render(rc, 1280, 800, 1.0 / 60.0); };
+    auto click = [&](float x, float y) {
+        app.onMouseMove(x, y);
+        app.onMouseButton(MouseButtonId::Left, true, x, y);
+        app.onMouseButton(MouseButtonId::Left, false, x, y);
+        settle();
+    };
+    auto shows = [&](const char* text) { return rc.serialize().find(text) != std::string::npos; };
+    const char* kHelper = "Shown to anyone you connect with";
+
+    app.applySnapshotState("settings_profile");   // the name field is focused
+    AppSettings s = id.settings();
+    s.displayName.clear();
+    id.updateSettings(s);
+    settle();
+    app.onText("\x01");
+    app.onText("Jane");
+    app.onText("\r");   // Enter saves
+    TEST_ASSERT(id.settings().displayName == "Jane");
+    app.onText("\x01");
+    app.onText("  Kim  ");
+    TEST_ASSERT(id.settings().displayName == "Jane");   // still typing
+    click(190, 126);                                     // leaving the page (Appearance) saves, trimmed
+    TEST_ASSERT(id.settings().displayName == "Kim");
+
+    app.applySnapshotState("settings_appearance");
+    settle();
+    TEST_ASSERT(!shows(kHelper));
+    click(36, 642);   // the rail avatar, above Theme
+    TEST_ASSERT(shows(kHelper));
+
+    // Change picture (the fake picker returns shell.pickPath), then Remove
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::remove(id.ownPicturePath(), ec);
+    std::vector<uint8_t> px(200u * 120u * 4u, 0x80);
+    const auto jpeg = TileCodec::encodeJpeg(px.data(), 200, 120, 85);
+    const fs::path jpg = fs::temp_directory_path() / "cppdesk_profile_pick.jpg";
+    { std::ofstream(jpg, std::ios::binary).write(reinterpret_cast<const char*>(jpeg.data()), static_cast<std::streamsize>(jpeg.size())); }
+    settle();
+    TEST_ASSERT(!shows("Remove"));
+    shell.pickPath = jpg.string();
+    click(497, 125);
+    TEST_ASSERT(fs::exists(id.ownPicturePath(), ec));
+    TEST_ASSERT(shows("Picture updated") && shows("Remove"));
+    TEST_ASSERT(shows("drawImage"));   // the picked picture is drawn
+    click(620, 125);   // Remove
+    TEST_ASSERT(!fs::exists(id.ownPicturePath(), ec));
+
+    { std::ofstream(jpg, std::ios::binary | std::ios::trunc) << "not a picture"; }
+    click(497, 125);
+    TEST_ASSERT(!fs::exists(id.ownPicturePath(), ec));
+    TEST_ASSERT(shows("couldn't be used"));
+
+    fs::remove(jpg, ec);
+    fs::remove(id.configFilePath(), ec);
+}
+
+// The Home update pill: shown only for a newer release, updates in place or opens the release page, one download at a time.
+void testHomeUpdatePill() {
+    std::cout << "[TEST 131] The Home update pill downloads where the shell can, else opens the release page..." << std::endl;
+    IdentityManager id(4256);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    UpdateInfo info;
+    info.success = info.checkSucceeded = info.updateRequired = true;
+    info.latestVersion = "v1.0.2";
+    info.releaseUrl = "https://github.com/oocsng/cppdesk/releases/tag/v1.0.2";
+    info.directDownloadUrl = "https://github.com/oocsng/cppdesk/releases/download/v1.0.2/CppDesk.exe";
+    auto run = [&](FakeShell& shell, auto body) {
+        AppUi app(id, net, shell, "");
+        ui::RecordingCanvas rc;
+        auto frames = [&](int n) { for (int i = 0; i < n; ++i) app.render(rc, 1280, 800, 1.0 / 60.0); };
+        auto textRect = [&](const std::string& label) -> std::optional<ui::Rect> {
+            std::istringstream in(rc.serialize());
+            for (std::string line; std::getline(in, line);) {
+                if (line.rfind("drawText ", 0) != 0 || !line.ends_with("|" + label)) continue;
+                ui::Rect r{};
+                if (std::sscanf(line.c_str(), "drawText %f %f %f %f", &r.left, &r.top, &r.right, &r.bottom) == 4) return r;
+            }
+            return std::nullopt;
+        };
+        auto click = [&](const std::string& label) {
+            const auto r = textRect(label);
+            TEST_ASSERT(r.has_value());
+            if (!r) return;
+            const float x = (r->left + r->right) / 2, y = (r->top + r->bottom) / 2;
+            app.onMouseMove(x, y);
+            frames(30);
+            app.onMouseButton(MouseButtonId::Left, true, x, y);
+            frames(30);
+            app.onMouseButton(MouseButtonId::Left, false, x, y);
+            frames(30);
+        };
+        frames(2);
+        TEST_ASSERT(textRect("Connect to a desk").has_value());   // the Home screen is up
+        body(app, frames, textRect, click);
+    };
+    const auto noPill = [&](const std::function<std::optional<ui::Rect>(const std::string&)>& textRect) {
+        return !textRect("Update to v1.0.2") && !textRect("Get v1.0.2");
+    };
+
+    {   // No in-app update (Linux, macOS): the pill opens the release page and starts nothing
+        FakeShell shell;
+        shell.autoUpdate = false;
+        run(shell, [&](AppUi& app, auto frames, auto textRect, auto click) {
+            app.onUpdateCheckDone(info, false);
+            frames(30);
+            TEST_ASSERT(textRect("Get v1.0.2").has_value());
+            click("Get v1.0.2");
+        });
+        TEST_ASSERT(shell.openedUrls.size() == 1 && shell.openedUrls[0] == info.releaseUrl);
+        TEST_ASSERT(shell.updateDownloads.empty());
+    }
+    {   // In-app update: one download, then the pill shows progress and ignores clicks
+        FakeShell shell;
+        run(shell, [&](AppUi& app, auto frames, auto textRect, auto click) {
+            app.onUpdateCheckDone(info, false);
+            frames(30);
+            click("Update to v1.0.2");
+            TEST_ASSERT(shell.updateDownloads.size() == 1 && shell.updateDownloads[0] == info.directDownloadUrl);
+            TEST_ASSERT(shell.openedUrls.empty());
+            frames(5);
+            TEST_ASSERT(textRect("Updating 0%").has_value());
+            click("Updating 0%");
+            TEST_ASSERT(shell.updateDownloads.size() == 1 && shell.openedUrls.empty());
+        });
+    }
+    {   // No newer release, or a failed check: no pill
+        FakeShell shell;
+        run(shell, [&](AppUi& app, auto frames, auto textRect, auto) {
+            UpdateInfo none = info;
+            none.updateRequired = false;
+            app.onUpdateCheckDone(none, false);
+            frames(30);
+            TEST_ASSERT(noPill(textRect));
+            UpdateInfo failed = info;
+            failed.success = false;
+            app.onUpdateCheckDone(failed, false);
+            frames(30);
+            TEST_ASSERT(noPill(textRect));
+        });
+    }
+    {   // First show: fade plus a 4 px slide; with reduced motion the fade only
+        for (const uint8_t mode : { uint8_t(2), uint8_t(1) }) {
+            AppSettings s = id.settings();
+            s.reduceMotion = mode;
+            id.updateSettings(s);
+            FakeShell shell;
+            run(shell, [&](AppUi& app, auto frames, auto textRect, auto) {
+                app.onUpdateCheckDone(info, false);
+                frames(1);
+                const auto first = textRect("Update to v1.0.2");
+                frames(30);
+                const auto settled = textRect("Update to v1.0.2");
+                TEST_ASSERT(first && settled);
+                if (first && settled) {
+                    if (mode == 2) TEST_ASSERT(first->top > settled->top + 0.5f && first->top <= settled->top + 4.0f);
+                    else TEST_ASSERT(first->top == settled->top);
+                }
+            });
+        }
+    }
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
+
+// The own avatar when its picture changes: crossfade over 150 ms, or instant with reduced motion.
+void testOwnAvatarCrossfade() {
+    std::cout << "[TEST 130] The own avatar crossfades when the picture changes and swaps instantly with reduced motion...\n";
+    IdentityManager id(4255);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    FakeShell shell;
+    AppUi app(id, net, shell, "");
+    ui::RecordingCanvas rc;
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    {
+        AppSettings s = id.settings();
+        s.displayName = "Zq";   // its initial "Z" is the only avatar on the dashboard
+        s.reduceMotion = 2;     // motion forced on
+        id.updateSettings(s);
+    }
+    auto motion = [&](uint8_t mode) { AppSettings s = id.settings(); s.reduceMotion = mode; id.updateSettings(s); };
+    auto frames = [&](int n) { for (int i = 0; i < n; ++i) app.render(rc, 1280, 800, 1.0 / 60.0); return rc.serialize(); };
+    auto opacities = [](const std::string& ops) {   // "drawImage id l t r b o<opacity>" lines of the last frame
+        std::vector<float> out;
+        std::istringstream in(ops);
+        for (std::string line; std::getline(in, line);)
+            if (line.rfind("drawImage", 0) == 0) out.push_back(std::stof(line.substr(line.rfind(" o") + 2)));
+        return out;
+    };
+    auto initials = [](const std::string& ops) {
+        size_t n = 0;
+        for (size_t p = ops.find("|Z\n"); p != std::string::npos; p = ops.find("|Z\n", p + 1)) ++n;
+        return n;
+    };
+    auto jpegOf = [](uint8_t tint) {
+        std::vector<uint8_t> px(96u * 96u * 4u);
+        for (size_t i = 0; i < px.size(); i += 4) { px[i] = tint; px[i + 1] = static_cast<uint8_t>(i / 64); px[i + 2] = 40; px[i + 3] = 255; }
+        return TileCodec::encodeJpeg(px.data(), 96, 96, 85);
+    };
+    auto setPicture = [&](const std::vector<uint8_t>& jpeg) {   // what the Profile page does to the file, then sendProfilePicture
+        if (jpeg.empty()) fs::remove(id.ownPicturePath(), ec);
+        else std::ofstream(id.ownPicturePath(), std::ios::binary | std::ios::trunc).write(reinterpret_cast<const char*>(jpeg.data()), static_cast<std::streamsize>(jpeg.size()));
+        net.sendProfilePicture();
+    };
+    const auto pictA = jpegOf(0x40), pictB = jpegOf(0xC0);
+
+    setPicture({});
+    std::string ops = frames(3);
+    const size_t base = opacities(ops).size();   // pictures on screen that are not ours
+    TEST_ASSERT(initials(ops) == 1);
+
+    setPicture(pictA);   // initial -> picture: fades in over the initial
+    ops = frames(1);
+    TEST_ASSERT(opacities(ops).size() == base + 1 && opacities(ops).back() < 1.0f && initials(ops) == 1);
+    ops = frames(30);
+    TEST_ASSERT(opacities(ops).size() == base + 1 && opacities(ops).back() == 1.0f && initials(ops) == 0);
+
+    setPicture(pictB);   // picture -> picture: the old one stays under the new one
+    ops = frames(1);
+    {
+        const auto o = opacities(ops);
+        TEST_ASSERT(o.size() == base + 2 && o[o.size() - 2] == 1.0f && o.back() < 1.0f);
+    }
+    ops = frames(30);
+    TEST_ASSERT(opacities(ops).size() == base + 1 && opacities(ops).back() == 1.0f);
+
+    net.sendProfilePicture();   // same file again (a generation bump, e.g. a peer's picture): no fade
+    ops = frames(1);
+    TEST_ASSERT(opacities(ops).size() == base + 1 && opacities(ops).back() == 1.0f && initials(ops) == 0);
+
+    setPicture({});   // removed: the initial fades in over the old picture
+    ops = frames(1);
+    TEST_ASSERT(opacities(ops).size() == base + 1 && opacities(ops).back() == 1.0f && initials(ops) == 1);
+    ops = frames(30);
+    TEST_ASSERT(opacities(ops).size() == base && initials(ops) == 1);
+
+    motion(1);   // reduced motion: instant both ways
+    setPicture(pictA);
+    ops = frames(1);
+    TEST_ASSERT(opacities(ops).size() == base + 1 && opacities(ops).back() == 1.0f && initials(ops) == 0);
+    setPicture({});
+    ops = frames(1);
+    TEST_ASSERT(opacities(ops).size() == base && initials(ops) == 1);
+
+    fs::remove(id.ownPicturePath(), ec);
+    fs::remove(id.configFilePath(), ec);
+}
+
+void testAvatarFallbackAndSplitNames() {
+    std::cout << "[TEST 128] Avatar picture or initial, and split names in the home list...\n";
+    IdentityManager id(4253);
+    id.loadOrCreate();
+    NetworkEngine net(id);
+    FakeShell shell;
+    constexpr uint64_t kDesk = 555000402;   // seeded by home_desks
+    auto render = [&](const std::vector<uint8_t>& pic = {}) {
+        AppUi app(id, net, shell, "");
+        ui::RecordingCanvas rc;
+        app.applySnapshotState("home_desks");
+        id.addOrUpdateRecentSession(kDesk, "Jane \xC2\xB7 PC1", "");
+        net.injectPeerPictureForTest(kDesk, pic);   // after the state, which clears the seeded desks' pictures
+        for (int i = 0; i < 60; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);
+        return rc.serialize();
+    };
+    auto imageLines = [](const std::string& ops) {
+        std::vector<std::string> out;
+        std::istringstream in(ops);
+        for (std::string line; std::getline(in, line);) if (line.rfind("drawImage", 0) == 0) out.push_back(line);
+        return out;
+    };
+
+    std::string ops = render();
+    TEST_ASSERT(ops.find("|Jane\n") != std::string::npos);
+    TEST_ASSERT(ops.find("\xC2\xB7  PC1\n") != std::string::npos);                  // the computer, not the whole wire name
+    TEST_ASSERT(ops.find("|Jane \xC2\xB7 PC1") == std::string::npos);
+    TEST_ASSERT(imageLines(ops).empty());
+    const auto initials = [](const std::string& s) {   // "|J" lines: the row's initial, plus the rail's own avatar (Jane)
+        size_t n = 0;
+        for (size_t p = s.find("|J\n"); p != std::string::npos; p = s.find("|J\n", p + 1)) ++n;
+        return n;
+    };
+    const size_t withInitial = initials(ops);
+    TEST_ASSERT(withInitial == 2);                                                    // the initial of the username
+
+    std::vector<uint8_t> px(96u * 96u * 4u, 0x80);
+    ops = render(TileCodec::encodeJpeg(px.data(), 96, 96, 85));
+    const auto imgs = imageLines(ops);
+    TEST_ASSERT(imgs.size() == 1);
+    float l = 0, t = 0, r = 0, b = 0;
+    TEST_ASSERT(std::sscanf(imgs[0].c_str(), "drawImage %*d %f %f %f %f", &l, &t, &r, &b) == 4);
+    TEST_ASSERT(r - l == 36.0f && b - t == 36.0f);                                  // the 18px avatar rect
+    TEST_ASSERT(initials(ops) == withInitial - 1);                                    // the row shows the picture, the rail keeps its initial
+
+    // A CJK name draws its whole 3-byte first character as the initial, not a cut one
+    {
+        AppUi app(id, net, shell, "");
+        ui::RecordingCanvas rc;
+        app.applySnapshotState("home_desks");
+        id.addOrUpdateRecentSession(kDesk, "\xE6\x97\xA5\xE6\x9C\xAC \xC2\xB7 PC1", "");
+        net.injectPeerPictureForTest(kDesk, {});
+        for (int i = 0; i < 60; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);
+        const std::string cjk = rc.serialize();
+        TEST_ASSERT(cjk.find("|\xE6\x97\xA5\n") != std::string::npos);
+        TEST_ASSERT(cjk.find("|\xE6\x97\n") == std::string::npos);
+    }
+
+    // The host-side ACTIVE SESSION card names the viewer by username, not the whole wire name
+    const std::string card = renderAppState(id, net, shell, "dashboard_mic_on");
+    TEST_ASSERT(card.find("|Dana (123 456 789)") != std::string::npos);
+    TEST_ASSERT(card.find("Dana \xC2\xB7") == std::string::npos);
+
+    std::error_code ec;
+    std::filesystem::remove(id.configFilePath(), ec);
+}
 
 int main(int argc, char** argv) {
     try {
@@ -13090,6 +13855,16 @@ int main(int argc, char** argv) {
         testAppUiRendersEveryScreenHeadless(); std::cout << "Test 70 done\n" << std::flush;
         testAppUiPublicInputApi(); std::cout << "Test 71 done\n" << std::flush;
         testUiGoldens(); std::cout << "Test 72 done\n" << std::flush;
+        testProfileNames(); std::cout << "Test 122 done\n" << std::flush;
+        testAvatarImage(); std::cout << "Test 123 done\n" << std::flush;
+        testWireNameOnTheWire(); std::cout << "Test 124 done\n" << std::flush;
+        testAuthResponseTrailingPicture(); std::cout << "Test 125 done\n" << std::flush;
+        testPeerPictureCachedOnlyAfterAccept(); std::cout << "Test 126 done\n" << std::flush;
+        testProfilePictureRejectsHostile(); std::cout << "Test 127 done\n" << std::flush;
+        testAvatarFallbackAndSplitNames(); std::cout << "Test 128 done\n" << std::flush;
+        testSettingsProfile(); std::cout << "Test 129 done\n" << std::flush;
+        testOwnAvatarCrossfade(); std::cout << "Test 130 done\n" << std::flush;
+        testHomeUpdatePill(); std::cout << "Test 131 done\n" << std::flush;
 #if defined(__linux__)
         testCairoCanvas(); std::cout << "Test 73 done\n" << std::flush;
 #endif

@@ -16,8 +16,8 @@ namespace cppdesk {
 constexpr uint32_t PROTOCOL_MAGIC   = 0x43505044; // "CPPD" (CppDesk packet magic)
 constexpr uint32_t RELAY_MAGIC      = 0x4344534B; // "CDSK" (CppDesk relay magic)
 constexpr uint16_t PROTOCOL_VERSION = 4;
-constexpr const char* CPP_DESK_VERSION = "1.0.0";
-constexpr uint32_t CPP_DESK_VERSION_NUM = 0x010000;
+constexpr const char* CPP_DESK_VERSION = "1.0.1";
+constexpr uint32_t CPP_DESK_VERSION_NUM = 0x010001;
 
 struct SemanticVersion {
     int major = 0;
@@ -174,7 +174,8 @@ enum class PacketType : uint8_t {
 
     // Pairing offer inside an authenticated session
     PAIR_REQUEST        = 0x5C, // Viewer -> Host: u16 64 + viewer pairing key, string viewer hostname
-    PAIR_RESULT         = 0x5D  // Host -> Viewer: u8 accepted, u16 len + host pairing key (0 if refused), string message
+    PAIR_RESULT         = 0x5D, // Host -> Viewer: u8 accepted, u16 len + host pairing key (0 if refused), string message
+    PROFILE_PICTURE     = 0x5E, // Bidirectional (encrypted, after accept): u16 len + 96x96 JPEG, 0 = none
 };
 
 enum class SystemActionType : uint8_t {

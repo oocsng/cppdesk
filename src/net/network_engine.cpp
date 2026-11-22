@@ -4,6 +4,7 @@
 #endif
 #include "../capture/virtual_display_manager.hpp"
 #include "../capture/screen_blank_manager.hpp"
+#include "../capture/avatar_image.hpp"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1217,6 +1218,12 @@ NetworkEngine::NetworkEngine(IdentityManager& identity)
     localIp_ = detectPrimaryLocalIpv4();
     autoAcceptIncoming_.store(identity_.settings().autoAcceptIncoming);
     autoAcceptPerms_.store(identity_.settings().defaultPermissions);
+    applyReceiveDirectory();
+}
+
+void NetworkEngine::applyReceiveDirectory() {
+    const std::string dir = identity_.settings().receiveDir;
+    fileManager_.setReceiveDirectory(dir.empty() ? FileTransferManager::defaultReceiveDirectory() : dir);
 }
 
 NetworkEngine::~NetworkEngine() {
@@ -1396,7 +1403,7 @@ void NetworkEngine::sendDiscoveryQuery(uint64_t targetDeskId) {
     pkt.deskId = identity_.deskId();
     pkt.queryId = targetDeskId;
     pkt.tcpPort = identity_.listenPort();
-    std::strncpy(pkt.hostname, identity_.hostname().c_str(), sizeof(pkt.hostname) - 1);
+    std::strncpy(pkt.hostname, identity_.wireName(sizeof(pkt.hostname) - 1).c_str(), sizeof(pkt.hostname) - 1);
 
     for (int slot = 0; slot < 6; ++slot) {
         uint16_t port = static_cast<uint16_t>(DEFAULT_DISCOVERY_PORT - slot);
@@ -1489,7 +1496,7 @@ void NetworkEngine::discoveryLoop() {
                         reply.deskId = identity_.deskId();
                         reply.queryId = 0;
                         reply.tcpPort = identity_.listenPort();
-                        std::strncpy(reply.hostname, identity_.hostname().c_str(), sizeof(reply.hostname) - 1);
+                        std::strncpy(reply.hostname, identity_.wireName(sizeof(reply.hostname) - 1).c_str(), sizeof(reply.hostname) - 1);
                         sendto(us, reinterpret_cast<const char*>(&reply), sizeof(reply), 0,
                                reinterpret_cast<sockaddr*>(&fromAddr), sizeof(fromAddr));
                     }
@@ -1523,7 +1530,7 @@ void NetworkEngine::relayRegistrationLoop() {
 
         ByteWriter w;
         w.writeU64(identity_.deskId());
-        w.writeString(identity_.hostname());
+        w.writeString(identity_.wireName());
         w.writeString(localIp_);
         w.writeU16(identity_.listenPort());
         w.writeU8(relayowner::OWNER_CAP);
@@ -1923,7 +1930,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         {
             ByteWriter w;
             w.writeU64(identity_.deskId());
-            w.writeString(identity_.hostname());
+            w.writeString(identity_.wireName());
             w.writeBytes(nonce.data(), nonce.size());
             w.writeU8(identity_.unattendedEnabled() ? 1 : 0);
             w.writeU16(static_cast<uint16_t>(hostEcdh.localPublicKey().size()));
@@ -1981,6 +1988,11 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
         uint8_t hasPassword = authReader.readU8();
         std::array<uint8_t, 32> clientDigest{};
         authReader.readBytes(clientDigest.data(), clientDigest.size());
+        PairingKey::Signature viewerSig{};
+        const bool sigPresent = hasPassword == AUTH_MODE_PAIRED &&
+            authReader.hasRemaining(2 + viewerSig.size()) && authReader.readU16() == viewerSig.size();
+        if (sigPresent) authReader.readBytes(viewerSig.data(), viewerSig.size());
+        const auto viewerPicture = readWirePicture(authReader);   // after the mode fields; 1.0 viewers send none
 
         // Relayed sessions share clientIp == "Relay-Bridge", so they share one lockout. viewerId is chosen by the
         // peer, so keying on it would let an attacker dodge the lockout with a fresh id per guess.
@@ -2017,9 +2029,6 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
             CryptoUtils::secureZero(tokenHex.data(), tokenHex.size());
         } else if (hasPassword == AUTH_MODE_PAIRED) {
             // Must stay before the password branch: a paired login never falls through to password checks.
-            PairingKey::Signature viewerSig{};
-            const bool sigPresent = authReader.hasRemaining(2 + viewerSig.size()) && authReader.readU16() == viewerSig.size();
-            if (sigPresent) authReader.readBytes(viewerSig.data(), viewerSig.size());
             const auto peer = identity_.findPairedViewer(viewerId);
             const bool pairedOk = sigPresent && peer && !viewerPubBlob.empty() &&
                 PairingKey::verify(peer->publicKey,
@@ -2154,6 +2163,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                 pendingReq_.callerHostname = viewerHostname;
                 pendingReq_.callerIp = clientIp;
                 pendingReq_.proposedPermissions = identity_.settings().defaultPermissions;
+                pendingReq_.callerPicture = viewerPicture.value_or(std::vector<uint8_t>{});
                 approvalDecided_ = false;
                 approvalAccepted_ = false;
                 approvalPermissions_ = identity_.settings().defaultPermissions;
@@ -2214,6 +2224,12 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
             hostStatus_.securityFingerprint = sasFingerprint;
             hostStatus_.viewerAppVersion = viewerAppVersion;
             hostStatus_.paired = pairedLogin;
+        }
+        if (viewerPicture) storePeerPicture(viewerId, *viewerPicture);
+        {
+            ByteWriter w;
+            writeWirePicture(w, ownPicture());
+            sendHostEncryptedPacket(PacketType::PROFILE_PICTURE, 0, w.buffer().data(), w.buffer().size());
         }
 
         // Auto-provision virtual display if host is headless
@@ -2729,7 +2745,23 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                     dropNx = r.readF32();
                                     dropNy = r.readF32();
                                 }
-                                fileManager_.handleFileOffer(tid, fsz, fname, targetHint, dropNx, dropNy);
+                                std::filesystem::path dropFolder;
+#if defined(_WIN32)
+                                // A canvas drop: find the Explorer folder or desktop under the drop point on the streamed monitor
+                                if (targetHint == FileOfferTarget::Desktop && std::isfinite(dropNx) && std::isfinite(dropNy)) {
+                                    MonitorDesc md;
+                                    {
+                                        std::lock_guard<std::mutex> ml(monDescMutex);
+                                        md = currentMonDesc;
+                                    }
+                                    const int sx = static_cast<int>(std::lround(md.x + std::clamp(dropNx, 0.0f, 1.0f) * std::max(1, md.width - 1)));
+                                    const int sy = static_cast<int>(std::lround(md.y + std::clamp(dropNy, 0.0f, 1.0f) * std::max(1, md.height - 1)));
+                                    dropFolder = resolveDropFolder(sx, sy).value_or(std::filesystem::path{});
+                                }
+#else
+                                (void)targetHint; (void)dropNx; (void)dropNy;   // folder detection is Windows-only
+#endif
+                                fileManager_.handleFileOffer(tid, fsz, fname, dropFolder);
                             }
                             break;
                         }
@@ -3270,6 +3302,9 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                             enqueueHostPacket(PacketType::PAIR_RESULT, 0, pw.buffer(), false);
                             break;
                         }
+                        case PacketType::PROFILE_PICTURE:
+                            if (auto pic = readWirePicture(r)) storePeerPicture(viewerId, *pic);
+                            break;
                         case PacketType::DISCONNECT:
                             sessionAlive.store(false);
                             break;
@@ -3622,7 +3657,7 @@ bool NetworkEngine::requestPairing() {
     ByteWriter w;
     w.writeU16(static_cast<uint16_t>(key.publicKey().size()));
     w.writeBytes(key.publicKey().data(), key.publicKey().size());
-    w.writeString(identity_.hostname());
+    w.writeString(identity_.wireName());
     w.writeU16(static_cast<uint16_t>(popSig.size()));
     w.writeBytes(popSig.data(), popSig.size());
     pairingState_.store(PairingRequestState::Pending);   // before the send: the answer may beat us back
@@ -3926,7 +3961,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                 ByteWriter w;
                 w.writeU16(PROTOCOL_VERSION);
                 w.writeU64(identity_.deskId());
-                w.writeString(identity_.hostname());
+                w.writeString(identity_.wireName());
                 w.writeU16(static_cast<uint16_t>(viewerEcdh.localPublicKey().size()));
                 if (!viewerEcdh.localPublicKey().empty()) {
                     w.writeBytes(viewerEcdh.localPublicKey().data(), viewerEcdh.localPublicKey().size());
@@ -4154,6 +4189,7 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                     std::array<uint8_t, 32> zero{};
                     w.writeBytes(zero.data(), zero.size());
                 }
+                writeWirePicture(w, ownPicture());   // trailing field: 1.0 hosts stop reading before it
                 if (!sendViewerEncryptedPacket(PacketType::AUTH_RESPONSE, 0, w.buffer().data(), w.buffer().size())) {
                     if (!isReconnecting) {
                         setStatus(ViewerConnectionState::Error, "Failed to send authentication response.");
@@ -4848,15 +4884,8 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                 uint32_t tid = r.readU32();
                                 uint64_t fsz = r.readU64();
                                 std::string fname = r.readString();
-                                float dropNx = 0.0f, dropNy = 0.0f;
-                                if (r.hasRemaining(1)) {
-                                    (void)r.readU8(); // ignore remote targetHint; never write to viewer Desktop
-                                }
-                                if (r.hasRemaining(8)) {
-                                    dropNx = r.readF32();
-                                    dropNy = r.readF32();
-                                }
-                                fileManager_.handleFileOffer(tid, fsz, fname, FileOfferTarget::DefaultDownloads, dropNx, dropNy);
+                                // the offer's remote target hint and drop point are ignored: a viewer always saves into the receive dir
+                                fileManager_.handleFileOffer(tid, fsz, fname);
                             }
                             break;
                         }
@@ -5123,6 +5152,16 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                             }
                             break;
                         }
+                        case PacketType::PROFILE_PICTURE:
+                            if (auto pic = readWirePicture(r)) {
+                                uint64_t hostDeskId = 0;
+                                {
+                                    std::lock_guard<std::mutex> lock(viewerStatsMutex_);
+                                    hostDeskId = viewerStats_.remoteDeskId;
+                                }
+                                storePeerPicture(hostDeskId, *pic);
+                            }
+                            break;
                         case PacketType::DISCONNECT:
                             // The host may say why it ended the session (an older host sends nothing).
                             if (!payload.empty()) {
@@ -5531,7 +5570,7 @@ bool NetworkEngine::sendChatMessage(const std::string& text) {
     if (text.empty() || text.size() > 2048) return false;
 
     ByteWriter w;
-    w.writeString(identity_.hostname());
+    w.writeString(identity_.wireName());
     w.writeString(text);
 
     bool sent = false;
@@ -5548,16 +5587,98 @@ bool NetworkEngine::sendChatMessage(const std::string& text) {
 
     if (sent) {
         std::lock_guard<std::mutex> lock(chatMutex_);
-        appendChatMessageLocked({ "You (" + identity_.hostname() + ")", text, true, nowTickMs() });
+        appendChatMessageLocked({ "You (" + (identity_.displayName().empty() ? identity_.hostname() : identity_.displayName()) + ")", text, true, nowTickMs() });
     }
     return sent;
+}
+
+void writeWirePicture(ByteWriter& w, const std::vector<uint8_t>& jpeg) {
+    w.writeU16(static_cast<uint16_t>(jpeg.size()));
+    if (!jpeg.empty()) w.writeBytes(jpeg.data(), jpeg.size());
+}
+
+std::optional<std::vector<uint8_t>> readWirePicture(ByteReader& r) {
+    if (!r.hasRemaining(2)) return std::nullopt;
+    const uint16_t len = r.readU16();
+    if (len == 0) return std::vector<uint8_t>{};
+    if (len > avatar::kMaxWireBytes || !r.hasRemaining(len)) return std::nullopt;
+    auto jpeg = r.readBytesVector(len);
+    if (!avatar::validateWireJpeg(jpeg)) return std::nullopt;
+    return jpeg;
+}
+
+static std::vector<uint8_t> readPictureFile(const std::filesystem::path& path, size_t cap) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec || size == 0 || size > cap) return {};
+    std::vector<uint8_t> bytes(static_cast<size_t>(size));
+    std::ifstream f(path, std::ios::binary);
+    if (!f.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) return {};
+    return bytes;
+}
+
+std::vector<uint8_t> NetworkEngine::ownPicture() const {
+    return readPictureFile(identity_.ownPicturePath(), 0xFFFF);   // the u16 wire length; the receiver enforces the real cap
+}
+
+std::vector<uint8_t> NetworkEngine::peerPicture(uint64_t deskId) const {
+    {
+        std::lock_guard<std::mutex> lk(peerPictureMutex_);
+        auto it = peerPictures_.find(deskId);
+        if (it != peerPictures_.end()) return it->second;
+    }
+    auto bytes = readPictureFile(identity_.peerPicturePath(deskId), avatar::kMaxWireBytes);
+    return avatar::validateWireJpeg(bytes) ? bytes : std::vector<uint8_t>{};
+}
+
+void NetworkEngine::storePeerPicture(uint64_t deskId, const std::vector<uint8_t>& jpeg) {
+    const auto path = identity_.peerPicturePath(deskId);
+    {
+        std::lock_guard<std::mutex> lk(peerPictureMutex_);
+        std::error_code ec;
+        if (jpeg.empty()) {
+            peerPictures_.erase(deskId);
+            std::filesystem::remove(path, ec);
+        } else {
+            peerPictures_[deskId] = jpeg;
+            std::filesystem::create_directories(path.parent_path(), ec);
+            std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(jpeg.data()), static_cast<std::streamsize>(jpeg.size()));
+        }
+    }
+    peerPictureGeneration_.fetch_add(1);
+}
+
+void NetworkEngine::injectPeerPictureForTest(uint64_t deskId, const std::vector<uint8_t>& jpeg) {
+    {
+        std::lock_guard<std::mutex> lk(peerPictureMutex_);
+        if (jpeg.empty()) peerPictures_.erase(deskId); else peerPictures_[deskId] = jpeg;
+    }
+    peerPictureGeneration_.fetch_add(1);
+}
+
+void NetworkEngine::sendProfilePicture() {
+    ByteWriter w;
+    writeWirePicture(w, ownPicture());
+    bool hostAccepted = false, viewerConnected = false;
+    {
+        std::lock_guard<std::mutex> lock(hostStatusMutex_);
+        hostAccepted = hostStatus_.active;
+    }
+    {
+        std::lock_guard<std::mutex> lock(viewerStatsMutex_);
+        viewerConnected = viewerStats_.state == ViewerConnectionState::Connected;
+    }
+    // Never before accept: a host mid-handshake would also drop the session on an unexpected packet.
+    if (hostAccepted) sendHostEncryptedPacket(PacketType::PROFILE_PICTURE, 0, w.buffer().data(), w.buffer().size());
+    if (viewerConnected) sendViewerEncryptedPacket(PacketType::PROFILE_PICTURE, 0, w.buffer().data(), w.buffer().size());
+    peerPictureGeneration_.fetch_add(1);
 }
 
 bool NetworkEngine::sendChatImage(const std::vector<uint8_t>& jpegData, uint32_t w, uint32_t h, const std::string& caption) {
     if (jpegData.empty() || jpegData.size() > 2 * 1024 * 1024) return false;
 
     ChatMediaPayload p;
-    p.senderName = identity_.hostname();
+    p.senderName = identity_.wireName();
     p.captionText = caption;
     p.imgWidth = w;
     p.imgHeight = h;
@@ -5581,7 +5702,7 @@ bool NetworkEngine::sendChatImage(const std::vector<uint8_t>& jpegData, uint32_t
 
     if (sent) {
         std::lock_guard<std::mutex> lock(chatMutex_);
-        appendChatMessageLocked({ "You (" + identity_.hostname() + ")", caption, true, p.timestampMs, true, jpegData, w, h });
+        appendChatMessageLocked({ "You (" + (identity_.displayName().empty() ? identity_.hostname() : identity_.displayName()) + ")", caption, true, p.timestampMs, true, jpegData, w, h });
     }
     return sent;
 }

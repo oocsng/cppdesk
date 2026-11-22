@@ -71,7 +71,8 @@ enum class SettingsSection : uint8_t {
     CurtainPrivacy  = 6,
     SystemService   = 7,
     About           = 8,
-    Glide           = 9
+    Glide           = 9,
+    Profile         = 10
 };
 
 enum class FocusedField : uint8_t {
@@ -86,7 +87,6 @@ enum class FocusedField : uint8_t {
     ForwardLocal    = 8,
     ForwardTarget   = 9,
     ForwardDesc     = 10,
-    DashboardSearch = 11,
     EditAlias       = 12,
     EditTag         = 13,
     EditNotes       = 14,
@@ -108,7 +108,8 @@ enum class FocusedField : uint8_t {
     FileBrowserLocalPath = 30,
     FileBrowserRemotePath = 31,
     FileBrowserNewDir  = 32,
-    FileBrowserRename  = 33
+    FileBrowserRename  = 33,
+    DisplayName        = 34
 };
 
 enum class DrawerTab : uint8_t {
@@ -272,16 +273,45 @@ private:
     void applyWindowThemeAttribute();
     void switchTab(ActiveTab newTab);
 
-    // Second-order macOS spring animation step (returns true if any spring is in motion)
+    // Advances every spring by dt (returns true if any is still moving)
     bool stepAnimations(float dt);
+    // Reduced motion: the Appearance setting, or the OS when the setting follows it.
+    bool reduceMotionActive() const;
+    bool                    systemReducedMotion_ = false;   // the OS preference, read at startup and on focus
 
     // Rendering views
-    void drawTopNavBar(float width, float& outTopOffset);
+    // Home (ActiveTab::Dashboard): one row per desk as last drawn; keys, right-click and the menu act on these
+    struct HomeRow {
+        uint64_t    deskId = 0;
+        std::string target, name, sub, hostname, endpoint, alias, tag, notes;
+        bool        live = false, favorite = false, saved = false, paired = false;
+    };
+    void drawNavRail(float height);
+    void drawRailIcon(int kind, float cx, float cy, ui::Color color);   // 0 home, 1 sessions, 2 files, 3 settings
+    void selectRailItem(int index);                                        // 0 Home, 1 Sessions, 2 Files, 3 Settings
+    void drawSessionsEmptyView(const UiRect& bounds, float alpha);
     void drawDashboardView(const UiRect& bounds, float alpha = 1.0f);
+    void startUpdate();   // download and install where the shell can, else open the release page
+    void drawThisDeskPanel(const UiRect& panel, float alpha);
+    std::vector<HomeRow> buildHomeRows(size_t& nearbyStart) const;
+    void connectHomeRow(const HomeRow& row, bool keepPassword);
+    void connectFromHomeBar();
+    void removeHomeDesk(const HomeRow& row);
+    void undoHomeRemove();
+    void openHomeMenu(const HomeRow& row, float x, float y);
+    void drawHomeMenu(float winW, float winH);
+    struct MenuEntry { std::string id, label; bool danger = false; std::function<void()> act; };
+    void drawSegmented(const UiRect& r, const std::vector<MenuEntry>& segs, int active);
+    void drawPopoverMenu(const std::vector<MenuEntry>& items, float anchorX, float anchorY, bool alignRight,
+                         bool& open, float animT, float winW, float winH, const std::string& idPrefix);
     void drawSessionTabBar(const UiRect& bounds, float alpha = 1.0f);
     void drawRemoteSessionView(const UiRect& bounds, float alpha = 1.0f);
     void drawSettingsView(const UiRect& bounds, float alpha = 1.0f);
     void drawGlideSettings(float cx, float crx, float& cy);
+    void drawSettingsProfile(float cx, float crx, float& cy);
+    void commitDisplayName();                       // normalises displayNameEdit_ and saves it when it changed
+    void setOwnPicture(const std::string& path);    // picks, normalises and stores the own picture, then tells peers
+    std::string ownAvatarName() const;              // the username, else the computer name
     void drawFileTransferDrawer(const UiRect& bounds, float slideProgress);
     void drawFileManagerDrawer(const UiRect& contentRect);
     void drawSyncDrawer(const UiRect& contentRect);
@@ -300,7 +330,6 @@ private:
     void drawPortForwardModal(float width, float height, float modalProgress);
     void drawAddressBookModal(float width, float height, float modalProgress);
     void drawPairOfferModal(float width, float height, float modalProgress);
-    void drawFleetPickerModal(float width, float height, float modalProgress);
     void drawFleetView(const UiRect& bounds, float alpha);
     void closeFleetGrid();   // disconnects every grid PC and drops the tile images
     void drawWhiteboardOverlay(const UiRect& canvasRect);
@@ -343,6 +372,19 @@ private:
     void ensureAppIconImage();
     // Destroys the canvas image (if any) and clears the handle.
     void releaseImage(ui::ImageId& id);
+    // A peer's picture in a circle, or its initial on the desk's colour. jpeg overrides the lookup (approval: the caller's
+    // picture is not stored yet). Images are cached per desk and dropped when the engine's picture generation changes.
+    void drawAvatar(float cx, float cy, float r, uint64_t deskId, const std::string& name, float alpha,
+                    const std::vector<uint8_t>* jpeg = nullptr);
+    std::unordered_map<uint64_t, ui::ImageId> avatarImages_;   // invalid id = no picture
+    uint32_t                avatarGen_ = ~0u;
+    // Own-picture swap: the old image stays under the new one for 150 ms
+    ui::ImageId             ownPrevImg_;
+    float                   ownFadeT_ = 1.0f;                  // 0..1; 1 = settled
+    std::vector<uint8_t>    ownBytes_;                         // what the own avatar was last built from
+    bool                    ownBytesKnown_ = false;
+    std::vector<uint8_t>    avatarApprovalBytes_;              // what avatarImages_[kApprovalKey] was built from
+    std::vector<uint8_t>    snapshotCallerPicture_;            // a snapshot's stand-in for the pending caller's picture
 
     // Two-Factor Authentication (TOTP) rendering
     void renderQrCodeDirect2D(
@@ -413,6 +455,8 @@ private:
     std::string             relayAuthKeyEdit_;
     std::string             stunServerEdit_;
     uint8_t                 relayModeEdit_ = 0;
+    std::string             displayNameEdit_;
+    bool                    displayNameWasFocused_ = false;   // blur detector: commit when focus leaves the field
     std::string             privacyBrandEdit_;
     std::string             privacyNoticeEdit_;
     std::string             chatInput_;
@@ -485,19 +529,14 @@ private:
     bool                    inlineAnimActive_ = false;
     float                   animTimeSec_ = 0.0f;
 
-    float                   viewportPos_ = 0.0f;
-    float                   viewportVel_ = 0.0f;
     float                   tabEnterStaggerT_ = 1.0f;
     float                   tabEnterStaggerVel_ = 0.0f;
 
-    // Liquid macOS segmented control pill (independent left/right edge springs)
-    float                   navPillLeft_ = 400.0f;
-    float                   navPillRight_ = 510.0f;
-    float                   navPillVelL_ = 0.0f;
-    float                   navPillVelR_ = 0.0f;
-    float                   targetPillLeft_ = 400.0f;
-    float                   targetPillRight_ = 510.0f;
-    bool                    navPillInit_ = false;
+    // Rail page indicator (its top edge springs between items)
+    float                   railIndY_ = 0.0f;
+    float                   railIndVel_ = 0.0f;
+    float                   railIndTarget_ = 0.0f;
+    bool                    railIndInit_ = false;
 
     float                   themeAnimT_ = 0.0f;
     float                   themeAnimVel_ = 0.0f;
@@ -580,15 +619,12 @@ private:
     UiRect                  settingsScrollThumbRect_{};
 
     // Horizontal HUD and Drawer Tabs smooth scroll state
-    float                   sessionHudScrollOffset_ = 0.0f;
-    float                   sessionHudScrollTarget_ = 0.0f;
-    float                   sessionHudScrollVel_    = 0.0f;
-    float                   sessionHudMaxScroll_    = 0.0f;
-    UiRect                  sessionHudBarRect_{};
-    float                   drawerTabsScrollOffset_ = 0.0f;
-    float                   drawerTabsScrollTarget_ = 0.0f;
-    float                   drawerTabsScrollVel_    = 0.0f;
-    float                   drawerTabsMaxScroll_    = 0.0f;
+    std::vector<MenuEntry>  sessMoreItems_;            // the session bar's More menu, as last drawn
+    UiRect                  sessMoreBtnRect_{};
+    UiRect                  sessAudioBtnRect_{};
+    bool                    sessMore_ = false;
+    float                   sessMoreAnimT_ = 0.0f;
+    float                   sessMoreAnimVel_ = 0.0f;
 
     // Direct Canvas Drag-and-Drop File Drop UI state (Feature 2)
     bool                    canvasDropEffectActive_ = false;
@@ -623,8 +659,26 @@ private:
     std::string             forwardDescEdit_ = "RDP Remote Desktop";
 
     // Dashboard Address Book search & tag filtering (v2.1.0)
-    std::string             dashboardSearchQuery_;
-    std::string             dashboardFilterTag_ = "All";
+    std::string             dashboardFilterTag_ = "All";   // All, Favorites, Nearby or a tag
+    std::vector<HomeRow>    homeRows_;
+    std::vector<UiRect>     homeRowRects_;             // on screen, clipped to the list
+    std::vector<float>      homeRowTops_;              // in list space, for keeping the selection in view
+    UiRect                  homeListRect_{};
+    int                     homeSel_ = -1;
+    int                     homeLastClickRow_ = -1;
+    uint64_t                homeLastClickTick_ = 0;
+    float                   homeScroll_ = 0.0f;
+    float                   homeMaxScroll_ = 0.0f;
+    float                   homeIntroT_ = 0.0f;        // seconds since Home first showed, capped at 1
+    bool                    homeGridSelect_ = false;   // the list picks paired desks for a "Do it on all" grid
+    bool                    homeMenu_ = false;
+    HomeRow                 homeMenuRow_;
+    float                   homeMenuX_ = 0.0f;
+    float                   homeMenuY_ = 0.0f;
+    float                   homeMenuAnimT_ = 0.0f;
+    float                   homeMenuAnimVel_ = 0.0f;
+    bool                    editingLocalPass_ = false;
+    std::optional<RecentSessionEntry> undoRemoved_;    // the desk the toast's Undo puts back
     bool                    showAddressBookEditModal_ = false;
     float                   addressBookModalAnimT_ = 0.0f;
     float                   addressBookModalAnimVel_ = 0.0f;
@@ -641,12 +695,9 @@ private:
     std::string             pairOfferName_;
     PairingRequestState     prevPairingState_ = PairingRequestState::Idle;
 
-    // "Do it on all": the picker modal, then the grid (ActiveTab::Fleet). Keys go to every PC while
+    // "Do it on all": Home's grid select, then the grid (ActiveTab::Fleet). Keys go to every PC while
     // fleetTypeAll_, else to fleetFocused_; the mouse only ever goes to the tile it is over.
     FleetManager            fleet_;
-    bool                    showFleetPicker_ = false;
-    float                   fleetPickerAnimT_ = 0.0f;
-    float                   fleetPickerAnimVel_ = 0.0f;
     uint64_t                glidePickedDesk_ = 0;      // paired PC picked in Settings > Glide, waiting for an edge click
     // Glide: the paired PC whose session tab this window shows full screen after a push off a screen edge.
     struct GlideState { uint64_t deskId = 0; GlideEdge edge = GlideEdge::Off; uint32_t tabId = 0;
@@ -662,7 +713,7 @@ private:
     void glideTick(uint64_t nowMs, const ViewerSessionStats& viewer, bool hosting);   // called from onTick()
     void glideHomeNow(uint64_t nowMs, const std::string& toast = "");
     void glideOut(GlideEdge edge, ui::Point cursor, uint64_t nowMs);
-    std::vector<uint64_t>   fleetPicked_;              // desk IDs ticked in the picker
+    std::vector<uint64_t>   fleetPicked_;              // desk IDs ticked in grid select
     bool                    fleetTypeAll_ = false;
     uint64_t                fleetFocused_ = 0;
     uint64_t                fleetPressedDesk_ = 0;     // the tile a mouse button went down on, for its release
@@ -709,6 +760,7 @@ private:
 
     // In-App Self-Updater Download State
     bool                    isDownloadingUpdate_ = false;
+    float                   updatePillT_ = 0.0f;               // Home update pill fade-in, 0..1
     float                   updateDownloadProgress_ = 0.0f;
     uint64_t                updateDownloadedBytes_ = 0;
     uint64_t                updateTotalBytes_ = 0;

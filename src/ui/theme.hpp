@@ -21,6 +21,7 @@ extern ui::Color COL_BG_NAV;
 extern ui::Color COL_BG_CARD;
 extern ui::Color COL_BG_SUBTLE;
 extern ui::Color COL_BG_CARD_ALT;
+extern ui::Color COL_BG_RAISED;   // a selected segment or row: lighter than its track in both themes
 extern ui::Color COL_BG_INPUT;
 extern ui::Color COL_BG_INPUT_FOCUS;
 extern ui::Color COL_BORDER;
@@ -45,6 +46,9 @@ extern ui::Color COL_HUD_TEXT;            // text on always-dark overlays: fixed
 extern ui::Color COL_HUD_TEXT_SECONDARY;
 extern ui::Color COL_HUD_TEXT_MUTED;
 extern ui::Color COL_HUD_TEXT_ACCENT;
+extern ui::Color COL_RAIL_BG;          // the espresso navigation rail, dark in both modes
+extern ui::Color COL_RAIL_TEXT;
+extern ui::Color COL_RAIL_TEXT_ACTIVE;
 
 // Sets every live COL_* token to lerp(light, dark, darkT). darkT is clamped to 0..1.
 void updateActivePalette(float darkT);
@@ -65,6 +69,7 @@ double contrastRatio(const ui::Color& a, const ui::Color& b);
 namespace theme {
 
 namespace space { inline constexpr float xs = 4.0f, sm = 8.0f, md = 12.0f, lg = 16.0f, xl = 24.0f, xxl = 32.0f; }
+inline constexpr float railWidth = 72.0f;   // the left navigation rail
 
 namespace radius { inline constexpr float sm = 6.0f, md = 12.0f, lg = 16.0f; }
 
@@ -75,10 +80,10 @@ inline constexpr Style hero{33.0f, 700}, heading{18.5f, 600}, subheading{14.5f, 
 }
 
 namespace motion {
-struct Spring { float omega; float zeta; };  // damped spring: stiffness, damping ratio
-inline constexpr Spring themeBlend{20.0f, 0.92f}, hover{32.0f, 0.72f}, press{38.0f, 0.68f},
-                        standard{28.0f, 0.74f}, menu{32.0f, 0.76f}, panel{26.0f, 0.78f},
-                        drawer{26.0f, 0.80f}, scroll{32.0f, 0.88f};
+struct Spring { float omega; float zeta; };  // damped spring: stiffness, damping ratio (1 = critical: no overshoot)
+inline constexpr Spring themeBlend{20.0f, 1.0f}, hover{32.0f, 1.0f}, press{38.0f, 1.0f},
+                        standard{28.0f, 1.0f}, menu{43.0f, 1.0f}, panel{26.0f, 1.0f},
+                        drawer{26.0f, 1.0f}, scroll{32.0f, 1.0f};
 }
 
 } // namespace theme

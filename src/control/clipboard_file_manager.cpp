@@ -10,6 +10,8 @@
 #include <bcrypt.h>
 #include <shlobj.h>
 #include <shellapi.h>
+#include <exdisp.h>
+#include <servprov.h>
 #elif defined(__APPLE__)
 #include <CommonCrypto/CommonDigest.h>
 #include <unistd.h>
@@ -34,6 +36,8 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <future>
+#include <thread>
 
 namespace cppdesk {
 
@@ -646,17 +650,107 @@ void ClipboardManager::applyRemoteClipboard(const std::string& utf8Text) {
 
 #endif
 
+#if defined(_WIN32)
+namespace {
+
+template <class T>
+struct ComPtr {
+    T* p = nullptr;
+    ~ComPtr() { if (p) p->Release(); }
+    T** put() { return &p; }
+    void** putVoid() { return reinterpret_cast<void**>(&p); }
+};
+
+// The folder an Explorer window (top-level HWND) is showing, via its active shell view
+std::optional<std::filesystem::path> explorerFolderOf(HWND root) {
+    ComPtr<IShellWindows> windows;
+    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_IShellWindows, windows.putVoid()))) return std::nullopt;
+    long count = 0;
+    windows.p->get_Count(&count);
+    for (long i = 0; i < count; ++i) {
+        VARIANT idx;
+        VariantInit(&idx);
+        idx.vt = VT_I4;
+        idx.lVal = i;
+        ComPtr<IDispatch> disp;
+        if (FAILED(windows.p->Item(idx, disp.put())) || !disp.p) continue;
+        ComPtr<IWebBrowserApp> app;
+        if (FAILED(disp.p->QueryInterface(IID_IWebBrowserApp, app.putVoid()))) continue;
+        SHANDLE_PTR h = 0;
+        if (FAILED(app.p->get_HWND(&h)) || reinterpret_cast<HWND>(h) != root) continue;
+
+        ComPtr<IServiceProvider> sp;
+        ComPtr<IShellBrowser> browser;
+        ComPtr<IShellView> view;
+        ComPtr<IFolderView> folderView;
+        ComPtr<IPersistFolder2> folder;
+        if (FAILED(app.p->QueryInterface(IID_IServiceProvider, sp.putVoid())) ||
+            FAILED(sp.p->QueryService(SID_STopLevelBrowser, IID_IShellBrowser, browser.putVoid()))) return std::nullopt;
+        // Windows 11 tabs share one top-level window: only the active tab is the first ShellTabWindowClass child
+        HWND tab = nullptr;
+        const HWND activeTab = FindWindowExW(root, nullptr, L"ShellTabWindowClass", nullptr);
+        if (activeTab && SUCCEEDED(browser.p->GetWindow(&tab)) && tab != activeTab) continue;
+        if (FAILED(browser.p->QueryActiveShellView(view.put())) ||
+            FAILED(view.p->QueryInterface(IID_IFolderView, folderView.putVoid())) ||
+            FAILED(folderView.p->GetFolder(IID_IPersistFolder2, folder.putVoid()))) return std::nullopt;
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (FAILED(folder.p->GetCurFolder(&pidl)) || !pidl) return std::nullopt;
+        wchar_t path[MAX_PATH] = {};
+        const bool ok = SHGetPathFromIDListW(pidl, path) != FALSE;   // false for virtual folders (This PC, Network...)
+        CoTaskMemFree(pidl);
+        if (!ok) return std::nullopt;
+        return std::filesystem::path(path);
+    }
+    return std::nullopt;
+}
+
+std::optional<std::filesystem::path> lookupDropFolder(int x, int y) {
+    const HWND hit = WindowFromPoint(POINT{ x, y });
+    const HWND root = hit ? GetAncestor(hit, GA_ROOT) : nullptr;
+    if (!root) return std::nullopt;
+    wchar_t cls[64] = {};
+    GetClassNameW(root, cls, 64);
+    const bool onDesktop = wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0;
+    if (!onDesktop && wcscmp(cls, L"CabinetWClass") != 0) return std::nullopt;
+
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    std::optional<std::filesystem::path> result;
+    if (onDesktop) {
+        PWSTR desk = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desk)) && desk) result = std::filesystem::path(desk);
+        CoTaskMemFree(desk);
+    } else {
+        result = explorerFolderOf(root);
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+    return result;
+}
+
+} // namespace
+
+std::optional<std::filesystem::path> resolveDropFolder(int screenX, int screenY) {
+    // A hung Explorer must not hold the session thread: the lookup runs detached and is abandoned after 1 s
+    auto prom = std::make_shared<std::promise<std::optional<std::filesystem::path>>>();
+    auto fut = prom->get_future();
+    std::thread([prom, screenX, screenY] { prom->set_value(lookupDropFolder(screenX, screenY)); }).detach();
+    if (fut.wait_for(std::chrono::milliseconds(1000)) != std::future_status::ready) return std::nullopt;
+    return fut.get();
+}
+#endif
+
 // ---------------- FileTransferManager ----------------
 
 static constexpr const char* kDefaultReceivedFolder = "CppDesk_Received";
 
-FileTransferManager::FileTransferManager() {
+std::string FileTransferManager::defaultReceiveDirectory() {
     std::filesystem::path dl;
 #if defined(_WIN32)
-    char profileDir[MAX_PATH] = {};
-    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_PROFILE, nullptr, 0, profileDir))) {
+    // Wide API: the ANSI one returns bytes std::filesystem (UTF-8 here) cannot decode when the profile name is not ASCII
+    PWSTR profileDir = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Profile, 0, nullptr, &profileDir)) && profileDir) {
         dl = std::filesystem::path(profileDir) / "Downloads" / kDefaultReceivedFolder;
     }
+    CoTaskMemFree(profileDir);
 #else
     const char* home = std::getenv("HOME");
     if (home) {
@@ -666,9 +760,13 @@ FileTransferManager::FileTransferManager() {
     if (dl.empty()) {
         dl = kDefaultReceivedFolder;
     }
+    return dl.string();
+}
+
+FileTransferManager::FileTransferManager() {
+    receiveDir_ = defaultReceiveDirectory();
     std::error_code ec;
-    std::filesystem::create_directories(dl, ec);
-    receiveDir_ = dl.string();
+    std::filesystem::create_directories(receiveDir_, ec);
 }
 
 FileTransferManager::~FileTransferManager() {
@@ -699,7 +797,7 @@ void FileTransferManager::openReceiveDirectoryInExplorer() const {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
 #if defined(_WIN32)
-    ShellExecuteA(nullptr, "open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    ShellExecuteW(nullptr, L"open", std::filesystem::path(dir).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #elif defined(__APPLE__)
     cppdesk::spawn::detached({"open", dir});
 #else
@@ -1075,32 +1173,25 @@ void FileTransferManager::abortActiveTransfers() {
 }
 
 void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalBytes, const std::string& fileName,
-                                         FileOfferTarget targetHint, float dropNx, float dropNy) {
-    (void)dropNx;
-    (void)dropNy;
+                                         const std::filesystem::path& dropFolder) {
     std::lock_guard<std::mutex> lock(mutex_);
     std::error_code ec;
 
     std::string baseDir = receiveDir_;
-    if (targetHint == FileOfferTarget::Desktop) {
-#if defined(_WIN32)
-        PWSTR pDesk = nullptr;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &pDesk)) && pDesk) {
-            std::filesystem::path deskPath(pDesk);
-            CoTaskMemFree(pDesk);
-            baseDir = deskPath.string();
-        }
-#else
-        const char* home = std::getenv("HOME");
-        if (home) {
-            std::filesystem::path deskPath = std::filesystem::path(home) / "Desktop";
-            if (std::filesystem::exists(deskPath, ec)) {
-                baseDir = deskPath.string();
-            }
-        }
-#endif
+    // Only a folder we can actually create a file in is used (not C:\ or Program Files on a non-elevated host)
+    auto canWriteIn = [&](const std::filesystem::path& dir) {
+        const auto probe = dir / ".cppdesk_write_test";
+        const bool existed = std::filesystem::exists(probe, ec);
+        bool ok = false;
+        { std::ofstream f(probe, std::ios::app); ok = f.is_open(); }
+        if (!existed) std::filesystem::remove(probe, ec);
+        return ok;
+    };
+    if (!dropFolder.empty() && std::filesystem::is_directory(dropFolder, ec) && canWriteIn(dropFolder)) {
+        baseDir = dropFolder.string();
+    } else {
+        std::filesystem::create_directories(baseDir, ec);
     }
-    std::filesystem::create_directories(baseDir, ec);
 
     std::string cleanName = sanitizeFilename(fileName);
     std::filesystem::path targetPath = std::filesystem::path(baseDir) / cleanName;
@@ -1204,7 +1295,8 @@ void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalByt
     inc->hasher = std::make_unique<IncrementalSha256>();
     bool hasherOk = inc->hasher && inc->hasher->ok();
     if (hasherOk) {
-        inc->stream.open(partPathStr, std::ios::binary | std::ios::trunc);
+        // a path, not the string: open(const char*) reads the ANSI code page, so a non-ASCII folder fails there
+        inc->stream.open(std::filesystem::path(partPathStr), std::ios::binary | std::ios::trunc);
     }
 
     FileTransferItem item;
