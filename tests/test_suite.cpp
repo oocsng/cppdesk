@@ -8124,6 +8124,13 @@ bool textInField(AppUi& app, float wDip, float hDip, const std::string& text, co
     return r && r->top < field.bottom && r->bottom > field.top && r->left < field.right && r->right > field.left;
 }
 
+// A fresh window has the desk box focused, which hides its placeholder; Esc blurs it so the box can be found.
+std::optional<ui::Rect> findDeskField(AppUi& app, float wDip, float hDip) {
+    app.onKey(KeyEvent{ VK_ESCAPE, 0x01, true, false });
+    app.onKey(KeyEvent{ VK_ESCAPE, 0x01, false, false });
+    return findTextRect(app, wDip, hDip, "Desk ID or name");
+}
+
 #endif
 
 #if defined(__linux__)
@@ -8198,7 +8205,7 @@ void testLinuxWindow() {
         }
 
         // Click the desk search box and type into it.
-        auto field = findTextRect(w.app(), wDip, hDip, "Desk ID or name");
+        auto field = findDeskField(w.app(), wDip, hDip);
         TEST_ASSERT(field.has_value());
         if (field) {
             sendButton(peer, win, static_cast<int>((field->left + field->right) / 2),
@@ -8288,7 +8295,7 @@ void testLinuxWindow() {
         }));
         TEST_ASSERT(attrs.width >= 2 * 900);   // at least the 900-DIP minimum, doubled
         const float wd = attrs.width / 2.0f, hd = attrs.height / 2.0f;
-        auto field = findTextRect(w.app(), wd, hd, "Desk ID or name");
+        auto field = findDeskField(w.app(), wd, hd);
         TEST_ASSERT(field.has_value());
         if (field) {
             sendButton(peer, win, static_cast<int>(field->left + field->right), static_cast<int>(field->top + field->bottom));
@@ -8326,7 +8333,7 @@ void testMacWindow() {
         TEST_ASSERT(macWindowDrewVariedPixels(w.nativeWindow()));
 
         // Click the desk search box and type into it: once each, not twice (keyDown and the text input client).
-        auto field = findTextRect(w.app(), wDip, hDip, "Desk ID or name");
+        auto field = findDeskField(w.app(), wDip, hDip);
         TEST_ASSERT(field.has_value());
         if (field) {
             macClick(w.nativeWindow(), (field->left + field->right) / 2, (field->top + field->bottom) / 2);

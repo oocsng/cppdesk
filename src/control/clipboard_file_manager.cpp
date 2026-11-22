@@ -1295,7 +1295,8 @@ void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalByt
     inc->hasher = std::make_unique<IncrementalSha256>();
     bool hasherOk = inc->hasher && inc->hasher->ok();
     if (hasherOk) {
-        inc->stream.open(partPathStr, std::ios::binary | std::ios::trunc);
+        // a path, not the string: open(const char*) reads the ANSI code page, so a non-ASCII folder fails there
+        inc->stream.open(std::filesystem::path(partPathStr), std::ios::binary | std::ios::trunc);
     }
 
     FileTransferItem item;
