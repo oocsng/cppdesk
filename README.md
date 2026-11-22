@@ -262,7 +262,7 @@ If you hit a bug, a connection failure, or want to suggest an improvement, [open
 
 Include in your report:
 - Operating system and version (for example, Windows 11 23H2 x64, macOS 14.5, Ubuntu 24.04 X11)
-- CppDesk version (for example, v1.0.0; it is shown in Settings > About & Data)
+- CppDesk version (for example, v1.0.1; it is shown in Settings > About & Data)
 - Connection type (Direct LAN, STUN NAT traversal, or Relay)
 - Steps to reproduce, along with relevant log lines or status messages
 
