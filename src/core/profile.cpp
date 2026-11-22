@@ -22,7 +22,25 @@ std::string trimSpaces(const std::string& s) {
 }
 } // namespace
 
-std::string normaliseName(const std::string& utf8) {
+std::string stripFormatting(const std::string& utf8) {
+    std::string out;
+    for (size_t i = 0; i < utf8.size();) {
+        size_t n = 1;
+        while (i + n < utf8.size() && isContinuation(utf8[i + n])) ++n;
+        const unsigned char b1 = n > 1 ? static_cast<unsigned char>(utf8[i + 1]) : 0;
+        const unsigned char b2 = n > 2 ? static_cast<unsigned char>(utf8[i + 2]) : 0;
+        const bool fmt = (n == 3 && static_cast<unsigned char>(utf8[i]) == 0xE2 &&
+                          ((b1 == 0x80 && ((b2 >= 0x8B && b2 <= 0x8F) || (b2 >= 0xAA && b2 <= 0xAE))) ||   // U+200B-200F, U+202A-202E
+                           (b1 == 0x81 && b2 >= 0xA6 && b2 <= 0xA9))) ||                                   // U+2066-2069
+                        (n == 3 && static_cast<unsigned char>(utf8[i]) == 0xEF && b1 == 0xBB && b2 == 0xBF);   // U+FEFF
+        if (!fmt) out.append(utf8, i, n);
+        i += n;
+    }
+    return out;
+}
+
+std::string normaliseName(const std::string& utf8Raw) {
+    const std::string utf8 = stripFormatting(utf8Raw);
     std::string out;
     for (size_t i = 0; i < utf8.size();) {
         size_t n = 1;
@@ -51,9 +69,10 @@ std::string composeWireName(const std::string& name, const std::string& hostname
 }
 
 WireName splitWireName(const std::string& wire) {
-    size_t pos = wire.rfind(kSep);
-    if (pos == std::string::npos) return {wire, ""};
-    return {wire.substr(0, pos), wire.substr(pos + kSep.size())};
+    const std::string clean = stripFormatting(wire);   // every display path goes through here
+    size_t pos = clean.rfind(kSep);
+    if (pos == std::string::npos) return {clean, ""};
+    return {clean.substr(0, pos), clean.substr(pos + kSep.size())};
 }
 
 std::filesystem::path ownPicturePath(const std::filesystem::path& configFile, int instanceId) {

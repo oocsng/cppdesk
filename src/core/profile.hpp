@@ -7,6 +7,9 @@
 
 namespace cppdesk::profile {
 
+// Removes bidi overrides/isolates, zero-width and BOM code points (UTF-8 in, UTF-8 out); they can spoof a displayed name.
+std::string stripFormatting(const std::string& utf8);
+
 // Trims, strips control characters and caps at 32 code points (UTF-8 in, UTF-8 out).
 std::string normaliseName(const std::string& utf8);
 

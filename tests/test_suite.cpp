@@ -13074,6 +13074,19 @@ void testProfileNames() {
     for (int i = 0; i < 40; ++i) longName += "\xE6\x97\xA5";
     TEST_ASSERT(normaliseName(longName).size() == 96);
 
+    // Direction and zero-width formatting marks cannot spoof a name; plain CJK and emoji survive
+    TEST_ASSERT(normaliseName("Ja\xE2\x80\xAEne\xE2\x80\x8B\xEF\xBB\xBF\xE2\x81\xA6") == "Jane");
+    TEST_ASSERT(normaliseName("\xE2\x80\x8F" "\xE6\x97\xA5\xF0\x9F\x98\x80") == "\xE6\x97\xA5\xF0\x9F\x98\x80");
+    TEST_ASSERT(stripFormatting("evil\xE2\x80\xAE") == "evil");
+    TEST_ASSERT(splitWireName("Ja\xE2\x80\xAEne \xC2\xB7 P\xE2\x80\x8B" "C").name == "Jane");
+    TEST_ASSERT(splitWireName("Ja\xE2\x80\xAEne \xC2\xB7 P\xE2\x80\x8B" "C").computer == "PC");
+    {
+        std::string mixed;
+        for (int i = 0; i < 40; ++i) mixed += "\xE2\x80\xAE\xF0\x9F\x98\x80";
+        const std::string m = normaliseName(mixed);
+        TEST_ASSERT(m.size() == 128 && isValidUtf8(m));   // 32 emoji, the marks do not count toward the cap
+    }
+
     std::string emoji;
     for (int i = 0; i < 32; ++i) emoji += "\xF0\x9F\x98\x80";
     std::string tight = composeWireName(emoji, "VERY-LONG-HOSTNAME", 63);
@@ -13687,6 +13700,19 @@ void testAvatarFallbackAndSplitNames() {
     TEST_ASSERT(std::sscanf(imgs[0].c_str(), "drawImage %*d %f %f %f %f", &l, &t, &r, &b) == 4);
     TEST_ASSERT(r - l == 36.0f && b - t == 36.0f);                                  // the 18px avatar rect
     TEST_ASSERT(initials(ops) == withInitial - 1);                                    // the row shows the picture, the rail keeps its initial
+
+    // A CJK name draws its whole 3-byte first character as the initial, not a cut one
+    {
+        AppUi app(id, net, shell, "");
+        ui::RecordingCanvas rc;
+        app.applySnapshotState("home_desks");
+        id.addOrUpdateRecentSession(kDesk, "\xE6\x97\xA5\xE6\x9C\xAC \xC2\xB7 PC1", "");
+        net.injectPeerPictureForTest(kDesk, {});
+        for (int i = 0; i < 60; ++i) app.render(rc, 1280, 800, 1.0 / 60.0);
+        const std::string cjk = rc.serialize();
+        TEST_ASSERT(cjk.find("|\xE6\x97\xA5\n") != std::string::npos);
+        TEST_ASSERT(cjk.find("|\xE6\x97\n") == std::string::npos);
+    }
 
     // The host-side ACTIVE SESSION card names the viewer by username, not the whole wire name
     const std::string card = renderAppState(id, net, shell, "dashboard_mic_on");

@@ -21,7 +21,7 @@ namespace {
 // The username part of a peer's wire name ("Jane \xC2\xB7 PC1" -> "Jane"); a plain hostname comes back unchanged.
 std::string peerName(const std::string& wire) {
     const std::string n = profile::splitWireName(wire).name;
-    return n.empty() ? wire : n;
+    return n.empty() ? profile::stripFormatting(wire) : n;
 }
 
 #pragma pack(push, 2)
@@ -553,8 +553,9 @@ void AppUi::drawAvatar(float cx, float cy, float r, uint64_t deskId, const std::
                                              rgba(136, 80, 118), rgba(112, 100, 52), rgba(96, 88, 80) };
         canvas_->fillEllipse(cx, cy, r, r, withAlpha(kAvatar[deskId % 6], a));
         const char first = name.empty() ? '?' : name[0];
-        const std::string initial = (static_cast<unsigned char>(first) < 0x80) ? std::string(1, static_cast<char>(std::toupper(static_cast<unsigned char>(first))))
-                                                                               : name.substr(0, name.size() > 1 ? 2 : 1);
+        const unsigned char lead = static_cast<unsigned char>(first);
+        const size_t len = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;   // the whole first UTF-8 character
+        const std::string initial = lead < 0x80 ? std::string(1, static_cast<char>(std::toupper(lead))) : name.substr(0, std::min(len, name.size()));
         drawText(initial, { cx - r, cy - r, cx + r, cy + r }, r < 14.0f ? ui::FontRole::Small : ui::FontRole::BodyBold,
                  withAlpha(rgba(255, 255, 255), a), ui::HAlign::Center, ui::VAlign::Center);
     };
@@ -7346,7 +7347,7 @@ void AppUi::drawUpdateRequiredModal(float width, float height, float modalProgre
     UiRect dlBtn = { leftBtn.right + 14.0f, my, mrx, my + 40.0f };
     std::string dlBtnLabel = isDownloadingUpdate_
         ? ("Downloading " + std::to_string(static_cast<int>(updateDownloadProgress_ * 100.0f)) + "%")
-        : "Download and update";
+        : (shell_->has(ui::Capability::AutoUpdate) ? "Download and update" : "View release");
 
     drawButton("update_modal_download", dlBtn, dlBtnLabel,
                isDownloadingUpdate_ ? COL_SEC_BTN_BG : COL_PRIMARY_ACCENT,
