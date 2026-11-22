@@ -107,6 +107,7 @@ public:
     FileTransferManager();
     ~FileTransferManager();
 
+    static std::string defaultReceiveDirectory();
     void setReceiveDirectory(const std::string& dirPath);
     std::string receiveDirectory() const;
     void openReceiveDirectoryInExplorer() const;

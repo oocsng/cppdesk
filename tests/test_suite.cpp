@@ -673,6 +673,24 @@ void testAppSettingsAndAdaptiveFps() {
         TEST_ASSERT(def.defaultPermissions == PERM_ALL);
         TEST_ASSERT(def.hardwareAcceleration == true);
     }
+
+    // 4. Received-files folder: persists, is applied to the file manager, and Reset puts the default back
+    {
+        IdentityManager idA(104);
+        TEST_ASSERT(idA.settings().receiveDir.empty());
+        AppSettings s = idA.settings();
+        const auto dir = (std::filesystem::temp_directory_path() / "cppdesk_recv_setting").string();
+        s.receiveDir = dir;
+        idA.updateSettings(s);
+        IdentityManager idB(104);
+        TEST_ASSERT(idB.loadOrCreate());
+        TEST_ASSERT(idB.settings().receiveDir == dir);
+        NetworkEngine eng(idB);
+        TEST_ASSERT(eng.fileTransferManager().receiveDirectory() == dir);
+        idB.resetSettingsToDefault();
+        eng.applyReceiveDirectory();
+        TEST_ASSERT(eng.fileTransferManager().receiveDirectory() == FileTransferManager::defaultReceiveDirectory());
+    }
 }
 
 void testAvx2SimdAssemblyKernels() {

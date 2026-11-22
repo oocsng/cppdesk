@@ -650,7 +650,7 @@ void ClipboardManager::applyRemoteClipboard(const std::string& utf8Text) {
 
 static constexpr const char* kDefaultReceivedFolder = "CppDesk_Received";
 
-FileTransferManager::FileTransferManager() {
+std::string FileTransferManager::defaultReceiveDirectory() {
     std::filesystem::path dl;
 #if defined(_WIN32)
     char profileDir[MAX_PATH] = {};
@@ -666,9 +666,13 @@ FileTransferManager::FileTransferManager() {
     if (dl.empty()) {
         dl = kDefaultReceivedFolder;
     }
+    return dl.string();
+}
+
+FileTransferManager::FileTransferManager() {
+    receiveDir_ = defaultReceiveDirectory();
     std::error_code ec;
-    std::filesystem::create_directories(dl, ec);
-    receiveDir_ = dl.string();
+    std::filesystem::create_directories(receiveDir_, ec);
 }
 
 FileTransferManager::~FileTransferManager() {

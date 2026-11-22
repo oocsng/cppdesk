@@ -41,6 +41,7 @@ struct AppSettings {
     bool          enableTaskbarFlash = true;             // Pulse taskbar orange when background alerts arrive
     bool          enableNotificationSounds = true;       // Audio chime on incoming alerts
     bool          minimizeToTray = false;                // Minimize window to Windows Notification Area
+    std::string   receiveDir = "";                       // Folder for received files (UTF-8); empty = built-in default
 
     // Self-Hosted Relay & STUN Configuration
     std::string   relayServer = "127.0.0.1:50999";

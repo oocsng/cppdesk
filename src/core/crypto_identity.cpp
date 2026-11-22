@@ -728,6 +728,8 @@ bool IdentityManager::loadOrCreate() {
                 settings_.audioInputDeviceName = val;
             } else if (key == "audio_output_device_name") {
                 settings_.audioOutputDeviceName = val;
+            } else if (key == "receive_dir") {
+                settings_.receiveDir = val;
             } else if (key == "wayland_restore_token") {
                 if (val.size() <= 256) settings_.waylandRestoreToken = val;
             } else if (key == "auto_virtual_display") {
@@ -932,6 +934,7 @@ bool IdentityManager::save() const {
         out << "audio_output_device_id=" << settings_.audioOutputDeviceId << "\n";
         out << "audio_input_device_name=" << sanitizeIniLine(settings_.audioInputDeviceName) << "\n";
         out << "audio_output_device_name=" << sanitizeIniLine(settings_.audioOutputDeviceName) << "\n";
+        out << "receive_dir=" << sanitizeIniLine(settings_.receiveDir) << "\n";
         out << "wayland_restore_token=" << sanitizeIniLine(settings_.waylandRestoreToken) << "\n";
         out << "auto_virtual_display=" << (settings_.autoVirtualDisplay ? "1" : "0") << "\n";
         out << "privacy_notice=" << sanitizeIniValue(settings_.privacyCustomNotice) << "\n";

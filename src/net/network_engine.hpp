@@ -397,6 +397,8 @@ public:
     uint32_t unreadChatCount() const { return unreadChatCount_.load(); }
     void markChatRead() { unreadChatCount_.store(0); }
 
+    // Points the file manager at settings().receiveDir (or the built-in default when empty)
+    void applyReceiveDirectory();
     FileTransferManager& fileTransferManager() { return fileManager_; }
     const FileTransferManager& fileTransferManager() const { return fileManager_; }
     ClipboardFileTransferManager& clipboardFileTransferManager() { return clipFileMgr_; }

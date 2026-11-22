@@ -1218,6 +1218,12 @@ NetworkEngine::NetworkEngine(IdentityManager& identity)
     localIp_ = detectPrimaryLocalIpv4();
     autoAcceptIncoming_.store(identity_.settings().autoAcceptIncoming);
     autoAcceptPerms_.store(identity_.settings().defaultPermissions);
+    applyReceiveDirectory();
+}
+
+void NetworkEngine::applyReceiveDirectory() {
+    const std::string dir = identity_.settings().receiveDir;
+    fileManager_.setReceiveDirectory(dir.empty() ? FileTransferManager::defaultReceiveDirectory() : dir);
 }
 
 NetworkEngine::~NetworkEngine() {
