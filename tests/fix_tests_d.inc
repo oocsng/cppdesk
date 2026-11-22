@@ -336,6 +336,14 @@ void testFixesD() {
         mgr.handleFileComplete(41, CryptoUtils::sha256Hex("AAAA"));
         TEST_ASSERT(fs::exists(ftDir / "gone.txt"));
         TEST_ASSERT(!fs::exists(baseTmp / "no_such_dir"));
+        // A drop folder we cannot create a file in falls back too (here the write probe's name is taken by a directory)
+        const fs::path lockedDir = baseTmp / "ft_drop_locked";
+        fs::create_directories(lockedDir / ".cppdesk_write_test", ec);
+        mgr.handleFileOffer(43, 4, "locked.txt", lockedDir);
+        mgr.handleFileChunk(43, 0, d1, 4);
+        mgr.handleFileComplete(43, CryptoUtils::sha256Hex("AAAA"));
+        TEST_ASSERT(fs::exists(ftDir / "locked.txt"));
+        TEST_ASSERT(!fs::exists(lockedDir / "locked.txt"));
         const fs::path notDir = baseTmp / "ft_not_a_dir.txt";
         std::ofstream(notDir) << "x";
         mgr.handleFileOffer(42, 4, "file_as_dir.txt", notDir);

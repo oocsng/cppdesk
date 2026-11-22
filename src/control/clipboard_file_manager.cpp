@@ -685,8 +685,12 @@ std::optional<std::filesystem::path> explorerFolderOf(HWND root) {
         ComPtr<IFolderView> folderView;
         ComPtr<IPersistFolder2> folder;
         if (FAILED(app.p->QueryInterface(IID_IServiceProvider, sp.putVoid())) ||
-            FAILED(sp.p->QueryService(SID_STopLevelBrowser, IID_IShellBrowser, browser.putVoid())) ||
-            FAILED(browser.p->QueryActiveShellView(view.put())) ||
+            FAILED(sp.p->QueryService(SID_STopLevelBrowser, IID_IShellBrowser, browser.putVoid()))) return std::nullopt;
+        // Windows 11 tabs share one top-level window: only the active tab is the first ShellTabWindowClass child
+        HWND tab = nullptr;
+        const HWND activeTab = FindWindowExW(root, nullptr, L"ShellTabWindowClass", nullptr);
+        if (activeTab && SUCCEEDED(browser.p->GetWindow(&tab)) && tab != activeTab) continue;
+        if (FAILED(browser.p->QueryActiveShellView(view.put())) ||
             FAILED(view.p->QueryInterface(IID_IFolderView, folderView.putVoid())) ||
             FAILED(folderView.p->GetFolder(IID_IPersistFolder2, folder.putVoid()))) return std::nullopt;
         PIDLIST_ABSOLUTE pidl = nullptr;
@@ -1172,7 +1176,16 @@ void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalByt
     std::error_code ec;
 
     std::string baseDir = receiveDir_;
-    if (!dropFolder.empty() && std::filesystem::is_directory(dropFolder, ec)) {
+    // Only a folder we can actually create a file in is used (not C:\ or Program Files on a non-elevated host)
+    auto canWriteIn = [&](const std::filesystem::path& dir) {
+        const auto probe = dir / ".cppdesk_write_test";
+        const bool existed = std::filesystem::exists(probe, ec);
+        bool ok = false;
+        { std::ofstream f(probe, std::ios::app); ok = f.is_open(); }
+        if (!existed) std::filesystem::remove(probe, ec);
+        return ok;
+    };
+    if (!dropFolder.empty() && std::filesystem::is_directory(dropFolder, ec) && canWriteIn(dropFolder)) {
         baseDir = dropFolder.string();
     } else {
         std::filesystem::create_directories(baseDir, ec);
