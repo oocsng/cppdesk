@@ -2745,7 +2745,23 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                     dropNx = r.readF32();
                                     dropNy = r.readF32();
                                 }
-                                fileManager_.handleFileOffer(tid, fsz, fname);
+                                std::filesystem::path dropFolder;
+#if defined(_WIN32)
+                                // A canvas drop: find the Explorer folder or desktop under the drop point on the streamed monitor
+                                if (targetHint == FileOfferTarget::Desktop && std::isfinite(dropNx) && std::isfinite(dropNy)) {
+                                    MonitorDesc md;
+                                    {
+                                        std::lock_guard<std::mutex> ml(monDescMutex);
+                                        md = currentMonDesc;
+                                    }
+                                    const int sx = static_cast<int>(std::lround(md.x + std::clamp(dropNx, 0.0f, 1.0f) * std::max(1, md.width - 1)));
+                                    const int sy = static_cast<int>(std::lround(md.y + std::clamp(dropNy, 0.0f, 1.0f) * std::max(1, md.height - 1)));
+                                    dropFolder = resolveDropFolder(sx, sy).value_or(std::filesystem::path{});
+                                }
+#else
+                                (void)targetHint; (void)dropNx; (void)dropNy;   // folder detection is Windows-only
+#endif
+                                fileManager_.handleFileOffer(tid, fsz, fname, dropFolder);
                             }
                             break;
                         }

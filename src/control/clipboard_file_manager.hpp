@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <memory>
 #include <functional>
+#include <optional>
 #include <algorithm>
 #include "shell_clipboard.hpp"
 
@@ -99,6 +100,12 @@ private:
     std::string             lastAppliedHash_;
     ClipboardHistoryManager history_;
 };
+
+#if defined(_WIN32)
+// The folder shown under a screen point: the desktop, or the folder of an Explorer window.
+// nullopt for any other window, a virtual folder, a failed lookup, or when it takes over 1000 ms.
+std::optional<std::filesystem::path> resolveDropFolder(int screenX, int screenY);
+#endif
 
 class FileTransferManager {
 public:

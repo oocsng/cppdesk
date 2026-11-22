@@ -10,6 +10,8 @@
 #include <bcrypt.h>
 #include <shlobj.h>
 #include <shellapi.h>
+#include <exdisp.h>
+#include <servprov.h>
 #elif defined(__APPLE__)
 #include <CommonCrypto/CommonDigest.h>
 #include <unistd.h>
@@ -34,6 +36,8 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <future>
+#include <thread>
 
 namespace cppdesk {
 
@@ -644,6 +648,90 @@ void ClipboardManager::applyRemoteClipboard(const std::string& utf8Text) {
     lastSeqNumber_++;
 }
 
+#endif
+
+#if defined(_WIN32)
+namespace {
+
+template <class T>
+struct ComPtr {
+    T* p = nullptr;
+    ~ComPtr() { if (p) p->Release(); }
+    T** put() { return &p; }
+    void** putVoid() { return reinterpret_cast<void**>(&p); }
+};
+
+// The folder an Explorer window (top-level HWND) is showing, via its active shell view
+std::optional<std::filesystem::path> explorerFolderOf(HWND root) {
+    ComPtr<IShellWindows> windows;
+    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_IShellWindows, windows.putVoid()))) return std::nullopt;
+    long count = 0;
+    windows.p->get_Count(&count);
+    for (long i = 0; i < count; ++i) {
+        VARIANT idx;
+        VariantInit(&idx);
+        idx.vt = VT_I4;
+        idx.lVal = i;
+        ComPtr<IDispatch> disp;
+        if (FAILED(windows.p->Item(idx, disp.put())) || !disp.p) continue;
+        ComPtr<IWebBrowserApp> app;
+        if (FAILED(disp.p->QueryInterface(IID_IWebBrowserApp, app.putVoid()))) continue;
+        SHANDLE_PTR h = 0;
+        if (FAILED(app.p->get_HWND(&h)) || reinterpret_cast<HWND>(h) != root) continue;
+
+        ComPtr<IServiceProvider> sp;
+        ComPtr<IShellBrowser> browser;
+        ComPtr<IShellView> view;
+        ComPtr<IFolderView> folderView;
+        ComPtr<IPersistFolder2> folder;
+        if (FAILED(app.p->QueryInterface(IID_IServiceProvider, sp.putVoid())) ||
+            FAILED(sp.p->QueryService(SID_STopLevelBrowser, IID_IShellBrowser, browser.putVoid())) ||
+            FAILED(browser.p->QueryActiveShellView(view.put())) ||
+            FAILED(view.p->QueryInterface(IID_IFolderView, folderView.putVoid())) ||
+            FAILED(folderView.p->GetFolder(IID_IPersistFolder2, folder.putVoid()))) return std::nullopt;
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (FAILED(folder.p->GetCurFolder(&pidl)) || !pidl) return std::nullopt;
+        wchar_t path[MAX_PATH] = {};
+        const bool ok = SHGetPathFromIDListW(pidl, path) != FALSE;   // false for virtual folders (This PC, Network...)
+        CoTaskMemFree(pidl);
+        if (!ok) return std::nullopt;
+        return std::filesystem::path(path);
+    }
+    return std::nullopt;
+}
+
+std::optional<std::filesystem::path> lookupDropFolder(int x, int y) {
+    const HWND hit = WindowFromPoint(POINT{ x, y });
+    const HWND root = hit ? GetAncestor(hit, GA_ROOT) : nullptr;
+    if (!root) return std::nullopt;
+    wchar_t cls[64] = {};
+    GetClassNameW(root, cls, 64);
+    const bool onDesktop = wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0;
+    if (!onDesktop && wcscmp(cls, L"CabinetWClass") != 0) return std::nullopt;
+
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    std::optional<std::filesystem::path> result;
+    if (onDesktop) {
+        PWSTR desk = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desk)) && desk) result = std::filesystem::path(desk);
+        CoTaskMemFree(desk);
+    } else {
+        result = explorerFolderOf(root);
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+    return result;
+}
+
+} // namespace
+
+std::optional<std::filesystem::path> resolveDropFolder(int screenX, int screenY) {
+    // A hung Explorer must not hold the session thread: the lookup runs detached and is abandoned after 1 s
+    auto prom = std::make_shared<std::promise<std::optional<std::filesystem::path>>>();
+    auto fut = prom->get_future();
+    std::thread([prom, screenX, screenY] { prom->set_value(lookupDropFolder(screenX, screenY)); }).detach();
+    if (fut.wait_for(std::chrono::milliseconds(1000)) != std::future_status::ready) return std::nullopt;
+    return fut.get();
+}
 #endif
 
 // ---------------- FileTransferManager ----------------

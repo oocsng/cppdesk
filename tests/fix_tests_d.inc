@@ -342,6 +342,14 @@ void testFixesD() {
         mgr.handleFileChunk(42, 0, d1, 4);
         mgr.handleFileComplete(42, CryptoUtils::sha256Hex("AAAA"));
         TEST_ASSERT(fs::exists(ftDir / "file_as_dir.txt"));
+#if defined(_WIN32)
+        // No window sits at a far off-screen point: no folder, and the lookup returns well inside its 1 s bound
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            TEST_ASSERT(!resolveDropFolder(-30000, -30000).has_value());
+            TEST_ASSERT(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(1500));
+        }
+#endif
 
         // Spamming oversized offers must respect the 150-item cap
         for (uint32_t i = 1000; i < 1200; ++i) {
