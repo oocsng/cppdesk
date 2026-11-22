@@ -1079,32 +1079,16 @@ void FileTransferManager::abortActiveTransfers() {
 }
 
 void FileTransferManager::handleFileOffer(uint32_t transferId, uint64_t totalBytes, const std::string& fileName,
-                                         FileOfferTarget targetHint, float dropNx, float dropNy) {
-    (void)dropNx;
-    (void)dropNy;
+                                         const std::filesystem::path& dropFolder) {
     std::lock_guard<std::mutex> lock(mutex_);
     std::error_code ec;
 
     std::string baseDir = receiveDir_;
-    if (targetHint == FileOfferTarget::Desktop) {
-#if defined(_WIN32)
-        PWSTR pDesk = nullptr;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &pDesk)) && pDesk) {
-            std::filesystem::path deskPath(pDesk);
-            CoTaskMemFree(pDesk);
-            baseDir = deskPath.string();
-        }
-#else
-        const char* home = std::getenv("HOME");
-        if (home) {
-            std::filesystem::path deskPath = std::filesystem::path(home) / "Desktop";
-            if (std::filesystem::exists(deskPath, ec)) {
-                baseDir = deskPath.string();
-            }
-        }
-#endif
+    if (!dropFolder.empty() && std::filesystem::is_directory(dropFolder, ec)) {
+        baseDir = dropFolder.string();
+    } else {
+        std::filesystem::create_directories(baseDir, ec);
     }
-    std::filesystem::create_directories(baseDir, ec);
 
     std::string cleanName = sanitizeFilename(fileName);
     std::filesystem::path targetPath = std::filesystem::path(baseDir) / cleanName;

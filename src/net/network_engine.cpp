@@ -2745,7 +2745,7 @@ void NetworkEngine::runHostSession(uintptr_t clientSock, std::string clientIp) {
                                     dropNx = r.readF32();
                                     dropNy = r.readF32();
                                 }
-                                fileManager_.handleFileOffer(tid, fsz, fname, targetHint, dropNx, dropNy);
+                                fileManager_.handleFileOffer(tid, fsz, fname);
                             }
                             break;
                         }
@@ -4868,15 +4868,8 @@ void NetworkEngine::runViewerSession(std::string targetInput, std::string passwo
                                 uint32_t tid = r.readU32();
                                 uint64_t fsz = r.readU64();
                                 std::string fname = r.readString();
-                                float dropNx = 0.0f, dropNy = 0.0f;
-                                if (r.hasRemaining(1)) {
-                                    (void)r.readU8(); // ignore remote targetHint; never write to viewer Desktop
-                                }
-                                if (r.hasRemaining(8)) {
-                                    dropNx = r.readF32();
-                                    dropNy = r.readF32();
-                                }
-                                fileManager_.handleFileOffer(tid, fsz, fname, FileOfferTarget::DefaultDownloads, dropNx, dropNy);
+                                // the offer's remote target hint and drop point are ignored: a viewer always saves into the receive dir
+                                fileManager_.handleFileOffer(tid, fsz, fname);
                             }
                             break;
                         }

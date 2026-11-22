@@ -136,9 +136,9 @@ public:
     void abortActiveTransfers();
 
     // Handle incoming file transfer packets from remote peer
+    // dropFolder (if an existing directory) is where the file lands; otherwise the receive directory
     void handleFileOffer(uint32_t transferId, uint64_t totalBytes, const std::string& fileName,
-                         FileOfferTarget targetHint = FileOfferTarget::DefaultDownloads,
-                         float dropNx = 0.0f, float dropNy = 0.0f);
+                         const std::filesystem::path& dropFolder = {});
     void handleFileChunk(uint32_t transferId, uint64_t offset, const uint8_t* chunkData, size_t chunkLen);
     void handleFileComplete(uint32_t transferId, const std::string& sha256Hex);
     void handleFileCancel(uint32_t transferId);

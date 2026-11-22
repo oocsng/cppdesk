@@ -324,6 +324,25 @@ void testFixesD() {
         TEST_ASSERT(fs::exists(ftDir / "dup.txt"));
         TEST_ASSERT(fs::exists(ftDir / "dup (1).txt"));
 
+        // A drop folder is used when it is a directory; a missing or non-directory one falls back to the receive dir
+        const fs::path dropDir = baseTmp / "ft_drop";
+        fs::create_directories(dropDir, ec);
+        mgr.handleFileOffer(40, 4, "drop.txt", dropDir);
+        mgr.handleFileChunk(40, 0, d1, 4);
+        mgr.handleFileComplete(40, CryptoUtils::sha256Hex("AAAA"));
+        TEST_ASSERT(fs::exists(dropDir / "drop.txt"));
+        mgr.handleFileOffer(41, 4, "gone.txt", baseTmp / "no_such_dir");
+        mgr.handleFileChunk(41, 0, d1, 4);
+        mgr.handleFileComplete(41, CryptoUtils::sha256Hex("AAAA"));
+        TEST_ASSERT(fs::exists(ftDir / "gone.txt"));
+        TEST_ASSERT(!fs::exists(baseTmp / "no_such_dir"));
+        const fs::path notDir = baseTmp / "ft_not_a_dir.txt";
+        std::ofstream(notDir) << "x";
+        mgr.handleFileOffer(42, 4, "file_as_dir.txt", notDir);
+        mgr.handleFileChunk(42, 0, d1, 4);
+        mgr.handleFileComplete(42, CryptoUtils::sha256Hex("AAAA"));
+        TEST_ASSERT(fs::exists(ftDir / "file_as_dir.txt"));
+
         // Spamming oversized offers must respect the 150-item cap
         for (uint32_t i = 1000; i < 1200; ++i) {
             mgr.handleFileOffer(i, 5ULL * 1024 * 1024 * 1024, "huge.bin");
