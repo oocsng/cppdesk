@@ -182,12 +182,33 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
 /* ---- 4. The real thing ---- */
 .real .shot { margin-top: clamp(2rem, 4vw, 3rem); }
 .shot img { width: 100%; height: auto; aspect-ratio: 1280 / 800; }
+/* The frame keeps its full size in the layout; only its transform grows with the scroll. */
+@media (prefers-reduced-motion: no-preference) {
+  @supports (animation-timeline: view()) {
+    .shot { transform-origin: 50% 0; animation: shot-grow linear both; animation-timeline: view(); animation-range: entry 0% cover 30%; }
+    @keyframes shot-grow { from { transform: scale(0.6); } }
+  }
+}
 .promo { margin-top: 1.5rem; }
 
 /* ---- 5 / 7. Window decks ---- */
 .deck { margin-top: clamp(2rem, 4vw, 3rem); display: grid; gap: clamp(1.25rem, 2.5vw, 2rem); grid-template-columns: repeat(12, 1fr); }
 .f { grid-column: span 12; }
 .numerals { display: flex; gap: 1.25rem; font: 400 2.4rem/1 var(--serif); }
+@media (min-width: 48rem) {
+  .features .f:nth-child(odd) { rotate: -0.7deg; }
+  .features .f:nth-child(even) { rotate: 0.6deg; }
+  .features .f:nth-child(n+4) { margin-top: -0.75rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  @supports (animation-timeline: view()) {
+    /* Cards are dealt in as each reaches the lower half of the screen. */
+    .features .f { animation: deal linear both; animation-timeline: view(); animation-range: entry 0% entry 70%; }
+    .features .f:nth-child(3n+2) { animation-range: entry 8% entry 78%; }
+    .features .f:nth-child(3n) { animation-range: entry 16% entry 86%; }
+    @keyframes deal { from { opacity: 0; translate: 0 3.5rem; rotate: 5deg; } }
+  }
+}
 .hot .win-bar { background: var(--orange-text); color: var(--cream); }
 .hot .win-id { color: var(--cream); }
 .notes { margin-top: 2.5rem; display: grid; gap: 1rem; max-width: 44rem; }
@@ -195,7 +216,13 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
 /* ---- 6. Security: the ink band ---- */
 .security { background: var(--ink); color: var(--paper); --ring: var(--paper); }
 .security .section-lede { color: var(--paper); }
-.stamp { display: inline-block; margin-top: 1.75rem; padding: 0.4rem 1.1rem; border: 3px solid var(--orange); border-radius: 8px; color: var(--orange); font: 400 clamp(1.5rem, 1rem + 1.6vw, 2.2rem)/1.2 var(--serif); }
+.stamp { display: inline-block; rotate: -2deg; margin-top: 1.75rem; padding: 0.4rem 1.1rem; border: 3px solid var(--orange); border-radius: 8px; color: var(--orange); font: 400 clamp(1.5rem, 1rem + 1.6vw, 2.2rem)/1.2 var(--serif); }
+@media (prefers-reduced-motion: no-preference) {
+  @supports (animation-timeline: view()) {
+    .stamp { animation: stamp-land linear both; animation-timeline: view(); animation-range: entry 40% entry 100%; }
+    @keyframes stamp-land { from { opacity: 0; scale: 1.7; rotate: -9deg; } }
+  }
+}
 .locks { margin-top: 2rem; display: grid; gap: 0.6rem; max-width: 38rem; }
 .locks li { padding-left: 1.5rem; position: relative; }
 .locks li::before { content: ""; position: absolute; left: 0; top: 0.7em; width: 0.7rem; height: 3px; background: var(--orange); }
