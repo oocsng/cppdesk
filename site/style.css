@@ -40,7 +40,7 @@ a { color: inherit; text-decoration-thickness: 1.5px; text-underline-offset: 0.2
 a:hover { text-decoration-color: var(--orange); }
 code { font: 600 0.92em var(--sans); background: var(--paper-2); padding: 0.05em 0.35em; border-radius: 4px; }
 :focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; border-radius: 4px; }
-.btn:focus-visible, .pick:focus-visible { outline: 3px solid var(--orange-lit); outline-offset: 5px; } /* clear of the hard shadow */
+.btn:focus-visible, .pick:focus-visible { outline: 3px solid var(--ring); outline-offset: 5px; } /* clear of the hard shadow */
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .dim { color: var(--ink-2); }
 
@@ -142,13 +142,14 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
 .plug-dot { width: 0.9rem; height: 0.9rem; border-radius: 50%; background: var(--orange); border: var(--line); flex: none; }
 
 /* Pinned scene: tall track, sticky stage, choreography on the track's own view timeline.
-   The pinned phase is cover 28.6% to 71.4% (track 250vh, stage 100vh). Phones and short screens get the plain list. */
-@media (min-width: 48rem) and (min-height: 41rem) {
-  .scene { height: 250vh; }
-  .scene-pin { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; justify-content: flex-start; padding-top: clamp(3rem, 12vh, 8rem); }
+   The pinned phase is cover 28.6% to 71.4% (track 250vh, stage 100vh). Only where the animation can run, and only
+   with two columns and a tall screen: phones, tablets in portrait, short screens, reduced motion and no-support
+   browsers get the plain two-step list. */
+@media (min-width: 52rem) and (min-height: 41rem) {
   @media (prefers-reduced-motion: no-preference) {
     @supports (animation-timeline: view()) {
-      .scene { view-timeline: --scene block; }
+      .scene { height: 250vh; view-timeline: --scene block; }
+      .scene-pin { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; justify-content: flex-start; padding-top: clamp(3rem, 12vh, 8rem); }
       .step + .step .win, .step + .step .step-text { animation: step-in linear both; animation-timeline: --scene; animation-range: cover 30% cover 38%; }
       .dg { animation: type-in linear both; animation-timeline: --scene; animation-range: cover calc(40% + var(--i) * 2.4%) cover calc(41.5% + var(--i) * 2.4%); }
       .live-line { animation: step-in linear both; animation-timeline: --scene; animation-range: cover 64% cover 68%; }
