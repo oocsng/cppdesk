@@ -65,7 +65,7 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
 .win { background: var(--cream); border: var(--line); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; text-align: left; color: var(--ink); font: inherit; padding: 0; }
 .win-bar { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; padding: 0.55rem 0.95rem; background: var(--paper-2); border-bottom: var(--line); }
 .win-name { font: 600 0.9375rem/1.3 var(--sans); }
-.win-id { font: 600 0.875rem/1.3 var(--sans); color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.win-id { white-space: nowrap; font: 600 0.875rem/1.3 var(--sans); color: var(--ink-2); font-variant-numeric: tabular-nums; }
 .win-body { display: block; padding: 1rem 0.95rem 1.1rem; }
 .win-body > * + * { margin-top: 0.6rem; }
 
@@ -117,6 +117,13 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
 .gone li { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 2rem; }
 .word { position: relative; font: 400 clamp(3.5rem, 1rem + 13vw, 11rem)/1.05 var(--serif); letter-spacing: -0.02em; }
 .word::after { content: ""; position: absolute; left: -1%; right: -1%; top: 54%; height: clamp(6px, 1.2vw, 14px); background: var(--orange); transform-origin: left center; }
+@media (prefers-reduced-motion: no-preference) {
+  @supports (animation-timeline: view()) {
+    /* Each bar draws once its word reaches mid-screen. */
+    .word::after { animation: strike linear both; animation-timeline: view(); animation-range: entry 60% cover 50%; }
+    @keyframes strike { from { transform: scaleX(0); } }
+  }
+}
 .none { font: 600 1.0625rem var(--sans); color: var(--ink-2); }
 
 /* ---- 3. Connect ---- */
@@ -132,6 +139,25 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
 .sp { display: inline-block; width: 0.35em; }
 .plug-dot { width: 0.9rem; height: 0.9rem; border-radius: 50%; background: var(--orange); border: var(--line); flex: none; }
 
+/* Pinned scene: tall track, sticky stage, choreography on the track's own view timeline.
+   The pinned phase is cover 28.6% to 71.4% (track 250vh, stage 100vh). Phones and short screens get the plain list. */
+@media (min-width: 48rem) and (min-height: 41rem) {
+  .scene { height: 250vh; }
+  .scene-pin { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; justify-content: center; }
+  @media (prefers-reduced-motion: no-preference) {
+    @supports (animation-timeline: view()) {
+      .scene { view-timeline: --scene block; }
+      .step + .step .win, .step + .step .step-text { animation: step-in linear both; animation-timeline: --scene; animation-range: cover 30% cover 38%; }
+      .dg { animation: type-in linear both; animation-timeline: --scene; animation-range: cover calc(40% + var(--i) * 2.4%) cover calc(41.5% + var(--i) * 2.4%); }
+      .live-line { animation: step-in linear both; animation-timeline: --scene; animation-range: cover 64% cover 68%; }
+      .plug-dot { animation: plug-snap linear both; animation-timeline: --scene; animation-range: cover 63% cover 67%; }
+      @keyframes step-in { from { opacity: 0.2; translate: 0 1.5rem; } }
+      @keyframes type-in { from { opacity: 0; } }
+      @keyframes plug-snap { from { transform: scale(0); } 70% { transform: scale(1.35); } }
+    }
+  }
+}
+
 .toy { margin-top: clamp(3rem, 7vw, 6rem); }
 .toy h3 { font: 400 clamp(1.6rem, 1rem + 2vw, 2.4rem)/1.1 var(--serif); }
 .toy-lede { max-width: 38rem; margin-top: 0.9rem; }
@@ -141,7 +167,7 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
 .link circle { fill: var(--orange); stroke: var(--ink); stroke-width: 1.5; }
 #cable.draw { stroke-dasharray: var(--len); animation: draw 0.5s ease-out both; }
 @keyframes draw { from { stroke-dashoffset: var(--len); } to { stroke-dashoffset: 0; } }
-.picks { display: grid; gap: 1.25rem; grid-template-columns: repeat(auto-fill, minmax(11.5rem, 1fr)); }
+.picks { display: grid; gap: 1.25rem; grid-template-columns: repeat(auto-fill, minmax(13.5rem, 1fr)); }
 .pick { cursor: pointer; width: 100%; transition: transform 0.12s, box-shadow 0.12s; box-shadow: 4px 4px 0 var(--ink); }
 .pick:hover { transform: translate(-2px, -2px); box-shadow: 6px 6px 0 var(--ink); }
 .pick:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--ink); }
