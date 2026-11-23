@@ -80,11 +80,37 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
 .lede { text-wrap: pretty; font-size: clamp(1.1875rem, 1rem + 0.6vw, 1.4rem); line-height: 1.5; }
 .actions { margin-top: 1.5rem; }
 .alt { margin-top: 1.1rem; font-size: 0.9375rem; color: var(--ink-2); }
-.wire { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 2rem; margin-top: clamp(2.5rem, 6vw, 4.5rem); }
-.wire .win { position: relative; z-index: 1; width: min(19rem, 40%); }
-.cable { position: absolute; z-index: 0; left: 10%; width: 80%; top: 50%; height: 7.5rem; transform: translateY(-50%); overflow: visible; }
+.wire {
+  --w: min(19rem, 40cqw);
+  --gap: clamp(3rem, 12cqw, 9rem);
+  --spread: calc((100cqw - 2 * var(--w) - var(--gap)) / 2);
+  container-type: inline-size; position: relative; display: flex; align-items: center; justify-content: center; gap: var(--gap);
+  margin-top: clamp(2.5rem, 6vw, 4.5rem);
+}
+.wire .win { position: relative; z-index: 1; width: var(--w); }
+/* Spans window-centre to window-centre when the windows are far apart; the clip trims it to the gap once they close in. */
+.cable { position: absolute; z-index: 0; left: calc(var(--w) / 2); width: calc(100% - var(--w)); top: 50%; height: 7.5rem; transform: translateY(-50%); overflow: visible; clip-path: inset(0 var(--spread) 0 var(--spread)); }
 .cable path { fill: none; stroke: var(--orange); stroke-width: 4; stroke-linecap: round; }
 .cable .cable-pulse { stroke: var(--ink); stroke-dasharray: 3 97; }
+
+/* Hero motion. Without these queries the page rests in its finished state: windows close, cable joined. */
+@media (prefers-reduced-motion: no-preference) {
+  .cable-line { stroke-dasharray: 100; animation: cable-draw 1.5s 0.2s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+  .cable-pulse { animation: cable-pulse 2.8s linear 1.8s infinite; }
+  @keyframes cable-draw { from { stroke-dashoffset: 100; } to { stroke-dashoffset: 0; } }
+  @keyframes cable-pulse { from { stroke-dashoffset: 3; } to { stroke-dashoffset: -97; } }
+  @media (min-width: 48rem) {
+    @supports (animation-timeline: scroll()) {
+      .wire-a { animation: spread-a linear both; animation-timeline: scroll(root); animation-range: 0vh 60vh; }
+      .wire-b { animation: spread-b linear both; animation-timeline: scroll(root); animation-range: 0vh 60vh; }
+      .cable { animation: cable-trim linear both; animation-timeline: scroll(root); animation-range: 0vh 60vh; }
+      @keyframes spread-a { from { translate: calc(-1 * var(--spread)) 0; } }
+      @keyframes spread-b { from { translate: var(--spread) 0; } }
+      @keyframes cable-trim { from { clip-path: inset(0 0 0 0); } }
+    }
+  }
+}
+@media (prefers-reduced-motion: reduce) { .cable-pulse { display: none; } }
 
 /* ---- 2. What isn't there ---- */
 .gone { display: grid; gap: clamp(1rem, 3vw, 2.5rem); }
