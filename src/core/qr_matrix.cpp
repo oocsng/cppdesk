@@ -1,5 +1,6 @@
 #include "qr_matrix.hpp"
 
+#include <cstddef>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -353,8 +354,8 @@ QrMatrix QrMatrix::generate(const std::string& text, int minVersion, int maxVers
 
         for (int b = 0; b < bcount; ++b) {
             dBlocks[b].assign(
-                dataCodewords.begin() + b * dPerBlock,
-                dataCodewords.begin() + (b + 1) * dPerBlock
+                dataCodewords.begin() + static_cast<std::ptrdiff_t>(b) * dPerBlock,
+                dataCodewords.begin() + static_cast<std::ptrdiff_t>(b + 1) * dPerBlock
             );
             ecBlocks[b] = g_gf.computeErrorCorrection(dBlocks[b], ecPerBlock);
         }
@@ -374,8 +375,9 @@ QrMatrix QrMatrix::generate(const std::string& text, int minVersion, int maxVers
     }
 
     // 3. Matrix Setup & Function Patterns
-    std::vector<uint8_t> baseModules(N * N, 0);
-    std::vector<uint8_t> reserved(N * N, 0);
+    const size_t cells = static_cast<size_t>(N) * N;
+    std::vector<uint8_t> baseModules(cells, 0);
+    std::vector<uint8_t> reserved(cells, 0);
 
     // Finders
     applyFinderPattern(baseModules, reserved, N, 0, 0);
