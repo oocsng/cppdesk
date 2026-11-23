@@ -15,6 +15,7 @@
   --ink-2: #4A423B;            /* secondary text on paper: 8:1 */
   --orange: #C4542E;           /* cable, plugs, fills, large display only */
   --orange-text: #A8421F;      /* orange that passes 4.5:1 on paper and cream */
+  --orange-lit: #E56F45;       /* orange text on the ink band: 5.5:1 */
   --line: 1.5px solid var(--ink);
   --shadow: 6px 6px 0 var(--ink);
   --radius: 10px;
@@ -39,11 +40,12 @@ a { color: inherit; text-decoration-thickness: 1.5px; text-underline-offset: 0.2
 a:hover { text-decoration-color: var(--orange); }
 code { font: 600 0.92em var(--sans); background: var(--paper-2); padding: 0.05em 0.35em; border-radius: 4px; }
 :focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; border-radius: 4px; }
+.btn:focus-visible, .pick:focus-visible { outline: 3px solid var(--orange-lit); outline-offset: 5px; } /* clear of the hard shadow */
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .dim { color: var(--ink-2); }
 
 .wrap { width: min(100% - 2 * var(--edge), 80rem); margin-inline: auto; }
-.section { padding-block: clamp(4.5rem, 10vw, 9rem); }
+.section { padding-block: clamp(4.5rem, 10vw, 9rem); overflow-x: clip; } /* scroll-driven scale/rotate starts must not widen the page */
 .section-lede { max-width: 38rem; margin-top: 1.25rem; font-size: 1.1875rem; }
 
 h1, h2 { font: 400 clamp(2.1rem, 1rem + 4.4vw, 4.5rem)/1.04 var(--serif); letter-spacing: -0.012em; text-wrap: balance; }
@@ -63,7 +65,7 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
 
 /* ---- The window: the one component ---- */
 .win { background: var(--cream); border: var(--line); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; text-align: left; color: var(--ink); font: inherit; padding: 0; }
-.win-bar { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; padding: 0.55rem 0.95rem; background: var(--paper-2); border-bottom: var(--line); }
+.win-bar { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 1rem; padding: 0.55rem 0.95rem; background: var(--paper-2); border-bottom: var(--line); }
 .win-name { font: 600 0.9375rem/1.3 var(--sans); }
 .win-id { white-space: nowrap; font: 600 0.875rem/1.3 var(--sans); color: var(--ink-2); font-variant-numeric: tabular-nums; }
 .win-body { display: block; padding: 1rem 0.95rem 1.1rem; }
@@ -75,7 +77,7 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
 .btn:active { transform: translate(3px, 3px); box-shadow: 1px 1px 0 var(--ink); }
 
 /* ---- 1. Hero ---- */
-.hero { padding-top: clamp(2rem, 6vw, 5rem); }
+.hero { min-height: calc(100svh - 5.4rem); display: grid; align-content: center; padding-block: clamp(1.5rem, 4vw, 3rem); }
 .hero-copy { margin-top: clamp(1.5rem, 3vw, 2.5rem); max-width: 38rem; }
 .lede { text-wrap: pretty; font-size: clamp(1.1875rem, 1rem + 0.6vw, 1.4rem); line-height: 1.5; }
 .actions { margin-top: 1.5rem; }
@@ -85,7 +87,7 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
   --gap: clamp(3rem, 12cqw, 9rem);
   --spread: calc((100cqw - 2 * var(--w) - var(--gap)) / 2);
   container-type: inline-size; position: relative; display: flex; align-items: center; justify-content: center; gap: var(--gap);
-  margin-top: clamp(2.5rem, 6vw, 4.5rem);
+  margin-top: clamp(2rem, 4vw, 3rem);
 }
 .wire .win { position: relative; z-index: 1; width: var(--w); }
 /* Spans window-centre to window-centre when the windows are far apart; the clip trims it to the gap once they close in. */
@@ -143,7 +145,7 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
    The pinned phase is cover 28.6% to 71.4% (track 250vh, stage 100vh). Phones and short screens get the plain list. */
 @media (min-width: 48rem) and (min-height: 41rem) {
   .scene { height: 250vh; }
-  .scene-pin { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; justify-content: center; }
+  .scene-pin { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; justify-content: flex-start; padding-top: clamp(3rem, 12vh, 8rem); }
   @media (prefers-reduced-motion: no-preference) {
     @supports (animation-timeline: view()) {
       .scene { view-timeline: --scene block; }
@@ -167,7 +169,8 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
 .link circle { fill: var(--orange); stroke: var(--ink); stroke-width: 1.5; }
 #cable.draw { stroke-dasharray: var(--len); animation: draw 0.5s ease-out both; }
 @keyframes draw { from { stroke-dashoffset: var(--len); } to { stroke-dashoffset: 0; } }
-.picks { display: grid; gap: 1.25rem; grid-template-columns: repeat(auto-fill, minmax(13.5rem, 1fr)); }
+.picks { display: grid; gap: 1.25rem; grid-template-columns: repeat(2, 1fr); }
+@media (min-width: 48rem) { .picks { grid-template-columns: repeat(3, 1fr); } }
 .pick { cursor: pointer; width: 100%; transition: transform 0.12s, box-shadow 0.12s; box-shadow: 4px 4px 0 var(--ink); }
 .pick:hover { transform: translate(-2px, -2px); box-shadow: 6px 6px 0 var(--ink); }
 .pick:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--ink); }
@@ -216,7 +219,7 @@ nav a:hover { text-decoration: underline; text-decoration-color: var(--orange); 
 /* ---- 6. Security: the ink band ---- */
 .security { background: var(--ink); color: var(--paper); --ring: var(--paper); }
 .security .section-lede { color: var(--paper); }
-.stamp { display: inline-block; rotate: -2deg; margin-top: 1.75rem; padding: 0.4rem 1.1rem; border: 3px solid var(--orange); border-radius: 8px; color: var(--orange); font: 400 clamp(1.5rem, 1rem + 1.6vw, 2.2rem)/1.2 var(--serif); }
+.stamp { display: inline-block; rotate: -2deg; margin-top: 1.75rem; padding: 0.4rem 1.1rem; border: 3px solid var(--orange-lit); border-radius: 8px; color: var(--orange-lit); font: 400 clamp(1.5rem, 1rem + 1.6vw, 2.2rem)/1.2 var(--serif); }
 @media (prefers-reduced-motion: no-preference) {
   @supports (animation-timeline: view()) {
     .stamp { animation: stamp-land linear both; animation-timeline: view(); animation-range: entry 40% entry 100%; }
